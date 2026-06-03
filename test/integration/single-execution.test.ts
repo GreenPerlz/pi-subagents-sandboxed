@@ -1057,13 +1057,21 @@ process.exit(child.status ?? 0);
 			}
 			return normalized;
 		};
+		const extensionDir = path.join(tempDir, "absolute-extension-parent");
+		fs.mkdirSync(extensionDir, { recursive: true });
+		const absoluteExtensionPath = path.join(extensionDir, "custom-extension.ts");
+		fs.writeFileSync(absoluteExtensionPath, "export default {};\n", "utf-8");
+		const secretName = "PI_SUBAGENT_TEST_FAKE_SECRET";
+		const secretValue = "issue-4-secret-must-not-enter-bwrap-argv";
+		const previousSecret = process.env[secretName];
+		process.env[secretName] = secretValue;
 		const fakeBwrap = installFakeBwrap();
 		try {
 			const sessionDir = path.join(tempDir, "sessions");
 			const agent = makeAgent("echo", {
 				model: "mock/sandbox-model",
 				tools: ["read", "bash"],
-				extensions: [],
+				extensions: [absoluteExtensionPath],
 			});
 			const executor = makeExecutor([agent]);
 			mockPi.onCall({ output: "plain ok" });
@@ -1079,7 +1087,7 @@ process.exit(child.status ?? 0);
 			const plainPiArgs = readCallArgs();
 			mockPi.reset();
 
-			mockPi.onCall({ output: "sandboxed ok" });
+			mockPi.onCall({ echoEnv: [secretName] });
 			const result = await executor.execute(
 				"single-bubblewrap",
 				{
@@ -1094,8 +1102,10 @@ process.exit(child.status ?? 0);
 			);
 
 			assert.equal(result.isError, undefined);
-			assert.match(result.content[0]?.text ?? "", /sandboxed ok/);
+			assert.match(result.content[0]?.text ?? "", new RegExp(`"${secretName}":"${secretValue}"`));
 			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			assert.equal(bwrapArgs.includes(secretName), false, "bubblewrap argv should not include inherited env var names");
+			assert.equal(bwrapArgs.includes(secretValue), false, "bubblewrap argv should not include inherited env var values");
 			const separatorIndex = bwrapArgs.indexOf("--");
 			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
 			assert.equal(bwrapArgs[separatorIndex + 1], "pi");
@@ -1108,8 +1118,19 @@ process.exit(child.status ?? 0);
 			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,bash"]);
 			assert.ok(piArgs.includes("Task: Keep the same task"), "child should receive the original task text");
 			assert.ok(piArgs.includes("--session"), "fresh child session should still be configured");
+			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
+			const extensionParents = [...new Set(extensionArgs.filter((arg) => path.isAbsolute(arg)).map((arg) => path.dirname(arg)))];
+			assert.ok(extensionParents.includes(extensionDir), "custom absolute extension should be passed to pi");
+			for (const extensionParent of extensionParents) {
+				assert.ok(
+					bwrapArgs.some((arg, index) => arg === "--ro-bind" && bwrapArgs[index + 1] === extensionParent && bwrapArgs[index + 2] === extensionParent),
+					`bubblewrap should read-only mount extension parent ${extensionParent}`,
+				);
+			}
 		} finally {
 			fakeBwrap.restore();
+			if (previousSecret === undefined) delete process.env[secretName];
+			else process.env[secretName] = previousSecret;
 		}
 	});
 

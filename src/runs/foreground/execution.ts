@@ -116,6 +116,16 @@ function addSandboxMountParent(mounts: SandboxMount[], seen: Set<string>, filePa
 	addSandboxMount(mounts, seen, path.dirname(filePath), mode);
 }
 
+function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Set<string>, args: string[] | undefined): void {
+	if (!args) return;
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] !== "--extension") continue;
+		const extensionPath = args[i + 1];
+		if (!extensionPath || !path.isAbsolute(extensionPath)) continue;
+		addSandboxMountParent(mounts, seen, extensionPath, "ro");
+	}
+}
+
 function buildSingleRunSandboxMounts(input: {
 	cwd: string;
 	tempDir?: string;
@@ -125,6 +135,7 @@ function buildSingleRunSandboxMounts(input: {
 	jsonlPath?: string;
 	outputPath?: string;
 	structuredOutput?: RunSyncOptions["structuredOutput"];
+	piArgs?: string[];
 }): SandboxMount[] {
 	const mounts: SandboxMount[] = [];
 	const seen = new Set<string>();
@@ -137,6 +148,7 @@ function buildSingleRunSandboxMounts(input: {
 	addSandboxMountParent(mounts, seen, input.outputPath, "rw");
 	addSandboxMountParent(mounts, seen, input.structuredOutput?.schemaPath, "ro");
 	addSandboxMountParent(mounts, seen, input.structuredOutput?.outputPath, "rw");
+	addSandboxExtensionMountParents(mounts, seen, input.piArgs);
 	return mounts;
 }
 
@@ -299,9 +311,14 @@ async function runSingleAttempt(
 		};
 		if (options.sandbox) {
 			const provider = createSandboxProvider(options.sandbox);
+			const sandboxInvocation: SpawnableInvocation = {
+				command: piSpawnSpec.command,
+				args: piSpawnSpec.args,
+				cwd: childCwd,
+			};
 			const wrapped = provider.wrapInvocation({
 				config: options.sandbox,
-				invocation: piInvocation,
+				invocation: sandboxInvocation,
 				mounts: buildSingleRunSandboxMounts({
 					cwd: childCwd,
 					tempDir,
@@ -311,6 +328,7 @@ async function runSingleAttempt(
 					jsonlPath: shared.jsonlPath,
 					outputPath: options.outputPath,
 					structuredOutput: options.structuredOutput,
+					piArgs: args,
 				}),
 			});
 			const diagnosticMessages = wrapped.diagnostics

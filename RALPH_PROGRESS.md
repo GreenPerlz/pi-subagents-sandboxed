@@ -1,0 +1,1 @@
+- 2026-06-03 issue #2: Added sandbox config schema/frontmatter/settings parsing and deterministic resolver; focused sandbox/schema tests pass. Full unit suite was run and has unrelated pre-existing failures noted in final report.

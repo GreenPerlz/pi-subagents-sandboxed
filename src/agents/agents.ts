@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AcceptanceInput, OutputMode } from "../shared/types.ts";
+import type { AgentSandboxConfig, SandboxSettingsDefaults } from "../sandbox/types.ts";
 import { getAgentDir } from "../shared/utils.ts";
 import { KNOWN_FIELDS } from "./agent-serializer.ts";
 import { parseChain, parseJsonChain } from "./chain-serializer.ts";
@@ -96,6 +97,7 @@ export interface AgentConfig {
 	maxSubagentDepth?: number;
 	completionGuard?: boolean;
 	disabled?: boolean;
+	sandbox?: AgentSandboxConfig;
 	extraFields?: Record<string, string>;
 	override?: BuiltinAgentOverrideInfo;
 }
@@ -103,6 +105,7 @@ export interface AgentConfig {
 interface SubagentSettings {
 	overrides: Record<string, BuiltinAgentOverrideConfig>;
 	disableBuiltins?: boolean;
+	sandbox?: SandboxSettingsDefaults;
 }
 
 const EMPTY_SUBAGENT_SETTINGS: SubagentSettings = { overrides: {} };
@@ -187,6 +190,37 @@ function arraysEqual(a: string[] | undefined, b: string[] | undefined): boolean 
 		if (a[i] !== b[i]) return false;
 	}
 	return true;
+}
+
+function frontmatterString(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	const trimmed = value.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+function frontmatterBoolean(value: string | undefined): boolean | undefined {
+	if (value === "true") return true;
+	if (value === "false") return false;
+	return undefined;
+}
+
+function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSandboxConfig | undefined {
+	const sandbox: AgentSandboxConfig = {};
+	const provider = frontmatterString(frontmatter.sandboxProvider);
+	const profile = frontmatterString(frontmatter.sandboxProfile);
+	const network = frontmatterString(frontmatter.sandboxNetwork);
+	const trustProject = frontmatterBoolean(frontmatter.sandboxTrustProject);
+	const bashWrite = frontmatterBoolean(frontmatter.sandboxBashWrite);
+	const auth = frontmatterString(frontmatter.sandboxAuth);
+	const fallback = frontmatterString(frontmatter.sandboxFallback);
+	if (provider !== undefined) sandbox.provider = provider;
+	if (profile !== undefined) sandbox.profile = profile;
+	if (network !== undefined) sandbox.network = network;
+	if (trustProject !== undefined) sandbox.trustProject = trustProject;
+	if (bashWrite !== undefined) sandbox.bashWrite = bashWrite;
+	if (auth !== undefined) sandbox.auth = auth;
+	if (fallback !== undefined) sandbox.fallback = fallback;
+	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
 }
 
 function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
@@ -297,6 +331,51 @@ function parseOverrideStringArrayOrFalse(
 	return items;
 }
 
+function parseOptionalStringField(
+	value: unknown,
+	meta: { filePath: string; field: string },
+): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		throw new Error(`Subagent settings in '${meta.filePath}' have invalid '${meta.field}'; expected a string.`);
+	}
+	const trimmed = value.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+function parseOptionalBooleanField(
+	value: unknown,
+	meta: { filePath: string; field: string },
+): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") {
+		throw new Error(`Subagent settings in '${meta.filePath}' have invalid '${meta.field}'; expected a boolean.`);
+	}
+	return value;
+}
+
+function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSettingsDefaults | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`Subagent settings in '${filePath}' have invalid 'sandbox'; expected an object.`);
+	}
+	const input = value as Record<string, unknown>;
+	const sandbox: SandboxSettingsDefaults = {};
+	const defaultProvider = parseOptionalStringField(input.defaultProvider, { filePath, field: "sandbox.defaultProvider" });
+	const defaultProfile = parseOptionalStringField(input.defaultProfile, { filePath, field: "sandbox.defaultProfile" });
+	const network = parseOptionalStringField(input.network, { filePath, field: "sandbox.network" });
+	const auth = parseOptionalStringField(input.auth, { filePath, field: "sandbox.auth" });
+	const trustProject = parseOptionalBooleanField(input.trustProject, { filePath, field: "sandbox.trustProject" });
+	const fallback = parseOptionalStringField(input.fallback, { filePath, field: "sandbox.fallback" });
+	if (defaultProvider !== undefined) sandbox.defaultProvider = defaultProvider;
+	if (defaultProfile !== undefined) sandbox.defaultProfile = defaultProfile;
+	if (network !== undefined) sandbox.network = network;
+	if (auth !== undefined) sandbox.auth = auth;
+	if (trustProject !== undefined) sandbox.trustProject = trustProject;
+	if (fallback !== undefined) sandbox.fallback = fallback;
+	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
+}
+
 function parseBuiltinOverrideEntry(
 	name: string,
 	value: unknown,
@@ -400,16 +479,36 @@ function readSubagentSettings(filePath: string | null): SubagentSettings {
 		}
 	}
 
+	const sandbox = parseSandboxSettingsEntry(subagentsObject.sandbox, filePath);
 	const parsed: Record<string, BuiltinAgentOverrideConfig> = {};
 	const agentOverrides = subagentsObject.agentOverrides;
 	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) {
-		return { overrides: parsed, disableBuiltins };
+		return { overrides: parsed, disableBuiltins, sandbox };
 	}
 	for (const [name, value] of Object.entries(agentOverrides)) {
 		const override = parseBuiltinOverrideEntry(name, value, filePath);
 		if (override) parsed[name] = override;
 	}
-	return { overrides: parsed, disableBuiltins };
+	return { overrides: parsed, disableBuiltins, sandbox };
+}
+
+function mergeSandboxSettings(
+	base: SandboxSettingsDefaults | undefined,
+	override: SandboxSettingsDefaults | undefined,
+): SandboxSettingsDefaults | undefined {
+	const merged = {
+		...(base ?? {}),
+		...(override ?? {}),
+	};
+	return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+export function readSandboxSettings(cwd: string, scope: AgentScope = "both"): SandboxSettingsDefaults | undefined {
+	const userSettingsPath = getUserAgentSettingsPath();
+	const projectSettingsPath = getProjectAgentSettingsPath(cwd);
+	const userSettings = scope === "project" ? EMPTY_SUBAGENT_SETTINGS : readSubagentSettings(userSettingsPath);
+	const projectSettings = scope === "user" ? EMPTY_SUBAGENT_SETTINGS : readSubagentSettings(projectSettingsPath);
+	return mergeSandboxSettings(userSettings.sandbox, projectSettings.sandbox);
 }
 
 function applyBuiltinOverride(
@@ -670,6 +769,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			: frontmatter.completionGuard === "true"
 				? true
 				: undefined;
+		const sandbox = buildAgentSandboxConfig(frontmatter);
 
 		agents.push({
 			name: runtimeName,
@@ -699,6 +799,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 					? parsedMaxSubagentDepth
 					: undefined,
 			completionGuard,
+			sandbox,
 			extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
 		});
 	}

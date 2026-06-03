@@ -35,6 +35,16 @@ const ReadsOverride = Type.Unsafe({
 	description: "Files to read before running (array of filenames), or false to disable",
 });
 
+const SandboxOverride = Type.Object({
+	provider: Type.Optional(Type.String({ description: "Sandbox provider, e.g. 'bubblewrap'. Omit for no sandbox unless configured by settings or agent defaults." })),
+	profile: Type.Optional(Type.String({ description: "Sandbox profile, e.g. 'host-toolchain'." })),
+	network: Type.Optional(Type.String({ description: "Sandbox network policy, e.g. 'host' or 'none'." })),
+	trustProject: Type.Optional(Type.Boolean({ description: "Allow sandbox policy to trust project-local files/config." })),
+	bashWrite: Type.Optional(Type.Boolean({ description: "Allow bash-only tasks to imply writable project/cwd access." })),
+	auth: Type.Optional(Type.String({ description: "Sandbox auth policy, e.g. 'env'." })),
+	fallback: Type.Optional(Type.String({ description: "Fallback policy when sandboxing cannot be applied, e.g. 'fail' or 'none'." })),
+}, { additionalProperties: false });
+
 const JsonSchemaObject = Type.Unsafe({
 	type: "object",
 	additionalProperties: true,
@@ -286,6 +296,7 @@ export const SubagentParams = Type.Object({
 	// Clarification TUI
 	clarify: Type.Optional(Type.Boolean({ description: "Show TUI to preview/edit before execution. Explicit clarify: true keeps the run foreground for the clarify UI; omitted clarify can still run in the background when async: true is set." })),
 	control: Type.Optional(ControlOverrides),
+	sandbox: Type.Optional(SandboxOverride),
 	// Solo agent overrides
 	output: Type.Optional(Type.Unsafe({
 		anyOf: [

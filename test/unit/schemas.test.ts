@@ -53,6 +53,7 @@ interface SubagentParamsSchema {
 			};
 		};
 		skill?: JsonSchemaNode;
+		sandbox?: JsonSchemaNode & { properties?: Record<string, JsonSchemaNode>; additionalProperties?: boolean };
 		output?: JsonSchemaNode;
 		config?: JsonSchemaNode;
 		chain?: {
@@ -137,6 +138,29 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.ok(concurrencySchema, "concurrency schema should exist");
 		assert.equal(concurrencySchema.minimum, 1);
 		assert.match(String(concurrencySchema.description ?? ""), /parallel/i);
+	});
+
+	it("accepts per-run sandbox configuration", () => {
+		const sandboxSchema = SubagentParams?.properties?.sandbox;
+		assert.ok(sandboxSchema, "sandbox schema should exist");
+		assert.equal(sandboxSchema.type, "object");
+		assert.equal(sandboxSchema.additionalProperties, false);
+		assert.deepEqual(Object.keys(sandboxSchema.properties ?? {}).sort(), [
+			"auth",
+			"bashWrite",
+			"fallback",
+			"network",
+			"profile",
+			"provider",
+			"trustProject",
+		]);
+		assert.equal(sandboxSchema.properties?.provider?.type, "string");
+		assert.equal(sandboxSchema.properties?.profile?.type, "string");
+		assert.equal(sandboxSchema.properties?.network?.type, "string");
+		assert.equal(sandboxSchema.properties?.trustProject?.type, "boolean");
+		assert.equal(sandboxSchema.properties?.bashWrite?.type, "boolean");
+		assert.equal(sandboxSchema.properties?.auth?.type, "string");
+		assert.equal(sandboxSchema.properties?.fallback?.type, "string");
 	});
 
 	it("uses an enum for management and control actions", () => {
@@ -351,6 +375,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ chain: [{ parallel: [{ agent: "reviewer", phase: "Review", label: "Security", as: "security", outputSchema: { type: "object" } }] }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", output: "review.md", reads: ["input.md"], skill: "review" }] }] },
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 }, parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } }, collect: { as: "reviews" } }] },
+			{ agent: "worker", task: "Fix", sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host", trustProject: true, bashWrite: true, auth: "env", fallback: "fail" } },
 			{ agent: "worker", task: "Fix", acceptance: { criteria: ["Patch the bug"], evidence: ["changed-files"], maxFinalizationTurns: 2 } },
 			{ agent: "worker", task: "Fix", acceptance: { verify: [{ id: "unit", command: "npm test" }] } },
 			{ config: { name: "reviewer", description: "Review things" } },
@@ -371,6 +396,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4, expression: "items" }, parallel: { agent: "reviewer" }, collect: { as: "reviews" } }] },
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer", as: "child" }, collect: { as: "reviews" } }] },
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer" }, collect: { as: "reviews" }, when: "later" }] },
+			{ agent: "worker", task: "Fix", sandbox: { provider: 123 } },
+			{ agent: "worker", task: "Fix", sandbox: { provider: "bubblewrap", unknown: true } },
 			{ agent: "worker", task: "Fix", acceptance: true },
 			{ agent: "worker", task: "Fix", acceptance: "checked" },
 			{ agent: "worker", task: "Fix", acceptance: false },

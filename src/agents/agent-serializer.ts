@@ -22,6 +22,13 @@ export const KNOWN_FIELDS = new Set([
 	"interactive",
 	"maxSubagentDepth",
 	"completionGuard",
+	"sandboxProvider",
+	"sandboxProfile",
+	"sandboxNetwork",
+	"sandboxTrustProject",
+	"sandboxBashWrite",
+	"sandboxAuth",
+	"sandboxFallback",
 ]);
 
 function joinComma(values: string[] | undefined): string | undefined {
@@ -72,6 +79,13 @@ export function serializeAgent(config: AgentConfig): string {
 		lines.push(`maxSubagentDepth: ${maxSubagentDepth}`);
 	}
 	if (config.completionGuard === false) lines.push("completionGuard: false");
+	if (config.sandbox?.provider) lines.push(`sandboxProvider: ${config.sandbox.provider}`);
+	if (config.sandbox?.profile) lines.push(`sandboxProfile: ${config.sandbox.profile}`);
+	if (config.sandbox?.network) lines.push(`sandboxNetwork: ${config.sandbox.network}`);
+	if (config.sandbox?.trustProject !== undefined) lines.push(`sandboxTrustProject: ${config.sandbox.trustProject ? "true" : "false"}`);
+	if (config.sandbox?.bashWrite !== undefined) lines.push(`sandboxBashWrite: ${config.sandbox.bashWrite ? "true" : "false"}`);
+	if (config.sandbox?.auth) lines.push(`sandboxAuth: ${config.sandbox.auth}`);
+	if (config.sandbox?.fallback) lines.push(`sandboxFallback: ${config.sandbox.fallback}`);
 
 	if (config.extraFields) {
 		for (const [key, value] of Object.entries(config.extraFields)) {

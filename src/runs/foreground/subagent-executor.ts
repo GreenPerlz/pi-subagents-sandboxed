@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type AgentConfig, type AgentScope } from "../../agents/agents.ts";
+import type { SandboxRunConfig } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -127,6 +128,7 @@ export interface SubagentParamsLike {
 	clarify?: boolean;
 	share?: boolean;
 	control?: ControlConfig;
+	sandbox?: SandboxRunConfig;
 	sessionDir?: string;
 	cwd?: string;
 	maxOutput?: MaxOutputConfig;

@@ -88,6 +88,7 @@ describe("Bubblewrap sandbox provider", () => {
 		}), (error) => {
 			assert.ok(error instanceof SandboxUnavailableError);
 			assert.match(error.message, /Bubblewrap sandbox requested but bwrap is unavailable/);
+			assert.match(error.message, /README.*Sandboxed subagents/);
 			return true;
 		});
 	});
@@ -102,6 +103,7 @@ describe("Bubblewrap sandbox provider", () => {
 		});
 
 		assert.deepEqual(result.invocation, original);
+		assert.equal(result.fallbackOccurred, true);
 		assert.equal(result.diagnostics.length, 1);
 		assert.equal(result.diagnostics[0]?.level, "warning");
 		assert.match(result.diagnostics[0]?.message ?? "", /running without sandbox/);

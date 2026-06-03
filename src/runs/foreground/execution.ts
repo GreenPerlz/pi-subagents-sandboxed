@@ -49,6 +49,7 @@ import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/ski
 import { evaluateCompletionMutationGuard, resolveCompletionPolicy, type CompletionPolicy } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
+import { sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
 import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable } from "../../sandbox/write-inference.ts";
@@ -262,6 +263,7 @@ async function runSingleAttempt(
 			env: spawnEnv,
 		};
 		if (options.sandbox) {
+			result.sandbox = sandboxResultDetails(options.sandbox);
 			const provider = createSandboxProvider(options.sandbox);
 			const cwdMode = inferSandboxCwdWritable({ tools: agent.tools, sandbox: options.sandbox }) ? "rw" : "ro";
 			const sandboxInvocation: SpawnableInvocation = {
@@ -286,6 +288,7 @@ async function runSingleAttempt(
 					piArgs: args,
 				}),
 			});
+			result.sandbox = sandboxResultDetails(options.sandbox, wrapped);
 			const diagnosticMessages = wrapped.diagnostics
 				.filter((diagnostic) => diagnostic.level !== "info")
 				.map((diagnostic) => diagnostic.message);
@@ -302,6 +305,7 @@ async function runSingleAttempt(
 	} catch (error) {
 		cleanupTempDir(tempDir);
 		const message = error instanceof Error ? error.message : String(error);
+		if (options.sandbox) result.sandbox = sandboxResultDetails(options.sandbox);
 		result.exitCode = 1;
 		result.error = `Sandbox setup failed: ${message}`;
 		progress.status = "failed";

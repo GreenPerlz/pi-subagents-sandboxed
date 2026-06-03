@@ -5,7 +5,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
-import type { ResolvedSandboxConfig } from "../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxResultDetails } from "../sandbox/types.ts";
 import type { FSWatcher } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -440,6 +440,7 @@ export interface SingleResult {
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
+	sandbox?: SandboxResultDetails;
 }
 
 export interface Details {
@@ -640,6 +641,7 @@ export interface AsyncStatus {
 		structuredOutputPath?: string;
 		structuredOutputSchemaPath?: string;
 		acceptance?: AcceptanceLedger;
+		sandbox?: SandboxResultDetails;
 	}>;
 	sessionDir?: string;
 	outputFile?: string;

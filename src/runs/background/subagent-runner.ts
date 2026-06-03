@@ -7,9 +7,10 @@ import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
+import { sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
-import type { ResolvedSandboxConfig, SpawnableInvocation } from "../../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxResultDetails, SpawnableInvocation } from "../../sandbox/types.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	type AcceptanceFinalizationTurn,
@@ -146,6 +147,7 @@ interface StepResult {
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
+	sandbox?: SandboxResultDetails;
 }
 
 const ASYNC_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
@@ -240,6 +242,7 @@ interface RunPiStreamingResult {
 	finalOutput: string;
 	interrupted?: boolean;
 	observedMutationAttempt?: boolean;
+	sandbox?: SandboxResultDetails;
 }
 
 interface RunPiStreamingSandboxInput extends SubagentSandboxMountInput {
@@ -267,6 +270,7 @@ function runPiStreaming(
 			...(piArgv1 ? { argv1: piArgv1 } : {}),
 		});
 		let spawnSpec: SpawnableInvocation;
+		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;
 		try {
 			if (sandbox) {
 				const wrapped = createSandboxProvider(sandbox.config).wrapInvocation({
@@ -274,6 +278,7 @@ function runPiStreaming(
 					invocation: { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd },
 					mounts: buildSubagentSandboxMounts(sandbox),
 				});
+				sandboxDetails = sandboxResultDetails(sandbox.config, wrapped);
 				spawnSpec = {
 					command: wrapped.invocation.command,
 					args: wrapped.invocation.args,
@@ -293,6 +298,7 @@ function runPiStreaming(
 				usage: emptyUsage(),
 				error: `Sandbox setup failed: ${message}`,
 				finalOutput: "",
+				...(sandboxDetails ? { sandbox: sandboxDetails } : {}),
 			});
 			return;
 		}
@@ -488,6 +494,7 @@ function runPiStreaming(
 				finalOutput,
 				interrupted,
 				observedMutationAttempt,
+				...(sandboxDetails ? { sandbox: sandboxDetails } : {}),
 			});
 		});
 
@@ -499,7 +506,7 @@ function runPiStreaming(
 			outputStream.end();
 			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
 			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
-			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? assistantError ?? spawnErrorMessage, finalOutput, observedMutationAttempt });
+			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? assistantError ?? spawnErrorMessage, finalOutput, observedMutationAttempt, ...(sandboxDetails ? { sandbox: sandboxDetails } : {}) });
 		});
 	});
 }
@@ -1013,6 +1020,7 @@ async function runSingleStep(
 		structuredOutputPath: effectiveStructuredOutput?.outputPath,
 		structuredOutputSchemaPath: effectiveStructuredOutput?.schemaPath,
 		acceptance,
+		sandbox: finalResult?.sandbox,
 	};
 }
 
@@ -1181,6 +1189,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					model: task.model,
 					thinking: task.thinking,
 					attemptedModels: task.modelCandidates && task.modelCandidates.length > 0 ? task.modelCandidates : task.model ? [task.model] : undefined,
+					...((task.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((task.sandbox ?? config.sandbox)!) } : {}),
 					recentTools: [],
 					recentOutput: [],
 				});
@@ -1195,6 +1204,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				outputName: step.collect.as,
 				structured: Boolean(step.collect.outputSchema),
 				status: "pending",
+				...((step.parallel.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((step.parallel.sandbox ?? config.sandbox)!) } : {}),
 				recentTools: [],
 				recentOutput: [],
 			});
@@ -1212,6 +1222,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				model: step.model,
 				thinking: step.thinking,
 				attemptedModels: step.modelCandidates && step.modelCandidates.length > 0 ? step.modelCandidates : step.model ? [step.model] : undefined,
+				...((step.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((step.sandbox ?? config.sandbox)!) } : {}),
 				recentTools: [],
 				recentOutput: [],
 			});
@@ -1801,6 +1812,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.steps[fi].structuredOutputPath = singleResult.structuredOutputPath;
 				statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 				statusPayload.steps[fi].acceptance = singleResult.acceptance;
+				statusPayload.steps[fi].sandbox = singleResult.sandbox;
 				statusPayload.lastUpdate = taskEndTime;
 				writeStatusPayload();
 				appendJsonl(eventsPath, JSON.stringify({
@@ -1831,6 +1843,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					structuredOutputPath: pr.structuredOutputPath,
 					structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
 					acceptance: pr.acceptance,
+					sandbox: pr.sandbox,
 				});
 			}
 			const collection = collectDynamicResults(step as Parameters<typeof collectDynamicResults>[0], materialized.items, parallelResults);
@@ -2050,6 +2063,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].structuredOutputPath = singleResult.structuredOutputPath;
 						statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 						statusPayload.steps[fi].acceptance = singleResult.acceptance;
+						statusPayload.steps[fi].sandbox = singleResult.sandbox;
 						statusPayload.lastUpdate = taskEndTime;
 						writeStatusPayload();
 
@@ -2115,6 +2129,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							structuredOutputPath: pr.structuredOutputPath,
 							structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
 							acceptance: pr.acceptance,
+							sandbox: pr.sandbox,
 						});
 					}
 				for (let t = 0; t < group.parallel.length; t++) {
@@ -2218,6 +2233,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				structuredOutputPath: singleResult.structuredOutputPath,
 				structuredOutputSchemaPath: singleResult.structuredOutputSchemaPath,
 				acceptance: singleResult.acceptance,
+				sandbox: singleResult.sandbox,
 			});
 			if (seqStep.outputName) {
 				outputs[seqStep.outputName] = outputEntryFromAsyncResult({
@@ -2263,6 +2279,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.steps[flatIndex].structuredOutputPath = singleResult.structuredOutputPath;
 			statusPayload.steps[flatIndex].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 			statusPayload.steps[flatIndex].acceptance = singleResult.acceptance;
+			statusPayload.steps[flatIndex].sandbox = singleResult.sandbox;
 			if (stepTokens) {
 				statusPayload.steps[flatIndex].tokens = stepTokens;
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
@@ -2425,6 +2442,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				structuredOutputPath: r.structuredOutputPath,
 				structuredOutputSchemaPath: r.structuredOutputSchemaPath,
 				acceptance: r.acceptance,
+				sandbox: r.sandbox,
 			})),
 			outputs,
 			workflowGraph: statusPayload.workflowGraph,

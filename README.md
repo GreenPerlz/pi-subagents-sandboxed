@@ -2,19 +2,103 @@
   <img src="https://raw.githubusercontent.com/nicobailon/pi-subagents/main/banner.png" alt="pi-subagents" width="1100">
 </p>
 
-# pi-subagents
+# pi-subagents-sandboxed
 
-`pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
+`pi-subagents-sandboxed` lets Pi delegate work to focused child agents, with optional Bubblewrap sandboxing for child Pi processes. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
 https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
 
 ## Installation
 
 ```bash
-pi install npm:pi-subagents
+pi install npm:pi-subagents-sandboxed
 ```
 
-That is the only required step. You can add optional pieces later.
+`pi-subagents-sandboxed` is a replacement fork of `pi-subagents`, not a companion package. Do not install or enable both in the same Pi environment; keep only one `subagent` extension active so slash commands, bundled agents, and the `subagent` tool resolve unambiguously.
+
+That is the only required step for ordinary unsandboxed delegation. You can add optional sandboxing pieces later. See the parent design in [docs/prd/sandboxed-subagents.md](docs/prd/sandboxed-subagents.md).
+
+## Sandboxed subagents
+
+Sandboxing is optional. If no sandbox provider is configured or requested, runs use the same child Pi spawn path as upstream `pi-subagents`.
+
+### Bubblewrap requirements
+
+The MVP sandbox provider is `bubblewrap`, which shells out to `bwrap`. Install Bubblewrap with your OS package manager before requesting `sandbox.provider: "bubblewrap"` (for example, `sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, or `sudo pacman -S bubblewrap`). If Bubblewrap is missing, sandboxed runs fail closed by default and the error points back to this section and the [sandbox PRD](docs/prd/sandboxed-subagents.md).
+
+The only supported MVP profile is `host-toolchain`. It preserves original host paths and read-only mounts common host toolchain/runtime paths such as `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, and `/etc` where present, plus the Pi/package/temp paths needed to run the child. The child cwd/worktree is mounted read-only or writable according to write inference below.
+
+### Configure sandboxing
+
+Per run:
+
+```ts
+subagent({
+  agent: "worker",
+  task: "Fix the selected issue",
+  sandbox: {
+    provider: "bubblewrap",
+    profile: "host-toolchain",
+    network: "host",
+    auth: "env",
+    fallback: "fail",
+    bashWrite: true
+  }
+})
+```
+
+Per agent frontmatter:
+
+```yaml
+sandboxProvider: bubblewrap
+sandboxProfile: host-toolchain
+sandboxNetwork: host
+sandboxAuth: env
+sandboxFallback: fail
+sandboxBashWrite: true
+```
+
+Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
+
+```json
+{
+  "subagents": {
+    "sandbox": {
+      "defaultProvider": "bubblewrap",
+      "defaultProfile": "host-toolchain",
+      "network": "host",
+      "auth": "env",
+      "fallback": "fail"
+    }
+  }
+}
+```
+
+Run-level sandbox options override agent frontmatter, which overrides settings defaults.
+
+### Sandbox modes and diagnostics
+
+- Provider: `bubblewrap` wraps child Pi invocations with `bwrap`; provider `none` or an omitted provider means no sandbox.
+- Profile: `host-toolchain` is for local developer machines that already have the repo toolchain installed on the host.
+- Network: `host` is the default so child Pi processes can reach model/API providers; `none` passes Bubblewrap `--unshare-net` for offline tasks.
+- Auth: `env` is the default MVP mode and uses the child process environment. Future modes such as Pi/GitHub readonly config mounts are tracked in the [sandbox PRD](docs/prd/sandboxed-subagents.md).
+- Fallback: `fail` is the default and refuses to run when Bubblewrap cannot be applied. Explicit `fallback: "none"` runs the original unsandboxed invocation and records a warning/result marker.
+- Write inference: agents with `edit` or `write` tools get writable cwd/worktree mounts. `bash` alone stays read-only unless `bashWrite: true` is set. Parallel sandboxed writers require `worktree: true` so each writer gets an isolated writable worktree.
+
+Returned result details and async status steps include a `sandbox` diagnostic object for sandboxed executions:
+
+```json
+{
+  "provider": "bubblewrap",
+  "profile": "host-toolchain",
+  "network": "host",
+  "auth": "env",
+  "fallbackMode": "fail",
+  "fallbackOccurred": false
+}
+```
+
+When `fallback: "none"` is used because `bwrap` is unavailable, `fallbackOccurred` is `true` and `diagnostics` contains the warning explaining that the run was not sandboxed.
 
 ## Try this first
 

@@ -4,6 +4,7 @@ import type { SandboxMount, SandboxProvider, SandboxWrapInput, SandboxWrapResult
 import { SandboxUnavailableError } from "./types.ts";
 
 const DEFAULT_BWRAP_COMMAND = "bwrap";
+const SANDBOX_DOCS_REFERENCE = "See the README Sandboxed subagents section (README.md#sandboxed-subagents) and docs/prd/sandboxed-subagents.md for Bubblewrap setup, network/auth modes, and fallback configuration.";
 const HOST_TOOLCHAIN_READONLY_PATHS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"];
 
 export interface BubblewrapProviderDeps {
@@ -72,12 +73,13 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 					invocation: input.invocation,
 					diagnostics: [{
 						level: "warning",
-						message: "Bubblewrap sandbox requested but bwrap is unavailable; running without sandbox because fallback is none.",
+						message: `Bubblewrap sandbox requested but bwrap is unavailable; running without sandbox because fallback is none. ${SANDBOX_DOCS_REFERENCE}`,
 					}],
+					fallbackOccurred: true,
 				};
 			}
 
-			throw new SandboxUnavailableError("Bubblewrap sandbox requested but bwrap is unavailable; refusing to run without sandbox.");
+			throw new SandboxUnavailableError(`Bubblewrap sandbox requested but bwrap is unavailable; refusing to run without sandbox. ${SANDBOX_DOCS_REFERENCE}`);
 		}
 
 		const network = input.config.network ?? "host";
@@ -104,6 +106,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 				...(input.invocation.cwd !== undefined ? { cwd: input.invocation.cwd } : {}),
 			},
 			diagnostics: [],
+			fallbackOccurred: false,
 		};
 	}
 }

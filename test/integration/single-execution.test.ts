@@ -83,6 +83,15 @@ interface RunSyncResult {
 	outputReference?: { path: string; bytes: number; lines: number; message: string };
 	outputSaveError?: string;
 	sessionFile?: string;
+	sandbox?: {
+		provider?: string;
+		profile?: string;
+		network?: string;
+		auth?: string;
+		fallbackMode?: string;
+		fallbackOccurred?: boolean;
+		diagnostics?: Array<{ level?: string; message?: string }>;
+	};
 	acceptance?: {
 		status?: string;
 		finalization?: {
@@ -109,7 +118,7 @@ interface UtilsModule {
 
 interface ExecutorModule {
 	createSubagentExecutor?: (...args: unknown[]) => {
-		execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean }>;
+		execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean; details: { results: RunSyncResult[] } }>;
 	};
 }
 
@@ -1110,6 +1119,15 @@ process.exit(child.status ?? 0);
 			);
 
 			assert.equal(result.isError, undefined);
+			const sandboxDetails = result.details.results[0]?.sandbox;
+			assert.deepEqual(sandboxDetails, {
+				provider: "bubblewrap",
+				profile: "host-toolchain",
+				network: "host",
+				auth: "env",
+				fallbackMode: "fail",
+				fallbackOccurred: false,
+			});
 			assert.match(result.content[0]?.text ?? "", new RegExp(`"${secretName}":"${secretValue}"`));
 			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
 			assert.equal(bwrapArgs.includes(secretName), false, "bubblewrap argv should not include inherited env var names");
@@ -1213,7 +1231,7 @@ process.exit(child.status ?? 0);
 
 	it("reports sandbox setup failures as foreground subagent errors", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const previousPath = process.env.PATH;
-		process.env.PATH = "";
+		process.env.PATH = path.join(path.dirname(mockPi.dir), "bin");
 		try {
 			mockPi.onCall({ output: "should not run" });
 			const executor = makeExecutor([makeAgent("echo")]);
@@ -1228,7 +1246,40 @@ process.exit(child.status ?? 0);
 
 			assert.equal(result.isError, true);
 			assert.match(result.content[0]?.text ?? "", /Sandbox setup failed: Bubblewrap sandbox requested but bwrap is unavailable/);
+			assert.match(result.content[0]?.text ?? "", /README.*Sandboxed subagents/);
 			assert.equal(mockPi.callCount(), 0);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	});
+
+	it("surfaces fallback-none sandbox diagnostics in foreground details", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const previousPath = process.env.PATH;
+		process.env.PATH = path.join(path.dirname(mockPi.dir), "bin");
+		try {
+			mockPi.onCall({ output: "fallback ok" });
+			const executor = makeExecutor([makeAgent("echo")]);
+
+			const result = await executor.execute(
+				"single-bubblewrap-fallback-none",
+				{ agent: "echo", task: "Fallback allowed", sandbox: { provider: "bubblewrap", fallback: "none" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.equal(result.content[0]?.text, "fallback ok");
+			assert.equal(mockPi.callCount(), 1);
+			const sandboxDetails = result.details.results[0]?.sandbox;
+			assert.equal(sandboxDetails?.provider, "bubblewrap");
+			assert.equal(sandboxDetails?.profile, "host-toolchain");
+			assert.equal(sandboxDetails?.network, "host");
+			assert.equal(sandboxDetails?.auth, "env");
+			assert.equal(sandboxDetails?.fallbackMode, "none");
+			assert.equal(sandboxDetails?.fallbackOccurred, true);
+			assert.match(sandboxDetails?.diagnostics?.[0]?.message ?? "", /running without sandbox/);
 		} finally {
 			if (previousPath === undefined) delete process.env.PATH;
 			else process.env.PATH = previousPath;

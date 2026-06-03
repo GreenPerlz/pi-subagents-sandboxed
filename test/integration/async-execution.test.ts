@@ -22,6 +22,16 @@ interface AsyncExecutionResult {
 	details: { asyncId?: string };
 }
 
+interface SandboxDiagnosticsPayload {
+	provider?: string;
+	profile?: string;
+	network?: string;
+	auth?: string;
+	fallbackMode?: string;
+	fallbackOccurred?: boolean;
+	diagnostics?: Array<{ level?: string; message?: string }>;
+}
+
 interface AsyncResultPayload {
 	success: boolean;
 	state?: string;
@@ -29,7 +39,7 @@ interface AsyncResultPayload {
 	sessionId?: string;
 	mode?: string;
 	summary?: string;
-	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown } }>;
+	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown }; sandbox?: SandboxDiagnosticsPayload }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; error?: string }> }> };
 }
@@ -57,6 +67,7 @@ interface AsyncStatusPayload {
 		thinking?: string;
 		tokens?: { total: number };
 		acceptance?: { status?: string };
+		sandbox?: SandboxDiagnosticsPayload;
 	}>;
 }
 
@@ -376,10 +387,19 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			const resultPath = await waitForAsyncResultFile(id, 10_000);
 			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
 			assert.equal(payload.success, true);
+			assert.deepEqual(payload.results[0]?.sandbox, {
+				provider: "bubblewrap",
+				profile: "host-toolchain",
+				network: "host",
+				auth: "env",
+				fallbackMode: "fail",
+				fallbackOccurred: false,
+			});
 
-			const status = readStatus(path.join(ASYNC_DIR, id));
+			const status = readStatus(path.join(ASYNC_DIR, id)) as (AsyncStatusPayload & { runId?: string }) | null;
 			assert.equal(status?.runId, id);
 			assert.equal(status?.state, "complete");
+			assert.deepEqual(status?.steps?.[0]?.sandbox, payload.results[0]?.sandbox);
 
 			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
 			const asyncSessionDir = path.join(sessionRoot, `async-${id}`);

@@ -59,6 +59,17 @@ export interface SandboxWrapInput {
 export interface SandboxWrapResult {
 	invocation: SpawnableInvocation;
 	diagnostics: SandboxDiagnostic[];
+	fallbackOccurred?: boolean;
+}
+
+export interface SandboxResultDetails {
+	provider: string;
+	profile: string;
+	network: string;
+	auth: string;
+	fallbackMode: string;
+	fallbackOccurred: boolean;
+	diagnostics?: SandboxDiagnostic[];
 }
 
 export interface SandboxProvider {

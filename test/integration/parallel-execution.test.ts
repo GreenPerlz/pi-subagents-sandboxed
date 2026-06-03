@@ -131,6 +131,58 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
 	}
 
+	function installFakeBwrap(): { recordDir: string; restore: () => void } {
+		const rootDir = fs.mkdtempSync(path.join(tempDir, "fake-bwrap-"));
+		const binDir = path.join(rootDir, "bin");
+		const recordDir = path.join(rootDir, "records");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.mkdirSync(recordDir, { recursive: true });
+		const scriptPath = path.join(binDir, "fake-bwrap.mjs");
+		fs.writeFileSync(scriptPath, `
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+const args = process.argv.slice(2);
+const recordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+if (!recordDir) process.exit(97);
+fs.mkdirSync(recordDir, { recursive: true });
+fs.writeFileSync(path.join(recordDir, \`call-\${Date.now()}-\${process.pid}.json\`), JSON.stringify({ args, cwd: process.cwd() }), "utf-8");
+const separator = args.indexOf("--");
+if (separator === -1 || !args[separator + 1]) process.exit(98);
+const child = spawnSync(args[separator + 1], args.slice(separator + 2), { stdio: "inherit", env: process.env, cwd: process.cwd() });
+if (child.error) process.exit(99);
+process.exit(child.status ?? 0);
+`, "utf-8");
+		const bwrapPath = path.join(binDir, "bwrap");
+		fs.writeFileSync(bwrapPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`, "utf-8");
+		fs.chmodSync(bwrapPath, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRecordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+		process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+		process.env.FAKE_BWRAP_RECORD_DIR = recordDir;
+		return {
+			recordDir,
+			restore() {
+				if (previousPath === undefined) delete process.env.PATH;
+				else process.env.PATH = previousPath;
+				if (previousRecordDir === undefined) delete process.env.FAKE_BWRAP_RECORD_DIR;
+				else process.env.FAKE_BWRAP_RECORD_DIR = previousRecordDir;
+			},
+		};
+	}
+
+	function readLastFakeBwrapArgs(recordDir: string): string[] {
+		const callFile = fs.readdirSync(recordDir).filter((name) => name.startsWith("call-") && name.endsWith(".json")).sort().at(-1);
+		assert.ok(callFile, "expected a recorded fake bwrap call");
+		const payload = JSON.parse(fs.readFileSync(path.join(recordDir, callFile), "utf-8")) as { args?: string[] };
+		assert.ok(Array.isArray(payload.args), "expected recorded bwrap args");
+		return payload.args;
+	}
+
+	function assertBind(args: string[], source: string): void {
+		assert.deepEqual(args.slice(args.indexOf(source) - 1, args.indexOf(source) + 2), ["--bind", source, source]);
+	}
+
 	it("runs multiple agents concurrently via mapConcurrent + runSync", async () => {
 		mockPi.onCall({ output: "Done" });
 		const agents = makeAgentConfigs(["agent-a", "agent-b", "agent-c"]);
@@ -306,6 +358,35 @@ Inspect`));
 		const args = readLastCallArgs();
 		assert.ok((args.at(-1) ?? "").includes(`Update progress at: ${path.join(tempDir, "progress.md")}`));
 		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
+	});
+
+	it("top-level parallel sandbox preserves child output, artifacts, session, and progress mounts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "Sandboxed parallel done" });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const sessionDir = path.join(tempDir, "subagent-sessions");
+			const executor = makeExecutor();
+
+			const result = await executor.execute(
+				"parallel-bubblewrap",
+				{
+					tasks: [{ agent: "echo", task: "Track work", output: "parallel-sandbox-output.md", progress: true }],
+					sandbox: { provider: "bubblewrap" },
+					sessionDir,
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
+			assertBind(bwrapArgs, path.dirname(path.join(tempDir, "parallel-sandbox-output.md")));
+			assertBind(bwrapArgs, path.join(sessionDir, "run-0"));
+			assertBind(bwrapArgs, tempDir);
+		} finally {
+			fakeBwrap.restore();
+		}
 	});
 
 	it("top-level parallel suppresses progress when the task is review-only", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

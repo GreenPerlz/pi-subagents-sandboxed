@@ -278,6 +278,7 @@ async function runSingleAttempt(
 					artifactsDir: options.artifactsDir,
 					jsonlPath: shared.jsonlPath,
 					outputPath: options.outputPath,
+					progressPaths: options.progressPaths,
 					structuredOutput: options.structuredOutput,
 					piArgs: args,
 				}),

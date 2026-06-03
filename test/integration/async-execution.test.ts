@@ -217,6 +217,21 @@ function readLastFakeBwrapArgs(recordDir: string): string[] {
 	return payload.args;
 }
 
+function readAllFakeBwrapArgs(recordDir: string): string[][] {
+	const callFiles = fs.readdirSync(recordDir)
+		.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+		.sort();
+	return callFiles.map((callFile) => {
+		const payload = JSON.parse(fs.readFileSync(path.join(recordDir, callFile), "utf-8")) as { args?: string[] };
+		assert.ok(Array.isArray(payload.args), "expected recorded bwrap args");
+		return payload.args;
+	});
+}
+
+function assertBind(args: string[], source: string): void {
+	assert.deepEqual(args.slice(args.indexOf(source) - 1, args.indexOf(source) + 2), ["--bind", source, source]);
+}
+
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
@@ -372,6 +387,62 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.deepEqual(bwrapArgs.slice(bwrapArgs.indexOf(path.dirname(outputPath)) - 1, bwrapArgs.indexOf(path.dirname(outputPath)) + 2), ["--bind", path.dirname(outputPath), path.dirname(outputPath)]);
 			assert.ok(bwrapArgs.includes(path.join(tempDir, "artifacts")), "expected artifacts dir mount");
 			assert.ok(!bwrapArgs.includes(sessionRoot), "should not mount broad session root");
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("sandboxed async parallel and chain children preserve detached status and mounted paths", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const fakeBwrap = installFakeBwrap(tempDir);
+		try {
+			const artifactConfig = { enabled: true, includeInput: true, includeOutput: true, includeJsonl: true, includeMetadata: true, cleanupDays: 7 };
+			const sessionRoot = path.join(tempDir, "async-sessions");
+			const artifactsDir = path.join(tempDir, "async-artifacts");
+
+			mockPi.onCall({ output: "async parallel a" });
+			mockPi.onCall({ output: "async parallel b" });
+			const parallelId = `async-sandbox-parallel-${Date.now().toString(36)}`;
+			const parallelResult = executeAsyncChain(parallelId, {
+				chain: [{ parallel: [{ agent: "worker", task: "Do A", output: "parallel-a.md", progress: true }, { agent: "reviewer", task: "Do B" }] }],
+				resultMode: "parallel",
+				agents: [makeAgent("worker"), makeAgent("reviewer")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-parallel" },
+				artifactConfig,
+				artifactsDir,
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				sessionRoot,
+				sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host" },
+			});
+			assert.equal(parallelResult.isError, undefined);
+			await waitForAsyncResultFile(parallelId, 10_000);
+			const parallelStatus = readStatus(path.join(ASYNC_DIR, parallelId));
+			assert.equal(parallelStatus?.state, "complete");
+
+			mockPi.onCall({ output: "async chain done" });
+			const chainId = `async-sandbox-chain-${Date.now().toString(36)}`;
+			const chainResult = executeAsyncChain(chainId, {
+				chain: [{ agent: "worker", task: "Do chained work", progress: true }],
+				agents: [makeAgent("worker")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-chain" },
+				artifactConfig,
+				artifactsDir,
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				sessionRoot,
+				sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host" },
+			});
+			assert.equal(chainResult.isError, undefined);
+			await waitForAsyncResultFile(chainId, 10_000);
+			const chainStatus = readStatus(path.join(ASYNC_DIR, chainId));
+			assert.equal(chainStatus?.state, "complete");
+
+			const allBwrapArgs = readAllFakeBwrapArgs(fakeBwrap.recordDir);
+			assert.ok(allBwrapArgs.length >= 3, "expected bwrap to wrap parallel and chain children");
+			const parallelSessionPrefix = path.join(sessionRoot, `async-${parallelId}`);
+			assert.ok(allBwrapArgs.some((args) => args.some((arg) => arg.startsWith(`${parallelSessionPrefix}${path.sep}`))), "parallel child session dir should be mounted");
+			assert.ok(allBwrapArgs.some((args) => args.includes(path.join(sessionRoot, `async-${chainId}`))), "chain child session dir should be mounted");
+			for (const args of allBwrapArgs) assertBind(args, artifactsDir);
 		} finally {
 			fakeBwrap.restore();
 		}

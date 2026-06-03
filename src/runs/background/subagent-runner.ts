@@ -124,6 +124,7 @@ interface SubagentRunConfig {
 	nestedRoute?: NestedRouteInfo;
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 	sandbox?: ResolvedSandboxConfig;
+	progressPaths?: string[];
 }
 
 interface StepResult {
@@ -629,6 +630,7 @@ interface SingleStepContext {
 	orchestratorIntercomTarget?: string;
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
+	progressPaths?: string[];
 	onAttemptStart?: (attempt: { model?: string; thinking?: string }) => void;
 	onChildEvent?: (event: ChildEvent) => void;
 }
@@ -699,6 +701,7 @@ async function runSingleStep(
 			artifactsDir: ctx.artifactsDir,
 			jsonlPath: input.outputFile,
 			outputPath: step.outputPath,
+			progressPaths: ctx.progressPaths,
 			statusPaths: [path.join(path.dirname(input.outputFile), "status.json"), eventsPath],
 			structuredOutput: input.structuredOutput,
 			piArgs: input.args,
@@ -1752,6 +1755,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					orchestratorIntercomTarget: config.controlIntercomTarget,
 					nestedRoute: config.nestedRoute,
 					sandbox: config.sandbox,
+					progressPaths: config.progressPaths,
 					registerInterrupt: (interrupt) => {
 						activeChildInterrupt = interrupt;
 					},
@@ -1976,6 +1980,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							orchestratorIntercomTarget: config.controlIntercomTarget,
 							nestedRoute: config.nestedRoute,
 							sandbox: config.sandbox,
+							progressPaths: config.progressPaths,
 							registerInterrupt: (interrupt) => {
 								activeChildInterrupt = interrupt;
 							},
@@ -2142,6 +2147,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				orchestratorIntercomTarget: config.controlIntercomTarget,
 				nestedRoute: config.nestedRoute,
 				sandbox: config.sandbox,
+				progressPaths: config.progressPaths,
 				registerInterrupt: (interrupt) => {
 					activeChildInterrupt = interrupt;
 				},

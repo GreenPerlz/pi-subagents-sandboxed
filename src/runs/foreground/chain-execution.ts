@@ -59,6 +59,7 @@ import {
 	MAX_CONCURRENCY,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
+import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
 import { resolveModelCandidate } from "../shared/model-fallback.ts";
 import { validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
@@ -135,6 +136,8 @@ interface ParallelChainRunInput {
 	worktreeSetup?: WorktreeSetup;
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
+	sandbox?: ResolvedSandboxConfig;
+	progressPaths?: string[];
 }
 
 function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details {
@@ -289,6 +292,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				structuredOutput: structuredRuntime,
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
+				sandbox: input.sandbox,
+				progressPaths: behavior.progress ? input.progressPaths : undefined,
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
 						const stepResults = progressUpdate.details?.results || [];
@@ -391,6 +396,7 @@ interface ChainExecutionParams {
 	nestedRoute?: NestedRouteInfo;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	sandbox?: ResolvedSandboxConfig;
 }
 
 interface ChainExecutionResult {
@@ -666,6 +672,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					nestedRoute: params.nestedRoute,
 					worktreeSetup,
 					maxSubagentDepth: params.maxSubagentDepth,
+					sandbox: params.sandbox,
+					progressPaths: [path.join(chainDir, "progress.md")],
 				});
 				globalTaskIndex += step.parallel.length;
 
@@ -852,6 +860,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				foregroundControl,
 				nestedRoute: params.nestedRoute,
 				maxSubagentDepth: params.maxSubagentDepth,
+				sandbox: params.sandbox,
+				progressPaths: [path.join(chainDir, "progress.md")],
 			});
 			globalTaskIndex += dynamicParallelStep.parallel.length;
 
@@ -1033,6 +1043,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				structuredOutput: structuredRuntime,
 				acceptance: seqStep.acceptance,
 				acceptanceContext: { mode: "chain" },
+				sandbox: params.sandbox,
+				progressPaths: behavior.progress ? [path.join(chainDir, "progress.md")] : undefined,
 				onUpdate: onUpdate
 					? (p) => {
 						const stepResults = p.details?.results || [];

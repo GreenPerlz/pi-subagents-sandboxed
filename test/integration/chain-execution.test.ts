@@ -168,6 +168,58 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
 	}
 
+	function installFakeBwrap(): { recordDir: string; restore: () => void } {
+		const rootDir = fs.mkdtempSync(path.join(tempDir, "fake-bwrap-"));
+		const binDir = path.join(rootDir, "bin");
+		const recordDir = path.join(rootDir, "records");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.mkdirSync(recordDir, { recursive: true });
+		const scriptPath = path.join(binDir, "fake-bwrap.mjs");
+		fs.writeFileSync(scriptPath, `
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+const args = process.argv.slice(2);
+const recordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+if (!recordDir) process.exit(97);
+fs.mkdirSync(recordDir, { recursive: true });
+fs.writeFileSync(path.join(recordDir, \`call-\${Date.now()}-\${process.pid}.json\`), JSON.stringify({ args, cwd: process.cwd() }), "utf-8");
+const separator = args.indexOf("--");
+if (separator === -1 || !args[separator + 1]) process.exit(98);
+const child = spawnSync(args[separator + 1], args.slice(separator + 2), { stdio: "inherit", env: process.env, cwd: process.cwd() });
+if (child.error) process.exit(99);
+process.exit(child.status ?? 0);
+`, "utf-8");
+		const bwrapPath = path.join(binDir, "bwrap");
+		fs.writeFileSync(bwrapPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`, "utf-8");
+		fs.chmodSync(bwrapPath, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRecordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+		process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+		process.env.FAKE_BWRAP_RECORD_DIR = recordDir;
+		return {
+			recordDir,
+			restore() {
+				if (previousPath === undefined) delete process.env.PATH;
+				else process.env.PATH = previousPath;
+				if (previousRecordDir === undefined) delete process.env.FAKE_BWRAP_RECORD_DIR;
+				else process.env.FAKE_BWRAP_RECORD_DIR = previousRecordDir;
+			},
+		};
+	}
+
+	function readLastFakeBwrapArgs(recordDir: string): string[] {
+		const callFile = fs.readdirSync(recordDir).filter((name) => name.startsWith("call-") && name.endsWith(".json")).sort().at(-1);
+		assert.ok(callFile, "expected a recorded fake bwrap call");
+		const payload = JSON.parse(fs.readFileSync(path.join(recordDir, callFile), "utf-8")) as { args?: string[] };
+		assert.ok(Array.isArray(payload.args), "expected recorded bwrap args");
+		return payload.args;
+	}
+
+	function assertBind(args: string[], source: string): void {
+		assert.deepEqual(args.slice(args.indexOf(source) - 1, args.indexOf(source) + 2), ["--bind", source, source]);
+	}
+
 	function acceptanceReport(overrides: Record<string, unknown> = {}): string {
 		return [
 			"done",
@@ -935,6 +987,37 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		assert.ok(!result.isError);
 		assert.deepEqual(result.details.chainAgents, ["a", "b"]);
 		assert.equal(result.details.totalSteps, 2);
+	});
+
+	it("sandboxed foreground chain mounts custom chain progress and session paths", async () => {
+		mockPi.onCall({ output: "Sandboxed chain done" });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const agents = [makeAgent("worker")];
+			const chainDir = path.join(tempDir, "custom-chain-dir");
+			const sessionRoot = path.join(tempDir, "chain-sessions");
+
+			const result = await executeChain(
+				makeChainParams(
+					[{ agent: "worker", task: "Track progress", progress: true }],
+					agents,
+					{
+						chainDir,
+						sessionDirForIndex: (index = 0) => path.join(sessionRoot, `run-${index}`),
+						sandbox: { provider: "bubblewrap" },
+					},
+				),
+			);
+
+			assert.equal(result.isError, undefined);
+			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
+			const mountedChainDir = bwrapArgs.find((arg) => arg.startsWith(`${chainDir}${path.sep}`));
+			assert.ok(mountedChainDir, "expected custom chain run dir to be mounted for progress writes");
+			assertBind(bwrapArgs, mountedChainDir);
+			assertBind(bwrapArgs, path.join(sessionRoot, "run-0"));
+		} finally {
+			fakeBwrap.restore();
+		}
 	});
 
 	it("uses custom chainDir when provided", async () => {

@@ -822,6 +822,8 @@ export interface RunSyncOptions {
 	};
 	/** Resolved sandbox config for this child process; omitted preserves the original spawn path. */
 	sandbox?: ResolvedSandboxConfig;
+	/** Progress files the child is instructed to update; parent dirs are mounted writable when sandboxed. */
+	progressPaths?: string[];
 }
 
 export type IntercomBridgeMode = "off" | "fork-only" | "always";

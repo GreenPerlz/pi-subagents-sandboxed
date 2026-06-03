@@ -5,7 +5,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
 import { resolveSandboxConfig } from "../../sandbox/config.ts";
-import type { SandboxRunConfig } from "../../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxRunConfig } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -1125,6 +1125,10 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 	const currentProvider = ctx.model?.provider;
 	const controlIntercomTarget = intercomBridge.active ? intercomBridge.orchestratorTarget : undefined;
 	const childIntercomTarget = intercomBridge.active ? (agent: string, index: number) => resolveSubagentIntercomTarget(id, agent, index) : undefined;
+	const sandbox = resolveSandboxConfig({
+		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		run: params.sandbox,
+	});
 
 	if (hasTasks && params.tasks) {
 		const agentConfigs = params.tasks.map((task) => agents.find((agent) => agent.name === task.agent));
@@ -1169,6 +1173,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			controlIntercomTarget,
 			childIntercomTarget,
 			nestedRoute,
+			sandbox,
 		});
 	}
 
@@ -1198,6 +1203,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			controlIntercomTarget,
 			childIntercomTarget,
 			nestedRoute,
+			sandbox,
 		});
 	}
 
@@ -1217,7 +1223,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		const skills = normalizedSkills === false ? [] : normalizedSkills;
 		const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, a.maxSubagentDepth);
 		const modelOverride = resolveModelCandidate((params.model as string | undefined) ?? a.model, availableModels, currentProvider);
-		const sandbox = resolveSandboxConfig({
+		const singleSandbox = resolveSandboxConfig({
 			settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
 			agent: a,
 			run: params.sandbox,
@@ -1247,7 +1253,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			childIntercomTarget: childIntercomTarget ? (agent, index) => childIntercomTarget(agent, index) : undefined,
 			nestedRoute,
 			acceptance: params.acceptance,
-			sandbox,
+			sandbox: singleSandbox,
 		});
 	}
 
@@ -1278,6 +1284,10 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 	const chainSkills = normalized === false ? [] : (normalized ?? []);
 	const chain = wrapChainTasksForFork(params.chain as ChainStep[], params.context);
 	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const sandbox = resolveSandboxConfig({
+		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		run: params.sandbox,
+	});
 	const chainResult = await executeChain({
 		chain,
 		task: params.task,
@@ -1307,6 +1317,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		maxSubagentDepth: currentMaxSubagentDepth,
 		worktreeSetupHook: deps.config.worktreeSetupHook,
 		worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
+		sandbox,
 	});
 
 	if (chainResult.requestedAsync) {
@@ -1347,6 +1358,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 			childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
 			nestedRoute: data.nestedRoute,
+			sandbox,
 		});
 	}
 
@@ -1404,6 +1416,8 @@ interface ForegroundParallelRunInput {
 	liveProgress: (AgentProgress | undefined)[];
 	onUpdate?: (r: AgentToolResult<Details>) => void;
 	worktreeSetup?: WorktreeSetup;
+	sandbox?: ResolvedSandboxConfig;
+	progressPaths?: string[];
 }
 
 function buildParallelModeError(message: string): AgentToolResult<Details> {
@@ -1564,39 +1578,41 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			skills: effectiveSkills === false ? [] : effectiveSkills,
 			acceptance: task.acceptance,
 			acceptanceContext: { mode: "parallel" },
-				onUpdate: input.onUpdate
-					? (progressUpdate) => {
-						const stepResults = progressUpdate.details?.results || [];
-						const stepProgress = progressUpdate.details?.progress || [];
-						if (input.foregroundControl && stepProgress.length > 0) {
-							const current = stepProgress[0];
-							input.foregroundControl.currentAgent = task.agent;
-							input.foregroundControl.currentIndex = index;
-							input.foregroundControl.currentActivityState = current?.activityState;
-							input.foregroundControl.lastActivityAt = current?.lastActivityAt;
-							input.foregroundControl.currentTool = current?.currentTool;
-							input.foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
-							input.foregroundControl.currentPath = current?.currentPath;
-							input.foregroundControl.turnCount = current?.turnCount;
-							input.foregroundControl.tokens = current?.tokens;
-							input.foregroundControl.toolCount = current?.toolCount;
-							input.foregroundControl.updatedAt = Date.now();
-						}
-						if (stepResults.length > 0) input.liveResults[index] = stepResults[0];
-						if (stepProgress.length > 0) input.liveProgress[index] = stepProgress[0];
-						const mergedResults = input.liveResults.filter((result): result is SingleResult => result !== undefined);
-						const mergedProgress = input.liveProgress.filter((progress): progress is AgentProgress => progress !== undefined);
-						input.onUpdate?.({
-							content: progressUpdate.content,
-							details: {
-								mode: "parallel",
-								results: mergedResults,
-								progress: mergedProgress,
-								controlEvents: progressUpdate.details?.controlEvents,
-								totalSteps: input.tasks.length,
-							},
-						});
+			sandbox: input.sandbox,
+			progressPaths: behavior?.progress ? input.progressPaths : undefined,
+			onUpdate: input.onUpdate
+				? (progressUpdate) => {
+					const stepResults = progressUpdate.details?.results || [];
+					const stepProgress = progressUpdate.details?.progress || [];
+					if (input.foregroundControl && stepProgress.length > 0) {
+						const current = stepProgress[0];
+						input.foregroundControl.currentAgent = task.agent;
+						input.foregroundControl.currentIndex = index;
+						input.foregroundControl.currentActivityState = current?.activityState;
+						input.foregroundControl.lastActivityAt = current?.lastActivityAt;
+						input.foregroundControl.currentTool = current?.currentTool;
+						input.foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
+						input.foregroundControl.currentPath = current?.currentPath;
+						input.foregroundControl.turnCount = current?.turnCount;
+						input.foregroundControl.tokens = current?.tokens;
+						input.foregroundControl.toolCount = current?.toolCount;
+						input.foregroundControl.updatedAt = Date.now();
 					}
+					if (stepResults.length > 0) input.liveResults[index] = stepResults[0];
+					if (stepProgress.length > 0) input.liveProgress[index] = stepProgress[0];
+					const mergedResults = input.liveResults.filter((result): result is SingleResult => result !== undefined);
+					const mergedProgress = input.liveProgress.filter((progress): progress is AgentProgress => progress !== undefined);
+					input.onUpdate?.({
+						content: progressUpdate.content,
+						details: {
+							mode: "parallel",
+							results: mergedResults,
+							progress: mergedProgress,
+							controlEvents: progressUpdate.details?.controlEvents,
+							totalSteps: input.tasks.length,
+						},
+					});
+				}
 				: undefined,
 		}).finally(() => {
 			if (input.foregroundControl?.currentIndex === index) {
@@ -1657,6 +1673,10 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	const maxSubagentDepths = agentConfigs.map((config) =>
 		resolveChildMaxSubagentDepth(currentMaxSubagentDepth, config.maxSubagentDepth),
 	);
+	const sandbox = resolveSandboxConfig({
+		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		run: params.sandbox,
+	});
 
 	if (params.worktree) {
 		const worktreeTaskCwdError = buildParallelWorktreeTaskCwdError(tasks, effectiveCwd);
@@ -1776,6 +1796,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				controlConfig,
 				controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
+				sandbox,
 			});
 		}
 	}
@@ -1813,6 +1834,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 
 		const parallelProgressPrecreated = firstProgressIndex !== -1;
 		if (parallelProgressPrecreated) writeInitialProgressFile(effectiveCwd);
+		const progressPaths = parallelProgressPrecreated ? [path.join(effectiveCwd, "progress.md")] : undefined;
 
 		if (params.context === "fork") {
 			for (let i = 0; i < taskTexts.length; i++) {
@@ -1850,6 +1872,8 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			liveProgress,
 			onUpdate,
 			worktreeSetup,
+			sandbox,
+			progressPaths,
 		});
 		for (let i = 0; i < results.length; i++) {
 			const run = results[i]!;

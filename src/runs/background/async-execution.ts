@@ -122,6 +122,7 @@ interface AsyncChainParams {
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
+	sandbox?: ResolvedSandboxConfig;
 }
 
 interface AsyncSingleParams {
@@ -484,6 +485,8 @@ export function executeAsyncChain(
 				resultMode,
 				dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
 				workflowGraph,
+				sandbox: params.sandbox,
+				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,

@@ -1217,6 +1217,11 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		const skills = normalizedSkills === false ? [] : normalizedSkills;
 		const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, a.maxSubagentDepth);
 		const modelOverride = resolveModelCandidate((params.model as string | undefined) ?? a.model, availableModels, currentProvider);
+		const sandbox = resolveSandboxConfig({
+			settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+			agent: a,
+			run: params.sandbox,
+		});
 		return executeAsyncSingle(id, {
 			agent: params.agent!,
 			task: params.context === "fork" ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
@@ -1242,6 +1247,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			childIntercomTarget: childIntercomTarget ? (agent, index) => childIntercomTarget(agent, index) : undefined,
 			nestedRoute,
 			acceptance: params.acceptance,
+			sandbox,
 		});
 	}
 
@@ -2014,6 +2020,11 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				currentSessionId: deps.state.currentSessionId!,
 				currentModelProvider: ctx.model?.provider,
 			};
+			const sandbox = resolveSandboxConfig({
+				settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+				agent: agentConfig,
+				run: params.sandbox,
+			});
 			return executeAsyncSingle(id, {
 				agent: params.agent!,
 				task: params.context === "fork" ? wrapForkTask(task) : task,
@@ -2037,6 +2048,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				controlConfig,
 				controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
+				sandbox,
 			});
 		}
 	}

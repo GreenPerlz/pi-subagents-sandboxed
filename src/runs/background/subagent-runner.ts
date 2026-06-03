@@ -6,6 +6,9 @@ import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
+import { createSandboxProvider } from "../../sandbox/provider.ts";
+import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
+import type { ResolvedSandboxConfig, SpawnableInvocation } from "../../sandbox/types.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	type AcceptanceFinalizationTurn,
@@ -120,6 +123,7 @@ interface SubagentRunConfig {
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
+	sandbox?: ResolvedSandboxConfig;
 }
 
 interface StepResult {
@@ -236,6 +240,10 @@ interface RunPiStreamingResult {
 	observedMutationAttempt?: boolean;
 }
 
+interface RunPiStreamingSandboxInput extends SubagentSandboxMountInput {
+	config: ResolvedSandboxConfig;
+}
+
 function runPiStreaming(
 	args: string[],
 	cwd: string,
@@ -247,18 +255,49 @@ function runPiStreaming(
 	childEventContext?: ChildEventContext,
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void,
 	onChildEvent?: (event: ChildEvent) => void,
+	sandbox?: RunPiStreamingSandboxInput,
 ): Promise<RunPiStreamingResult> {
 	return new Promise((resolve) => {
 		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
 		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv(maxSubagentDepth) };
-		const spawnSpec = getPiSpawnCommand(args, {
+		const piSpawnSpec = getPiSpawnCommand(args, {
 			...(piPackageRoot ? { piPackageRoot } : {}),
 			...(piArgv1 ? { argv1: piArgv1 } : {}),
 		});
+		let spawnSpec: SpawnableInvocation;
+		try {
+			if (sandbox) {
+				const wrapped = createSandboxProvider(sandbox.config).wrapInvocation({
+					config: sandbox.config,
+					invocation: { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd },
+					mounts: buildSubagentSandboxMounts(sandbox),
+				});
+				spawnSpec = {
+					command: wrapped.invocation.command,
+					args: wrapped.invocation.args,
+					cwd: wrapped.invocation.cwd ?? cwd,
+					env: wrapped.invocation.env ?? spawnEnv,
+				};
+			} else {
+				spawnSpec = { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd, env: spawnEnv };
+			}
+		} catch (setupError) {
+			const message = setupError instanceof Error ? setupError.message : String(setupError);
+			outputStream.end();
+			resolve({
+				stderr: message,
+				exitCode: 1,
+				messages: [],
+				usage: emptyUsage(),
+				error: `Sandbox setup failed: ${message}`,
+				finalOutput: "",
+			});
+			return;
+		}
 		const child = spawn(spawnSpec.command, spawnSpec.args, {
-			cwd,
+			cwd: spawnSpec.cwd ?? cwd,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: spawnEnv,
+			env: spawnSpec.env ?? spawnEnv,
 			windowsHide: true,
 		});
 		let stderr = "";
@@ -589,6 +628,7 @@ interface SingleStepContext {
 	childIntercomTarget?: string;
 	orchestratorIntercomTarget?: string;
 	nestedRoute?: NestedRouteInfo;
+	sandbox?: ResolvedSandboxConfig;
 	onAttemptStart?: (attempt: { model?: string; thinking?: string }) => void;
 	onChildEvent?: (event: ChildEvent) => void;
 }
@@ -648,6 +688,22 @@ async function runSingleStep(
 	const modelAttempts: ModelAttempt[] = [];
 	const attemptNotes: string[] = [];
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
+	const buildSandboxInput = (input: { args: string[]; tempDir?: string; sessionDir?: string; sessionFile?: string; outputFile: string; structuredOutput?: { schemaPath?: string; outputPath?: string } }): RunPiStreamingSandboxInput | undefined => {
+		if (!ctx.sandbox) return undefined;
+		return {
+			config: ctx.sandbox,
+			cwd: step.cwd ?? ctx.cwd,
+			tempDir: input.tempDir,
+			sessionDir: input.sessionDir,
+			sessionFile: input.sessionFile,
+			artifactsDir: ctx.artifactsDir,
+			jsonlPath: input.outputFile,
+			outputPath: step.outputPath,
+			statusPaths: [path.join(path.dirname(input.outputFile), "status.json"), eventsPath],
+			structuredOutput: input.structuredOutput,
+			piArgs: input.args,
+		};
+	};
 	let finalResult: RunPiStreamingResult | undefined;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let completionGuardTriggeredFinal = false;
@@ -701,6 +757,7 @@ async function runSingleStep(
 			{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
 			ctx.registerInterrupt,
 			ctx.onChildEvent,
+			buildSandboxInput({ args, tempDir, sessionDir, sessionFile: step.sessionFile, outputFile: ctx.outputFile, structuredOutput: effectiveStructuredOutput }),
 		);
 		cleanupTempDir(tempDir);
 
@@ -850,10 +907,11 @@ async function runSingleStep(
 					parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
 				});
 				ctx.onAttemptStart?.({ model: finalResult?.model ?? step.model, thinking: resolveEffectiveThinking(finalResult?.model ?? step.model, step.thinking) });
+				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;
 				const finalizationRun = await runPiStreaming(
 					args,
 					step.cwd ?? ctx.cwd,
-					`${ctx.outputFile}.finalization-${turn}.log`,
+					finalizationOutputFile,
 					env,
 					ctx.piPackageRoot,
 					ctx.piArgv1,
@@ -861,6 +919,7 @@ async function runSingleStep(
 					{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
 					ctx.registerInterrupt,
 					ctx.onChildEvent,
+					buildSandboxInput({ args, tempDir, sessionFile, outputFile: finalizationOutputFile }),
 				);
 				cleanupTempDir(tempDir);
 				modelAttempts.push({
@@ -1692,6 +1751,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					childIntercomTarget: config.childIntercomTargets?.[fi],
 					orchestratorIntercomTarget: config.controlIntercomTarget,
 					nestedRoute: config.nestedRoute,
+					sandbox: config.sandbox,
 					registerInterrupt: (interrupt) => {
 						activeChildInterrupt = interrupt;
 					},
@@ -1915,6 +1975,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							childIntercomTarget: config.childIntercomTargets?.[fi],
 							orchestratorIntercomTarget: config.controlIntercomTarget,
 							nestedRoute: config.nestedRoute,
+							sandbox: config.sandbox,
 							registerInterrupt: (interrupt) => {
 								activeChildInterrupt = interrupt;
 							},
@@ -2080,6 +2141,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				childIntercomTarget: config.childIntercomTargets?.[flatIndex],
 				orchestratorIntercomTarget: config.controlIntercomTarget,
 				nestedRoute: config.nestedRoute,
+				sandbox: config.sandbox,
 				registerInterrupt: (interrupt) => {
 					activeChildInterrupt = interrupt;
 				},

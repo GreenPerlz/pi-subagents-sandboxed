@@ -163,6 +163,60 @@ function readMockPiArgs(mockPi: MockPi, index: number): string[] {
 	return payload.args;
 }
 
+function installFakeBwrap(rootDir: string): { recordDir: string; restore: () => void } {
+	const binDir = path.join(rootDir, "fake-bwrap-bin");
+	const recordDir = path.join(rootDir, "fake-bwrap-records");
+	fs.mkdirSync(binDir, { recursive: true });
+	fs.mkdirSync(recordDir, { recursive: true });
+	const scriptPath = path.join(binDir, "fake-bwrap.mjs");
+	fs.writeFileSync(scriptPath, `
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const args = process.argv.slice(2);
+const recordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+if (!recordDir) process.exit(97);
+fs.mkdirSync(recordDir, { recursive: true });
+fs.writeFileSync(path.join(recordDir, \`call-\${Date.now()}-\${process.pid}.json\`), JSON.stringify({ args, cwd: process.cwd() }), "utf-8");
+const separator = args.indexOf("--");
+if (separator === -1 || !args[separator + 1]) process.exit(98);
+const child = spawnSync(args[separator + 1], args.slice(separator + 2), { stdio: "inherit", env: process.env, cwd: process.cwd() });
+if (child.error) {
+  console.error(child.error.message);
+  process.exit(99);
+}
+process.exit(child.status ?? 0);
+`, "utf-8");
+	const bwrapPath = path.join(binDir, "bwrap");
+	fs.writeFileSync(bwrapPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`, "utf-8");
+	fs.chmodSync(bwrapPath, 0o755);
+	const previousPath = process.env.PATH;
+	const previousRecordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+	process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+	process.env.FAKE_BWRAP_RECORD_DIR = recordDir;
+	return {
+		recordDir,
+		restore() {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousRecordDir === undefined) delete process.env.FAKE_BWRAP_RECORD_DIR;
+			else process.env.FAKE_BWRAP_RECORD_DIR = previousRecordDir;
+		},
+	};
+}
+
+function readLastFakeBwrapArgs(recordDir: string): string[] {
+	const callFile = fs.readdirSync(recordDir)
+		.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+		.sort()
+		.at(-1);
+	assert.ok(callFile, "expected a recorded fake bwrap call");
+	const payload = JSON.parse(fs.readFileSync(path.join(recordDir, callFile), "utf-8")) as { args?: string[] };
+	assert.ok(Array.isArray(payload.args), "expected recorded bwrap args");
+	return payload.args;
+}
+
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
@@ -272,6 +326,55 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(chainResult.content[0]?.text ?? "", /Async chain:/);
 		assert.match(chainResult.content[0]?.text ?? "", /Do not run sleep timers or polling loops/);
 		await waitForAsyncResultFile(chainId, 10_000);
+	});
+
+	it("sandboxed async single preserves status inspection and mounts child paths", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const fakeBwrap = installFakeBwrap(tempDir);
+		try {
+			mockPi.onCall({ output: "sandboxed async done" });
+			const artifactConfig = {
+				enabled: true,
+				includeInput: true,
+				includeOutput: true,
+				includeJsonl: true,
+				includeMetadata: true,
+				cleanupDays: 7,
+			};
+			const id = `async-sandbox-single-${Date.now().toString(36)}`;
+			const sessionRoot = path.join(tempDir, "subagent-sessions");
+			const outputPath = path.join(tempDir, "outputs", "async-sandbox.md");
+			const result = executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Do sandboxed async work",
+				agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-sandbox" },
+				artifactConfig,
+				artifactsDir: path.join(tempDir, "artifacts"),
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				sessionRoot,
+				output: outputPath,
+				sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host" },
+			});
+			assert.equal(result.isError, undefined);
+			assert.equal(result.details.asyncId, id);
+			const resultPath = await waitForAsyncResultFile(id, 10_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true);
+
+			const status = readStatus(path.join(ASYNC_DIR, id));
+			assert.equal(status?.runId, id);
+			assert.equal(status?.state, "complete");
+
+			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
+			const asyncSessionDir = path.join(sessionRoot, `async-${id}`);
+			assert.deepEqual(bwrapArgs.slice(bwrapArgs.indexOf(asyncSessionDir) - 1, bwrapArgs.indexOf(asyncSessionDir) + 2), ["--bind", asyncSessionDir, asyncSessionDir]);
+			assert.deepEqual(bwrapArgs.slice(bwrapArgs.indexOf(path.dirname(outputPath)) - 1, bwrapArgs.indexOf(path.dirname(outputPath)) + 2), ["--bind", path.dirname(outputPath), path.dirname(outputPath)]);
+			assert.ok(bwrapArgs.includes(path.join(tempDir, "artifacts")), "expected artifacts dir mount");
+			assert.ok(!bwrapArgs.includes(sessionRoot), "should not mount broad session root");
+		} finally {
+			fakeBwrap.restore();
+		}
 	});
 
 	it("top-level async parallel conversion preserves output, reads, and progress", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

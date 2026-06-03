@@ -1,0 +1,115 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, it } from "node:test";
+import { buildSubagentSandboxMounts } from "../../src/sandbox/mount-policy.ts";
+
+const tempRoots: string[] = [];
+
+function tempRoot(): string {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-sandbox-mounts-"));
+	tempRoots.push(root);
+	return root;
+}
+
+function mkdirp(p: string): string {
+	fs.mkdirSync(p, { recursive: true });
+	return p;
+}
+
+function writeFile(p: string, content = "x"): string {
+	fs.mkdirSync(path.dirname(p), { recursive: true });
+	fs.writeFileSync(p, content, "utf-8");
+	return p;
+}
+
+function mountMode(mounts: ReturnType<typeof buildSubagentSandboxMounts>, source: string): string | undefined {
+	return mounts.find((mount) => mount.source === path.resolve(source))?.mode;
+}
+
+afterEach(() => {
+	for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("subagent sandbox mount policy", () => {
+	it("mounts a fresh child session directory writable without mounting the broad session root", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const sessionRoot = mkdirp(path.join(root, "sessions"));
+		const childSessionDir = mkdirp(path.join(sessionRoot, "run-0"));
+		const childSessionFile = path.join(childSessionDir, "session.jsonl");
+		const tempDir = mkdirp(path.join(root, "prompt-temp"));
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			tempDir,
+			sessionDir: childSessionDir,
+			sessionFile: childSessionFile,
+		});
+
+		assert.equal(mountMode(mounts, cwd), "rw");
+		assert.equal(mountMode(mounts, tempDir), "ro");
+		assert.equal(mountMode(mounts, childSessionDir), "rw");
+		assert.equal(mountMode(mounts, sessionRoot), undefined);
+	});
+
+	it("mounts an existing forked session file writable without mounting the parent session root", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const broadSessionRoot = mkdirp(path.join(root, "host-session-root"));
+		const forkedSessionFile = writeFile(path.join(broadSessionRoot, "forked-child.jsonl"));
+		const perRunSessionDir = mkdirp(path.join(root, "subagent-sessions", "run-0"));
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			sessionDir: perRunSessionDir,
+			sessionFile: forkedSessionFile,
+		});
+
+		assert.equal(mountMode(mounts, forkedSessionFile), "rw");
+		assert.equal(mountMode(mounts, perRunSessionDir), "rw");
+		assert.equal(mountMode(mounts, broadSessionRoot), undefined);
+	});
+
+	it("mounts prompt temp, output, artifact, structured output, async status, and absolute extension paths with least privilege", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const tempDir = mkdirp(path.join(root, "prompt-temp"));
+		const artifactsDir = mkdirp(path.join(root, "artifacts"));
+		const jsonlPath = path.join(root, "logs", "child.jsonl");
+		const outputPath = path.join(root, "outputs", "answer.md");
+		const progressPath = path.join(root, "progress", "progress.md");
+		const statusPath = path.join(root, "async", "status.json");
+		const schemaPath = writeFile(path.join(root, "schemas", "schema.json"));
+		const structuredOutputPath = path.join(root, "structured", "result.json");
+		const extensionPath = writeFile(path.join(root, "extensions", "tool.mjs"));
+		mkdirp(path.dirname(jsonlPath));
+		mkdirp(path.dirname(outputPath));
+		mkdirp(path.dirname(progressPath));
+		mkdirp(path.dirname(statusPath));
+		mkdirp(path.dirname(structuredOutputPath));
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			tempDir,
+			artifactsDir,
+			jsonlPath,
+			outputPath,
+			progressPaths: [progressPath],
+			statusPaths: [statusPath],
+			structuredOutput: { schemaPath, outputPath: structuredOutputPath },
+			piArgs: ["--extension", extensionPath],
+		});
+
+		assert.equal(mountMode(mounts, tempDir), "ro");
+		assert.equal(mountMode(mounts, artifactsDir), "rw");
+		assert.equal(mountMode(mounts, path.dirname(jsonlPath)), "rw");
+		assert.equal(mountMode(mounts, path.dirname(outputPath)), "rw");
+		assert.equal(mountMode(mounts, path.dirname(progressPath)), "rw");
+		assert.equal(mountMode(mounts, path.dirname(statusPath)), "rw");
+		assert.equal(mountMode(mounts, path.dirname(schemaPath)), "ro");
+		assert.equal(mountMode(mounts, path.dirname(structuredOutputPath)), "rw");
+		assert.equal(mountMode(mounts, path.dirname(extensionPath)), "ro");
+	});
+});

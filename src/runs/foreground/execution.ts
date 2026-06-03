@@ -49,7 +49,8 @@ import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/ski
 import { evaluateCompletionMutationGuard, resolveCompletionPolicy, type CompletionPolicy } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
-import type { SandboxMount, SpawnableInvocation } from "../../sandbox/types.ts";
+import type { SpawnableInvocation } from "../../sandbox/types.ts";
+import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
@@ -100,56 +101,6 @@ function sumUsage(target: Usage, source: Usage): void {
 	target.cacheWrite += source.cacheWrite;
 	target.cost += source.cost;
 	target.turns += source.turns;
-}
-
-function addSandboxMount(mounts: SandboxMount[], seen: Set<string>, source: string | undefined, mode: SandboxMount["mode"]): void {
-	if (!source) return;
-	const resolved = path.resolve(source);
-	if (seen.has(resolved)) return;
-	if (!existsSync(resolved)) return;
-	seen.add(resolved);
-	mounts.push({ source: resolved, mode });
-}
-
-function addSandboxMountParent(mounts: SandboxMount[], seen: Set<string>, filePath: string | undefined, mode: SandboxMount["mode"]): void {
-	if (!filePath) return;
-	addSandboxMount(mounts, seen, path.dirname(filePath), mode);
-}
-
-function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Set<string>, args: string[] | undefined): void {
-	if (!args) return;
-	for (let i = 0; i < args.length; i++) {
-		if (args[i] !== "--extension") continue;
-		const extensionPath = args[i + 1];
-		if (!extensionPath || !path.isAbsolute(extensionPath)) continue;
-		addSandboxMountParent(mounts, seen, extensionPath, "ro");
-	}
-}
-
-function buildSingleRunSandboxMounts(input: {
-	cwd: string;
-	tempDir?: string;
-	sessionDir?: string;
-	sessionFile?: string;
-	artifactsDir?: string;
-	jsonlPath?: string;
-	outputPath?: string;
-	structuredOutput?: RunSyncOptions["structuredOutput"];
-	piArgs?: string[];
-}): SandboxMount[] {
-	const mounts: SandboxMount[] = [];
-	const seen = new Set<string>();
-	addSandboxMount(mounts, seen, input.cwd, "rw");
-	addSandboxMount(mounts, seen, input.tempDir, "rw");
-	addSandboxMount(mounts, seen, input.sessionDir, "rw");
-	addSandboxMountParent(mounts, seen, input.sessionFile, "rw");
-	addSandboxMount(mounts, seen, input.artifactsDir, "rw");
-	addSandboxMountParent(mounts, seen, input.jsonlPath, "rw");
-	addSandboxMountParent(mounts, seen, input.outputPath, "rw");
-	addSandboxMountParent(mounts, seen, input.structuredOutput?.schemaPath, "ro");
-	addSandboxMountParent(mounts, seen, input.structuredOutput?.outputPath, "rw");
-	addSandboxExtensionMountParents(mounts, seen, input.piArgs);
-	return mounts;
 }
 
 function appendRecentOutput(progress: AgentProgress, lines: string[]): void {
@@ -319,7 +270,7 @@ async function runSingleAttempt(
 			const wrapped = provider.wrapInvocation({
 				config: options.sandbox,
 				invocation: sandboxInvocation,
-				mounts: buildSingleRunSandboxMounts({
+				mounts: buildSubagentSandboxMounts({
 					cwd: childCwd,
 					tempDir,
 					sessionDir: options.sessionDir,

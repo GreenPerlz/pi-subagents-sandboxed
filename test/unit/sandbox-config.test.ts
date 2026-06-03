@@ -48,7 +48,7 @@ describe("sandbox configuration resolution", () => {
 		writeJson(path.join(project, ".pi", "settings.json"), {
 			subagents: {
 				sandbox: {
-					defaultProvider: "bubblewrap",
+					defaultProvider: "settings-provider",
 					defaultProfile: "settings-profile",
 					network: "settings-network",
 					auth: "settings-auth",
@@ -58,7 +58,7 @@ describe("sandbox configuration resolution", () => {
 			},
 		});
 		writeAgent(project, [
-			"sandboxProvider: bubblewrap",
+			"sandboxProvider: agent-provider",
 			"sandboxProfile: agent-profile",
 			"sandboxNetwork: agent-network",
 			"sandboxTrustProject: true",
@@ -71,7 +71,7 @@ describe("sandbox configuration resolution", () => {
 		const agent = discoverAgents(project, "project").agents.find((candidate) => candidate.name === "worker");
 		assert.ok(agent, "worker should be discovered");
 		assert.deepEqual(agent.sandbox, {
-			provider: "bubblewrap",
+			provider: "agent-provider",
 			profile: "agent-profile",
 			network: "agent-network",
 			trustProject: true,
@@ -82,7 +82,7 @@ describe("sandbox configuration resolution", () => {
 		assert.equal(agent.extraFields?.sandboxProvider, undefined);
 
 		assert.deepEqual(resolveSandboxConfig({ settings }), {
-			provider: "bubblewrap",
+			provider: "settings-provider",
 			profile: "settings-profile",
 			network: "settings-network",
 			trustProject: false,
@@ -90,7 +90,7 @@ describe("sandbox configuration resolution", () => {
 			fallback: "settings-fallback",
 		});
 		assert.deepEqual(resolveSandboxConfig({ settings, agent }), {
-			provider: "bubblewrap",
+			provider: "agent-provider",
 			profile: "agent-profile",
 			network: "agent-network",
 			trustProject: true,
@@ -102,7 +102,7 @@ describe("sandbox configuration resolution", () => {
 			settings,
 			agent,
 			run: {
-				provider: "bubblewrap",
+				provider: "run-provider",
 				profile: "run-profile",
 				network: "run-network",
 				trustProject: false,
@@ -111,7 +111,7 @@ describe("sandbox configuration resolution", () => {
 				fallback: "run-fallback",
 			},
 		}), {
-			provider: "bubblewrap",
+			provider: "run-provider",
 			profile: "run-profile",
 			network: "run-network",
 			trustProject: false,

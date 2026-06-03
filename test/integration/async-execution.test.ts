@@ -448,6 +448,58 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("runs async sandboxed read-only dynamic fanout", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const fakeBwrap = installFakeBwrap(tempDir);
+		try {
+			mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+			mockPi.onCall({ output: "review-a", structuredOutput: { ok: "a" } });
+			mockPi.onCall({ output: "review-b", structuredOutput: { ok: "b" } });
+			const id = `async-sandbox-dynamic-readonly-${Date.now().toString(36)}`;
+			const sessionRoot = path.join(tempDir, "async-dynamic-sessions");
+			const result = executeAsyncChain(id, {
+				chain: [
+					{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+					{
+						expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+						parallel: {
+							agent: "reader",
+							task: "Read {target.path}",
+							label: "Read {target.path}",
+							outputSchema: { type: "object" },
+						},
+						collect: { as: "reviews" },
+					},
+				],
+				agents: [makeAgent("producer", { tools: ["read"] }), makeAgent("reader", { tools: ["read"] })],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-readonly" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				sessionRoot,
+				sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host" },
+			});
+			assert.equal(result.isError, undefined);
+
+			const resultPath = await waitForAsyncResultFile(id, 10_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true);
+			assert.equal(mockPi.callCount(), 3);
+			assert.match(readMockPiArgs(mockPi, 1).at(-1) ?? "", /Read src\/a\.ts/);
+			assert.match(readMockPiArgs(mockPi, 2).at(-1) ?? "", /Read src\/b\.ts/);
+			const collected = payload.outputs?.reviews?.structured as Array<{ key: string; structured: unknown }>;
+			assert.deepEqual(collected.map((item) => item.key), ["src/a.ts", "src/b.ts"]);
+			assert.deepEqual(collected.map((item) => item.structured), [{ ok: "a" }, { ok: "b" }]);
+
+			const allBwrapArgs = readAllFakeBwrapArgs(fakeBwrap.recordDir);
+			assert.equal(allBwrapArgs.length, 3, "expected producer and dynamic read-only children to run under bwrap");
+			for (const args of allBwrapArgs) {
+				assert.deepEqual(args.slice(args.indexOf(tempDir) - 1, args.indexOf(tempDir) + 2), ["--ro-bind", tempDir, tempDir]);
+			}
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
 	it("rejects async sandboxed writable parallel and dynamic fanout without worktree isolation", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
 		const artifactConfig = { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 };
 

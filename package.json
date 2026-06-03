@@ -1,17 +1,17 @@
 {
-  "name": "pi-subagents",
-  "version": "0.27.0",
-  "description": "Pi extension for delegating tasks to subagents with chains, parallel execution, and TUI clarification",
+  "name": "pi-subagents-sandboxed",
+  "version": "0.27.0-sandbox.0",
+  "description": "Pi extension for delegating tasks to subagents with chains, parallel execution, TUI clarification, and optional sandboxing",
   "author": "Nico Bailon",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nicobailon/pi-subagents.git"
+    "url": "git+https://github.com/GreenPerlz/pi-subagents-sandboxed.git"
   },
-  "homepage": "https://github.com/nicobailon/pi-subagents#readme",
+  "homepage": "https://github.com/GreenPerlz/pi-subagents-sandboxed#readme",
   "bugs": {
-    "url": "https://github.com/nicobailon/pi-subagents/issues"
+    "url": "https://github.com/GreenPerlz/pi-subagents-sandboxed/issues"
   },
   "keywords": [
     "pi-package",
@@ -23,7 +23,7 @@
     "cli"
   ],
   "bin": {
-    "pi-subagents": "install.mjs"
+    "pi-subagents-sandboxed": "install.mjs"
   },
   "files": [
     "src/**/*.ts",

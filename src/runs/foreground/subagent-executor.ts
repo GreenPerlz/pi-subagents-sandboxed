@@ -5,6 +5,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
 import { resolveSandboxConfig } from "../../sandbox/config.ts";
+import { hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
@@ -1677,6 +1678,9 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
 		run: params.sandbox,
 	});
+	if (sandbox && !params.worktree && hasSandboxWritableAgent({ agents: agentConfigs, sandbox })) {
+		return buildParallelModeError(sandboxParallelWorktreeRequiredMessage());
+	}
 
 	if (params.worktree) {
 		const worktreeTaskCwdError = buildParallelWorktreeTaskCwdError(tasks, effectiveCwd);

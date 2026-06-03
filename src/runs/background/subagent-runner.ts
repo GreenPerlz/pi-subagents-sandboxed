@@ -8,6 +8,7 @@ import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
+import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import type { ResolvedSandboxConfig, SpawnableInvocation } from "../../sandbox/types.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
@@ -695,6 +696,7 @@ async function runSingleStep(
 		return {
 			config: ctx.sandbox,
 			cwd: step.cwd ?? ctx.cwd,
+			cwdMode: inferSandboxCwdWritable({ tools: step.tools, sandbox: ctx.sandbox }) ? "rw" : "ro",
 			tempDir: input.tempDir,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
@@ -1859,6 +1861,24 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const groupStartFlatIndex = flatIndex;
 			let aborted = false;
 			let worktreeSetup: WorktreeSetup | undefined;
+			if (config.sandbox && !group.worktree && hasSandboxWritableAgent({ agents: group.parallel, sandbox: config.sandbox })) {
+				const failedAt = Date.now();
+				markParallelGroupSetupFailure({
+					statusPayload,
+					results,
+					group,
+					groupStartFlatIndex,
+					setupError: sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`),
+					failedAt,
+					statusPath,
+					eventsPath,
+					asyncDir,
+					runId: id,
+					stepIndex,
+				});
+				flatIndex += group.parallel.length;
+				break;
+			}
 			if (group.worktree) {
 				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(group.parallel, cwd);
 				if (worktreeTaskCwdConflict) {

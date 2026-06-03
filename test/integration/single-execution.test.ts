@@ -259,6 +259,14 @@ process.exit(child.status ?? 0);
 		return payload.args;
 	}
 
+	function assertMountMode(args: string[], source: string, mode: "ro" | "rw"): void {
+		const expectedFlag = mode === "rw" ? "--bind" : "--ro-bind";
+		assert.ok(
+			args.some((arg, index) => arg === expectedFlag && args[index + 1] === source && args[index + 2] === source),
+			`expected ${source} to be mounted ${mode}`,
+		);
+	}
+
 	function makeExecutor(agents = [makeAgent("echo")]) {
 		return createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
@@ -1131,6 +1139,55 @@ process.exit(child.status ?? 0);
 			fakeBwrap.restore();
 			if (previousSecret === undefined) delete process.env[secretName];
 			else process.env[secretName] = previousSecret;
+		}
+	});
+
+	it("mounts single sandboxed bash-only agents read-only by default", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "read only ok" });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("reader", { tools: ["read", "bash"] })]);
+			const result = await executor.execute(
+				"single-readonly-sandbox",
+				{ agent: "reader", task: "Inspect only", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assertMountMode(readFakeBwrapArgs(fakeBwrap.recordDir), tempDir, "ro");
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("mounts single sandboxed edit/write agents writable and lets sandboxBashWrite opt bash into writes", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "write ok" });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("writer", { tools: ["read", "edit"], completionGuard: false }), makeAgent("shell", { tools: ["bash"] })]);
+			const writerResult = await executor.execute(
+				"single-writable-sandbox",
+				{ agent: "writer", task: "Edit", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(writerResult.isError, undefined);
+			assertMountMode(readFakeBwrapArgs(fakeBwrap.recordDir), tempDir, "rw");
+
+			const shellResult = await executor.execute(
+				"single-bash-write-sandbox",
+				{ agent: "shell", task: "Shell write", sandbox: { provider: "bubblewrap", bashWrite: true } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(shellResult.isError, undefined);
+			assertMountMode(readFakeBwrapArgs(fakeBwrap.recordDir), tempDir, "rw");
+		} finally {
+			fakeBwrap.restore();
 		}
 	});
 

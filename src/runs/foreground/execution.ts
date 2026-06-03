@@ -51,6 +51,7 @@ import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
 import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
+import { inferSandboxCwdWritable } from "../../sandbox/write-inference.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
@@ -262,6 +263,7 @@ async function runSingleAttempt(
 		};
 		if (options.sandbox) {
 			const provider = createSandboxProvider(options.sandbox);
+			const cwdMode = inferSandboxCwdWritable({ tools: agent.tools, sandbox: options.sandbox }) ? "rw" : "ro";
 			const sandboxInvocation: SpawnableInvocation = {
 				command: piSpawnSpec.command,
 				args: piSpawnSpec.args,
@@ -272,6 +274,7 @@ async function runSingleAttempt(
 				invocation: sandboxInvocation,
 				mounts: buildSubagentSandboxMounts({
 					cwd: childCwd,
+					cwdMode,
 					tempDir,
 					sessionDir: options.sessionDir,
 					sessionFile: options.sessionFile,

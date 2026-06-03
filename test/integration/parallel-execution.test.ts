@@ -12,6 +12,8 @@ import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
+import { spawnSync } from "node:child_process";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createEventBus,
@@ -171,16 +173,44 @@ process.exit(child.status ?? 0);
 		};
 	}
 
+	function readFakeBwrapCalls(recordDir: string): string[][] {
+		const callFiles = fs.readdirSync(recordDir).filter((name) => name.startsWith("call-") && name.endsWith(".json")).sort();
+		assert.ok(callFiles.length > 0, "expected recorded fake bwrap calls");
+		return callFiles.map((callFile) => {
+			const payload = JSON.parse(fs.readFileSync(path.join(recordDir, callFile), "utf-8")) as { args?: string[] };
+			assert.ok(Array.isArray(payload.args), "expected recorded bwrap args");
+			return payload.args;
+		});
+	}
+
 	function readLastFakeBwrapArgs(recordDir: string): string[] {
-		const callFile = fs.readdirSync(recordDir).filter((name) => name.startsWith("call-") && name.endsWith(".json")).sort().at(-1);
-		assert.ok(callFile, "expected a recorded fake bwrap call");
-		const payload = JSON.parse(fs.readFileSync(path.join(recordDir, callFile), "utf-8")) as { args?: string[] };
-		assert.ok(Array.isArray(payload.args), "expected recorded bwrap args");
-		return payload.args;
+		return readFakeBwrapCalls(recordDir).at(-1)!;
+	}
+
+	function assertMountMode(args: string[], source: string, mode: "ro" | "rw"): void {
+		const expectedFlag = mode === "rw" ? "--bind" : "--ro-bind";
+		assert.ok(
+			args.some((arg, index) => arg === expectedFlag && args[index + 1] === source && args[index + 2] === source),
+			`expected ${source} to be mounted ${mode}`,
+		);
 	}
 
 	function assertBind(args: string[], source: string): void {
-		assert.deepEqual(args.slice(args.indexOf(source) - 1, args.indexOf(source) + 2), ["--bind", source, source]);
+		assertMountMode(args, source, "rw");
+	}
+
+	function initGitRepo(repo: string): void {
+		fs.mkdirSync(repo, { recursive: true });
+		fs.writeFileSync(path.join(repo, "README.md"), "test repo\n", "utf-8");
+		const run = (args: string[]) => {
+			const result = spawnSync("git", args, { cwd: repo, encoding: "utf-8" });
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+		};
+		run(["init"]);
+		run(["config", "user.email", "test@example.com"]);
+		run(["config", "user.name", "Test User"]);
+		run(["add", "README.md"]);
+		run(["commit", "-m", "init"]);
 	}
 
 	it("runs multiple agents concurrently via mapConcurrent + runSync", async () => {
@@ -360,12 +390,12 @@ Inspect`));
 		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
 	});
 
-	it("top-level parallel sandbox preserves child output, artifacts, session, and progress mounts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("top-level parallel sandbox preserves read-only child output, session, and progress mounts without worktree", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Sandboxed parallel done" });
 		const fakeBwrap = installFakeBwrap();
 		try {
 			const sessionDir = path.join(tempDir, "subagent-sessions");
-			const executor = makeExecutor();
+			const executor = makeExecutor([makeAgent("echo", { tools: ["read", "bash"] })]);
 
 			const result = await executor.execute(
 				"parallel-bubblewrap",
@@ -381,9 +411,63 @@ Inspect`));
 
 			assert.equal(result.isError, undefined);
 			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
-			assertBind(bwrapArgs, path.dirname(path.join(tempDir, "parallel-sandbox-output.md")));
+			assertMountMode(bwrapArgs, tempDir, "ro");
 			assertBind(bwrapArgs, path.join(sessionDir, "run-0"));
-			assertBind(bwrapArgs, tempDir);
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("rejects sandboxed parallel write-capable agents unless worktree isolation is enabled", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("writer", { tools: ["read", "edit"] })]);
+
+			const result = await executor.execute(
+				"parallel-sandbox-writer-no-worktree",
+				{ tasks: [{ agent: "writer", task: "Edit" }], sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /require worktree: true/);
+			assert.equal(fs.readdirSync(fakeBwrap.recordDir).filter((name) => name.endsWith(".json")).length, 0);
+			assert.equal(mockPi.callCount(), 0);
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("mounts each sandboxed parallel writer worktree writable when worktree isolation is enabled", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "Writable worktree done" });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const repo = path.join(tempDir, "repo");
+			initGitRepo(repo);
+			const executor = makeExecutor([makeAgent("writer", { tools: ["write"] })]);
+
+			const result = await executor.execute(
+				"parallel-sandbox-writer-worktree",
+				{
+					tasks: [{ agent: "writer", task: "Write A" }, { agent: "writer", task: "Write B" }],
+					sandbox: { provider: "bubblewrap" },
+					worktree: true,
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(repo),
+			);
+
+			assert.equal(result.isError, undefined);
+			const calls = readFakeBwrapCalls(fakeBwrap.recordDir);
+			assert.equal(calls.length, 2);
+			for (const args of calls) {
+				const mountedWorktree = args.find((arg, index) => args[index - 1] === "--bind" && arg.includes("pi-worktree-") && arg.startsWith(os.tmpdir()));
+				assert.ok(mountedWorktree, "expected each child worktree to be mounted writable");
+				assertMountMode(args, mountedWorktree, "rw");
+			}
 		} finally {
 			fakeBwrap.restore();
 		}

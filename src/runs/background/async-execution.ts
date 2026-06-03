@@ -11,6 +11,7 @@ import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
+import { hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { applyThinkingSuffix } from "../shared/pi-args.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
@@ -273,7 +274,8 @@ export function executeAsyncChain(
 	}
 	const workflowGraph = buildWorkflowGraphSnapshot({ runId: id, mode: resultMode, steps: chain });
 
-	for (const s of chain) {
+	for (let stepIndex = 0; stepIndex < chain.length; stepIndex++) {
+		const s = chain[stepIndex]!;
 		const stepAgents = isParallelStep(s)
 			? s.parallel.map((t) => t.agent)
 			: isDynamicParallelStep(s)
@@ -286,6 +288,14 @@ export function executeAsyncChain(
 					isError: true,
 					details: { mode: resultMode, results: [] },
 				};
+			}
+		}
+		if (params.sandbox && isParallelStep(s) && !s.worktree) {
+			const stepAgentConfigs = s.parallel
+				.map((task) => agents.find((agent) => agent.name === task.agent))
+				.filter((agent): agent is AgentConfig => Boolean(agent));
+			if (hasSandboxWritableAgent({ agents: stepAgentConfigs, sandbox: params.sandbox })) {
+				return formatAsyncStartError(resultMode, sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`));
 			}
 		}
 	}

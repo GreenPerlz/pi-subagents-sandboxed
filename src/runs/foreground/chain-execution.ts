@@ -60,6 +60,7 @@ import {
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
 import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
+import { hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { resolveModelCandidate } from "../shared/model-fallback.ts";
 import { validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
@@ -597,6 +598,15 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		if (isParallelStep(step)) {
 			const parallelTemplates = stepTemplates as string[];
 			const parallelCwd = resolveChildCwd(cwd ?? ctx.cwd, step.cwd);
+			const stepAgentConfigs = step.parallel
+				.map((task) => agents.find((agent) => agent.name === task.agent))
+				.filter((agent): agent is AgentConfig => Boolean(agent));
+			if (params.sandbox && !step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs, sandbox: params.sandbox })) {
+				return buildChainExecutionErrorResult(
+					sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`),
+					makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
+				);
+			}
 			let worktreeSetup: WorktreeSetup | undefined;
 			if (step.worktree) {
 				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(step.parallel, parallelCwd);

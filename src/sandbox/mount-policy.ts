@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync } from "node:fs";
 import * as path from "node:path";
-import type { SandboxMount } from "./types.ts";
+import type { SandboxMount, SandboxMountMode } from "./types.ts";
 
 export interface StructuredOutputMountInput {
 	schemaPath?: string;
@@ -19,6 +19,7 @@ export interface SubagentSandboxMountInput {
 	statusPaths?: string[];
 	structuredOutput?: StructuredOutputMountInput;
 	piArgs?: string[];
+	cwdMode?: SandboxMountMode;
 }
 
 function addSandboxMount(mounts: SandboxMount[], seen: Set<string>, source: string | undefined, mode: SandboxMount["mode"]): void {
@@ -60,7 +61,7 @@ function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Set<strin
 export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): SandboxMount[] {
 	const mounts: SandboxMount[] = [];
 	const seen = new Set<string>();
-	addSandboxMount(mounts, seen, input.cwd, "rw");
+	addSandboxMount(mounts, seen, input.cwd, input.cwdMode ?? "rw");
 	addSandboxMount(mounts, seen, input.tempDir, "ro");
 	addSandboxMount(mounts, seen, input.sessionDir, "rw");
 	addSandboxSessionFileMount(mounts, seen, input.sessionFile);

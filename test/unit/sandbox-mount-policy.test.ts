@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { buildSubagentSandboxMounts } from "../../src/sandbox/mount-policy.ts";
+import { inferSandboxCwdWritable } from "../../src/sandbox/write-inference.ts";
 
 const tempRoots: string[] = [];
 
@@ -32,7 +33,25 @@ afterEach(() => {
 	for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("sandbox write capability inference", () => {
+	it("treats edit/write as writer-capable while bash is read-only unless sandbox bash writes are enabled", () => {
+		assert.equal(inferSandboxCwdWritable({ tools: ["read", "bash"], sandbox: { bashWrite: false } }), false);
+		assert.equal(inferSandboxCwdWritable({ tools: ["read", "bash"], sandbox: { bashWrite: true } }), true);
+		assert.equal(inferSandboxCwdWritable({ tools: ["read", "edit"] }), true);
+		assert.equal(inferSandboxCwdWritable({ tools: ["write"] }), true);
+	});
+});
+
 describe("subagent sandbox mount policy", () => {
+	it("mounts cwd read-only when write inference says the child is read-only", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: "ro" });
+
+		assert.equal(mountMode(mounts, cwd), "ro");
+	});
+
 	it("mounts a fresh child session directory writable without mounting the broad session root", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));

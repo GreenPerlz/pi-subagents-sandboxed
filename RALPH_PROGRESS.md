@@ -1,1 +1,2 @@
 - 2026-06-03 issue #2: Added sandbox config schema/frontmatter/settings parsing and deterministic resolver; focused sandbox/schema tests pass. Full unit suite was run and has unrelated pre-existing failures noted in final report.
+- 2026-06-03 issue #3: Added internal sandbox provider abstraction plus Bubblewrap host-toolchain invocation builder with mount/env/network/fallback unit coverage; focused sandbox tests pass. Full unit suite still has unrelated pre-existing failures (agent frontmatter fork default and Node --experimental-transform-types child-registration tests).

@@ -48,6 +48,8 @@ import {
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { evaluateCompletionMutationGuard, resolveCompletionPolicy, type CompletionPolicy } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
+import { createSandboxProvider } from "../../sandbox/provider.ts";
+import type { SandboxMount, SpawnableInvocation } from "../../sandbox/types.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
@@ -98,6 +100,44 @@ function sumUsage(target: Usage, source: Usage): void {
 	target.cacheWrite += source.cacheWrite;
 	target.cost += source.cost;
 	target.turns += source.turns;
+}
+
+function addSandboxMount(mounts: SandboxMount[], seen: Set<string>, source: string | undefined, mode: SandboxMount["mode"]): void {
+	if (!source) return;
+	const resolved = path.resolve(source);
+	if (seen.has(resolved)) return;
+	if (!existsSync(resolved)) return;
+	seen.add(resolved);
+	mounts.push({ source: resolved, mode });
+}
+
+function addSandboxMountParent(mounts: SandboxMount[], seen: Set<string>, filePath: string | undefined, mode: SandboxMount["mode"]): void {
+	if (!filePath) return;
+	addSandboxMount(mounts, seen, path.dirname(filePath), mode);
+}
+
+function buildSingleRunSandboxMounts(input: {
+	cwd: string;
+	tempDir?: string;
+	sessionDir?: string;
+	sessionFile?: string;
+	artifactsDir?: string;
+	jsonlPath?: string;
+	outputPath?: string;
+	structuredOutput?: RunSyncOptions["structuredOutput"];
+}): SandboxMount[] {
+	const mounts: SandboxMount[] = [];
+	const seen = new Set<string>();
+	addSandboxMount(mounts, seen, input.cwd, "rw");
+	addSandboxMount(mounts, seen, input.tempDir, "rw");
+	addSandboxMount(mounts, seen, input.sessionDir, "rw");
+	addSandboxMountParent(mounts, seen, input.sessionFile, "rw");
+	addSandboxMount(mounts, seen, input.artifactsDir, "rw");
+	addSandboxMountParent(mounts, seen, input.jsonlPath, "rw");
+	addSandboxMountParent(mounts, seen, input.outputPath, "rw");
+	addSandboxMountParent(mounts, seen, input.structuredOutput?.schemaPath, "ro");
+	addSandboxMountParent(mounts, seen, input.structuredOutput?.outputPath, "rw");
+	return mounts;
 }
 
 function appendRecentOutput(progress: AgentProgress, lines: string[]): void {
@@ -247,12 +287,61 @@ async function runSingleAttempt(
 	result.progress = progress;
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
 	let observedMutationAttempt = false;
+	const childCwd = options.cwd ?? runtimeCwd;
+	let spawnSpec: SpawnableInvocation;
+	try {
+		const piSpawnSpec = getPiSpawnCommand(args);
+		const piInvocation: SpawnableInvocation = {
+			command: piSpawnSpec.command,
+			args: piSpawnSpec.args,
+			cwd: childCwd,
+			env: spawnEnv,
+		};
+		if (options.sandbox) {
+			const provider = createSandboxProvider(options.sandbox);
+			const wrapped = provider.wrapInvocation({
+				config: options.sandbox,
+				invocation: piInvocation,
+				mounts: buildSingleRunSandboxMounts({
+					cwd: childCwd,
+					tempDir,
+					sessionDir: options.sessionDir,
+					sessionFile: options.sessionFile,
+					artifactsDir: options.artifactsDir,
+					jsonlPath: shared.jsonlPath,
+					outputPath: options.outputPath,
+					structuredOutput: options.structuredOutput,
+				}),
+			});
+			const diagnosticMessages = wrapped.diagnostics
+				.filter((diagnostic) => diagnostic.level !== "info")
+				.map((diagnostic) => diagnostic.message);
+			appendRecentOutput(progress, diagnosticMessages);
+			spawnSpec = {
+				command: wrapped.invocation.command,
+				args: wrapped.invocation.args,
+				cwd: wrapped.invocation.cwd ?? childCwd,
+				env: wrapped.invocation.env ?? spawnEnv,
+			};
+		} else {
+			spawnSpec = piInvocation;
+		}
+	} catch (error) {
+		cleanupTempDir(tempDir);
+		const message = error instanceof Error ? error.message : String(error);
+		result.exitCode = 1;
+		result.error = `Sandbox setup failed: ${message}`;
+		progress.status = "failed";
+		progress.error = result.error;
+		progress.durationMs = Date.now() - startTime;
+		result.progressSummary = { toolCount: 0, tokens: 0, durationMs: progress.durationMs };
+		return result;
+	}
 
 	const exitCode = await new Promise<number>((resolve) => {
-		const spawnSpec = getPiSpawnCommand(args);
 		const proc = spawn(spawnSpec.command, spawnSpec.args, {
-			cwd: options.cwd ?? runtimeCwd,
-			env: spawnEnv,
+			cwd: spawnSpec.cwd ?? childCwd,
+			env: spawnSpec.env ?? spawnEnv,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
 		});

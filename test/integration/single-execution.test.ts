@@ -190,6 +190,75 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		return payload.args;
 	}
 
+	function installFakeBwrap(): { recordDir: string; restore: () => void } {
+		const rootDir = fs.mkdtempSync(path.join(tempDir, "fake-bwrap-"));
+		const binDir = path.join(rootDir, "bin");
+		const recordDir = path.join(rootDir, "records");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.mkdirSync(recordDir, { recursive: true });
+		const scriptPath = path.join(binDir, "fake-bwrap.mjs");
+		fs.writeFileSync(scriptPath, `
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const args = process.argv.slice(2);
+const recordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+if (!recordDir) {
+  console.error("FAKE_BWRAP_RECORD_DIR is required");
+  process.exit(97);
+}
+fs.mkdirSync(recordDir, { recursive: true });
+fs.writeFileSync(
+  path.join(recordDir, \`call-\${Date.now()}-\${process.pid}.json\`),
+  JSON.stringify({ args, cwd: process.cwd() }),
+  "utf-8",
+);
+const separator = args.indexOf("--");
+if (separator === -1 || !args[separator + 1]) {
+  console.error("fake bwrap expected -- followed by a command");
+  process.exit(98);
+}
+const child = spawnSync(args[separator + 1], args.slice(separator + 2), {
+  stdio: "inherit",
+  env: process.env,
+  cwd: process.cwd(),
+});
+if (child.error) {
+  console.error(child.error.message);
+  process.exit(99);
+}
+process.exit(child.status ?? 0);
+`, "utf-8");
+		const bwrapPath = path.join(binDir, "bwrap");
+		fs.writeFileSync(bwrapPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`, "utf-8");
+		fs.chmodSync(bwrapPath, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRecordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+		process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+		process.env.FAKE_BWRAP_RECORD_DIR = recordDir;
+		return {
+			recordDir,
+			restore() {
+				if (previousPath === undefined) delete process.env.PATH;
+				else process.env.PATH = previousPath;
+				if (previousRecordDir === undefined) delete process.env.FAKE_BWRAP_RECORD_DIR;
+				else process.env.FAKE_BWRAP_RECORD_DIR = previousRecordDir;
+			},
+		};
+	}
+
+	function readFakeBwrapArgs(recordDir: string): string[] {
+		const callFile = fs.readdirSync(recordDir)
+			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.sort()
+			.at(-1);
+		assert.ok(callFile, "expected a recorded fake bwrap call");
+		const payload = JSON.parse(fs.readFileSync(path.join(recordDir, callFile), "utf-8")) as { args?: string[] };
+		assert.ok(Array.isArray(payload.args), "expected recorded bwrap args");
+		return payload.args;
+	}
+
 	function makeExecutor(agents = [makeAgent("echo")]) {
 		return createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
@@ -977,6 +1046,95 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(fs.existsSync(path.join(tempDir, "false")), false);
 		assert.equal(fs.existsSync(path.join(tempDir, "default-report.md")), false);
 		assert.doesNotMatch(readCallArgs().at(-1) ?? "", /Write your findings to:/);
+	});
+
+	it("wraps a fresh single subagent run with bubblewrap and preserves child pi args", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const normalizeVolatileArgs = (args: string[]) => {
+			const normalized = [...args];
+			for (const flag of ["--system-prompt", "--append-system-prompt"]) {
+				const index = normalized.indexOf(flag);
+				if (index !== -1 && normalized[index + 1]) normalized[index + 1] = "<prompt-file>";
+			}
+			return normalized;
+		};
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const sessionDir = path.join(tempDir, "sessions");
+			const agent = makeAgent("echo", {
+				model: "mock/sandbox-model",
+				tools: ["read", "bash"],
+				extensions: [],
+			});
+			const executor = makeExecutor([agent]);
+			mockPi.onCall({ output: "plain ok" });
+			const plainResult = await executor.execute(
+				"single-unsandboxed",
+				{ agent: "echo", task: "Keep the same task", sessionDir },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(plainResult.isError, undefined);
+			assert.equal(fs.readdirSync(fakeBwrap.recordDir).filter((name) => name.endsWith(".json")).length, 0, "unsandboxed run should not call bwrap");
+			const plainPiArgs = readCallArgs();
+			mockPi.reset();
+
+			mockPi.onCall({ output: "sandboxed ok" });
+			const result = await executor.execute(
+				"single-bubblewrap",
+				{
+					agent: "echo",
+					task: "Keep the same task",
+					sandbox: { provider: "bubblewrap" },
+					sessionDir,
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /sandboxed ok/);
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const separatorIndex = bwrapArgs.indexOf("--");
+			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
+			assert.equal(bwrapArgs[separatorIndex + 1], "pi");
+			const wrappedPiArgs = bwrapArgs.slice(separatorIndex + 2);
+			const piArgs = readCallArgs();
+			assert.deepEqual(piArgs, wrappedPiArgs, "fake bubblewrap should exec pi with the same args it wrapped");
+			assert.deepEqual(normalizeVolatileArgs(piArgs), normalizeVolatileArgs(plainPiArgs), "sandboxing should preserve child pi argument configuration");
+			assert.deepEqual(piArgs.slice(0, 3), ["--mode", "json", "-p"]);
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--model"), piArgs.indexOf("--model") + 2), ["--model", "mock/sandbox-model"]);
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,bash"]);
+			assert.ok(piArgs.includes("Task: Keep the same task"), "child should receive the original task text");
+			assert.ok(piArgs.includes("--session"), "fresh child session should still be configured");
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("reports sandbox setup failures as foreground subagent errors", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const previousPath = process.env.PATH;
+		process.env.PATH = "";
+		try {
+			mockPi.onCall({ output: "should not run" });
+			const executor = makeExecutor([makeAgent("echo")]);
+
+			const result = await executor.execute(
+				"single-bubblewrap-unavailable",
+				{ agent: "echo", task: "Need sandbox", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /Sandbox setup failed: Bubblewrap sandbox requested but bwrap is unavailable/);
+			assert.equal(mockPi.callCount(), 0);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
 	});
 
 	it("rejects file-only mode without an output path before spawning", async () => {

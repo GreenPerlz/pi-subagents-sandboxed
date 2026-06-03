@@ -5,6 +5,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
+import type { ResolvedSandboxConfig } from "../sandbox/types.ts";
 import type { FSWatcher } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -819,6 +820,8 @@ export interface RunSyncOptions {
 		dynamic?: boolean;
 		dynamicGroup?: boolean;
 	};
+	/** Resolved sandbox config for this child process; omitted preserves the original spawn path. */
+	sandbox?: ResolvedSandboxConfig;
 }
 
 export type IntercomBridgeMode = "off" | "fork-only" | "always";

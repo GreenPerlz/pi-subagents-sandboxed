@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type AgentConfig, type AgentScope } from "../../agents/agents.ts";
+import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
+import { resolveSandboxConfig } from "../../sandbox/config.ts";
 import type { SandboxRunConfig } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
@@ -2093,6 +2094,11 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		}
 		: undefined;
 
+	const sandbox = resolveSandboxConfig({
+		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		agent: agentConfig,
+		run: params.sandbox,
+	});
 	const r = await runSync(ctx.cwd, agents, params.agent!, task, {
 		cwd: effectiveCwd,
 		signal,
@@ -2122,6 +2128,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		skills: effectiveSkills,
 		acceptance: params.acceptance,
 		acceptanceContext: { mode: "single" },
+		sandbox,
 	});
 	if (foregroundControl?.currentIndex === 0) {
 		foregroundControl.interrupt = undefined;

@@ -22,23 +22,31 @@ export interface SubagentSandboxMountInput {
 	cwdMode?: SandboxMountMode;
 }
 
-function addSandboxMount(mounts: SandboxMount[], seen: Set<string>, source: string | undefined, mode: SandboxMount["mode"]): void {
+function addSandboxMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, source: string | undefined, mode: SandboxMount["mode"]): void {
 	if (!source) return;
 	const resolved = path.resolve(source);
-	if (seen.has(resolved)) return;
+	const existingMode = seen.get(resolved);
+	if (existingMode) {
+		if (existingMode === "ro" && mode === "rw") {
+			seen.set(resolved, "rw");
+			const existingMount = mounts.find((mount) => mount.source === resolved);
+			if (existingMount) existingMount.mode = "rw";
+		}
+		return;
+	}
 	if (!existsSync(resolved)) return;
-	seen.add(resolved);
+	seen.set(resolved, mode);
 	mounts.push({ source: resolved, mode });
 }
 
-function addSandboxMountParent(mounts: SandboxMount[], seen: Set<string>, filePath: string | undefined, mode: SandboxMount["mode"]): void {
+function addSandboxMountParent(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, filePath: string | undefined, mode: SandboxMount["mode"]): void {
 	if (!filePath) return;
 	const parent = path.dirname(filePath);
 	if (mode === "rw") mkdirSync(parent, { recursive: true });
 	addSandboxMount(mounts, seen, parent, mode);
 }
 
-function addSandboxSessionFileMount(mounts: SandboxMount[], seen: Set<string>, sessionFile: string | undefined): void {
+function addSandboxSessionFileMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, sessionFile: string | undefined): void {
 	if (!sessionFile) return;
 	const resolved = path.resolve(sessionFile);
 	if (existsSync(resolved)) {
@@ -48,7 +56,7 @@ function addSandboxSessionFileMount(mounts: SandboxMount[], seen: Set<string>, s
 	addSandboxMountParent(mounts, seen, resolved, "rw");
 }
 
-function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Set<string>, args: string[] | undefined): void {
+function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, args: string[] | undefined): void {
 	if (!args) return;
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] !== "--extension") continue;
@@ -60,7 +68,7 @@ function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Set<strin
 
 export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): SandboxMount[] {
 	const mounts: SandboxMount[] = [];
-	const seen = new Set<string>();
+	const seen = new Map<string, SandboxMount["mode"]>();
 	addSandboxMount(mounts, seen, input.cwd, input.cwdMode ?? "rw");
 	addSandboxMount(mounts, seen, input.tempDir, "ro");
 	addSandboxMount(mounts, seen, input.sessionDir, "rw");

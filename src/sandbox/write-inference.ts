@@ -15,17 +15,26 @@ function isBuiltinTool(tool: string, name: string): boolean {
  * when the resolved sandbox config opts into bash writes.
  */
 export function inferSandboxCwdWritable(input: SandboxWriteInferenceInput): boolean {
-	const tools = input.tools ?? [];
+	if (input.tools === undefined) return true;
+	const tools = input.tools;
 	if (tools.some((tool) => isBuiltinTool(tool, "edit") || isBuiltinTool(tool, "write"))) return true;
 	if (input.sandbox?.bashWrite === true && tools.some((tool) => isBuiltinTool(tool, "bash"))) return true;
 	return false;
 }
 
 export function hasSandboxWritableAgent(input: { agents: Array<SandboxWriteInferenceInput>; sandbox?: ResolvedSandboxConfig }): boolean {
-	if (!input.sandbox) return false;
-	return input.agents.some((agent) => inferSandboxCwdWritable({ tools: agent.tools, sandbox: input.sandbox }));
+	const hasSandbox = Boolean(input.sandbox) || input.agents.some((agent) => Boolean(agent.sandbox));
+	if (!hasSandbox) return false;
+	return input.agents.some((agent) => {
+		const sandbox = agent.sandbox ?? input.sandbox;
+		return Boolean(sandbox) && inferSandboxCwdWritable({ tools: agent.tools, sandbox });
+	});
 }
 
 export function sandboxParallelWorktreeRequiredMessage(scope = "Parallel sandboxed tasks"): string {
 	return `${scope} include write-capable tools and require worktree: true so each writer gets an isolated writable worktree.`;
+}
+
+export function sandboxDynamicFanoutUnsupportedMessage(scope = "Dynamic sandboxed fanout"): string {
+	return `${scope} includes write-capable tools, but dynamic fanout does not support worktree: true isolation yet.`;
 }

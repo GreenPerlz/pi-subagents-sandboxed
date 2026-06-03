@@ -10,8 +10,9 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
-import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
-import { hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { resolveSandboxConfig } from "../../sandbox/config.ts";
+import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
+import { hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { applyThinkingSuffix } from "../shared/pi-args.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
@@ -124,6 +125,8 @@ interface AsyncChainParams {
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
 	sandbox?: ResolvedSandboxConfig;
+	sandboxSettings?: SandboxSettingsDefaults;
+	sandboxRun?: SandboxRunConfig;
 }
 
 interface AsyncSingleParams {
@@ -152,6 +155,8 @@ interface AsyncSingleParams {
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
 	sandbox?: ResolvedSandboxConfig;
+	sandboxSettings?: SandboxSettingsDefaults;
+	sandboxRun?: SandboxRunConfig;
 }
 
 interface AsyncExecutionResult {
@@ -258,6 +263,15 @@ export function executeAsyncChain(
 	const chainSkills = params.chainSkills ?? [];
 	const availableModels = params.availableModels;
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
+	const sharedSandbox = hasSandboxResolutionInputs
+		? resolveSandboxConfig({ settings: params.sandboxSettings, run: params.sandboxRun })
+		: params.sandbox;
+	const resolveStepSandbox = (agent: AgentConfig): ResolvedSandboxConfig | undefined => hasSandboxResolutionInputs
+		? resolveSandboxConfig({ settings: params.sandboxSettings, agent, run: params.sandboxRun })
+		: params.sandbox
+			? resolveSandboxConfig({ agent, run: params.sandbox })
+			: resolveSandboxConfig({ agent });
 	const firstStep = chain[0];
 	const originalTask = params.task ?? (firstStep
 		? (isParallelStep(firstStep)
@@ -290,12 +304,19 @@ export function executeAsyncChain(
 				};
 			}
 		}
-		if (params.sandbox && isParallelStep(s) && !s.worktree) {
+		if (isParallelStep(s) && !s.worktree) {
 			const stepAgentConfigs = s.parallel
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
-			if (hasSandboxWritableAgent({ agents: stepAgentConfigs, sandbox: params.sandbox })) {
+			const sandboxWriteInputs = stepAgentConfigs.map((agent) => ({ tools: agent.tools, sandbox: resolveStepSandbox(agent) }));
+			if (hasSandboxWritableAgent({ agents: sandboxWriteInputs })) {
 				return formatAsyncStartError(resultMode, sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`));
+			}
+		}
+		if (isDynamicParallelStep(s)) {
+			const agent = agents.find((candidate) => candidate.name === s.parallel.agent);
+			if (agent && hasSandboxWritableAgent({ agents: [{ tools: agent.tools, sandbox: resolveStepSandbox(agent) }] })) {
+				return formatAsyncStartError(resultMode, sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`));
 			}
 		}
 	}
@@ -330,6 +351,7 @@ export function executeAsyncChain(
 	};
 	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior) => {
 		const a = agents.find((x) => x.name === s.agent)!;
+		const stepSandbox = resolveStepSandbox(a);
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
 		const instructionCwd = behaviorCwd ?? stepCwd;
 		const behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
@@ -383,6 +405,7 @@ export function executeAsyncChain(
 			outputMode: behavior.outputMode,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
+			sandbox: stepSandbox,
 			effectiveAcceptance: resolveEffectiveAcceptance({
 				explicit: s.acceptance,
 				agentName: s.agent,
@@ -495,7 +518,7 @@ export function executeAsyncChain(
 				resultMode,
 				dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
 				workflowGraph,
-				sandbox: params.sandbox,
+				sandbox: sharedSandbox,
 				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
@@ -640,6 +663,12 @@ export function executeAsyncSingle(
 	} = params;
 	const task = params.task ?? "";
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
+	const sandbox = hasSandboxResolutionInputs
+		? resolveSandboxConfig({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun })
+		: params.sandbox
+			? resolveSandboxConfig({ agent: agentConfig, run: params.sandbox })
+			: resolveSandboxConfig({ agent: agentConfig });
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
 	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(skillNames, runnerCwd, ctx.cwd);
@@ -704,6 +733,7 @@ export function executeAsyncSingle(
 						outputMode,
 						sessionFile,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
+						sandbox,
 						effectiveAcceptance: resolveEffectiveAcceptance({
 							explicit: params.acceptance,
 							agentName: agent,
@@ -731,7 +761,7 @@ export function executeAsyncSingle(
 				controlIntercomTarget,
 				childIntercomTargets: childIntercomTarget ? [childIntercomTarget(agent, 0)] : undefined,
 				resultMode: "single",
-				sandbox: params.sandbox,
+				sandbox,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,

@@ -405,7 +405,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			const parallelResult = executeAsyncChain(parallelId, {
 				chain: [{ parallel: [{ agent: "worker", task: "Do A", output: "parallel-a.md", progress: true }, { agent: "reviewer", task: "Do B" }] }],
 				resultMode: "parallel",
-				agents: [makeAgent("worker"), makeAgent("reviewer")],
+				agents: [makeAgent("worker", { tools: ["read", "bash"] }), makeAgent("reviewer", { tools: ["read", "bash"] })],
 				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-parallel" },
 				artifactConfig,
 				artifactsDir,
@@ -446,6 +446,41 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		} finally {
 			fakeBwrap.restore();
 		}
+	});
+
+	it("rejects async sandboxed writable parallel and dynamic fanout without worktree isolation", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+		const artifactConfig = { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 };
+
+		const parallelResult = executeAsyncChain(`async-sandbox-agent-bash-${Date.now().toString(36)}`, {
+			chain: [{ parallel: [{ agent: "shell", task: "Shell write" }] }],
+			agents: [makeAgent("shell", { tools: ["bash"], sandbox: { bashWrite: true } })],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-agent-bash" },
+			artifactConfig,
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sandbox: { provider: "bubblewrap" },
+		});
+		assert.equal(parallelResult.isError, true);
+		assert.match(parallelResult.content[0]?.text ?? "", /require worktree: true/);
+
+		const dynamicResult = executeAsyncChain(`async-sandbox-dynamic-writer-${Date.now().toString(36)}`, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "file", key: "/path", maxItems: 4 },
+					parallel: { agent: "writer", task: "Edit {file.path}" },
+					collect: { as: "reviews" },
+				},
+			],
+			agents: [makeAgent("producer"), makeAgent("writer", { tools: ["write"] })],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-writer" },
+			artifactConfig,
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sandbox: { provider: "bubblewrap" },
+		});
+		assert.equal(dynamicResult.isError, true);
+		assert.match(dynamicResult.content[0]?.text ?? "", /dynamic fanout does not support worktree: true/i);
 	});
 
 	it("top-level async parallel conversion preserves output, reads, and progress", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

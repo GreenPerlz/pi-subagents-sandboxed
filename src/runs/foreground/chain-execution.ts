@@ -7,6 +7,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
+import { resolveSandboxConfig } from "../../sandbox/config.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import {
@@ -59,8 +60,8 @@ import {
 	MAX_CONCURRENCY,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
-import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
-import { hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
+import { hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { resolveModelCandidate } from "../shared/model-fallback.ts";
 import { validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
@@ -138,6 +139,7 @@ interface ParallelChainRunInput {
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
+	sandboxes?: (ResolvedSandboxConfig | undefined)[];
 	progressPaths?: string[];
 }
 
@@ -293,7 +295,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				structuredOutput: structuredRuntime,
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
-				sandbox: input.sandbox,
+				sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox,
 				progressPaths: behavior.progress ? input.progressPaths : undefined,
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
@@ -398,6 +400,8 @@ interface ChainExecutionParams {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	sandbox?: ResolvedSandboxConfig;
+	sandboxSettings?: SandboxSettingsDefaults;
+	sandboxRun?: SandboxRunConfig;
 }
 
 interface ChainExecutionResult {
@@ -440,6 +444,12 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		chainDir: chainDirBase,
 	} = params;
 	const chainSkills = chainSkillsParam ?? [];
+	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
+	const resolveStepSandbox = (agent: AgentConfig): ResolvedSandboxConfig | undefined => hasSandboxResolutionInputs
+		? resolveSandboxConfig({ settings: params.sandboxSettings, agent, run: params.sandboxRun })
+		: params.sandbox
+			? resolveSandboxConfig({ agent, run: params.sandbox })
+			: resolveSandboxConfig({ agent });
 
 	const results: SingleResult[] = [];
 	const outputs: ChainOutputMap = {};
@@ -601,7 +611,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const stepAgentConfigs = step.parallel
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
-			if (params.sandbox && !step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs, sandbox: params.sandbox })) {
+			const stepSandboxes = stepAgentConfigs.map((agent) => resolveStepSandbox(agent));
+			if (!step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
 				return buildChainExecutionErrorResult(
 					sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`),
 					makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
@@ -683,6 +694,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					worktreeSetup,
 					maxSubagentDepth: params.maxSubagentDepth,
 					sandbox: params.sandbox,
+					sandboxes: stepSandboxes,
 					progressPaths: [path.join(chainDir, "progress.md")],
 				});
 				globalTaskIndex += step.parallel.length;
@@ -768,6 +780,13 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				if (worktreeSetup) cleanupWorktrees(worktreeSetup);
 			}
 		} else if (isDynamicParallelStep(step)) {
+			const dynamicAgentConfig = agents.find((agent) => agent.name === step.parallel.agent);
+			const dynamicSandbox = dynamicAgentConfig ? resolveStepSandbox(dynamicAgentConfig) : undefined;
+			if (dynamicAgentConfig && hasSandboxWritableAgent({ agents: [{ tools: dynamicAgentConfig.tools, sandbox: dynamicSandbox }] })) {
+				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
+				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
+				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+			}
 			if (Object.hasOwn(step, "acceptance")) {
 				const message = `Dynamic fanout step ${stepIndex + 1} does not support group-level acceptance; set acceptance on the child template instead.`;
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
@@ -871,6 +890,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				nestedRoute: params.nestedRoute,
 				maxSubagentDepth: params.maxSubagentDepth,
 				sandbox: params.sandbox,
+				sandboxes: dynamicParallelStep.parallel.map(() => dynamicSandbox),
 				progressPaths: [path.join(chainDir, "progress.md")],
 			});
 			globalTaskIndex += dynamicParallelStep.parallel.length;
@@ -973,6 +993,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						: normalizeSkillInput(seqStep.skill),
 			};
 			const behavior = suppressProgressForReadOnlyTask(resolveStepBehavior(agentConfig, stepOverride, chainSkills), stepTemplate, originalTask);
+			const stepSandbox = resolveStepSandbox(agentConfig);
 
 			const isFirstProgress = behavior.progress && !progressCreated;
 			if (isFirstProgress) {
@@ -1053,7 +1074,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				structuredOutput: structuredRuntime,
 				acceptance: seqStep.acceptance,
 				acceptanceContext: { mode: "chain" },
-				sandbox: params.sandbox,
+				sandbox: stepSandbox,
 				progressPaths: behavior.progress ? [path.join(chainDir, "progress.md")] : undefined,
 				onUpdate: onUpdate
 					? (p) => {

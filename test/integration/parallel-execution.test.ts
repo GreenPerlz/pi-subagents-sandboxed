@@ -390,7 +390,7 @@ Inspect`));
 		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
 	});
 
-	it("top-level parallel sandbox preserves read-only child output, session, and progress mounts without worktree", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("top-level parallel sandbox preserves child output, session, and progress mounts without worktree", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Sandboxed parallel done" });
 		const fakeBwrap = installFakeBwrap();
 		try {
@@ -411,7 +411,7 @@ Inspect`));
 
 			assert.equal(result.isError, undefined);
 			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
-			assertMountMode(bwrapArgs, tempDir, "ro");
+			assertMountMode(bwrapArgs, tempDir, "rw");
 			assertBind(bwrapArgs, path.join(sessionDir, "run-0"));
 		} finally {
 			fakeBwrap.restore();
@@ -435,6 +435,58 @@ Inspect`));
 			assert.match(result.content[0]?.text ?? "", /require worktree: true/);
 			assert.equal(fs.readdirSync(fakeBwrap.recordDir).filter((name) => name.endsWith(".json")).length, 0);
 			assert.equal(mockPi.callCount(), 0);
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("rejects sandboxed parallel agents with omitted tools unless worktree isolation is enabled", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("default-tools")]);
+
+			const result = await executor.execute(
+				"parallel-sandbox-omitted-tools-no-worktree",
+				{ tasks: [{ agent: "default-tools", task: "Use default tools" }], sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /require worktree: true/);
+			assert.equal(fs.readdirSync(fakeBwrap.recordDir).filter((name) => name.endsWith(".json")).length, 0);
+			assert.equal(mockPi.callCount(), 0);
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("uses agent-level sandbox bashWrite for top-level parallel guard and preserves run-level overrides", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("shell", { tools: ["bash"], sandbox: { bashWrite: true } })]);
+
+			const rejected = await executor.execute(
+				"parallel-agent-bash-write-no-worktree",
+				{ tasks: [{ agent: "shell", task: "Shell write" }], sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(rejected.isError, true);
+			assert.match(rejected.content[0]?.text ?? "", /require worktree: true/);
+
+			mockPi.onCall({ output: "read only shell" });
+			const allowed = await executor.execute(
+				"parallel-run-bash-write-override",
+				{ tasks: [{ agent: "shell", task: "Inspect" }], sandbox: { provider: "bubblewrap", bashWrite: false } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(allowed.isError, undefined);
+			assertMountMode(readLastFakeBwrapArgs(fakeBwrap.recordDir), tempDir, "ro");
 		} finally {
 			fakeBwrap.restore();
 		}

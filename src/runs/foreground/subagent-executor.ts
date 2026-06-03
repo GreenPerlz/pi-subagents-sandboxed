@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
 import { resolveSandboxConfig } from "../../sandbox/config.ts";
 import { hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
-import type { ResolvedSandboxConfig, SandboxRunConfig } from "../../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -143,6 +143,14 @@ export interface SubagentParamsLike {
 	agentScope?: unknown;
 	chainDir?: string;
 	acceptance?: AcceptanceInput;
+}
+
+function resolveChildSandboxConfig(input: {
+	settings?: SandboxSettingsDefaults;
+	agent?: AgentConfig;
+	run?: SandboxRunConfig;
+}): ResolvedSandboxConfig | undefined {
+	return resolveSandboxConfig(input);
 }
 
 interface ExecutorDeps {
@@ -1126,8 +1134,9 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 	const currentProvider = ctx.model?.provider;
 	const controlIntercomTarget = intercomBridge.active ? intercomBridge.orchestratorTarget : undefined;
 	const childIntercomTarget = intercomBridge.active ? (agent: string, index: number) => resolveSubagentIntercomTarget(id, agent, index) : undefined;
+	const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
 	const sandbox = resolveSandboxConfig({
-		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		settings: sandboxSettings,
 		run: params.sandbox,
 	});
 
@@ -1175,6 +1184,8 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			childIntercomTarget,
 			nestedRoute,
 			sandbox,
+			sandboxSettings,
+			sandboxRun: params.sandbox,
 		});
 	}
 
@@ -1205,6 +1216,8 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			childIntercomTarget,
 			nestedRoute,
 			sandbox,
+			sandboxSettings,
+			sandboxRun: params.sandbox,
 		});
 	}
 
@@ -1285,8 +1298,9 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 	const chainSkills = normalized === false ? [] : (normalized ?? []);
 	const chain = wrapChainTasksForFork(params.chain as ChainStep[], params.context);
 	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
 	const sandbox = resolveSandboxConfig({
-		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		settings: sandboxSettings,
 		run: params.sandbox,
 	});
 	const chainResult = await executeChain({
@@ -1319,6 +1333,8 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		worktreeSetupHook: deps.config.worktreeSetupHook,
 		worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
 		sandbox,
+		sandboxSettings,
+		sandboxRun: params.sandbox,
 	});
 
 	if (chainResult.requestedAsync) {
@@ -1360,6 +1376,8 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
 			nestedRoute: data.nestedRoute,
 			sandbox,
+			sandboxSettings,
+			sandboxRun: params.sandbox,
 		});
 	}
 
@@ -1418,6 +1436,7 @@ interface ForegroundParallelRunInput {
 	onUpdate?: (r: AgentToolResult<Details>) => void;
 	worktreeSetup?: WorktreeSetup;
 	sandbox?: ResolvedSandboxConfig;
+	sandboxes?: (ResolvedSandboxConfig | undefined)[];
 	progressPaths?: string[];
 }
 
@@ -1579,7 +1598,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			skills: effectiveSkills === false ? [] : effectiveSkills,
 			acceptance: task.acceptance,
 			acceptanceContext: { mode: "parallel" },
-			sandbox: input.sandbox,
+			sandbox: input.sandboxes?.[index] ?? input.sandbox,
 			progressPaths: behavior?.progress ? input.progressPaths : undefined,
 			onUpdate: input.onUpdate
 				? (progressUpdate) => {
@@ -1674,11 +1693,13 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	const maxSubagentDepths = agentConfigs.map((config) =>
 		resolveChildMaxSubagentDepth(currentMaxSubagentDepth, config.maxSubagentDepth),
 	);
+	const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
 	const sandbox = resolveSandboxConfig({
-		settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		settings: sandboxSettings,
 		run: params.sandbox,
 	});
-	if (sandbox && !params.worktree && hasSandboxWritableAgent({ agents: agentConfigs, sandbox })) {
+	const taskSandboxes = agentConfigs.map((agent) => resolveChildSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox }));
+	if (!params.worktree && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
 		return buildParallelModeError(sandboxParallelWorktreeRequiredMessage());
 	}
 
@@ -1801,6 +1822,8 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
 				sandbox,
+				sandboxSettings,
+				sandboxRun: params.sandbox,
 			});
 		}
 	}
@@ -1877,6 +1900,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			onUpdate,
 			worktreeSetup,
 			sandbox,
+			sandboxes: taskSandboxes,
 			progressPaths,
 		});
 		for (let i = 0; i < results.length; i++) {

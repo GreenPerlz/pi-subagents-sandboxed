@@ -8,7 +8,7 @@ import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
-import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import type { ResolvedSandboxConfig, SpawnableInvocation } from "../../sandbox/types.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
@@ -692,11 +692,12 @@ async function runSingleStep(
 	const attemptNotes: string[] = [];
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	const buildSandboxInput = (input: { args: string[]; tempDir?: string; sessionDir?: string; sessionFile?: string; outputFile: string; structuredOutput?: { schemaPath?: string; outputPath?: string } }): RunPiStreamingSandboxInput | undefined => {
-		if (!ctx.sandbox) return undefined;
+		const sandbox = step.sandbox ?? ctx.sandbox;
+		if (!sandbox) return undefined;
 		return {
-			config: ctx.sandbox,
+			config: sandbox,
 			cwd: step.cwd ?? ctx.cwd,
-			cwdMode: inferSandboxCwdWritable({ tools: step.tools, sandbox: ctx.sandbox }) ? "rw" : "ro",
+			cwdMode: inferSandboxCwdWritable({ tools: step.tools, sandbox }) ? "rw" : "ro",
 			tempDir: input.tempDir,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
@@ -1598,6 +1599,28 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 		if (isDynamicRunnerGroup(step)) {
 			const groupStartFlatIndex = flatIndex;
+			const dynamicSandbox = step.parallel.sandbox ?? config.sandbox;
+			if (dynamicSandbox && inferSandboxCwdWritable({ tools: step.parallel.tools, sandbox: dynamicSandbox })) {
+				const now = Date.now();
+				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
+				statusPayload.state = "failed";
+				statusPayload.error = message;
+				statusPayload.currentStep = flatIndex;
+				const placeholder = statusPayload.steps[groupStartFlatIndex];
+				if (placeholder) {
+					placeholder.status = "failed";
+					placeholder.error = message;
+					placeholder.startedAt = now;
+					placeholder.endedAt = now;
+					placeholder.durationMs = 0;
+					placeholder.exitCode = 1;
+				}
+				statusPayload.lastUpdate = now;
+				markDynamicGraphGroup(stepIndex, "failed", message);
+				writeStatusPayload();
+				results.push({ agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1 });
+				break;
+			}
 			let materialized: ReturnType<typeof materializeDynamicParallelStep>;
 			try {
 				materialized = materializeDynamicParallelStep(step as Parameters<typeof materializeDynamicParallelStep>[0], outputs, stepIndex, { maxItems: config.dynamicFanoutMaxItems, allowRunnerFields: true });
@@ -1861,7 +1884,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const groupStartFlatIndex = flatIndex;
 			let aborted = false;
 			let worktreeSetup: WorktreeSetup | undefined;
-			if (config.sandbox && !group.worktree && hasSandboxWritableAgent({ agents: group.parallel, sandbox: config.sandbox })) {
+			if (!group.worktree && hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, sandbox: task.sandbox ?? config.sandbox })) })) {
 				const failedAt = Date.now();
 				markParallelGroupSetupFailure({
 					statusPayload,

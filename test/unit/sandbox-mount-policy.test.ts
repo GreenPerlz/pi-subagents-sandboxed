@@ -40,6 +40,11 @@ describe("sandbox write capability inference", () => {
 		assert.equal(inferSandboxCwdWritable({ tools: ["read", "edit"] }), true);
 		assert.equal(inferSandboxCwdWritable({ tools: ["write"] }), true);
 	});
+
+	it("treats omitted tools as writer-capable because child pi receives its default tools", () => {
+		assert.equal(inferSandboxCwdWritable({ tools: undefined, sandbox: { bashWrite: false } }), true);
+		assert.equal(inferSandboxCwdWritable({ tools: [], sandbox: { bashWrite: true } }), false);
+	});
 });
 
 describe("subagent sandbox mount policy", () => {
@@ -89,6 +94,17 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, forkedSessionFile), "rw");
 		assert.equal(mountMode(mounts, perRunSessionDir), "rw");
 		assert.equal(mountMode(mounts, broadSessionRoot), undefined);
+	});
+
+	it("upgrades a cwd read-only mount when a writable progress parent resolves to the same path", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const progressPath = path.join(cwd, "progress.md");
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: "ro", progressPaths: [progressPath] });
+
+		assert.equal(mountMode(mounts, cwd), "rw");
+		assert.equal(mounts.filter((mount) => mount.source === cwd).length, 1);
 	});
 
 	it("mounts prompt temp, output, artifact, structured output, async status, and absolute extension paths with least privilege", () => {

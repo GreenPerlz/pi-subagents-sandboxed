@@ -1020,6 +1020,66 @@ process.exit(child.status ?? 0);
 		}
 	});
 
+	it("uses agent-level sandbox bashWrite for foreground parallel chain guard and preserves run-level overrides", async () => {
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const agents = [makeAgent("shell", { tools: ["bash"], sandbox: { bashWrite: true } })];
+
+			const rejected = await executeChain(
+				makeChainParams(
+					[{ parallel: [{ agent: "shell", task: "Shell write" }] }],
+					agents,
+					{ sandbox: { provider: "bubblewrap" } },
+				),
+			);
+			assert.equal(rejected.isError, true);
+			assert.match(rejected.content[0]?.text ?? "", /require worktree: true/);
+
+			mockPi.onCall({ output: "read-only shell" });
+			const allowed = await executeChain(
+				makeChainParams(
+					[{ parallel: [{ agent: "shell", task: "Inspect" }] }],
+					agents,
+					{ sandbox: { provider: "bubblewrap", bashWrite: false } },
+				),
+			);
+			assert.equal(allowed.isError, undefined);
+			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
+			assert.ok(bwrapArgs.some((arg, index) => arg === "--ro-bind" && bwrapArgs[index + 1] === tempDir && bwrapArgs[index + 2] === tempDir));
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("rejects sandboxed writable dynamic fanout because dynamic worktree isolation is unsupported", async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }] } });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const agents = [makeAgent("producer", { tools: ["read", "bash"] }), makeAgent("writer", { tools: ["write"] })];
+
+			const result = await executeChain(
+				makeChainParams(
+					[
+						{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+						{
+							expand: { from: { output: "targets", path: "/items" }, item: "file", key: "/path", maxItems: 4 },
+							parallel: { agent: "writer", task: "Edit {file.path}" },
+							collect: { as: "reviews" },
+						},
+					],
+					agents,
+					{ sandbox: { provider: "bubblewrap" } },
+				),
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /dynamic fanout does not support worktree: true/i);
+			assert.equal(mockPi.callCount(), 1);
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
 	it("uses custom chainDir when provided", async () => {
 		mockPi.onCall({ output: "Done" });
 		const agents = [makeAgent("worker")];

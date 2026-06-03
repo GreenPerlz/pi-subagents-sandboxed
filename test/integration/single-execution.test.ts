@@ -1162,6 +1162,26 @@ process.exit(child.status ?? 0);
 		}
 	});
 
+	it("mounts single sandboxed agents with omitted tools writable", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "default tools ok" });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("default-tools")]);
+			const result = await executor.execute(
+				"single-omitted-tools-sandbox",
+				{ agent: "default-tools", task: "Use default tools", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assertMountMode(readFakeBwrapArgs(fakeBwrap.recordDir), tempDir, "rw");
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
 	it("mounts single sandboxed edit/write agents writable and lets sandboxBashWrite opt bash into writes", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "write ok" });
 		const fakeBwrap = installFakeBwrap();

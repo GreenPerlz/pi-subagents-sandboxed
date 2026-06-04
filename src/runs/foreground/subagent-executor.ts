@@ -793,13 +793,10 @@ function isRalphNestedWorkerAgentName(agent: unknown): boolean {
 	return typeof agent === "string" && (agent === "worker" || agent.endsWith("-worker"));
 }
 
-function ralphNestedLaunchWorkerTargetCount(params: SubagentParamsLike): number {
-	let sawTarget = false;
-	let workerTargets = 0;
+function collectRalphNestedLaunchAgentTargets(params: SubagentParamsLike): string[] {
+	const targets: string[] = [];
 	const visitAgent = (agent: unknown) => {
-		if (typeof agent !== "string") return;
-		sawTarget = true;
-		if (isRalphNestedWorkerAgentName(agent)) workerTargets += 1;
+		if (typeof agent === "string") targets.push(agent);
 	};
 
 	if ((params.chain?.length ?? 0) > 0) {
@@ -817,9 +814,24 @@ function ralphNestedLaunchWorkerTargetCount(params: SubagentParamsLike): number 
 	} else {
 		visitAgent(params.agent);
 	}
+	return targets;
+}
 
+function ralphNestedLaunchWorkerTargetCount(params: SubagentParamsLike): number {
+	const targets = collectRalphNestedLaunchAgentTargets(params);
+	const workerTargets = targets.filter(isRalphNestedWorkerAgentName).length;
 	if (workerTargets > 0) return workerTargets;
-	return sawTarget ? 0 : 1;
+	return targets.length > 0 ? 0 : 1;
+}
+
+function isRalphOrchestratorNestedWorkerLaunch(input: {
+	params: SubagentParamsLike;
+	inheritedNestedRoute?: NestedRouteInfo;
+	nestedParentAddress?: NestedRunAddress;
+}): boolean {
+	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "ralph-orchestrator") return false;
+	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return false;
+	return collectRalphNestedLaunchAgentTargets(input.params).some(isRalphNestedWorkerAgentName);
 }
 
 function ralphNestedLaunchGuardResult(input: {
@@ -835,6 +847,11 @@ function ralphNestedLaunchGuardResult(input: {
 	if (workerTargetCount === 0) return null;
 	const parentStep = input.nestedParentAddress.parentStepIndex ?? "root";
 	const orchestratorRunId = process.env[SUBAGENT_RUN_ID_ENV] || input.nestedParentAddress.parentRunId;
+	if (input.params.async === true && isRalphOrchestratorNestedWorkerLaunch(input)) {
+		const message = `Ralph orchestrator nested worker async guard blocked this subagent call: ralph-orchestrator nested worker launches must be synchronous/awaited by default (run ${orchestratorRunId}); omit async:true and wait for the worker result before launching another worker.`;
+		console.warn(message);
+		return validationErrorResult(input.mode, message);
+	}
 	if (workerTargetCount > 1) {
 		const message = `Ralph orchestrator nested worker guard blocked this subagent call: multiple nested worker targets (${workerTargetCount}) are not allowed in one ralph-orchestrator nested call (run ${orchestratorRunId}); launch exactly one worker target at most.`;
 		console.warn(message);
@@ -2584,7 +2601,14 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		} catch (error) {
 			return toExecutionErrorResult(effectiveParams, error);
 		}
-		const requestedAsync = effectiveParams.async ?? deps.asyncByDefault;
+		const ralphNestedWorkerLaunch = isRalphOrchestratorNestedWorkerLaunch({
+			params: effectiveParams,
+			inheritedNestedRoute,
+			nestedParentAddress,
+		});
+		const requestedAsync = ralphNestedWorkerLaunch && effectiveParams.async === undefined
+			? false
+			: effectiveParams.async ?? deps.asyncByDefault;
 		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
 		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
 		const controlConfig = resolveControlConfig(deps.config.control, effectiveParams.control);

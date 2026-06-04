@@ -49,7 +49,7 @@ import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/ski
 import { evaluateCompletionMutationGuard, resolveCompletionPolicy, type CompletionPolicy } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
-import { sandboxResultDetails } from "../../sandbox/diagnostics.ts";
+import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
 import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable } from "../../sandbox/write-inference.ts";
@@ -255,6 +255,7 @@ async function runSingleAttempt(
 	let observedMutationAttempt = false;
 	const childCwd = options.cwd ?? runtimeCwd;
 	let spawnSpec: SpawnableInvocation;
+	let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
 	try {
 		const piSpawnSpec = getPiSpawnCommand(args, options.sandbox ? { preferNodeCli: true } : {});
 		const piInvocation: SpawnableInvocation = {
@@ -272,25 +273,28 @@ async function runSingleAttempt(
 				args: piSpawnSpec.args,
 				cwd: childCwd,
 			};
+			effectiveSandboxMounts = buildSubagentSandboxMounts({
+				cwd: childCwd,
+				cwdMode,
+				tempDir,
+				sessionDir: options.sessionDir,
+				sessionFile: options.sessionFile,
+				artifactsDir: options.artifactsDir,
+				jsonlPath: shared.jsonlPath,
+				outputPath: options.outputPath,
+				progressPaths: options.progressPaths,
+				structuredOutput: options.structuredOutput,
+				piArgs: args,
+				spawnCommand: piSpawnSpec.command,
+				spawnArgs: piSpawnSpec.args,
+				authMode: options.sandbox.auth,
+				extraReadOnlyMounts: options.sandbox.extraReadOnlyMounts,
+				extraWritableMounts: options.sandbox.extraWritableMounts,
+			});
 			const wrapped = provider.wrapInvocation({
 				config: options.sandbox,
 				invocation: sandboxInvocation,
-				mounts: buildSubagentSandboxMounts({
-					cwd: childCwd,
-					cwdMode,
-					tempDir,
-					sessionDir: options.sessionDir,
-					sessionFile: options.sessionFile,
-					artifactsDir: options.artifactsDir,
-					jsonlPath: shared.jsonlPath,
-					outputPath: options.outputPath,
-					progressPaths: options.progressPaths,
-					structuredOutput: options.structuredOutput,
-					piArgs: args,
-					spawnCommand: piSpawnSpec.command,
-					spawnArgs: piSpawnSpec.args,
-					authMode: options.sandbox.auth,
-				}),
+				mounts: effectiveSandboxMounts,
 			});
 			result.sandbox = sandboxResultDetails(options.sandbox, wrapped);
 			const diagnosticMessages = wrapped.diagnostics
@@ -659,6 +663,21 @@ async function runSingleAttempt(
 			childExited = true;
 			clearFinalDrainTimers();
 		});
+		const attachFailureDiagnostics = (message?: string): void => {
+			if (!result.sandbox || !options.sandbox) return;
+			const diagnostics = diagnoseSandboxFailure({
+				stderr: stderrBuf,
+				error: message,
+				mounts: effectiveSandboxMounts,
+				cwd: childCwd,
+			});
+			if (diagnostics.length === 0) return;
+			result.sandbox = {
+				...result.sandbox,
+				diagnostics: [...(result.sandbox.diagnostics ?? []), ...diagnostics],
+			};
+		};
+
 		proc.on("close", (code, signal) => {
 			clearFinalDrainTimers();
 			clearStdioGuard();
@@ -678,6 +697,9 @@ async function runSingleAttempt(
 				result.error = stderrBuf.trim();
 			}
 			const finalCode = forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
+			if ((finalCode !== 0 || result.error) && options.sandbox) {
+				attachFailureDiagnostics(result.error);
+			}
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {
@@ -690,6 +712,7 @@ async function runSingleAttempt(
 			if (!result.error) {
 				result.error = error instanceof Error ? error.message : String(error);
 			}
+			attachFailureDiagnostics(result.error);
 			finish(1);
 		});
 

@@ -1341,6 +1341,33 @@ process.exit(child.status ?? 0);
 		}
 	});
 
+	it("honors explicit extraReadOnlyMounts and extraWritableMounts in foreground sandbox args", async () => {
+		mockPi.onCall({ output: "extra mounts ok" });
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const readOnlyDir = path.join(tempDir, "toolchain");
+			const writableDir = path.join(tempDir, "cache");
+			fs.mkdirSync(readOnlyDir, { recursive: true });
+			fs.mkdirSync(writableDir, { recursive: true });
+			const agents = makeAgentConfigs(["echo"]);
+
+			const result = await runSync(tempDir, agents, "echo", "Task", {
+				sandbox: {
+					provider: "bubblewrap",
+					extraReadOnlyMounts: [readOnlyDir],
+					extraWritableMounts: [writableDir],
+				},
+			});
+
+			assert.equal(result.exitCode, 0);
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			assertMountMode(bwrapArgs, readOnlyDir, "ro");
+			assertMountMode(bwrapArgs, writableDir, "rw");
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
 	it("rejects file-only mode without an output path before spawning", async () => {
 		const agents = makeAgentConfigs(["echo"]);
 

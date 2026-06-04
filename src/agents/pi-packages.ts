@@ -140,7 +140,8 @@ function parsePackageEntry(entry: unknown): PackageEntrySelection | undefined {
 
 function resolvePackageExtensionPaths(packageRoot: string, selectedExtensions?: string[] | false): string[] {
 	if (selectedExtensions === false) return [];
-	const manifestPath = path.join(packageRoot, "package.json");
+	const canonicalRoot = tryRealpathSync(packageRoot);
+	const manifestPath = path.join(canonicalRoot, "package.json");
 	const manifest = readJsonBestEffort(manifestPath);
 	if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return [];
 	const pi = (manifest as { pi?: unknown }).pi;
@@ -149,8 +150,16 @@ function resolvePackageExtensionPaths(packageRoot: string, selectedExtensions?: 
 	const rawExtensions = selectedExtensions ?? (Array.isArray(manifestExtensions) ? manifestExtensions : []);
 	return rawExtensions
 		.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0 && !path.isAbsolute(entry))
-		.map((entry) => path.resolve(packageRoot, entry))
-		.filter((resolved) => isWithinPath(resolved, packageRoot));
+		.map((entry) => path.resolve(canonicalRoot, entry))
+		.filter((resolved) => isWithinPath(resolved, canonicalRoot));
+}
+
+function tryRealpathSync(filePath: string): string {
+	try {
+		return fs.realpathSync(filePath);
+	} catch {
+		return filePath;
+	}
 }
 
 function isWithinPath(filePath: string, dir: string): boolean {
@@ -173,12 +182,16 @@ export function resolveProjectLocalPiPackageResources(cwd: string): ProjectLocal
 
 	const addPackageRoot = (packageRoot: string, selectedExtensions?: string[] | false) => {
 		const resolvedRoot = path.resolve(packageRoot);
-		if (!fs.existsSync(path.join(resolvedRoot, "package.json"))) return;
-		const extensionPaths = resolvePackageExtensionPaths(resolvedRoot, selectedExtensions);
+		const canonicalRoot = tryRealpathSync(resolvedRoot);
+		if (!fs.existsSync(path.join(canonicalRoot, "package.json"))) return;
+		const extensionPaths = resolvePackageExtensionPaths(canonicalRoot, selectedExtensions);
 		if (extensionPaths.length === 0) return;
-		pushUnique(packageRoots, seenRoots, resolvedRoot);
+		pushUnique(packageRoots, seenRoots, canonicalRoot);
 		for (const extensionPath of extensionPaths) {
-			if (fs.existsSync(extensionPath)) pushUnique(extensions, seenExtensions, extensionPath);
+			if (!fs.existsSync(extensionPath)) continue;
+			const canonicalExtension = tryRealpathSync(extensionPath);
+			if (!isWithinPath(canonicalExtension, canonicalRoot)) continue;
+			pushUnique(extensions, seenExtensions, canonicalExtension);
 		}
 	};
 
@@ -195,7 +208,11 @@ export function resolveProjectLocalPiPackageResources(cwd: string): ProjectLocal
 				if (!parsed) continue;
 				const packageRoot = resolveSettingsPackageRoot(parsed.source, configDir);
 				if (!packageRoot) continue;
-				if (projectRoot && !isWithinPath(packageRoot, projectRoot)) continue;
+				if (projectRoot) {
+					const canonicalPackageRoot = tryRealpathSync(packageRoot);
+					const canonicalProjectRoot = tryRealpathSync(projectRoot);
+					if (!isWithinPath(canonicalPackageRoot, canonicalProjectRoot)) continue;
+				}
 				addPackageRoot(packageRoot, parsed.extensions);
 			}
 		}

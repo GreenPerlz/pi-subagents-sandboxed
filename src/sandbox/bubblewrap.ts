@@ -118,6 +118,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		for (const source of HOST_TOOLCHAIN_READONLY_PATHS) {
 			if (this.pathExists(source)) addMount(args, { source, mode: "ro" }, seenMounts);
 		}
+		args.push("--dev", "/dev");
 		if (network === "host") {
 			const dnsMount = systemdResolvedMount(this.pathExists, this.realPath);
 			if (dnsMount) addMount(args, { source: dnsMount, mode: "ro" }, seenMounts);

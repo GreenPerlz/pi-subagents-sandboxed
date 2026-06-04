@@ -207,6 +207,23 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.equal(result.invocation.args.includes("/run/systemd/resolve"), false);
 	});
 
+	it("provides /dev so sandboxed child processes can open /dev/null", () => {
+		const result = availableProvider().wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: {
+				command: "node",
+				args: ["script.js"],
+				cwd: "/home/alice/project",
+			},
+			mounts: [{ source: "/home/alice/project", mode: "ro" }],
+		});
+
+		const args = result.invocation.args;
+		const idx = args.indexOf("/dev");
+		assert.ok(idx !== -1, "expected /dev to be provided via --dev");
+		assert.equal(args[idx - 1], "--dev");
+	});
+
 	it("does not mount /run/systemd/resolve when network is none", () => {
 		const provider = new BubblewrapSandboxProvider({
 			isBubblewrapAvailable: () => true,

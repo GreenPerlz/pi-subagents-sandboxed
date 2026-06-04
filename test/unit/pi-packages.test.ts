@@ -171,4 +171,70 @@ describe("resolveProjectLocalPiPackageResources", () => {
 		assert.equal(result.extensions.some((e) => e.includes("escaped")), false);
 		assert.equal(result.extensions.includes(absoluteBad), false);
 	});
+
+	it("rejects symlinked package roots that escape the project boundary", () => {
+		const { project, configDir } = makeProject();
+		const outsideProject = makeTempDir("pi-subagents-outside-");
+		makePackage(outsideProject, ["./ext.ts"]);
+		fs.writeFileSync(path.join(outsideProject, "ext.ts"), "", "utf-8");
+
+		const evilLink = path.join(configDir, "packages", "evil");
+		fs.mkdirSync(path.dirname(evilLink), { recursive: true });
+		fs.symlinkSync(outsideProject, evilLink, "dir");
+
+		writeJson(path.join(configDir, "settings.json"), {
+			packages: [{ source: "file:./packages/evil" }],
+		});
+
+		const result = resolveProjectLocalPiPackageResources(project);
+
+		assert.equal(result.packageRoots.includes(evilLink), false, "should reject symlinked lexical root");
+		assert.equal(result.packageRoots.includes(outsideProject), false, "should reject resolved symlink target outside project");
+		assert.equal(result.extensions.some((e) => e.includes("ext.ts")), false, "should not include extensions from escaped package");
+	});
+
+	it("accepts legitimate symlinked package roots within the project boundary", () => {
+		const { project, configDir } = makeProject();
+		const realPkg = path.join(project, "real-pkg");
+		fs.mkdirSync(realPkg, { recursive: true });
+		makePackage(realPkg, ["./ext.ts"]);
+		fs.writeFileSync(path.join(realPkg, "ext.ts"), "", "utf-8");
+
+		const linkPkg = path.join(configDir, "packages", "linked");
+		fs.mkdirSync(path.dirname(linkPkg), { recursive: true });
+		fs.symlinkSync(realPkg, linkPkg, "dir");
+
+		writeJson(path.join(configDir, "settings.json"), {
+			packages: [{ source: "file:./packages/linked" }],
+		});
+
+		const result = resolveProjectLocalPiPackageResources(project);
+
+		assert.equal(result.packageRoots.includes(linkPkg), false, "should not include lexical symlink path as root");
+		assert.equal(result.packageRoots.includes(realPkg), true, "should include canonical target within project");
+		assert.equal(result.extensions.some((e) => e.endsWith(path.join("real-pkg", "ext.ts"))), true, "should include canonical extension path");
+	});
+
+	it("rejects extension paths that escape the package root via symlinks", () => {
+		const { project, configDir } = makeProject();
+		const pkgDir = path.join(configDir, "packages", "safe-pkg");
+		fs.mkdirSync(pkgDir, { recursive: true });
+		makePackage(pkgDir, ["./safe.ts", "./link-to-parent/ext.ts"]);
+		fs.writeFileSync(path.join(pkgDir, "safe.ts"), "", "utf-8");
+
+		// Create a symlink inside the package root that points to parent
+		fs.symlinkSync("..", path.join(pkgDir, "link-to-parent"), "dir");
+		// The real path of link-to-parent/ext.ts would be outside the package root
+		fs.writeFileSync(path.resolve(pkgDir, "../ext.ts"), "", "utf-8");
+
+		writeJson(path.join(configDir, "settings.json"), {
+			packages: [{ source: "file:./packages/safe-pkg" }],
+		});
+
+		const result = resolveProjectLocalPiPackageResources(project);
+
+		assert.ok(result.packageRoots.includes(pkgDir), "package root should be included");
+		assert.equal(result.extensions.some((e) => e.endsWith("safe.ts")), true, "safe extension should be included");
+		assert.equal(result.extensions.some((e) => e.includes("ext.ts") && !e.includes("safe.ts")), false, "symlink-escaped extension should be rejected");
+	});
 });

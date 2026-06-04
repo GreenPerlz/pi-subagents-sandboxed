@@ -41,9 +41,8 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		fallback?: string;
 		extraReadOnlyMounts: string[];
 		extraWritableMounts: string[];
-	} = { extraReadOnlyMounts: [], extraWritableMounts: [] };
 		packageDiscovery?: string;
-	} = {};
+	} = { extraReadOnlyMounts: [], extraWritableMounts: [] };
 
 	const settings = input.settings;
 	if (settings) {

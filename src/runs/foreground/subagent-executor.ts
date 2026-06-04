@@ -51,7 +51,7 @@ import {
 	stripDetailsOutputsForIntercomReceipt,
 } from "../../intercom/result-intercom.ts";
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../background/async-resume.ts";
-import { createNestedRoute, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { createNestedRoute, projectNestedEvents, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateAsyncJobNestedProjection, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV, SUBAGENT_RUN_ID_ENV } from "../shared/pi-args.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
@@ -72,6 +72,7 @@ import {
 	type AcceptanceInput,
 	type ArtifactConfig,
 	type ArtifactPaths,
+	type AsyncStatus,
 	type ControlConfig,
 	type ControlEvent,
 	type Details,
@@ -438,14 +439,20 @@ function interruptAsyncRun(state: SubagentState, runId: string | undefined): Age
 		};
 	}
 	try {
-		process.kill(status.pid, ASYNC_INTERRUPT_SIGNAL);
 		const tracked = state.asyncJobs.get(target.asyncId);
+		const cascade = cascadeStopNestedDescendants({ route: tracked?.nestedRoute, children: tracked?.nestedChildren, sourceRunId: target.asyncId });
+		process.kill(status.pid, ASYNC_INTERRUPT_SIGNAL);
 		if (tracked) {
 			tracked.activityState = undefined;
 			tracked.updatedAt = Date.now();
+			try {
+				updateAsyncJobNestedProjection(tracked);
+			} catch {
+				// Non-fatal: cascadeStopNestedDescendants already made a best-effort status update.
+			}
 		}
 		return {
-			content: [{ type: "text", text: `Interrupt requested for async run ${target.asyncId}.` }],
+			content: [{ type: "text", text: appendNestedCleanupSummary(`Interrupt requested for async run ${target.asyncId}.`, cascade) }],
 			details: { mode: "management", results: [] },
 		};
 	} catch (error) {
@@ -536,13 +543,107 @@ async function sendNestedControlRequest(target: ResolvedSubagentRunId & { kind: 
 	return waitForNestedControlResult(target, requestId);
 }
 
+function isTerminalNestedState(state: NestedRunSummary["state"]): boolean {
+	return state === "complete" || state === "failed" || state === "paused";
+}
+
+function collectLiveNestedRuns(children: NestedRunSummary[] | undefined, output: NestedRunSummary[] = [], visited = new Set<string>()): NestedRunSummary[] {
+	for (const child of children ?? []) {
+		if (visited.has(child.id)) continue;
+		visited.add(child.id);
+		collectLiveNestedRuns(child.children, output, visited);
+		collectLiveNestedRuns(child.steps?.flatMap((step) => step.children ?? []), output, visited);
+		if (!isTerminalNestedState(child.state)) output.push(child);
+	}
+	return output;
+}
+
+function trustedRunningAsyncPid(status: AsyncStatus | null): number | undefined {
+	if (!status || (status.state !== "running" && status.state !== "queued")) return undefined;
+	return typeof status.pid === "number" && status.pid > 0 ? status.pid : undefined;
+}
+
+function markNestedRunPaused(route: NestedRouteInfo, run: NestedRunSummary, message: string): void {
+	writeNestedEvent(route, {
+		type: "subagent.nested.completed",
+		ts: Date.now(),
+		parentRunId: run.parentRunId,
+		parentStepIndex: run.parentStepIndex,
+		child: {
+			...run,
+			state: "paused",
+			activityState: undefined,
+			endedAt: Date.now(),
+			lastUpdate: Date.now(),
+			error: run.error ?? message,
+		},
+	});
+}
+
+function cascadeStopNestedDescendants(input: { route?: NestedRouteInfo; children?: NestedRunSummary[]; sourceRunId: string; kill?: typeof process.kill }): { stopped: number; warnings: string[] } {
+	const route = input.route;
+	if (!route) return { stopped: 0, warnings: [] };
+	let children = input.children;
+	const warnings: string[] = [];
+	try {
+		if (!children) children = projectNestedEvents(route).children;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { stopped: 0, warnings: [`Nested cleanup warning for ${input.sourceRunId}: status projection failed: ${message}`] };
+	}
+	let stopped = 0;
+	for (const run of collectLiveNestedRuns(children)) {
+		let acted = false;
+		try {
+			writeNestedControlRequest(route, {
+				ts: Date.now(),
+				requestId: randomUUID(),
+				targetRunId: run.id,
+				action: "interrupt",
+			});
+			acted = true;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			warnings.push(`Nested cleanup warning for ${run.id}: control request failed: ${message}`);
+		}
+		const asyncDir = resolveNestedAsyncDir(route.rootRunId, run);
+		if (asyncDir) {
+			try {
+				const pid = trustedRunningAsyncPid(readStatus(asyncDir));
+				if (typeof pid === "number") {
+					(input.kill ?? process.kill)(pid, ASYNC_INTERRUPT_SIGNAL);
+					acted = true;
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				warnings.push(`Nested cleanup warning for ${run.id}: async pid interrupt failed: ${message}`);
+			}
+		}
+		try {
+			markNestedRunPaused(route, run, `Interrupted because parent run ${input.sourceRunId} was stopped.`);
+			acted = true;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			warnings.push(`Nested cleanup warning for ${run.id}: pause status update failed: ${message}`);
+		}
+		if (acted) stopped++;
+	}
+	return { stopped, warnings };
+}
+
+function appendNestedCleanupSummary(text: string, cascade: { stopped: number; warnings: string[] }): string {
+	const lines = [text];
+	if (cascade.stopped > 0) lines.push(`Nested cleanup: interrupt requested for ${cascade.stopped} live descendant${cascade.stopped === 1 ? "" : "s"}.`);
+	lines.push(...cascade.warnings);
+	return lines.join("\n");
+}
+
 function directNestedAsyncInterrupt(target: ResolvedSubagentRunId & { kind: "nested" }): AgentToolResult<Details> | undefined {
 	const run = target.match.run;
 	const asyncDir = resolveNestedAsyncDir(target.match.rootRunId, run);
 	if (!asyncDir) return undefined;
-	const status = readStatus(asyncDir);
-	const pid = typeof status?.pid === "number" && status.pid > 0 ? status.pid : run.pid;
-	if (!status || status.state !== "running" || typeof pid !== "number" || pid <= 0) return undefined;
+	const pid = trustedRunningAsyncPid(readStatus(asyncDir));
+	if (typeof pid !== "number") return undefined;
 	try {
 		process.kill(pid, ASYNC_INTERRUPT_SIGNAL);
 		return { content: [{ type: "text", text: `Interrupt requested for nested async run ${run.id}.` }], details: { mode: "management", results: [] } };
@@ -2479,12 +2580,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				if (resolved?.kind === "nested") return interruptNestedRun(resolved);
 				const foreground = getForegroundControl(deps.state, resolved?.kind === "foreground" ? resolved.id : targetRunId);
 				if (foreground?.interrupt) {
+					const cascade = cascadeStopNestedDescendants({ route: foreground.nestedRoute, children: foreground.nestedChildren, sourceRunId: foreground.runId });
 					const interrupted = foreground.interrupt();
 					if (interrupted) {
 						foreground.updatedAt = Date.now();
 						foreground.currentActivityState = undefined;
+						try {
+							updateForegroundNestedProjection(foreground);
+						} catch {
+							// Non-fatal: cascadeStopNestedDescendants already made a best-effort status update.
+						}
 						return {
-							content: [{ type: "text", text: `Interrupt requested for foreground run ${foreground.runId}.` }],
+							content: [{ type: "text", text: appendNestedCleanupSummary(`Interrupt requested for foreground run ${foreground.runId}.`, cascade) }],
 							details: { mode: "management", results: [] },
 						};
 					}

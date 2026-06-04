@@ -18,7 +18,7 @@ import {
 	SUBAGENT_PARENT_RUN_ID_ENV,
 	SUBAGENT_RUN_ID_ENV,
 } from "../../src/runs/shared/pi-args.ts";
-import { ASYNC_DIR, type SubagentState } from "../../src/shared/types.ts";
+import { ASYNC_DIR, TEMP_ROOT_DIR, type AsyncStatus, type NestedRunSummary, type SubagentState } from "../../src/shared/types.ts";
 
 const routeRoots: string[] = [];
 const savedEnv = {
@@ -129,6 +129,11 @@ function text(result: Awaited<ReturnType<ReturnType<typeof createExecutor>["exec
 	return result.content[0]?.type === "text" ? result.content[0].text : "";
 }
 
+function writeAsyncStatus(asyncDir: string, status: Partial<AsyncStatus> & Pick<AsyncStatus, "runId" | "state" | "startedAt" | "mode">): void {
+	fs.mkdirSync(asyncDir, { recursive: true });
+	fs.writeFileSync(path.join(asyncDir, "status.json"), `${JSON.stringify(status)}\n`, "utf-8");
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
@@ -139,6 +144,212 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 }
 
 describe("nested control routing", () => {
+	it("cascades foreground parent interrupt to live nested descendants before stopping the active child", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-foreground-cascade-"));
+		try {
+			const route = createNestedRun("nested-live-cascade", "running");
+			const state = stateWithNestedRoute(route);
+			let parentInterrupted = false;
+			state.foregroundControls.get(route.rootRunId)!.interrupt = () => {
+				parentInterrupted = true;
+				return true;
+			};
+			const result = await createExecutor(state).execute("interrupt", { action: "interrupt", id: route.rootRunId }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, undefined);
+			assert.equal(parentInterrupted, true);
+			const requests = readNestedControlRequests(route);
+			assert.equal(requests.length, 1);
+			assert.equal(requests[0]?.action, "interrupt");
+			assert.equal(requests[0]?.targetRunId, "nested-live-cascade");
+			const registry = projectNestedEvents(route);
+			assert.equal(registry.children[0]?.state, "paused");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("cascades async parent interrupt to live nested descendants", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-async-cascade-"));
+		const originalKill = process.kill;
+		const killed: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = [];
+		try {
+			const nestedAsyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-async-cascade");
+			fs.rmSync(nestedAsyncDir, { recursive: true, force: true });
+			const route = createNestedRun("nested-async-cascade", "running", { asyncDir: nestedAsyncDir, pid: 43210 });
+			const state = createState();
+			const parentAsyncDir = path.join(root, "async-parent");
+			writeAsyncStatus(parentAsyncDir, { runId: "parent-async", mode: "single", state: "running", startedAt: 1, pid: 12345 });
+			writeAsyncStatus(nestedAsyncDir, { runId: "nested-async-cascade", mode: "single", state: "running", startedAt: 1, pid: 43210 });
+			state.asyncJobs.set("parent-async", { asyncId: "parent-async", asyncDir: parentAsyncDir, status: "running", pid: 12345, startedAt: 1, updatedAt: 1, nestedRoute: route });
+			process.kill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+				killed.push({ pid, signal });
+				return true;
+			}) as typeof process.kill;
+
+			const result = await createExecutor(state).execute("interrupt", { action: "interrupt", id: "parent-async" }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, undefined);
+			assert.deepEqual(killed.map((entry) => entry.pid), [43210, 12345]);
+			assert.equal(readNestedControlRequests(route)[0]?.targetRunId, "nested-async-cascade");
+			assert.equal(projectNestedEvents(route).children[0]?.state, "paused");
+		} finally {
+			process.kill = originalKill;
+			fs.rmSync(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-async-cascade"), { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not signal nested async runs without a trusted status pid during parent interrupt cascade", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-untrusted-pid-cascade-"));
+		const originalKill = process.kill;
+		const killed: number[] = [];
+		try {
+			const route = createNestedRoute("root-control");
+			routeRoots.push(path.dirname(route.eventSink));
+			const missingStatusDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-missing-status");
+			const noPidStatusDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-status-no-pid");
+			fs.rmSync(missingStatusDir, { recursive: true, force: true });
+			fs.rmSync(noPidStatusDir, { recursive: true, force: true });
+			fs.mkdirSync(missingStatusDir, { recursive: true });
+			writeAsyncStatus(noPidStatusDir, { runId: "nested-status-no-pid", mode: "single", state: "running", startedAt: 1 });
+			const state = stateWithNestedRoute(route);
+			state.foregroundControls.get(route.rootRunId)!.nestedChildren = [
+				{ id: "nested-missing-status", parentRunId: "root-control", parentStepIndex: 0, depth: 1, path: [{ runId: "root-control", stepIndex: 0 }], state: "running", agent: "worker", asyncDir: missingStatusDir, pid: 54321 },
+				{ id: "nested-status-no-pid", parentRunId: "root-control", parentStepIndex: 1, depth: 1, path: [{ runId: "root-control", stepIndex: 1 }], state: "running", agent: "worker", asyncDir: noPidStatusDir, pid: 54322 },
+			] as NestedRunSummary[];
+			state.foregroundControls.get(route.rootRunId)!.interrupt = () => true;
+			process.kill = ((pid: number) => {
+				killed.push(pid);
+				return true;
+			}) as typeof process.kill;
+
+			const result = await createExecutor(state).execute("interrupt", { action: "interrupt", id: route.rootRunId }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, undefined);
+			assert.deepEqual(killed, []);
+			assert.deepEqual(readNestedControlRequests(route).map((request) => request.targetRunId).sort(), ["nested-missing-status", "nested-status-no-pid"]);
+			assert.match(text(result), /Nested cleanup: interrupt requested for 2 live descendants/);
+		} finally {
+			process.kill = originalKill;
+			fs.rmSync(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-missing-status"), { recursive: true, force: true });
+			fs.rmSync(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-status-no-pid"), { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not signal nested async direct fallback without a trusted status pid", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-untrusted-pid-direct-"));
+		const originalKill = process.kill;
+		let killed = 0;
+		try {
+			const nestedAsyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-direct-no-pid");
+			fs.rmSync(nestedAsyncDir, { recursive: true, force: true });
+			const route = createNestedRun("nested-direct-no-pid", "running", { asyncDir: nestedAsyncDir, pid: 54323 });
+			writeAsyncStatus(nestedAsyncDir, { runId: "nested-direct-no-pid", mode: "single", state: "running", startedAt: 1 });
+			process.kill = (() => {
+				killed++;
+				return true;
+			}) as typeof process.kill;
+
+			const result = await createExecutor(stateWithNestedRoute(route)).execute("interrupt", { action: "interrupt", id: "nested-direct-no-pid" }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, true);
+			assert.equal(killed, 0);
+			assert.match(text(result), /no safe direct async interrupt fallback/i);
+		} finally {
+			process.kill = originalKill;
+			fs.rmSync(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-direct-no-pid"), { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("deduplicates live nested descendants projected through children and step children during parent interrupt cascade", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-dedupe-cascade-"));
+		const originalKill = process.kill;
+		const killed: number[] = [];
+		try {
+			const route = createNestedRoute("root-control");
+			routeRoots.push(path.dirname(route.eventSink));
+			const nestedAsyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-duplicate");
+			fs.rmSync(nestedAsyncDir, { recursive: true, force: true });
+			writeAsyncStatus(nestedAsyncDir, { runId: "nested-duplicate", mode: "single", state: "running", startedAt: 1, pid: 54324 });
+			const duplicate: NestedRunSummary = { id: "nested-duplicate", parentRunId: "root-control", parentStepIndex: 0, depth: 2, path: [{ runId: "root-control", stepIndex: 0 }], state: "running", agent: "worker", asyncDir: nestedAsyncDir, pid: 54324 };
+			const parent: NestedRunSummary = {
+				id: "nested-parent-complete",
+				parentRunId: "root-control",
+				parentStepIndex: 0,
+				depth: 1,
+				path: [{ runId: "root-control", stepIndex: 0 }],
+				state: "complete",
+				agent: "orchestrator",
+				children: [duplicate],
+				steps: [{ agent: "worker", status: "running", children: [duplicate] }],
+			};
+			const state = stateWithNestedRoute(route);
+			state.foregroundControls.get(route.rootRunId)!.nestedChildren = [parent];
+			state.foregroundControls.get(route.rootRunId)!.interrupt = () => true;
+			process.kill = ((pid: number) => {
+				killed.push(pid);
+				return true;
+			}) as typeof process.kill;
+
+			const result = await createExecutor(state).execute("interrupt", { action: "interrupt", id: route.rootRunId }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, undefined);
+			assert.deepEqual(killed, [54324]);
+			assert.deepEqual(readNestedControlRequests(route).map((request) => request.targetRunId), ["nested-duplicate"]);
+			assert.match(text(result), /Nested cleanup: interrupt requested for 1 live descendant\./);
+		} finally {
+			process.kill = originalKill;
+			fs.rmSync(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "root-control", "nested-duplicate"), { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores already terminal nested descendants during parent interrupt cascade", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-terminal-cascade-"));
+		const originalKill = process.kill;
+		let killed = 0;
+		try {
+			const route = createNestedRun("nested-complete-cascade", "complete", { asyncDir: path.join(root, "nested-subagent-runs", "root-control", "nested-complete-cascade"), pid: 43211 });
+			const state = stateWithNestedRoute(route);
+			state.foregroundControls.get(route.rootRunId)!.interrupt = () => true;
+			process.kill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+				killed++;
+				return true;
+			}) as typeof process.kill;
+
+			const result = await createExecutor(state).execute("interrupt", { action: "interrupt", id: route.rootRunId }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, undefined);
+			assert.equal(readNestedControlRequests(route).length, 0);
+			assert.equal(killed, 0);
+			assert.equal(projectNestedEvents(route).children[0]?.state, "complete");
+		} finally {
+			process.kill = originalKill;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("handles unreachable nested owners gracefully during parent interrupt cascade", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-unreachable-cascade-"));
+		try {
+			const route = createNestedRun("nested-unreachable-cascade", "running");
+			fs.rmSync(route.controlInbox, { recursive: true, force: true });
+			fs.writeFileSync(route.controlInbox, "not a directory", "utf-8");
+			const state = stateWithNestedRoute(route);
+			state.foregroundControls.get(route.rootRunId)!.interrupt = () => true;
+			const result = await createExecutor(state).execute("interrupt", { action: "interrupt", id: route.rootRunId }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, undefined);
+			assert.match(text(result), /nested cleanup warning/i);
+			assert.equal(projectNestedEvents(route).children[0]?.state, "paused");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects ralph-orchestrator nested worker async:true before execution", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-async-worker-guard-"));
 		try {

@@ -148,8 +148,14 @@ function resolvePackageExtensionPaths(packageRoot: string, selectedExtensions?: 
 	const manifestExtensions = (pi as { extensions?: unknown }).extensions;
 	const rawExtensions = selectedExtensions ?? (Array.isArray(manifestExtensions) ? manifestExtensions : []);
 	return rawExtensions
-		.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
-		.map((entry) => path.resolve(packageRoot, entry));
+		.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0 && !path.isAbsolute(entry))
+		.map((entry) => path.resolve(packageRoot, entry))
+		.filter((resolved) => isWithinPath(resolved, packageRoot));
+}
+
+function isWithinPath(filePath: string, dir: string): boolean {
+	const relative = path.relative(dir, filePath);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function pushUnique(target: string[], seen: Set<string>, value: string): void {
@@ -177,6 +183,7 @@ export function resolveProjectLocalPiPackageResources(cwd: string): ProjectLocal
 	};
 
 	const configDir = findNearestProjectConfigDir(cwd);
+	const projectRoot = configDir ? path.dirname(configDir) : undefined;
 	if (configDir) {
 		const settings = readJsonBestEffort(path.join(configDir, "settings.json"));
 		const packages = settings && typeof settings === "object" && !Array.isArray(settings)
@@ -187,7 +194,9 @@ export function resolveProjectLocalPiPackageResources(cwd: string): ProjectLocal
 				const parsed = parsePackageEntry(entry);
 				if (!parsed) continue;
 				const packageRoot = resolveSettingsPackageRoot(parsed.source, configDir);
-				if (packageRoot) addPackageRoot(packageRoot, parsed.extensions);
+				if (!packageRoot) continue;
+				if (projectRoot && !isWithinPath(packageRoot, projectRoot)) continue;
+				addPackageRoot(packageRoot, parsed.extensions);
 			}
 		}
 	}

@@ -740,6 +740,7 @@ export interface SubagentState {
 		schedule(file: string, delayMs?: number): boolean;
 		clear(): void;
 	};
+	ralphOrchestratorNestedLaunchGuard?: Map<string, { attempts: number; firstAttemptAt: number; lastAttemptAt: number }>;
 }
 
 // ============================================================================

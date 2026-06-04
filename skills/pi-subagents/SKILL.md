@@ -461,7 +461,17 @@ Use `oracle` as a smart-friend escalation when the parent needs help with trajec
 
 ## Subagent + Intercom Coordination
 
-`pi-subagents` works without `pi-intercom`. When `pi-intercom` is installed and enabled, the intercom bridge can automatically give child agents a private coordination channel back to the parent session.
+`pi-subagents` works without `pi-intercom`, but only for fire-and-return delegation: launch children, track status, and collect final results. Live parent/child communication requires the separate `pi-intercom` package.
+
+Before promising that a child can ask the parent questions, use `contact_supervisor`, receive live nudges, or be resumed while still running, verify the bridge is active with `subagent({ action: "doctor" })` or prior known setup. If the bridge is inactive, explicitly warn the user that live child ↔ parent communication is unavailable and suggest:
+
+```bash
+pi install npm:pi-intercom
+```
+
+Then restart/reload Pi so extension discovery picks it up. Existing already-running children may not gain intercom routes retroactively; restart or revive them after the bridge is active if live coordination is required.
+
+When `pi-intercom` is installed and enabled, the intercom bridge can automatically give child agents a private coordination channel back to the parent session.
 
 Most agents should not call generic `intercom` directly unless bridge instructions provide a target and `contact_supervisor` is unavailable. Do not invent a target. Prefer the tool from the injected bridge instructions.
 

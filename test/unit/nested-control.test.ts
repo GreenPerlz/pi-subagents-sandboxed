@@ -61,12 +61,12 @@ function createState(): SubagentState {
 	};
 }
 
-function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }) {
+function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }, asyncByDefault = false) {
 	return createSubagentExecutor({
 		pi: { events, getSessionName() { return "parent"; } } as any,
 		state,
 		config: { maxSubagentDepth: 2, control: {}, intercomBridge: {} } as any,
-		asyncByDefault: false,
+		asyncByDefault,
 		tempArtifactsDir: os.tmpdir(),
 		getSubagentSessionRoot: (parentSessionFile) => parentSessionFile ? path.join(path.dirname(parentSessionFile), path.basename(parentSessionFile, ".jsonl")) : os.tmpdir(),
 		expandTilde: (value) => value,
@@ -139,6 +139,75 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 }
 
 describe("nested control routing", () => {
+	it("rejects ralph-orchestrator nested worker async:true before execution", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-async-worker-guard-"));
+		try {
+			const route = createNestedRoute("root-ralph-async-worker");
+			routeRoots.push(path.dirname(route.eventSink));
+			setRalphOrchestratorNestedEnv(route, "ralph-async-worker-run");
+			const throwingCtx = {
+				...ctx(root),
+				modelRegistry: { getAvailable() { throw new Error("async worker attempt reached execution"); } },
+			};
+			const executor = createExecutor(createState(), [{ name: "worker", description: "Worker", prompt: "Do work" }]);
+
+			const result = await executor.execute("run", { agent: "worker", task: "go", async: true }, new AbortController().signal, undefined, throwingCtx);
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), /Ralph orchestrator nested worker async guard blocked/);
+			assert.match(text(result), /async:true/);
+			assert.match(text(result), /wait for the worker result|omit async:true/);
+			assert.doesNotMatch(text(result), /async worker attempt reached execution/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps ralph-orchestrator nested worker launches synchronous when async is only configured by default", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-default-sync-worker-"));
+		try {
+			const route = createNestedRoute("root-ralph-default-sync-worker");
+			routeRoots.push(path.dirname(route.eventSink));
+			setRalphOrchestratorNestedEnv(route, "ralph-default-sync-worker-run");
+			const throwingCtx = {
+				...ctx(root),
+				modelRegistry: { getAvailable() { throw new Error("foreground worker attempt reached execution"); } },
+			};
+			const executor = createExecutor(createState(), [{ name: "worker", description: "Worker", prompt: "Do work" }], true, { emit() {}, on() { return () => {}; } }, true);
+
+			const result = await executor.execute("run", { agent: "worker", task: "go" }, new AbortController().signal, undefined, throwingCtx);
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), /foreground worker attempt reached execution/);
+			assert.doesNotMatch(text(result), /Async mode requires/);
+			assert.doesNotMatch(text(result), /Ralph orchestrator nested worker async guard blocked/);
+			const registry = projectNestedEvents(route);
+			assert.equal(registry.children.length, 1);
+			assert.equal(registry.children[0]?.state, "failed");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("allows top-level async worker requests", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-top-level-async-worker-"));
+		try {
+			const throwingCtx = {
+				...ctx(root),
+				modelRegistry: { getAvailable() { throw new Error("top-level async reached execution setup"); } },
+			};
+			const executor = createExecutor(createState(), [{ name: "worker", description: "Worker", prompt: "Do work" }]);
+
+			const result = await executor.execute("run", { agent: "worker", task: "go", async: true }, new AbortController().signal, undefined, throwingCtx);
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), /top-level async reached execution setup/);
+			assert.doesNotMatch(text(result), /Ralph orchestrator nested worker async guard blocked/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("allows ralph-orchestrator to launch one nested worker then a nested ralph-reviewer", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-worker-reviewer-guard-"));
 		try {

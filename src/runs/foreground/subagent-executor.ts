@@ -33,6 +33,7 @@ import {
 	type SequentialStep,
 	type StepOverrides,
 } from "../../shared/settings.ts";
+import { runSandboxPreflight } from "../../sandbox/preflight.ts";
 import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skills.ts";
 import { executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable } from "../background/async-execution.ts";
 import { createForkContextResolver } from "../../shared/fork-context.ts";
@@ -2692,6 +2693,40 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		});
 		if (ralphGuardError) return ralphGuardError;
 
+		// Ralph orchestrator sandbox preflight: check gh auth, git probe, and worktree pointer
+		// before launching nested workers, so environmental failures are detected early.
+		let preflightSummaryForResult: string | undefined;
+		if (isRalphOrchestratorNestedWorkerLaunch({
+			params: effectiveParams,
+			inheritedNestedRoute,
+			nestedParentAddress,
+		})) {
+			const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(effectiveParams.agentScope));
+			const ralphWorkerTargetAgentName = collectRalphNestedLaunchAgentTargets(effectiveParams).find(isRalphNestedWorkerAgentName);
+			const ralphWorkerTargetAgent = ralphWorkerTargetAgentName ? agents.find((a) => a.name === ralphWorkerTargetAgentName) : undefined;
+			const sandboxConfig = resolveSandboxConfig({ settings: sandboxSettings, agent: ralphWorkerTargetAgent, run: effectiveParams.sandbox });
+			const sandboxRoot = effectiveCwd;
+			const extraMountRoots = [
+				...(sandboxConfig?.extraReadOnlyMounts ?? []),
+				...(sandboxConfig?.extraWritableMounts ?? []),
+			];
+			const preflight = runSandboxPreflight({
+				cwd: effectiveCwd,
+				sandboxRoot,
+				extraMountRoots: extraMountRoots.length > 0 ? extraMountRoots : undefined,
+				requireGitWorktree: true,
+			});
+			if (!preflight.passed) {
+				console.warn(preflight.summary);
+				return validationErrorResult(
+					getRequestedModeLabel(effectiveParams),
+					`Ralph orchestrator sandbox preflight failed:\n${preflight.summary}`,
+				);
+			}
+			console.log(preflight.summary);
+			preflightSummaryForResult = preflight.summary;
+		}
+
 		const validationError = validateExecutionInput(
 			effectiveParams,
 			agents,
@@ -2804,9 +2839,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					: details?.results.some((child) => child.interrupted)
 						? "paused"
 						: "complete";
-			const errorText = result?.isError
-				? result.content.find((item) => item.type === "text")?.text
-				: undefined;
+			const resultText = result?.content.find((item) => item.type === "text")?.text;
+			const errorText = result?.isError ? resultText : undefined;
 			const agentsForSummary = hasTasks && effectiveParams.tasks
 				? effectiveParams.tasks.map((task) => task.agent)
 				: hasChain && effectiveParams.chain
@@ -2839,6 +2873,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						...(state !== "running" ? { endedAt: now } : {}),
 						lastUpdate: now,
 						...(errorText ? { error: errorText } : {}),
+						...(resultText ? { summary: resultText } : {}),
 						...(details?.results.length ? { steps: details.results.map((child) => ({
 							agent: child.agent,
 							status: child.interrupted ? "paused" : child.exitCode === 0 ? "complete" : "failed",
@@ -2852,33 +2887,47 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 		};
 
+		// Prepend preflight summary to result text for orchestrator visibility.
+		const withPreflightSummary = (result: AgentToolResult<Details>): AgentToolResult<Details> => {
+			if (!preflightSummaryForResult) return result;
+			const textIndex = result.content.findIndex((c): c is { type: "text"; text: string } => c.type === "text");
+			if (textIndex === -1) return result;
+			const newContent = [...result.content];
+			newContent[textIndex] = { type: "text" as const, text: `${preflightSummaryForResult}\n${newContent[textIndex].text}` };
+			return { ...result, content: newContent };
+		};
+
 		let nestedForegroundStarted = false;
 		try {
 			const asyncResult = runAsyncPath(execData, deps);
-			if (asyncResult) return withForkContext(asyncResult, effectiveParams.context);
+			if (asyncResult) return withForkContext(withPreflightSummary(asyncResult), effectiveParams.context);
 			if (foregroundControl) {
 				writeNestedForegroundEvent("subagent.nested.started");
 				nestedForegroundStarted = true;
 			}
 			if (hasChain && effectiveParams.chain) {
 				const result = await runChainPath(execData, deps);
-				writeNestedForegroundEvent("subagent.nested.completed", result);
-				return withForkContext(result, effectiveParams.context);
+				const wrappedResult = withPreflightSummary(result);
+				writeNestedForegroundEvent("subagent.nested.completed", wrappedResult);
+				return withForkContext(wrappedResult, effectiveParams.context);
 			}
 			if (hasTasks && effectiveParams.tasks) {
 				const result = await runParallelPath(execData, deps);
-				writeNestedForegroundEvent("subagent.nested.completed", result);
-				return withForkContext(result, effectiveParams.context);
+				const wrappedResult = withPreflightSummary(result);
+				writeNestedForegroundEvent("subagent.nested.completed", wrappedResult);
+				return withForkContext(wrappedResult, effectiveParams.context);
 			}
 			if (hasSingle) {
 				const result = await runSinglePath(execData, deps);
-				writeNestedForegroundEvent("subagent.nested.completed", result);
-				return withForkContext(result, effectiveParams.context);
+				const wrappedResult = withPreflightSummary(result);
+				writeNestedForegroundEvent("subagent.nested.completed", wrappedResult);
+				return withForkContext(wrappedResult, effectiveParams.context);
 			}
 		} catch (error) {
 			const errorResult = toExecutionErrorResult(effectiveParams, error);
-			if (nestedForegroundStarted) writeNestedForegroundEvent("subagent.nested.completed", errorResult);
-			return errorResult;
+			const wrappedErrorResult = withPreflightSummary(errorResult);
+			if (nestedForegroundStarted) writeNestedForegroundEvent("subagent.nested.completed", wrappedErrorResult);
+			return wrappedErrorResult;
 		} finally {
 			if (foregroundControl) {
 				clearPendingForegroundControlNotices(deps.state, runId);

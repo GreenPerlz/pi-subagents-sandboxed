@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -41,6 +42,15 @@ afterEach(() => {
 		else process.env[key] = value;
 	}
 });
+
+function git(cwd: string, args: string[]): string {
+	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8" });
+	if (result.status !== 0) {
+		const message = result.stderr.trim() || result.stdout.trim() || `git ${args.join(" ")} failed`;
+		throw new Error(message);
+	}
+	return result.stdout.trim();
+}
 
 function createState(): SubagentState {
 	return {
@@ -377,6 +387,12 @@ describe("nested control routing", () => {
 	it("keeps ralph-orchestrator nested worker launches synchronous when async is only configured by default", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-default-sync-worker-"));
 		try {
+			git(root, ["init"]);
+			git(root, ["config", "user.email", "tests@example.com"]);
+			git(root, ["config", "user.name", "Nested Control Tests"]);
+			fs.writeFileSync(path.join(root, "README.md"), "initial\n", "utf-8");
+			git(root, ["add", "-A"]);
+			git(root, ["commit", "-m", "init"]);
 			const route = createNestedRoute("root-ralph-default-sync-worker");
 			routeRoots.push(path.dirname(route.eventSink));
 			setRalphOrchestratorNestedEnv(route, "ralph-default-sync-worker-run");
@@ -422,6 +438,12 @@ describe("nested control routing", () => {
 	it("allows ralph-orchestrator to launch one nested worker then a nested ralph-reviewer", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-worker-reviewer-guard-"));
 		try {
+			git(root, ["init"]);
+			git(root, ["config", "user.email", "tests@example.com"]);
+			git(root, ["config", "user.name", "Nested Control Tests"]);
+			fs.writeFileSync(path.join(root, "README.md"), "initial\n", "utf-8");
+			git(root, ["add", "-A"]);
+			git(root, ["commit", "-m", "init"]);
 			const route = createNestedRoute("root-ralph-worker-reviewer");
 			routeRoots.push(path.dirname(route.eventSink));
 			setRalphOrchestratorNestedEnv(route, "ralph-worker-reviewer-run");
@@ -507,6 +529,12 @@ describe("nested control routing", () => {
 	it("allows the first ralph-orchestrator nested worker attempt and blocks the second", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-first-guard-"));
 		try {
+			git(root, ["init"]);
+			git(root, ["config", "user.email", "tests@example.com"]);
+			git(root, ["config", "user.name", "Nested Control Tests"]);
+			fs.writeFileSync(path.join(root, "README.md"), "initial\n", "utf-8");
+			git(root, ["add", "-A"]);
+			git(root, ["commit", "-m", "init"]);
 			const route = createNestedRoute("root-ralph-first");
 			routeRoots.push(path.dirname(route.eventSink));
 			setRalphOrchestratorNestedEnv(route, "ralph-first-run");
@@ -533,6 +561,12 @@ describe("nested control routing", () => {
 	it("counts malformed ralph-orchestrator nested acceptance attempts toward the guard", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-malformed-guard-"));
 		try {
+			git(root, ["init"]);
+			git(root, ["config", "user.email", "tests@example.com"]);
+			git(root, ["config", "user.name", "Nested Control Tests"]);
+			fs.writeFileSync(path.join(root, "README.md"), "initial\n", "utf-8");
+			git(root, ["add", "-A"]);
+			git(root, ["commit", "-m", "init"]);
 			const route = createNestedRoute("root-ralph-malformed");
 			routeRoots.push(path.dirname(route.eventSink));
 			setRalphOrchestratorNestedEnv(route, "ralph-malformed-run");

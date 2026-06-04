@@ -257,6 +257,50 @@ process.exit(child.status ?? 0);
 		};
 	}
 
+	function installFailingFakeBwrap(stderr: string, exitCode: number): { recordDir: string; restore: () => void } {
+		const rootDir = fs.mkdtempSync(path.join(tempDir, "fake-bwrap-"));
+		const binDir = path.join(rootDir, "bin");
+		const recordDir = path.join(rootDir, "records");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.mkdirSync(recordDir, { recursive: true });
+		const scriptPath = path.join(binDir, "fake-bwrap.mjs");
+		fs.writeFileSync(scriptPath, `
+import fs from "node:fs";
+import path from "node:path";
+
+const args = process.argv.slice(2);
+const recordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+if (!recordDir) {
+  console.error("FAKE_BWRAP_RECORD_DIR is required");
+  process.exit(97);
+}
+fs.mkdirSync(recordDir, { recursive: true });
+fs.writeFileSync(
+  path.join(recordDir, \`call-\${Date.now()}-\${process.pid}.json\`),
+  JSON.stringify({ args, cwd: process.cwd() }),
+  "utf-8",
+);
+console.error("${stderr.replace(/"/g, '\\"').trim()}");
+process.exit(${exitCode});
+`, "utf-8");
+		const bwrapPath = path.join(binDir, "bwrap");
+		fs.writeFileSync(bwrapPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`, "utf-8");
+		fs.chmodSync(bwrapPath, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRecordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+		process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+		process.env.FAKE_BWRAP_RECORD_DIR = recordDir;
+		return {
+			recordDir,
+			restore() {
+				if (previousPath === undefined) delete process.env.PATH;
+				else process.env.PATH = previousPath;
+				if (previousRecordDir === undefined) delete process.env.FAKE_BWRAP_RECORD_DIR;
+				else process.env.FAKE_BWRAP_RECORD_DIR = previousRecordDir;
+			},
+		};
+	}
+
 	function readFakeBwrapArgs(recordDir: string): string[] {
 		const callFile = fs.readdirSync(recordDir)
 			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
@@ -1363,6 +1407,33 @@ process.exit(child.status ?? 0);
 			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
 			assertMountMode(bwrapArgs, readOnlyDir, "ro");
 			assertMountMode(bwrapArgs, writableDir, "rw");
+		} finally {
+			fakeBwrap.restore();
+		}
+	});
+
+	it("uses wrapped sandbox mounts for foreground failure diagnostics", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const fakeBwrap = installFailingFakeBwrap("bwrap: execvp git: No such file or directory\n", 1);
+		try {
+			mockPi.onCall({ output: "should not run" });
+			const executor = makeExecutor([makeAgent("echo")]);
+
+			const result = await executor.execute(
+				"single-sandbox-diagnostics-mounts",
+				{ agent: "echo", task: "Need sandbox", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, true);
+			assert.equal(mockPi.callCount(), 0);
+			const sandboxDetails = result.details.results[0]?.sandbox;
+			assert.ok(sandboxDetails, "expected sandbox details");
+			const diagnostic = sandboxDetails?.diagnostics?.[0];
+			assert.ok(diagnostic, "expected sandbox failure diagnostic");
+			assert.match(diagnostic.message, /covered by a read-only sandbox mount/);
+			assert.doesNotMatch(diagnostic.message, /not mounted in the sandbox/);
 		} finally {
 			fakeBwrap.restore();
 		}

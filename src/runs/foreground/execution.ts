@@ -296,6 +296,15 @@ async function runSingleAttempt(
 				invocation: sandboxInvocation,
 				mounts: effectiveSandboxMounts,
 			});
+			if (wrapped.mounts?.length) {
+				const seenDiagnosticMounts = new Set(effectiveSandboxMounts.map((mount) => `${mount.mode}:${mount.source}`));
+				for (const mount of wrapped.mounts) {
+					const key = `${mount.mode}:${mount.path}`;
+					if (seenDiagnosticMounts.has(key)) continue;
+					seenDiagnosticMounts.add(key);
+					effectiveSandboxMounts.push({ source: mount.path, mode: mount.mode });
+				}
+			}
 			result.sandbox = sandboxResultDetails(options.sandbox, wrapped);
 			const diagnosticMessages = wrapped.diagnostics
 				.filter((diagnostic) => diagnostic.level !== "info")

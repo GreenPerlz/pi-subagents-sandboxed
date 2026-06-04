@@ -34,10 +34,11 @@ function commandExists(command: string, env: Record<string, string | undefined> 
 	return pathValue.split(path.delimiter).some((dir) => isExecutable(path.join(dir, command)));
 }
 
-function addMount(args: string[], mount: SandboxMount, seen?: Set<string>): void {
+function addMount(args: string[], mount: SandboxMount, seen?: Set<string>, diagnosticMounts?: SandboxMount[]): void {
 	const key = `${mount.mode}:${mount.source}`;
 	if (seen?.has(key)) return;
 	seen?.add(key);
+	diagnosticMounts?.push({ source: mount.source, mode: mount.mode });
 	if (mount.mode === "ro") {
 		args.push("--ro-bind", mount.source, mount.source);
 		return;
@@ -115,18 +116,19 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 
 		const args: string[] = [];
 		const seenMounts = new Set<string>();
+		const diagnosticMounts: SandboxMount[] = [];
 		for (const source of HOST_TOOLCHAIN_READONLY_PATHS) {
-			if (this.pathExists(source)) addMount(args, { source, mode: "ro" }, seenMounts);
+			if (this.pathExists(source)) addMount(args, { source, mode: "ro" }, seenMounts, diagnosticMounts);
 		}
 		args.push("--dev", "/dev");
 		if (network === "host") {
 			const dnsMount = systemdResolvedMount(this.pathExists, this.realPath);
-			if (dnsMount) addMount(args, { source: dnsMount, mode: "ro" }, seenMounts);
+			if (dnsMount) addMount(args, { source: dnsMount, mode: "ro" }, seenMounts, diagnosticMounts);
 		}
 		const nodeRoot = nodeInstallRoot(input.invocation.command);
-		if (nodeRoot && this.pathExists(nodeRoot)) addMount(args, { source: nodeRoot, mode: "ro" }, seenMounts);
+		if (nodeRoot && this.pathExists(nodeRoot)) addMount(args, { source: nodeRoot, mode: "ro" }, seenMounts, diagnosticMounts);
 		for (const mount of input.mounts ?? []) {
-			addMount(args, mount, seenMounts);
+			addMount(args, mount, seenMounts, diagnosticMounts);
 		}
 		if (network === "none") args.push("--unshare-net");
 		if (input.invocation.cwd) args.push("--chdir", input.invocation.cwd);
@@ -141,6 +143,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 			},
 			diagnostics: [],
 			fallbackOccurred: false,
+			mounts: diagnosticMounts.map((mount) => ({ path: mount.source, mode: mount.mode })),
 		};
 	}
 }

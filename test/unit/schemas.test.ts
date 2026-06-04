@@ -148,6 +148,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.deepEqual(Object.keys(sandboxSchema.properties ?? {}).sort(), [
 			"auth",
 			"bashWrite",
+			"extraReadOnlyMounts",
+			"extraWritableMounts",
 			"fallback",
 			"network",
 			"profile",

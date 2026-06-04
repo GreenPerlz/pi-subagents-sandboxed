@@ -29,6 +29,10 @@ export interface SubagentSandboxMountInput {
 	/** Pi agent config directory; defaults to PI_CODING_AGENT_DIR or ~/.pi/agent. */
 	agentDir?: string;
 	cwdMode?: SandboxMountMode;
+	/** Explicit user-requested read-only paths for installed toolchains/read-only inputs. */
+	extraReadOnlyMounts?: string[];
+	/** Explicit user-requested writable paths for caches, outputs, or work directories. */
+	extraWritableMounts?: string[];
 }
 
 function addSandboxMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, source: string | undefined, mode: SandboxMount["mode"]): void {
@@ -158,6 +162,14 @@ function addSandboxAuthMounts(mounts: SandboxMount[], seen: Map<string, SandboxM
 	// fails when npm is not available under Bubblewrap.
 }
 
+function addExplicitMounts(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, paths: string[] | undefined, mode: SandboxMount["mode"]): void {
+	for (const configuredPath of paths ?? []) {
+		const resolved = path.resolve(expandTilde(configuredPath));
+		if (mode === "rw") mkdirSync(resolved, { recursive: true });
+		addSandboxMount(mounts, seen, resolved, mode);
+	}
+}
+
 export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): SandboxMount[] {
 	const mounts: SandboxMount[] = [];
 	const seen = new Map<string, SandboxMount["mode"]>();
@@ -175,5 +187,7 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 	addSandboxExtensionMountParents(mounts, seen, input.piArgs);
 	addSandboxSpawnMounts(mounts, seen, input.spawnCommand, input.spawnArgs);
 	addSandboxAuthMounts(mounts, seen, input.authMode, input.agentDir);
+	addExplicitMounts(mounts, seen, input.extraReadOnlyMounts, "ro");
+	addExplicitMounts(mounts, seen, input.extraWritableMounts, "rw");
 	return mounts;
 }

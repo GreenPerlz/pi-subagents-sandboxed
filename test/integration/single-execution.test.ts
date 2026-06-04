@@ -1128,14 +1128,13 @@ process.exit(child.status ?? 0);
 
 			assert.equal(result.isError, undefined);
 			const sandboxDetails = result.details.results[0]?.sandbox;
-			assert.deepEqual(sandboxDetails, {
-				provider: "bubblewrap",
-				profile: "host-toolchain",
-				network: "host",
-				auth: "env",
-				fallbackMode: "fail",
-				fallbackOccurred: false,
-			});
+			assert.equal(sandboxDetails?.provider, "bubblewrap");
+			assert.equal(sandboxDetails?.profile, "host-toolchain");
+			assert.equal(sandboxDetails?.network, "host");
+			assert.equal(sandboxDetails?.auth, "env");
+			assert.equal(sandboxDetails?.fallbackMode, "fail");
+			assert.equal(sandboxDetails?.fallbackOccurred, false);
+			assert.ok(sandboxDetails?.mounts?.some((mount) => mount.mode === "ro" && mount.path === "/usr"), "sandbox details should include redacted mount info");
 			assert.match(result.content[0]?.text ?? "", new RegExp(`"${secretName}":"${secretValue}"`));
 			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
 			assert.equal(bwrapArgs.includes(secretName), false, "bubblewrap argv should not include inherited env var names");

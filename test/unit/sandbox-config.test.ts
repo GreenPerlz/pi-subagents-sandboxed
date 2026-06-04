@@ -54,6 +54,8 @@ describe("sandbox configuration resolution", () => {
 					auth: "settings-auth",
 					trustProject: false,
 					fallback: "settings-fallback",
+					extraReadOnlyMounts: ["/opt/settings-toolchain"],
+					extraWritableMounts: ["/var/cache/settings-cache"],
 				},
 			},
 		});
@@ -65,6 +67,8 @@ describe("sandbox configuration resolution", () => {
 			"sandboxBashWrite: true",
 			"sandboxAuth: agent-auth",
 			"sandboxFallback: agent-fallback",
+			"sandboxExtraReadOnlyMounts: /opt/agent-toolchain",
+			"sandboxExtraWritableMounts: /var/cache/agent-cache",
 		].join("\n") + "\n");
 
 		const settings = readSandboxSettings(project, "project");
@@ -78,6 +82,8 @@ describe("sandbox configuration resolution", () => {
 			bashWrite: true,
 			auth: "agent-auth",
 			fallback: "agent-fallback",
+			extraReadOnlyMounts: ["/opt/agent-toolchain"],
+			extraWritableMounts: ["/var/cache/agent-cache"],
 		});
 		assert.equal(agent.extraFields?.sandboxProvider, undefined);
 
@@ -88,6 +94,8 @@ describe("sandbox configuration resolution", () => {
 			trustProject: false,
 			auth: "settings-auth",
 			fallback: "settings-fallback",
+			extraReadOnlyMounts: ["/opt/settings-toolchain"],
+			extraWritableMounts: ["/var/cache/settings-cache"],
 		});
 		assert.deepEqual(resolveSandboxConfig({ settings, agent }), {
 			provider: "agent-provider",
@@ -97,6 +105,8 @@ describe("sandbox configuration resolution", () => {
 			bashWrite: true,
 			auth: "agent-auth",
 			fallback: "agent-fallback",
+			extraReadOnlyMounts: ["/opt/settings-toolchain", "/opt/agent-toolchain"],
+			extraWritableMounts: ["/var/cache/settings-cache", "/var/cache/agent-cache"],
 		});
 		assert.deepEqual(resolveSandboxConfig({
 			settings,
@@ -109,6 +119,8 @@ describe("sandbox configuration resolution", () => {
 				bashWrite: false,
 				auth: "run-auth",
 				fallback: "run-fallback",
+				extraReadOnlyMounts: ["/opt/run-toolchain"],
+				extraWritableMounts: ["/var/cache/run-cache"],
 			},
 		}), {
 			provider: "run-provider",
@@ -118,6 +130,8 @@ describe("sandbox configuration resolution", () => {
 			bashWrite: false,
 			auth: "run-auth",
 			fallback: "run-fallback",
+			extraReadOnlyMounts: ["/opt/settings-toolchain", "/opt/agent-toolchain", "/opt/run-toolchain"],
+			extraWritableMounts: ["/var/cache/settings-cache", "/var/cache/agent-cache", "/var/cache/run-cache"],
 		});
 	});
 

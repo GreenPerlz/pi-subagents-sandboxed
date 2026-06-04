@@ -22,6 +22,14 @@ function applyBooleanOverride<T extends string>(target: Record<T, boolean | unde
 	target[key] = value;
 }
 
+function appendPathOverrides(target: string[], value: string[] | undefined): void {
+	if (!value) return;
+	for (const item of value) {
+		const normalized = normalizeString(item);
+		if (normalized && !target.includes(normalized)) target.push(normalized);
+	}
+}
+
 export function resolveSandboxConfig(input: SandboxResolutionInput = {}): ResolvedSandboxConfig | undefined {
 	const resolved: {
 		provider?: string;
@@ -31,7 +39,9 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		bashWrite?: boolean;
 		auth?: string;
 		fallback?: string;
-	} = {};
+		extraReadOnlyMounts: string[];
+		extraWritableMounts: string[];
+	} = { extraReadOnlyMounts: [], extraWritableMounts: [] };
 
 	const settings = input.settings;
 	if (settings) {
@@ -41,6 +51,8 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyBooleanOverride(resolved, "trustProject", settings.trustProject);
 		applyStringOverride(resolved, "auth", settings.auth);
 		applyStringOverride(resolved, "fallback", settings.fallback);
+		appendPathOverrides(resolved.extraReadOnlyMounts, settings.extraReadOnlyMounts);
+		appendPathOverrides(resolved.extraWritableMounts, settings.extraWritableMounts);
 	}
 
 	const agent = input.agent?.sandbox;
@@ -52,6 +64,8 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyBooleanOverride(resolved, "bashWrite", agent.bashWrite);
 		applyStringOverride(resolved, "auth", agent.auth);
 		applyStringOverride(resolved, "fallback", agent.fallback);
+		appendPathOverrides(resolved.extraReadOnlyMounts, agent.extraReadOnlyMounts);
+		appendPathOverrides(resolved.extraWritableMounts, agent.extraWritableMounts);
 	}
 
 	const run = input.run;
@@ -63,6 +77,8 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyBooleanOverride(resolved, "bashWrite", run.bashWrite);
 		applyStringOverride(resolved, "auth", run.auth);
 		applyStringOverride(resolved, "fallback", run.fallback);
+		appendPathOverrides(resolved.extraReadOnlyMounts, run.extraReadOnlyMounts);
+		appendPathOverrides(resolved.extraWritableMounts, run.extraWritableMounts);
 	}
 
 	const provider = normalizeString(resolved.provider);
@@ -76,5 +92,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		...(resolved.bashWrite !== undefined ? { bashWrite: resolved.bashWrite } : {}),
 		...(resolved.auth !== undefined ? { auth: resolved.auth } : {}),
 		...(resolved.fallback !== undefined ? { fallback: resolved.fallback } : {}),
+		...(resolved.extraReadOnlyMounts.length > 0 ? { extraReadOnlyMounts: resolved.extraReadOnlyMounts } : {}),
+		...(resolved.extraWritableMounts.length > 0 ? { extraWritableMounts: resolved.extraWritableMounts } : {}),
 	};
 }

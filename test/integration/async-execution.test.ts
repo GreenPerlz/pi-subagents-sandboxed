@@ -2199,27 +2199,22 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				if (!sawNeedsAttention && status.activityState === "needs_attention" && status.steps?.[0]?.activityState === "needs_attention") {
 					sawNeedsAttention = true;
 				}
-				if (sawNeedsAttention && status.activityState !== "needs_attention" && status.steps?.[0]?.activityState !== "needs_attention") {
+				if (sawNeedsAttention && status.activityState !== "needs_attention" && status.steps?.[0]?.activityState !== "needs_attention" && status.state === "running" && !fs.existsSync(resultPath)) {
 					statusAfterRecovery = status;
 					break;
 				}
 			}
 			if (fs.existsSync(resultPath)) {
-				if (fs.existsSync(statusPath)) {
-					const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
-					if (sawNeedsAttention && status.activityState !== "needs_attention" && status.steps?.[0]?.activityState !== "needs_attention") {
-						statusAfterRecovery = status;
-					}
-				}
 				break;
 			}
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 
 		assert.ok(sawNeedsAttention, "expected status.json to expose needs_attention before recovery");
-		assert.ok(statusAfterRecovery, "expected status.json to clear needs_attention after resumed activity");
+		assert.ok(statusAfterRecovery, "expected status.json to clear needs_attention while the run is still running");
 		assert.equal(statusAfterRecovery.activityState, undefined);
 		assert.equal(statusAfterRecovery.steps?.[0]?.activityState, undefined);
+		assert.equal(statusAfterRecovery.state, "running");
 
 		const resultDeadline = Date.now() + 10_000;
 		while (!fs.existsSync(resultPath)) {
@@ -2283,27 +2278,92 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 						sawNeedsAttention = true;
 					}
 				} else {
-					if (status.activityState !== "needs_attention" && !status.steps?.some((s) => s.activityState === "needs_attention")) {
+					if (status.activityState !== "needs_attention" && !status.steps?.some((s) => s.activityState === "needs_attention") && status.state === "running" && !fs.existsSync(resultPath)) {
 						statusAfterRecovery = status;
 						break;
 					}
 				}
 			}
 			if (fs.existsSync(resultPath)) {
-				if (fs.existsSync(statusPath)) {
-					const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
-					if (sawNeedsAttention && status.activityState !== "needs_attention" && !status.steps?.some((s) => s.activityState === "needs_attention")) {
-						statusAfterRecovery = status;
-					}
-				}
 				break;
 			}
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 
 		assert.ok(sawNeedsAttention, "expected at least one step to reach needs_attention");
-		assert.ok(statusAfterRecovery, "expected top-level activityState to clear after stale child resumed");
+		assert.ok(statusAfterRecovery, "expected top-level activityState to clear while the run is still running");
 		assert.equal(statusAfterRecovery.activityState, undefined);
+		assert.equal(statusAfterRecovery.state, "running");
+
+		const resultDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > resultDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
+	it("background runs clear idle needs_attention after resumed activity", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("read", { path: "src/a.ts" })] },
+				{ delay: 2_500 },
+				{ jsonl: [events.toolEnd("read"), events.toolResult("read", "export const a = 1;")] },
+				{ delay: 2_500, jsonl: [events.assistantMessage("Done")] },
+			],
+		});
+
+		const id = `async-idle-recovery-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Read and summarize",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: {
+				enabled: true,
+				needsAttentionAfterMs: 1_500,
+				activeNoticeAfterTurns: 999_999,
+				activeNoticeAfterMs: 999_999,
+				activeNoticeAfterTokens: 999_999,
+				failedToolAttemptsBeforeAttention: 999_999,
+				notifyOn: ["active_long_running", "needs_attention"],
+				notifyChannels: ["event", "async", "intercom"],
+			},
+		});
+
+		const statusPath = path.join(asyncDir, "status.json");
+		const deadline = Date.now() + 12_000;
+		let sawNeedsAttention = false;
+		let statusAfterRecovery: AsyncStatusPayload | undefined;
+
+		while (Date.now() < deadline) {
+			if (fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (!sawNeedsAttention && status.activityState === "needs_attention" && status.steps?.[0]?.activityState === "needs_attention") {
+					sawNeedsAttention = true;
+				}
+				if (sawNeedsAttention && status.activityState !== "needs_attention" && status.steps?.[0]?.activityState !== "needs_attention" && status.state === "running" && !fs.existsSync(resultPath)) {
+					statusAfterRecovery = status;
+					break;
+				}
+			}
+			if (fs.existsSync(resultPath)) {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		assert.ok(sawNeedsAttention, "expected status.json to expose idle needs_attention before recovery");
+		assert.ok(statusAfterRecovery, "expected status.json to clear idle needs_attention while the run is still running");
+		assert.equal(statusAfterRecovery.activityState, undefined);
+		assert.equal(statusAfterRecovery.steps?.[0]?.activityState, undefined);
+		assert.equal(statusAfterRecovery.state, "running");
 
 		const resultDeadline = Date.now() + 10_000;
 		while (!fs.existsSync(resultPath)) {

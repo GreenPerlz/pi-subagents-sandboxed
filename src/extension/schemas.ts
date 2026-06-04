@@ -43,6 +43,8 @@ const SandboxOverride = Type.Object({
 	bashWrite: Type.Optional(Type.Boolean({ description: "Allow bash-only tasks to imply writable project/cwd access." })),
 	auth: Type.Optional(Type.String({ description: "Sandbox auth policy, e.g. 'env' or 'pi-json' to mount Pi auth JSON read-only without mounting settings JSON." })),
 	fallback: Type.Optional(Type.String({ description: "Fallback policy when sandboxing cannot be applied, e.g. 'fail' or 'none'." })),
+	extraReadOnlyMounts: Type.Optional(Type.Array(Type.String(), { description: "Extra explicit read-only sandbox mounts for installed toolchains or read-only inputs. Use the narrowest path that contains the required executable/files." })),
+	extraWritableMounts: Type.Optional(Type.Array(Type.String(), { description: "Extra explicit writable sandbox mounts for caches, outputs, or work directories only. Use the narrowest writable path." })),
 }, { additionalProperties: false });
 
 const JsonSchemaObject = Type.Unsafe({

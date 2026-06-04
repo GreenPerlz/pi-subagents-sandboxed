@@ -6,6 +6,8 @@ export interface SandboxRunConfig {
 	bashWrite?: boolean;
 	auth?: string;
 	fallback?: string;
+	extraReadOnlyMounts?: string[];
+	extraWritableMounts?: string[];
 }
 
 export interface AgentSandboxConfig extends SandboxRunConfig {}
@@ -17,6 +19,8 @@ export interface SandboxSettingsDefaults {
 	auth?: string;
 	trustProject?: boolean;
 	fallback?: string;
+	extraReadOnlyMounts?: string[];
+	extraWritableMounts?: string[];
 }
 
 export interface ResolvedSandboxConfig {
@@ -27,6 +31,8 @@ export interface ResolvedSandboxConfig {
 	bashWrite?: boolean;
 	auth?: string;
 	fallback?: string;
+	extraReadOnlyMounts?: string[];
+	extraWritableMounts?: string[];
 }
 
 export interface SpawnableInvocation {
@@ -50,6 +56,11 @@ export interface SandboxDiagnostic {
 	message: string;
 }
 
+export interface SandboxMountDiagnostic {
+	path: string;
+	mode: SandboxMountMode;
+}
+
 export interface SandboxWrapInput {
 	config: ResolvedSandboxConfig;
 	invocation: SpawnableInvocation;
@@ -60,6 +71,7 @@ export interface SandboxWrapResult {
 	invocation: SpawnableInvocation;
 	diagnostics: SandboxDiagnostic[];
 	fallbackOccurred?: boolean;
+	mounts?: SandboxMountDiagnostic[];
 }
 
 export interface SandboxResultDetails {
@@ -70,6 +82,7 @@ export interface SandboxResultDetails {
 	fallbackMode: string;
 	fallbackOccurred: boolean;
 	diagnostics?: SandboxDiagnostic[];
+	mounts?: SandboxMountDiagnostic[];
 }
 
 export interface SandboxProvider {

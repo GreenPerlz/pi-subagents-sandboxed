@@ -171,6 +171,23 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, nodeModulesRoot), "ro");
 	});
 
+	it("mounts explicit extra read-only and writable sandbox paths with least privilege", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const toolchain = mkdirp(path.join(root, "toolchain"));
+		const writableCache = path.join(root, "cache", "npm");
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			extraReadOnlyMounts: [toolchain],
+			extraWritableMounts: [writableCache],
+		});
+
+		assert.equal(mountMode(mounts, toolchain), "ro");
+		assert.equal(mountMode(mounts, writableCache), "rw");
+		assert.equal(fs.existsSync(writableCache), true, "writable explicit mounts should be created before bwrap binds them");
+	});
+
 	it("mounts Pi auth JSON read-only but NOT settings JSON when pi-json auth mode is requested", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));

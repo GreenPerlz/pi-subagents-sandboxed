@@ -7,7 +7,7 @@ import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
-import { sandboxResultDetails } from "../../sandbox/diagnostics.ts";
+import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import type { ResolvedSandboxConfig, SandboxResultDetails, SpawnableInvocation } from "../../sandbox/types.ts";
@@ -272,17 +272,30 @@ function runPiStreaming(
 		});
 		let spawnSpec: SpawnableInvocation;
 		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;
+		let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
 		try {
 			if (sandbox) {
+				effectiveSandboxMounts = buildSubagentSandboxMounts({
+					...sandbox,
+					extraReadOnlyMounts: sandbox.config.extraReadOnlyMounts,
+					extraWritableMounts: sandbox.config.extraWritableMounts,
+					spawnCommand: piSpawnSpec.command,
+					spawnArgs: piSpawnSpec.args,
+				});
 				const wrapped = createSandboxProvider(sandbox.config).wrapInvocation({
 					config: sandbox.config,
 					invocation: { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd },
-					mounts: buildSubagentSandboxMounts({
-						...sandbox,
-						spawnCommand: piSpawnSpec.command,
-						spawnArgs: piSpawnSpec.args,
-					}),
+					mounts: effectiveSandboxMounts,
 				});
+				if (wrapped.mounts?.length) {
+					const seenDiagnosticMounts = new Set(effectiveSandboxMounts.map((mount) => `${mount.mode}:${mount.source}`));
+					for (const mount of wrapped.mounts) {
+						const key = `${mount.mode}:${mount.path}`;
+						if (seenDiagnosticMounts.has(key)) continue;
+						seenDiagnosticMounts.add(key);
+						effectiveSandboxMounts.push({ source: mount.path, mode: mount.mode });
+					}
+				}
 				sandboxDetails = sandboxResultDetails(sandbox.config, wrapped);
 				spawnSpec = {
 					command: wrapped.invocation.command,
@@ -478,6 +491,21 @@ function runPiStreaming(
 			childExited = true;
 			clearDrainTimers();
 		});
+		const attachFailureDiagnostics = (message?: string): void => {
+			if (!sandboxDetails || !sandbox) return;
+			const diagnostics = diagnoseSandboxFailure({
+				stderr,
+				error: message,
+				mounts: effectiveSandboxMounts,
+				cwd,
+			});
+			if (diagnostics.length === 0) return;
+			sandboxDetails = {
+				...sandboxDetails,
+				diagnostics: [...(sandboxDetails.diagnostics ?? []), ...diagnostics],
+			};
+		};
+
 		child.on("close", (exitCode, signal) => {
 			settled = true;
 			registerInterrupt?.(undefined);
@@ -488,6 +516,7 @@ function runPiStreaming(
 			outputStream.end();
 			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
 			const finalError = error ?? assistantError;
+			if ((exitCode ?? 0) !== 0 || finalError) attachFailureDiagnostics(finalError);
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !finalError;
 			resolve({
 				stderr,
@@ -511,6 +540,7 @@ function runPiStreaming(
 			outputStream.end();
 			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
 			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
+			attachFailureDiagnostics(spawnErrorMessage);
 			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? assistantError ?? spawnErrorMessage, finalOutput, observedMutationAttempt, ...(sandboxDetails ? { sandbox: sandboxDetails } : {}) });
 		});
 	});
@@ -582,6 +612,7 @@ function writeRunLog(
 			agent: string;
 			status: string;
 			durationMs?: number;
+			sandbox?: SandboxResultDetails;
 		}>;
 		summary: string;
 		truncated: boolean;
@@ -611,6 +642,22 @@ function writeRunLog(
 		const duration = step.durationMs !== undefined ? formatDuration(step.durationMs) : "-";
 		lines.push(`| ${i + 1} | ${step.agent} | ${step.status} | ${duration} |`);
 	});
+	const sandboxSteps = input.steps
+		.map((step, index) => ({ ...step, index }))
+		.filter((step) => step.sandbox);
+	if (sandboxSteps.length > 0) {
+		lines.push("");
+		lines.push("## Sandbox diagnostics");
+		for (const step of sandboxSteps) {
+			const sandbox = step.sandbox!;
+			lines.push(`- Step ${step.index + 1} (${step.agent}): provider=${sandbox.provider}, profile=${sandbox.profile}, network=${sandbox.network}, auth=${sandbox.auth}, fallback=${sandbox.fallbackMode}, fallbackOccurred=${sandbox.fallbackOccurred}`);
+			for (const diagnostic of sandbox.diagnostics ?? []) lines.push(`  - ${diagnostic.level}: ${diagnostic.message}`);
+			if (sandbox.mounts?.length) {
+				const summary = sandbox.mounts.map((mount) => `${mount.mode}:${mount.path}`).join(", ");
+				lines.push(`  - mounts: ${summary}`);
+			}
+		}
+	}
 	lines.push("");
 	lines.push("## Summary");
 	if (input.truncated) {
@@ -2416,6 +2463,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			agent: step.agent,
 			status: step.status,
 			durationMs: step.durationMs,
+			sandbox: step.sandbox,
 		})),
 		summary,
 		truncated,

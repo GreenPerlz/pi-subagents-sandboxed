@@ -64,7 +64,9 @@ subagent({
     network: "host",
     auth: "env",
     fallback: "fail",
-    bashWrite: true
+    bashWrite: true,
+    extraReadOnlyMounts: ["/opt/project-toolchain"],
+    extraWritableMounts: [".cache/subagent-build"]
   }
 })
 ```
@@ -78,6 +80,8 @@ sandboxNetwork: host
 sandboxAuth: env
 sandboxFallback: fail
 sandboxBashWrite: true
+sandboxExtraReadOnlyMounts: /opt/project-toolchain
+sandboxExtraWritableMounts: .cache/subagent-build
 ```
 
 Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
@@ -90,13 +94,15 @@ Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
       "defaultProfile": "host-toolchain",
       "network": "host",
       "auth": "env",
-      "fallback": "fail"
+      "fallback": "fail",
+      "extraReadOnlyMounts": ["/opt/project-toolchain"],
+      "extraWritableMounts": [".cache/subagent-build"]
     }
   }
 }
 ```
 
-Run-level sandbox options override agent frontmatter, which overrides settings defaults.
+Run-level sandbox options override agent frontmatter, which overrides settings defaults. Explicit extra mounts are additive across settings, agent frontmatter, and run options so narrower per-run access can be added without broadening the default profile.
 
 ### Sandbox modes and diagnostics
 
@@ -106,6 +112,7 @@ Run-level sandbox options override agent frontmatter, which overrides settings d
 - Auth: `env` is the default MVP mode and uses the child process environment. Future modes such as Pi/GitHub readonly config mounts are tracked in the [sandbox PRD](docs/prd/sandboxed-subagents.md).
 - Fallback: `fail` is the default and refuses to run when Bubblewrap cannot be applied. Explicit `fallback: "none"` runs the original unsandboxed invocation and records a warning/result marker.
 - Write inference: agents with `edit` or `write` tools get writable cwd/worktree mounts. `bash` alone stays read-only unless `bashWrite: true` is set. Parallel sandboxed writers require `worktree: true` so each writer gets an isolated writable worktree.
+- Extra mounts: use `extraReadOnlyMounts` for installed executables/toolchains or read-only inputs. Use `extraWritableMounts` only for caches, outputs, or work directories that the agent must write. Do **not** mount all of `$HOME`; prefer the narrowest directory that contains the missing executable or failed cache/output path.
 
 Returned result details and async status steps include a `sandbox` diagnostic object for sandboxed executions:
 
@@ -116,11 +123,22 @@ Returned result details and async status steps include a `sandbox` diagnostic ob
   "network": "host",
   "auth": "env",
   "fallbackMode": "fail",
-  "fallbackOccurred": false
+  "fallbackOccurred": false,
+  "mounts": [
+    { "path": "/usr", "mode": "ro" },
+    { "path": "~/project", "mode": "rw" }
+  ]
 }
 ```
 
-When `fallback: "none"` is used because `bwrap` is unavailable, `fallbackOccurred` is `true` and `diagnostics` contains the warning explaining that the run was not sandboxed.
+When `fallback: "none"` is used because `bwrap` is unavailable, `fallbackOccurred` is `true` and `diagnostics` contains the warning explaining that the run was not sandboxed. If a sandboxed run fails with `execvp <tool>: No such file or directory`, Pi diagnoses whether the tool appears missing on the host or installed on the host but absent from sandbox mounts, then suggests a read-only mount. If a run fails with `EACCES`, `EPERM`, or `EROFS`, Pi explains whether the path is outside the mounted filesystem or under a read-only mount and suggests a writable mount only for cache/output/work paths. Mount lists are redacted before they appear in result details, async status, and run logs.
+
+Agent-assisted safe-access workflow:
+
+1. Re-run the smallest failing command/test inside the sandbox and inspect `details.results[*].sandbox` (or async status/run log) for `diagnostics` and redacted `mounts`.
+2. If the diagnostic says a host-installed executable is not mounted, add the narrowest containing directory to `sandbox.extraReadOnlyMounts` in the run options, agent frontmatter, or settings.
+3. If the diagnostic says a cache/output/work path is read-only or outside the mounted filesystem, create/use a narrow cache/output/work directory and add only that directory to `sandbox.extraWritableMounts`.
+4. Re-run the focused smoke test. Keep `fallback: "fail"`; do not retry unsandboxed except with an explicit user-approved `fallback: "none"`.
 
 ## Try this first
 

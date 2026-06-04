@@ -204,6 +204,12 @@ function frontmatterBoolean(value: string | undefined): boolean | undefined {
 	return undefined;
 }
 
+function frontmatterStringList(value: string | undefined): string[] | undefined {
+	if (value === undefined) return undefined;
+	const items = value.split(",").map((item) => item.trim()).filter(Boolean);
+	return items.length > 0 ? items : undefined;
+}
+
 function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSandboxConfig | undefined {
 	const sandbox: AgentSandboxConfig = {};
 	const provider = frontmatterString(frontmatter.sandboxProvider);
@@ -213,6 +219,8 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 	const bashWrite = frontmatterBoolean(frontmatter.sandboxBashWrite);
 	const auth = frontmatterString(frontmatter.sandboxAuth);
 	const fallback = frontmatterString(frontmatter.sandboxFallback);
+	const extraReadOnlyMounts = frontmatterStringList(frontmatter.sandboxExtraReadOnlyMounts);
+	const extraWritableMounts = frontmatterStringList(frontmatter.sandboxExtraWritableMounts);
 	if (provider !== undefined) sandbox.provider = provider;
 	if (profile !== undefined) sandbox.profile = profile;
 	if (network !== undefined) sandbox.network = network;
@@ -220,6 +228,8 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 	if (bashWrite !== undefined) sandbox.bashWrite = bashWrite;
 	if (auth !== undefined) sandbox.auth = auth;
 	if (fallback !== undefined) sandbox.fallback = fallback;
+	if (extraReadOnlyMounts !== undefined) sandbox.extraReadOnlyMounts = extraReadOnlyMounts;
+	if (extraWritableMounts !== undefined) sandbox.extraWritableMounts = extraWritableMounts;
 	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
 }
 
@@ -354,6 +364,25 @@ function parseOptionalBooleanField(
 	return value;
 }
 
+function parseOptionalStringArrayField(
+	value: unknown,
+	meta: { filePath: string; field: string },
+): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) {
+		throw new Error(`Subagent settings in '${meta.filePath}' have invalid '${meta.field}'; expected an array of strings.`);
+	}
+	const items: string[] = [];
+	for (const item of value) {
+		if (typeof item !== "string") {
+			throw new Error(`Subagent settings in '${meta.filePath}' have invalid '${meta.field}'; expected an array of strings.`);
+		}
+		const trimmed = item.trim();
+		if (trimmed) items.push(trimmed);
+	}
+	return items;
+}
+
 function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSettingsDefaults | undefined {
 	if (value === undefined) return undefined;
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -367,12 +396,16 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	const auth = parseOptionalStringField(input.auth, { filePath, field: "sandbox.auth" });
 	const trustProject = parseOptionalBooleanField(input.trustProject, { filePath, field: "sandbox.trustProject" });
 	const fallback = parseOptionalStringField(input.fallback, { filePath, field: "sandbox.fallback" });
+	const extraReadOnlyMounts = parseOptionalStringArrayField(input.extraReadOnlyMounts, { filePath, field: "sandbox.extraReadOnlyMounts" });
+	const extraWritableMounts = parseOptionalStringArrayField(input.extraWritableMounts, { filePath, field: "sandbox.extraWritableMounts" });
 	if (defaultProvider !== undefined) sandbox.defaultProvider = defaultProvider;
 	if (defaultProfile !== undefined) sandbox.defaultProfile = defaultProfile;
 	if (network !== undefined) sandbox.network = network;
 	if (auth !== undefined) sandbox.auth = auth;
 	if (trustProject !== undefined) sandbox.trustProject = trustProject;
 	if (fallback !== undefined) sandbox.fallback = fallback;
+	if (extraReadOnlyMounts !== undefined) sandbox.extraReadOnlyMounts = extraReadOnlyMounts;
+	if (extraWritableMounts !== undefined) sandbox.extraWritableMounts = extraWritableMounts;
 	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
 }
 

@@ -40,6 +40,12 @@ export interface PiSpawnDeps {
 	resolvePackageJson?: () => string;
 	resolvePackageEntry?: () => string;
 	piPackageRoot?: string;
+	/**
+	 * Prefer an absolute Node + Pi CLI script invocation instead of relying on
+	 * `pi` in PATH. This is useful for sandboxed runs where the user's shell
+	 * wrapper and PATH entries may not be mounted inside the sandbox.
+	 */
+	preferNodeCli?: boolean;
 }
 
 interface PiSpawnCommand {
@@ -56,17 +62,9 @@ function normalizePath(filePath: string): string {
 	return path.isAbsolute(filePath) ? filePath : path.resolve(filePath);
 }
 
-export function resolveWindowsPiCliScript(deps: PiSpawnDeps = {}): string | undefined {
+export function resolvePiPackageBin(deps: PiSpawnDeps = {}): string | undefined {
 	const existsSync = deps.existsSync ?? fs.existsSync;
 	const readFileSync = deps.readFileSync ?? ((filePath, encoding) => fs.readFileSync(filePath, encoding));
-	const argv1 = deps.argv1 ?? process.argv[1];
-
-	if (argv1) {
-		const argvPath = normalizePath(argv1);
-		if (isRunnableNodeScript(argvPath, existsSync)) {
-			return argvPath;
-		}
-	}
 
 	try {
 		const resolvePackageJson = deps.resolvePackageJson ?? (() => {
@@ -92,23 +90,40 @@ export function resolveWindowsPiCliScript(deps: PiSpawnDeps = {}): string | unde
 			return candidate;
 		}
 	} catch {
-		// Windows CLI resolution is optional; falling back to `pi` lets PATH handle execution.
+		// Package-bin resolution is optional; falling back to `pi` lets PATH handle execution.
 		return undefined;
 	}
 
 	return undefined;
 }
 
+export function resolveWindowsPiCliScript(deps: PiSpawnDeps = {}): string | undefined {
+	const existsSync = deps.existsSync ?? fs.existsSync;
+	const argv1 = deps.argv1 ?? process.argv[1];
+
+	if (argv1) {
+		const argvPath = normalizePath(argv1);
+		if (isRunnableNodeScript(argvPath, existsSync)) {
+			return argvPath;
+		}
+	}
+
+	return resolvePiPackageBin(deps);
+}
+
 export function getPiSpawnCommand(args: string[], deps: PiSpawnDeps = {}): PiSpawnCommand {
 	const platform = deps.platform ?? process.platform;
-	if (platform === "win32") {
-		const piCliPath = resolveWindowsPiCliScript(deps);
-		if (piCliPath) {
-			return {
-				command: deps.execPath ?? process.execPath,
-				args: [piCliPath, ...args],
-			};
-		}
+	const piCliPath = deps.preferNodeCli
+		? resolvePiPackageBin(deps)
+		: platform === "win32"
+			? resolveWindowsPiCliScript(deps)
+			: undefined;
+
+	if (piCliPath) {
+		return {
+			command: deps.execPath ?? process.execPath,
+			args: [piCliPath, ...args],
+		};
 	}
 
 	return { command: "pi", args };

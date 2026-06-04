@@ -41,7 +41,7 @@ const SandboxOverride = Type.Object({
 	network: Type.Optional(Type.String({ description: "Sandbox network policy, e.g. 'host' or 'none'." })),
 	trustProject: Type.Optional(Type.Boolean({ description: "Allow sandbox policy to trust project-local files/config." })),
 	bashWrite: Type.Optional(Type.Boolean({ description: "Allow bash-only tasks to imply writable project/cwd access." })),
-	auth: Type.Optional(Type.String({ description: "Sandbox auth policy, e.g. 'env'." })),
+	auth: Type.Optional(Type.String({ description: "Sandbox auth policy, e.g. 'env' or 'pi-json' to mount Pi auth JSON read-only without mounting settings JSON." })),
 	fallback: Type.Optional(Type.String({ description: "Fallback policy when sandboxing cannot be applied, e.g. 'fail' or 'none'." })),
 }, { additionalProperties: false });
 

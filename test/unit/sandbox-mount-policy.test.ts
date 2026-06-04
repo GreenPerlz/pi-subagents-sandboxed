@@ -118,7 +118,9 @@ describe("subagent sandbox mount policy", () => {
 		const statusPath = path.join(root, "async", "status.json");
 		const schemaPath = writeFile(path.join(root, "schemas", "schema.json"));
 		const structuredOutputPath = path.join(root, "structured", "result.json");
-		const extensionPath = writeFile(path.join(root, "extensions", "tool.mjs"));
+		const extensionRoot = mkdirp(path.join(root, "extensions"));
+		const extensionPath = writeFile(path.join(extensionRoot, "src", "tool.mjs"));
+		writeFile(path.join(extensionRoot, "package.json"), JSON.stringify({ name: "test-extension" }));
 		mkdirp(path.dirname(jsonlPath));
 		mkdirp(path.dirname(outputPath));
 		mkdirp(path.dirname(progressPath));
@@ -145,6 +147,40 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, path.dirname(statusPath)), "rw");
 		assert.equal(mountMode(mounts, path.dirname(schemaPath)), "ro");
 		assert.equal(mountMode(mounts, path.dirname(structuredOutputPath)), "rw");
-		assert.equal(mountMode(mounts, path.dirname(extensionPath)), "ro");
+		assert.equal(mountMode(mounts, extensionRoot), "ro");
+	});
+
+	it("mounts absolute sandbox spawn runtime paths so bwrap can exec child Pi without PATH wrappers", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const nodeInstallRoot = mkdirp(path.join(root, "node"));
+		const nodePath = writeFile(path.join(nodeInstallRoot, "bin", "node"));
+		writeFile(path.join(nodeInstallRoot, "bin", "npm"));
+		const nodeModulesRoot = mkdirp(path.join(root, "node_modules"));
+		const piPackageRoot = mkdirp(path.join(nodeModulesRoot, "@earendil-works", "pi-coding-agent"));
+		const cliPath = writeFile(path.join(piPackageRoot, "dist", "cli.js"));
+		writeFile(path.join(piPackageRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent" }));
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			spawnCommand: nodePath,
+			spawnArgs: [cliPath, "-p", "Task: hello"],
+		});
+
+		assert.equal(mountMode(mounts, nodeInstallRoot), "ro");
+		assert.equal(mountMode(mounts, nodeModulesRoot), "ro");
+	});
+
+	it("mounts Pi auth JSON read-only but NOT settings JSON when pi-json auth mode is requested", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const agentDir = mkdirp(path.join(root, "agent"));
+		const authPath = writeFile(path.join(agentDir, "auth.json"), "{}");
+		const settingsPath = writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:ambient-package-that-would-need-npm-root"] }));
+
+		const mounts = buildSubagentSandboxMounts({ cwd, authMode: "pi-json", agentDir });
+
+		assert.equal(mountMode(mounts, authPath), "ro");
+		assert.equal(mountMode(mounts, settingsPath), undefined);
 	});
 });

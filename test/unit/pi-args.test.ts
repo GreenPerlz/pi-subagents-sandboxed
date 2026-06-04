@@ -654,4 +654,42 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		assert.ok(args.includes("--system-prompt"));
 	});
+
+	it("adds closed-runtime flags for sandboxed children", () => {
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			sandbox: true,
+		});
+
+		assert.ok(args.includes("--no-extensions"));
+		assert.ok(args.includes("--no-prompt-templates"));
+		assert.ok(args.includes("--no-themes"));
+		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
+		assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "runs", "shared", "subagent-prompt-runtime.ts"))));
+	});
+
+	it("preserves explicit extensions and fanout runtime in sandboxed mode", () => {
+		const { args, env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["subagent"],
+			extensions: ["./agent-allowed-ext.ts"],
+			sandbox: true,
+		});
+
+		assert.ok(args.includes("--no-extensions"));
+		assert.ok(args.includes("--no-prompt-templates"));
+		assert.ok(args.includes("--no-themes"));
+		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
+		assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "extension", "fanout-child.ts"))));
+		assert.ok(extensionArgs.includes("./agent-allowed-ext.ts"));
+		assert.equal(env[SUBAGENT_FANOUT_CHILD_ENV], "1");
+	});
 });

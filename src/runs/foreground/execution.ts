@@ -202,6 +202,7 @@ async function runSingleAttempt(
 		parentRootRunId: options.nestedRoute?.rootRunId,
 		parentCapabilityToken: options.nestedRoute?.capabilityToken,
 		structuredOutput: options.structuredOutput,
+		sandbox: Boolean(options.sandbox),
 	});
 
 	const result: SingleResult = {
@@ -255,7 +256,7 @@ async function runSingleAttempt(
 	const childCwd = options.cwd ?? runtimeCwd;
 	let spawnSpec: SpawnableInvocation;
 	try {
-		const piSpawnSpec = getPiSpawnCommand(args);
+		const piSpawnSpec = getPiSpawnCommand(args, options.sandbox ? { preferNodeCli: true } : {});
 		const piInvocation: SpawnableInvocation = {
 			command: piSpawnSpec.command,
 			args: piSpawnSpec.args,
@@ -286,6 +287,9 @@ async function runSingleAttempt(
 					progressPaths: options.progressPaths,
 					structuredOutput: options.structuredOutput,
 					piArgs: args,
+					spawnCommand: piSpawnSpec.command,
+					spawnArgs: piSpawnSpec.args,
+					authMode: options.sandbox.auth,
 				}),
 			});
 			result.sandbox = sandboxResultDetails(options.sandbox, wrapped);

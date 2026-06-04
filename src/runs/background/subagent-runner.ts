@@ -268,6 +268,7 @@ function runPiStreaming(
 		const piSpawnSpec = getPiSpawnCommand(args, {
 			...(piPackageRoot ? { piPackageRoot } : {}),
 			...(piArgv1 ? { argv1: piArgv1 } : {}),
+			...(sandbox ? { preferNodeCli: true } : {}),
 		});
 		let spawnSpec: SpawnableInvocation;
 		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;
@@ -276,7 +277,11 @@ function runPiStreaming(
 				const wrapped = createSandboxProvider(sandbox.config).wrapInvocation({
 					config: sandbox.config,
 					invocation: { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd },
-					mounts: buildSubagentSandboxMounts(sandbox),
+					mounts: buildSubagentSandboxMounts({
+						...sandbox,
+						spawnCommand: piSpawnSpec.command,
+						spawnArgs: piSpawnSpec.args,
+					}),
 				});
 				sandboxDetails = sandboxResultDetails(sandbox.config, wrapped);
 				spawnSpec = {
@@ -715,6 +720,7 @@ async function runSingleStep(
 			statusPaths: [path.join(path.dirname(input.outputFile), "status.json"), eventsPath],
 			structuredOutput: input.structuredOutput,
 			piArgs: input.args,
+			authMode: sandbox.auth,
 		};
 	};
 	let finalResult: RunPiStreamingResult | undefined;
@@ -758,6 +764,7 @@ async function runSingleStep(
 			parentRootRunId: ctx.nestedRoute?.rootRunId,
 			parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
 			structuredOutput: effectiveStructuredOutput,
+			sandbox: Boolean(step.sandbox ?? ctx.sandbox),
 		});
 		const run = await runPiStreaming(
 			args,
@@ -918,6 +925,7 @@ async function runSingleStep(
 					parentControlInbox: ctx.nestedRoute?.controlInbox,
 					parentRootRunId: ctx.nestedRoute?.rootRunId,
 					parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
+					sandbox: Boolean(step.sandbox ?? ctx.sandbox),
 				});
 				ctx.onAttemptStart?.({ model: finalResult?.model ?? step.model, thinking: resolveEffectiveThinking(finalResult?.model ?? step.model, step.thinking) });
 				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;

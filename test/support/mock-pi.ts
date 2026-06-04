@@ -81,10 +81,8 @@ export function createMockPi(): MockPi {
 			originalQueueEnv = process.env.MOCK_PI_QUEUE_DIR;
 			process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
 			process.env.MOCK_PI_QUEUE_DIR = queueDir;
-			if (process.platform === "win32") {
-				originalArgv1 = process.argv[1];
-				process.argv[1] = SCRIPT_PATH;
-			}
+			originalArgv1 = process.argv[1];
+			process.argv[1] = SCRIPT_PATH;
 		},
 		uninstall() {
 			if (!installed) return;
@@ -93,10 +91,8 @@ export function createMockPi(): MockPi {
 			else process.env.PATH = originalPath;
 			if (originalQueueEnv === undefined) delete process.env.MOCK_PI_QUEUE_DIR;
 			else process.env.MOCK_PI_QUEUE_DIR = originalQueueEnv;
-			if (process.platform === "win32") {
-				if (originalArgv1 === undefined) delete process.argv[1];
-				else process.argv[1] = originalArgv1;
-			}
+			if (originalArgv1 === undefined) delete process.argv[1];
+			else process.argv[1] = originalArgv1;
 			try {
 				fs.rmSync(rootDir, { recursive: true, force: true });
 			} catch {}

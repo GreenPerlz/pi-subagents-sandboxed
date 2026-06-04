@@ -61,6 +61,13 @@ interface BuildPiArgsInput {
 		schemaPath: string;
 		outputPath: string;
 	};
+	/**
+	 * When true, the child Pi process is launched as a closed runtime:
+	 * --no-extensions, --no-prompt-templates, --no-themes are added,
+	 * and only explicitly required runtime extensions are loaded.
+	 * This prevents ambient package discovery (e.g. npm root -g) inside sandboxes.
+	 */
+	sandbox?: boolean;
 }
 
 interface BuildPiArgsResult {
@@ -118,15 +125,17 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	const runtimeExtensions = fanoutAuthorized
 		? [PROMPT_RUNTIME_EXTENSION_PATH, FANOUT_CHILD_EXTENSION_PATH]
 		: [PROMPT_RUNTIME_EXTENSION_PATH];
-	if (input.extensions !== undefined) {
+	const useExplicitExtensions = input.sandbox || input.extensions !== undefined;
+	if (useExplicitExtensions) {
 		args.push("--no-extensions");
-		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...input.extensions])]) {
-			args.push("--extension", extPath);
-		}
-	} else {
-		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths])]) {
-			args.push("--extension", extPath);
-		}
+	}
+	for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.extensions ?? [])])]) {
+		args.push("--extension", extPath);
+	}
+
+	if (input.sandbox) {
+		args.push("--no-prompt-templates");
+		args.push("--no-themes");
 	}
 
 	if (!input.inheritSkills) {

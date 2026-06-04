@@ -276,6 +276,14 @@ process.exit(child.status ?? 0);
 		);
 	}
 
+	function assertNotMounted(args: string[], source: string): void {
+		assert.equal(
+			args.some((arg, index) => (arg === "--bind" || arg === "--ro-bind") && args[index + 1] === source),
+			false,
+			`expected ${source} not to be mounted`,
+		);
+	}
+
 	function makeExecutor(agents = [makeAgent("echo")]) {
 		return createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
@@ -1072,7 +1080,7 @@ process.exit(child.status ?? 0);
 				const index = normalized.indexOf(flag);
 				if (index !== -1 && normalized[index + 1]) normalized[index + 1] = "<prompt-file>";
 			}
-			return normalized;
+			return normalized.filter((arg) => arg !== "--no-prompt-templates" && arg !== "--no-themes");
 		};
 		const extensionDir = path.join(tempDir, "absolute-extension-parent");
 		fs.mkdirSync(extensionDir, { recursive: true });
@@ -1134,29 +1142,77 @@ process.exit(child.status ?? 0);
 			assert.equal(bwrapArgs.includes(secretValue), false, "bubblewrap argv should not include inherited env var values");
 			const separatorIndex = bwrapArgs.indexOf("--");
 			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
-			assert.equal(bwrapArgs[separatorIndex + 1], "pi");
-			const wrappedPiArgs = bwrapArgs.slice(separatorIndex + 2);
+			assert.equal(bwrapArgs[separatorIndex + 1], process.execPath);
+			assert.ok(bwrapArgs[separatorIndex + 2]?.endsWith(".mjs"), "sandboxed child should exec via node script");
+			const wrappedPiArgs = bwrapArgs.slice(separatorIndex + 3);
 			const piArgs = readCallArgs();
 			assert.deepEqual(piArgs, wrappedPiArgs, "fake bubblewrap should exec pi with the same args it wrapped");
 			assert.deepEqual(normalizeVolatileArgs(piArgs), normalizeVolatileArgs(plainPiArgs), "sandboxing should preserve child pi argument configuration");
 			assert.deepEqual(piArgs.slice(0, 3), ["--mode", "json", "-p"]);
 			assert.deepEqual(piArgs.slice(piArgs.indexOf("--model"), piArgs.indexOf("--model") + 2), ["--model", "mock/sandbox-model"]);
 			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,bash"]);
+			assert.ok(piArgs.includes("--no-extensions"), "sandboxed child should disable extension discovery");
+			assert.ok(piArgs.includes("--no-prompt-templates"), "sandboxed child should disable prompt template discovery");
+			assert.ok(piArgs.includes("--no-themes"), "sandboxed child should disable theme discovery");
 			assert.ok(piArgs.includes("Task: Keep the same task"), "child should receive the original task text");
 			assert.ok(piArgs.includes("--session"), "fresh child session should still be configured");
 			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
-			const extensionParents = [...new Set(extensionArgs.filter((arg) => path.isAbsolute(arg)).map((arg) => path.dirname(arg)))];
+			const customExtensionArgs = extensionArgs.filter((arg) => !arg.includes("subagent-prompt-runtime") && !arg.includes("fanout-child"));
+			const extensionParents = [...new Set(customExtensionArgs.filter((arg) => path.isAbsolute(arg)).map((arg) => path.dirname(arg)))];
 			assert.ok(extensionParents.includes(extensionDir), "custom absolute extension should be passed to pi");
-			for (const extensionParent of extensionParents) {
-				assert.ok(
-					bwrapArgs.some((arg, index) => arg === "--ro-bind" && bwrapArgs[index + 1] === extensionParent && bwrapArgs[index + 2] === extensionParent),
-					`bubblewrap should read-only mount extension parent ${extensionParent}`,
-				);
+			for (const extPath of customExtensionArgs.filter((arg) => path.isAbsolute(arg))) {
+				const isMounted = bwrapArgs.some((arg, index) => {
+					if (arg !== "--ro-bind") return false;
+					const source = bwrapArgs[index + 1];
+					return source === extPath || source === path.dirname(extPath);
+				});
+				assert.ok(isMounted, `bubblewrap should read-only mount extension ${extPath} or its parent`);
 			}
 		} finally {
 			fakeBwrap.restore();
 			if (previousSecret === undefined) delete process.env[secretName];
 			else process.env[secretName] = previousSecret;
+		}
+	});
+
+	it("adds closed-runtime flags and mounts auth.json but not settings.json for pi-json sandboxed children", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "SUBAGENT_SANDBOXED_PI_JSON_OK" });
+		const agentDir = path.join(tempDir, "agent-home");
+		fs.mkdirSync(agentDir, { recursive: true });
+		const authPath = path.join(agentDir, "auth.json");
+		const settingsPath = path.join(agentDir, "settings.json");
+		fs.writeFileSync(authPath, JSON.stringify({ provider: "test", apiKey: "redacted" }), "utf-8");
+		fs.writeFileSync(settingsPath, JSON.stringify({ packages: ["npm:ambient-package-that-would-need-npm-root"] }), "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("echo")]);
+			const result = await executor.execute(
+				"single-sandbox-closed-runtime",
+				{ agent: "echo", task: "Smoke test sandboxed child launch using pi-json auth. Reply exactly: SUBAGENT_SANDBOXED_PI_JSON_OK", sandbox: { provider: "bubblewrap", auth: "pi-json" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /SUBAGENT_SANDBOXED_PI_JSON_OK/);
+			assert.equal(result.details.results[0]?.sandbox?.fallbackOccurred, false);
+			assert.equal(result.details.results[0]?.sandbox?.auth, "pi-json");
+			const piArgs = readCallArgs();
+			assert.ok(piArgs.includes("--no-extensions"), "sandboxed child should disable extension discovery");
+			assert.ok(piArgs.includes("--no-prompt-templates"), "sandboxed child should disable prompt template discovery");
+			assert.ok(piArgs.includes("--no-themes"), "sandboxed child should disable theme discovery");
+			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
+			assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "runs", "shared", "subagent-prompt-runtime.ts"))), "sandboxed child should still load prompt runtime extension");
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			assertMountMode(bwrapArgs, authPath, "ro");
+			assertNotMounted(bwrapArgs, settingsPath);
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
 	});
 

@@ -13,6 +13,7 @@ function makeDeps(input: {
 	packageJsonPath?: string;
 	packageJsonContent?: string;
 	packageEntry?: string;
+	preferNodeCli?: boolean;
 }): PiSpawnDeps {
 	const existing = new Set(input.existing ?? []);
 	const packageJsonPath = input.packageJsonPath;
@@ -30,6 +31,7 @@ function makeDeps(input: {
 		},
 		resolvePackageJson: packageJsonPath ? () => packageJsonPath : undefined,
 		resolvePackageEntry: input.packageEntry ? () => input.packageEntry! : undefined,
+		preferNodeCli: input.preferNodeCli,
 	};
 }
 
@@ -67,6 +69,43 @@ describe("getPiSpawnCommand", () => {
 		const args = ["--mode", "json", "Task: check output"];
 		const result = getPiSpawnCommand(args, { platform: "darwin" });
 		assert.deepEqual(result, { command: "pi", args });
+	});
+
+	it("uses node + CLI script on non-Windows when preferNodeCli is set for sandboxing", () => {
+		const packageJsonPath = "/opt/pi/package.json";
+		const cliPath = path.resolve(path.dirname(packageJsonPath), "dist/cli/index.js");
+		const deps = makeDeps({
+			platform: "linux",
+			execPath: "/usr/local/bin/node",
+			argv1: "/opt/pi/subagent-runner.ts",
+			packageJsonPath,
+			packageJsonContent: JSON.stringify({ bin: { pi: "dist/cli/index.js" } }),
+			existing: [packageJsonPath, cliPath],
+			preferNodeCli: true,
+		});
+		const args = ["-p", "Task: hello"];
+		const result = getPiSpawnCommand(args, deps);
+		assert.equal(result.command, "/usr/local/bin/node");
+		assert.deepEqual(result.args, [cliPath, ...args]);
+	});
+
+	it("uses package bin instead of unrelated argv1 JS when preferNodeCli is set", () => {
+		const packageJsonPath = "/opt/pi/package.json";
+		const cliPath = path.resolve(path.dirname(packageJsonPath), "dist/cli/index.js");
+		const argv1 = "/tmp/test-runner.mjs";
+		const deps = makeDeps({
+			platform: "linux",
+			execPath: "/usr/local/bin/node",
+			argv1,
+			packageJsonPath,
+			packageJsonContent: JSON.stringify({ bin: { pi: "dist/cli/index.js" } }),
+			existing: [argv1, packageJsonPath, cliPath],
+			preferNodeCli: true,
+		});
+		const args = ["-p", "Task: hello"];
+		const result = getPiSpawnCommand(args, deps);
+		assert.equal(result.command, "/usr/local/bin/node");
+		assert.deepEqual(result.args, [cliPath, ...args]);
 	});
 
 	it("uses node + argv1 script on Windows when argv1 is runnable JS", () => {

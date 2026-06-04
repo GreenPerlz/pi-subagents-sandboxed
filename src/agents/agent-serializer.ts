@@ -29,6 +29,7 @@ export const KNOWN_FIELDS = new Set([
 	"sandboxBashWrite",
 	"sandboxAuth",
 	"sandboxFallback",
+	"sandboxPackageDiscovery",
 ]);
 
 function joinComma(values: string[] | undefined): string | undefined {
@@ -86,6 +87,7 @@ export function serializeAgent(config: AgentConfig): string {
 	if (config.sandbox?.bashWrite !== undefined) lines.push(`sandboxBashWrite: ${config.sandbox.bashWrite ? "true" : "false"}`);
 	if (config.sandbox?.auth) lines.push(`sandboxAuth: ${config.sandbox.auth}`);
 	if (config.sandbox?.fallback) lines.push(`sandboxFallback: ${config.sandbox.fallback}`);
+	if (config.sandbox?.packageDiscovery) lines.push(`sandboxPackageDiscovery: ${config.sandbox.packageDiscovery}`);
 
 	if (config.extraFields) {
 		for (const [key, value] of Object.entries(config.extraFields)) {

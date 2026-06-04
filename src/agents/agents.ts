@@ -213,6 +213,7 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 	const bashWrite = frontmatterBoolean(frontmatter.sandboxBashWrite);
 	const auth = frontmatterString(frontmatter.sandboxAuth);
 	const fallback = frontmatterString(frontmatter.sandboxFallback);
+	const packageDiscovery = frontmatterString(frontmatter.sandboxPackageDiscovery);
 	if (provider !== undefined) sandbox.provider = provider;
 	if (profile !== undefined) sandbox.profile = profile;
 	if (network !== undefined) sandbox.network = network;
@@ -220,6 +221,7 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 	if (bashWrite !== undefined) sandbox.bashWrite = bashWrite;
 	if (auth !== undefined) sandbox.auth = auth;
 	if (fallback !== undefined) sandbox.fallback = fallback;
+	if (packageDiscovery !== undefined) sandbox.packageDiscovery = packageDiscovery;
 	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
 }
 
@@ -367,12 +369,14 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	const auth = parseOptionalStringField(input.auth, { filePath, field: "sandbox.auth" });
 	const trustProject = parseOptionalBooleanField(input.trustProject, { filePath, field: "sandbox.trustProject" });
 	const fallback = parseOptionalStringField(input.fallback, { filePath, field: "sandbox.fallback" });
+	const packageDiscovery = parseOptionalStringField(input.packageDiscovery, { filePath, field: "sandbox.packageDiscovery" });
 	if (defaultProvider !== undefined) sandbox.defaultProvider = defaultProvider;
 	if (defaultProfile !== undefined) sandbox.defaultProfile = defaultProfile;
 	if (network !== undefined) sandbox.network = network;
 	if (auth !== undefined) sandbox.auth = auth;
 	if (trustProject !== undefined) sandbox.trustProject = trustProject;
 	if (fallback !== undefined) sandbox.fallback = fallback;
+	if (packageDiscovery !== undefined) sandbox.packageDiscovery = packageDiscovery;
 	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
 }
 

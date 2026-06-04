@@ -64,7 +64,8 @@ subagent({
     network: "host",
     auth: "env",
     fallback: "fail",
-    bashWrite: true
+    bashWrite: true,
+    packageDiscovery: "project-local"
   }
 })
 ```
@@ -78,6 +79,7 @@ sandboxNetwork: host
 sandboxAuth: env
 sandboxFallback: fail
 sandboxBashWrite: true
+sandboxPackageDiscovery: project-local
 ```
 
 Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
@@ -90,7 +92,8 @@ Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
       "defaultProfile": "host-toolchain",
       "network": "host",
       "auth": "env",
-      "fallback": "fail"
+      "fallback": "fail",
+      "packageDiscovery": "closed"
     }
   }
 }
@@ -105,6 +108,7 @@ Run-level sandbox options override agent frontmatter, which overrides settings d
 - Network: `host` is the default so child Pi processes can reach model/API providers; `none` passes Bubblewrap `--unshare-net` for offline tasks.
 - Auth: `env` is the default MVP mode and uses the child process environment. Future modes such as Pi/GitHub readonly config mounts are tracked in the [sandbox PRD](docs/prd/sandboxed-subagents.md).
 - Fallback: `fail` is the default and refuses to run when Bubblewrap cannot be applied. Explicit `fallback: "none"` runs the original unsandboxed invocation and records a warning/result marker.
+- Package discovery: `closed` is the default for sandboxed children and starts child Pi with `--no-extensions`, `--no-prompt-templates`, and `--no-themes`, loading only runtime/explicit extension flags. `project-local` keeps those closed-runtime flags, but the parent resolves project-local Pi package declarations before Bubblewrap, passes their `package.json -> pi.extensions` as explicit `--extension` flags, and mounts those package roots read-only. It reads project `.pi/settings.json` package declarations and the nearest cwd package; it intentionally does not load user/global packages or mount user settings/global npm roots. `ambient` is unsafe/legacy and must be requested explicitly; it can re-enable Pi's normal discovery inside the sandbox and may require broader mounts, so it is not recommended for untrusted work.
 - Write inference: agents with `edit` or `write` tools get writable cwd/worktree mounts. `bash` alone stays read-only unless `bashWrite: true` is set. Parallel sandboxed writers require `worktree: true` so each writer gets an isolated writable worktree.
 
 Returned result details and async status steps include a `sandbox` diagnostic object for sandboxed executions:

@@ -43,7 +43,8 @@ subagent({
     trustProject: true,
     bashWrite: true,
     auth: "env",
-    fallback: "fail"
+    fallback: "fail",
+    packageDiscovery: "project-local"
   }
 })
 ```
@@ -58,6 +59,7 @@ sandboxTrustProject: true
 sandboxBashWrite: true
 sandboxAuth: env
 sandboxFallback: fail
+sandboxPackageDiscovery: project-local
 ```
 
 ### Settings
@@ -71,13 +73,20 @@ sandboxFallback: fail
       "network": "host",
       "auth": "env",
       "trustProject": true,
-      "fallback": "fail"
+      "fallback": "fail",
+      "packageDiscovery": "closed"
     }
   }
 }
 ```
 
 If no sandbox provider is configured or requested, behavior remains identical to upstream `pi-subagents`.
+
+Sandboxed package discovery modes:
+
+- `closed` (default): child Pi starts with `--no-extensions`, `--no-prompt-templates`, and `--no-themes`; only runtime and explicitly requested extension flags are loaded.
+- `project-local`: preserves the closed-runtime flags, but resolves project-local Pi package declarations outside Bubblewrap and passes package `pi.extensions` as explicit child `--extension` flags. The resolved package roots are mounted read-only. User/global packages are not consulted or mounted.
+- `ambient`: unsafe/legacy escape hatch if explicitly requested. It can re-enable normal child discovery inside the sandbox and therefore expands the trusted code/mount surface.
 
 ## Sandbox providers
 

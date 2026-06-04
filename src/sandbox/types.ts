@@ -1,3 +1,5 @@
+export type SandboxPackageDiscoveryMode = "closed" | "project-local" | "ambient";
+
 export interface SandboxRunConfig {
 	provider?: string;
 	profile?: string;
@@ -6,6 +8,7 @@ export interface SandboxRunConfig {
 	bashWrite?: boolean;
 	auth?: string;
 	fallback?: string;
+	packageDiscovery?: SandboxPackageDiscoveryMode | string;
 }
 
 export interface AgentSandboxConfig extends SandboxRunConfig {}
@@ -17,6 +20,7 @@ export interface SandboxSettingsDefaults {
 	auth?: string;
 	trustProject?: boolean;
 	fallback?: string;
+	packageDiscovery?: SandboxPackageDiscoveryMode | string;
 }
 
 export interface ResolvedSandboxConfig {
@@ -27,6 +31,7 @@ export interface ResolvedSandboxConfig {
 	bashWrite?: boolean;
 	auth?: string;
 	fallback?: string;
+	packageDiscovery?: SandboxPackageDiscoveryMode | string;
 }
 
 export interface SpawnableInvocation {

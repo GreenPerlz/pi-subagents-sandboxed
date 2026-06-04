@@ -43,6 +43,7 @@ const SandboxOverride = Type.Object({
 	bashWrite: Type.Optional(Type.Boolean({ description: "Allow bash-only tasks to imply writable project/cwd access." })),
 	auth: Type.Optional(Type.String({ description: "Sandbox auth policy, e.g. 'env' or 'pi-json' to mount Pi auth JSON read-only without mounting settings JSON." })),
 	fallback: Type.Optional(Type.String({ description: "Fallback policy when sandboxing cannot be applied, e.g. 'fail' or 'none'." })),
+	packageDiscovery: Type.Optional(Type.String({ enum: ["closed", "project-local", "ambient"], description: "Sandboxed child package discovery mode. 'closed' disables ambient discovery; 'project-local' lets the parent pass project-local Pi package extensions explicitly; 'ambient' is unsafe/legacy and must be requested explicitly." })),
 }, { additionalProperties: false });
 
 const JsonSchemaObject = Type.Unsafe({

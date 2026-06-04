@@ -150,6 +150,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			"bashWrite",
 			"fallback",
 			"network",
+			"packageDiscovery",
 			"profile",
 			"provider",
 			"trustProject",
@@ -161,6 +162,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(sandboxSchema.properties?.bashWrite?.type, "boolean");
 		assert.equal(sandboxSchema.properties?.auth?.type, "string");
 		assert.equal(sandboxSchema.properties?.fallback?.type, "string");
+		assert.equal(sandboxSchema.properties?.packageDiscovery?.type, "string");
 	});
 
 	it("uses an enum for management and control actions", () => {
@@ -375,7 +377,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ chain: [{ parallel: [{ agent: "reviewer", phase: "Review", label: "Security", as: "security", outputSchema: { type: "object" } }] }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", output: "review.md", reads: ["input.md"], skill: "review" }] }] },
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 }, parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } }, collect: { as: "reviews" } }] },
-			{ agent: "worker", task: "Fix", sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host", trustProject: true, bashWrite: true, auth: "env", fallback: "fail" } },
+			{ agent: "worker", task: "Fix", sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host", trustProject: true, bashWrite: true, auth: "env", fallback: "fail", packageDiscovery: "project-local" } },
 			{ agent: "worker", task: "Fix", acceptance: { criteria: ["Patch the bug"], evidence: ["changed-files"], maxFinalizationTurns: 2 } },
 			{ agent: "worker", task: "Fix", acceptance: { verify: [{ id: "unit", command: "npm test" }] } },
 			{ config: { name: "reviewer", description: "Review things" } },

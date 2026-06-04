@@ -54,6 +54,7 @@ describe("sandbox configuration resolution", () => {
 					auth: "settings-auth",
 					trustProject: false,
 					fallback: "settings-fallback",
+					packageDiscovery: "closed",
 				},
 			},
 		});
@@ -65,6 +66,7 @@ describe("sandbox configuration resolution", () => {
 			"sandboxBashWrite: true",
 			"sandboxAuth: agent-auth",
 			"sandboxFallback: agent-fallback",
+			"sandboxPackageDiscovery: project-local",
 		].join("\n") + "\n");
 
 		const settings = readSandboxSettings(project, "project");
@@ -78,6 +80,7 @@ describe("sandbox configuration resolution", () => {
 			bashWrite: true,
 			auth: "agent-auth",
 			fallback: "agent-fallback",
+			packageDiscovery: "project-local",
 		});
 		assert.equal(agent.extraFields?.sandboxProvider, undefined);
 
@@ -88,6 +91,7 @@ describe("sandbox configuration resolution", () => {
 			trustProject: false,
 			auth: "settings-auth",
 			fallback: "settings-fallback",
+			packageDiscovery: "closed",
 		});
 		assert.deepEqual(resolveSandboxConfig({ settings, agent }), {
 			provider: "agent-provider",
@@ -97,6 +101,7 @@ describe("sandbox configuration resolution", () => {
 			bashWrite: true,
 			auth: "agent-auth",
 			fallback: "agent-fallback",
+			packageDiscovery: "project-local",
 		});
 		assert.deepEqual(resolveSandboxConfig({
 			settings,
@@ -109,6 +114,7 @@ describe("sandbox configuration resolution", () => {
 				bashWrite: false,
 				auth: "run-auth",
 				fallback: "run-fallback",
+				packageDiscovery: "ambient",
 			},
 		}), {
 			provider: "run-provider",
@@ -118,6 +124,7 @@ describe("sandbox configuration resolution", () => {
 			bashWrite: false,
 			auth: "run-auth",
 			fallback: "run-fallback",
+			packageDiscovery: "ambient",
 		});
 	});
 

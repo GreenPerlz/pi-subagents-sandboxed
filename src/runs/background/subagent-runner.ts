@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
+import { resolveProjectLocalPiPackageResources } from "../../agents/pi-packages.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { sandboxResultDetails } from "../../sandbox/diagnostics.ts";
@@ -703,12 +704,18 @@ async function runSingleStep(
 	const modelAttempts: ModelAttempt[] = [];
 	const attemptNotes: string[] = [];
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
+	const effectiveSandbox = step.sandbox ?? ctx.sandbox;
+	const stepCwd = step.cwd ?? ctx.cwd;
+	const projectLocalPackageResources = effectiveSandbox?.packageDiscovery === "project-local"
+		? resolveProjectLocalPiPackageResources(stepCwd)
+		: undefined;
+	const closedSandboxRuntime = Boolean(effectiveSandbox && effectiveSandbox.packageDiscovery !== "ambient");
 	const buildSandboxInput = (input: { args: string[]; tempDir?: string; sessionDir?: string; sessionFile?: string; outputFile: string; structuredOutput?: { schemaPath?: string; outputPath?: string } }): RunPiStreamingSandboxInput | undefined => {
-		const sandbox = step.sandbox ?? ctx.sandbox;
+		const sandbox = effectiveSandbox;
 		if (!sandbox) return undefined;
 		return {
 			config: sandbox,
-			cwd: step.cwd ?? ctx.cwd,
+			cwd: stepCwd,
 			cwdMode: inferSandboxCwdWritable({ tools: step.tools, sandbox }) ? "rw" : "ro",
 			tempDir: input.tempDir,
 			sessionDir: input.sessionDir,
@@ -720,6 +727,7 @@ async function runSingleStep(
 			statusPaths: [path.join(path.dirname(input.outputFile), "status.json"), eventsPath],
 			structuredOutput: input.structuredOutput,
 			piArgs: input.args,
+			packageRoots: projectLocalPackageResources?.packageRoots,
 			authMode: sandbox.auth,
 		};
 	};
@@ -749,10 +757,11 @@ async function runSingleStep(
 			inheritSkills: step.inheritSkills,
 			tools: step.tools,
 			extensions: step.extensions,
+			packageExtensions: projectLocalPackageResources?.extensions,
 			systemPrompt: step.systemPrompt,
 			systemPromptMode: step.systemPromptMode,
 			mcpDirectTools: step.mcpDirectTools,
-			cwd: step.cwd ?? ctx.cwd,
+			cwd: stepCwd,
 			promptFileStem: step.agent,
 			intercomSessionName: ctx.childIntercomTarget,
 			orchestratorIntercomTarget: ctx.orchestratorIntercomTarget,
@@ -764,11 +773,11 @@ async function runSingleStep(
 			parentRootRunId: ctx.nestedRoute?.rootRunId,
 			parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
 			structuredOutput: effectiveStructuredOutput,
-			sandbox: Boolean(step.sandbox ?? ctx.sandbox),
+			sandbox: closedSandboxRuntime,
 		});
 		const run = await runPiStreaming(
 			args,
-			step.cwd ?? ctx.cwd,
+			stepCwd,
 			ctx.outputFile,
 			env,
 			ctx.piPackageRoot,
@@ -911,10 +920,11 @@ async function runSingleStep(
 					inheritSkills: step.inheritSkills,
 					tools: step.tools,
 					extensions: step.extensions,
+					packageExtensions: projectLocalPackageResources?.extensions,
 					systemPrompt: step.systemPrompt,
 					systemPromptMode: step.systemPromptMode,
 					mcpDirectTools: step.mcpDirectTools,
-					cwd: step.cwd ?? ctx.cwd,
+					cwd: stepCwd,
 					promptFileStem: `${step.agent}-acceptance-finalization`,
 					intercomSessionName: ctx.childIntercomTarget,
 					orchestratorIntercomTarget: ctx.orchestratorIntercomTarget,
@@ -925,13 +935,13 @@ async function runSingleStep(
 					parentControlInbox: ctx.nestedRoute?.controlInbox,
 					parentRootRunId: ctx.nestedRoute?.rootRunId,
 					parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
-					sandbox: Boolean(step.sandbox ?? ctx.sandbox),
+					sandbox: closedSandboxRuntime,
 				});
 				ctx.onAttemptStart?.({ model: finalResult?.model ?? step.model, thinking: resolveEffectiveThinking(finalResult?.model ?? step.model, step.thinking) });
 				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;
 				const finalizationRun = await runPiStreaming(
 					args,
-					step.cwd ?? ctx.cwd,
+					stepCwd,
 					finalizationOutputFile,
 					env,
 					ctx.piPackageRoot,
@@ -960,7 +970,7 @@ async function runSingleStep(
 				const selfReviewLedger = await evaluateAcceptance({
 					acceptance: selfReviewAcceptance,
 					output: finalizationOutput,
-					cwd: step.cwd ?? ctx.cwd,
+					cwd: stepCwd,
 				});
 				authoritativeLedger = selfReviewLedger;
 				turns.push(createFinalizationTurn({ turn, prompt, rawOutput: finalizationOutput, ledger: selfReviewLedger }));

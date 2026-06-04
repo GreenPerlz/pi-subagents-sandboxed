@@ -31,6 +31,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		bashWrite?: boolean;
 		auth?: string;
 		fallback?: string;
+		packageDiscovery?: string;
 	} = {};
 
 	const settings = input.settings;
@@ -41,6 +42,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyBooleanOverride(resolved, "trustProject", settings.trustProject);
 		applyStringOverride(resolved, "auth", settings.auth);
 		applyStringOverride(resolved, "fallback", settings.fallback);
+		applyStringOverride(resolved, "packageDiscovery", settings.packageDiscovery);
 	}
 
 	const agent = input.agent?.sandbox;
@@ -52,6 +54,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyBooleanOverride(resolved, "bashWrite", agent.bashWrite);
 		applyStringOverride(resolved, "auth", agent.auth);
 		applyStringOverride(resolved, "fallback", agent.fallback);
+		applyStringOverride(resolved, "packageDiscovery", agent.packageDiscovery);
 	}
 
 	const run = input.run;
@@ -63,6 +66,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyBooleanOverride(resolved, "bashWrite", run.bashWrite);
 		applyStringOverride(resolved, "auth", run.auth);
 		applyStringOverride(resolved, "fallback", run.fallback);
+		applyStringOverride(resolved, "packageDiscovery", run.packageDiscovery);
 	}
 
 	const provider = normalizeString(resolved.provider);
@@ -76,5 +80,6 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		...(resolved.bashWrite !== undefined ? { bashWrite: resolved.bashWrite } : {}),
 		...(resolved.auth !== undefined ? { auth: resolved.auth } : {}),
 		...(resolved.fallback !== undefined ? { fallback: resolved.fallback } : {}),
+		...(resolved.packageDiscovery !== undefined ? { packageDiscovery: resolved.packageDiscovery } : {}),
 	};
 }

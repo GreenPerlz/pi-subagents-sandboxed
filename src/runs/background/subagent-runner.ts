@@ -1401,6 +1401,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const emittedControlEventKeys = new Set<string>();
 	const activeLongRunningSteps = new Set<number>();
 	const mutatingFailureStates = initialStatusSteps.map(() => createMutatingFailureState());
+	const mutatingFailureAttentionSteps = initialStatusSteps.map(() => false);
 	const pendingToolResults: Array<{ tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined> = initialStatusSteps.map(() => undefined);
 	const mutatingFailureWindowMs = 5 * 60_000;
 	const appendControlEvent = (event: ReturnType<typeof buildControlEvent>) => {
@@ -1431,6 +1432,26 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		statusPayload.currentTool = activeStep?.currentTool;
 		statusPayload.currentToolStartedAt = activeStep?.currentToolStartedAt;
 		statusPayload.currentPath = activeStep?.currentPath;
+	};
+	const nextTopLevelActivityState = (): ActivityState | undefined => statusPayload.steps.some((step) => step.activityState === "needs_attention")
+		? "needs_attention"
+		: statusPayload.steps.some((step) => step.activityState === "active_long_running")
+			? "active_long_running"
+			: undefined;
+	const syncTopLevelActivityState = (): boolean => {
+		const nextRunState = nextTopLevelActivityState();
+		if (nextRunState === statusPayload.activityState) return false;
+		currentActivityState = nextRunState;
+		statusPayload.activityState = nextRunState;
+		return true;
+	};
+	const clearMutatingFailureAttentionAfterActivity = (flatIndex: number): boolean => {
+		if (!mutatingFailureAttentionSteps[flatIndex]) return false;
+		mutatingFailureAttentionSteps[flatIndex] = false;
+		const step = statusPayload.steps[flatIndex];
+		if (!step || step.activityState !== "needs_attention") return false;
+		step.activityState = undefined;
+		return true;
 	};
 	const maybeEmitActiveLongRunning = (flatIndex: number, now: number): boolean => {
 		if (!controlConfig.enabled || activeLongRunningSteps.has(flatIndex)) return false;
@@ -1481,6 +1502,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		if (!step) return;
 		const now = Date.now();
 		statusPayload.currentStep = flatIndex;
+		let activityStateChanged = clearMutatingFailureAttentionAfterActivity(flatIndex);
 		if (event.type === "tool_execution_start" && event.toolName) {
 			const mutates = isMutatingTool(event.toolName, event.args);
 			const currentPath = resolveCurrentPath(event.toolName, event.args);
@@ -1518,6 +1540,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				if (controlConfig.enabled && shouldEscalateMutatingFailures(state, controlConfig.failedToolAttemptsBeforeAttention) && step.activityState !== "needs_attention") {
 					const previous = step.activityState;
 					step.activityState = "needs_attention";
+					mutatingFailureAttentionSteps[flatIndex] = true;
 					statusPayload.activityState = "needs_attention";
 					appendControlEvent(buildControlEvent({
 						type: "needs_attention",
@@ -1561,7 +1584,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		step.lastActivityAt = now;
 		statusPayload.lastActivityAt = now;
 		statusPayload.lastUpdate = now;
-		maybeEmitActiveLongRunning(flatIndex, now);
+		if (maybeEmitActiveLongRunning(flatIndex, now)) {
+			activityStateChanged = true;
+		}
+		if (activityStateChanged) syncTopLevelActivityState();
 		writeStatusPayload();
 	};
 	const updateRunnerActivityState = (now: number): boolean => {
@@ -1599,7 +1625,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					changed = true;
 				}
 			} else {
-				if (step.activityState === "needs_attention") {
+				if (step.activityState === "needs_attention" && !mutatingFailureAttentionSteps[index]) {
 					step.activityState = undefined;
 					changed = true;
 				}
@@ -1612,14 +1638,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.lastActivityAt = runLastActivityAt;
 			changed = true;
 		}
-		const nextRunState = statusPayload.steps.some((step) => step.activityState === "needs_attention")
-			? "needs_attention"
-			: statusPayload.steps.some((step) => step.activityState === "active_long_running")
-				? "active_long_running"
-				: undefined;
-		if (nextRunState !== statusPayload.activityState) {
-			currentActivityState = nextRunState;
-			statusPayload.activityState = nextRunState;
+		if (syncTopLevelActivityState()) {
 			changed = true;
 		}
 		statusPayload.lastUpdate = now;
@@ -1781,6 +1800,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				config.childIntercomTargets = statusPayload.steps.map((statusStep, index) => resolveSubagentIntercomTarget(id, statusStep.agent, index));
 			}
 			mutatingFailureStates.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => createMutatingFailureState()));
+			mutatingFailureAttentionSteps.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => false));
 			pendingToolResults.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => undefined));
 			const materializedDelta = dynamicStatusSteps.length - 1;
 			for (const group of statusPayload.parallelGroups) {
@@ -1841,6 +1861,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.steps[fi].status = "running";
 				statusPayload.steps[fi].error = undefined;
 				statusPayload.steps[fi].activityState = undefined;
+				mutatingFailureAttentionSteps[fi] = false;
 				resetStepLiveDetail(statusPayload.steps[fi]);
 				statusPayload.steps[fi].startedAt = taskStartTime;
 				statusPayload.steps[fi].lastActivityAt = taskStartTime;
@@ -2075,6 +2096,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].status = "running";
 						statusPayload.steps[fi].error = undefined;
 						statusPayload.steps[fi].activityState = undefined;
+						mutatingFailureAttentionSteps[fi] = false;
 						resetStepLiveDetail(statusPayload.steps[fi]);
 						statusPayload.steps[fi].startedAt = taskStartTime;
 						statusPayload.steps[fi].endedAt = undefined;
@@ -2245,6 +2267,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.currentStep = flatIndex;
 			statusPayload.steps[flatIndex].status = "running";
 			statusPayload.steps[flatIndex].activityState = undefined;
+			mutatingFailureAttentionSteps[flatIndex] = false;
 			statusPayload.activityState = undefined;
 			resetStepLiveDetail(statusPayload.steps[flatIndex]);
 			statusPayload.steps[flatIndex].skills = seqStep.skills;

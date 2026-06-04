@@ -1617,7 +1617,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			: statusPayload.steps.some((step) => step.activityState === "active_long_running")
 				? "active_long_running"
 				: undefined;
-		if (nextRunState !== currentActivityState) {
+		if (nextRunState !== statusPayload.activityState) {
 			currentActivityState = nextRunState;
 			statusPayload.activityState = nextRunState;
 			changed = true;

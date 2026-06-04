@@ -2220,6 +2220,89 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("background runs latch mutating-failure attention after idle needs_attention overlap", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" })] },
+				{ delay: 3_500 },
+				{ jsonl: [events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ delay: 5_000, jsonl: [events.assistantMessage("I am still here.")] },
+			],
+		});
+
+		const id = `async-tool-failure-idle-overlap-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Implement the approved fixes",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: {
+				enabled: true,
+				needsAttentionAfterMs: 1_500,
+				activeNoticeAfterTurns: 999_999,
+				activeNoticeAfterMs: 999_999,
+				activeNoticeAfterTokens: 999_999,
+				failedToolAttemptsBeforeAttention: 3,
+				notifyOn: ["active_long_running", "needs_attention"],
+				notifyChannels: ["event", "async", "intercom"],
+			},
+		});
+
+		const statusPath = path.join(asyncDir, "status.json");
+		const outputPath = path.join(asyncDir, "output-0.log");
+		const failureCount = (): number => fs.existsSync(outputPath)
+			? (fs.readFileSync(outputPath, "utf-8").match(/No exact match found/g) ?? []).length
+			: 0;
+		const deadline = Date.now() + 12_000;
+		let sawIdleNeedsAttentionBeforeEscalation = false;
+
+		while (Date.now() < deadline) {
+			if (fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (failureCount() < 3 && status.activityState === "needs_attention" && status.steps?.[0]?.activityState === "needs_attention") {
+					sawIdleNeedsAttentionBeforeEscalation = true;
+					break;
+				}
+			}
+			if (fs.existsSync(resultPath)) {
+				assert.fail("run completed before idle needs_attention overlapped mutating-failure escalation");
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		assert.ok(sawIdleNeedsAttentionBeforeEscalation, "expected idle needs_attention before the third mutating failure");
+
+		while (Date.now() < deadline && failureCount() < 3) {
+			if (fs.existsSync(resultPath)) {
+				assert.fail("run completed before the third mutating failure was observed");
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		assert.equal(failureCount(), 3, "expected the third mutating failure to reach the attention threshold");
+
+		await new Promise((resolve) => setTimeout(resolve, 1_200));
+		assert.equal(fs.existsSync(resultPath), false, "expected run to still be running before resumed activity");
+		const statusAfterIdleTimer = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		assert.equal(statusAfterIdleTimer.state, "running");
+		assert.equal(statusAfterIdleTimer.activityState, "needs_attention");
+		assert.equal(statusAfterIdleTimer.steps?.[0]?.activityState, "needs_attention");
+
+		const resultDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > resultDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
 	it("background runs clear needs_attention after resumed activity", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			steps: [

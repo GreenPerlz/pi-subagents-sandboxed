@@ -54,15 +54,17 @@ Do work
 		assert.equal(worker?.defaultContext, "fork");
 	});
 
-	it("loads packaged planner, worker, and oracle with fork defaultContext", () => {
+	it("loads packaged planner and oracle with fork defaultContext and worker with fresh defaultContext", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-default-context-"));
 		tempDirs.push(dir);
 		const agents = discoverAgentsAll(dir).builtin;
 
-		for (const name of ["planner", "worker", "oracle"]) {
+		for (const name of ["planner", "oracle"]) {
 			const agent = agents.find((candidate) => candidate.name === name);
 			assert.equal(agent?.defaultContext, "fork", `${name} should default to fork context`);
 		}
+		const worker = agents.find((candidate) => candidate.name === "worker");
+		assert.equal(worker?.defaultContext, "fresh", "worker should default to fresh context");
 	});
 });
 

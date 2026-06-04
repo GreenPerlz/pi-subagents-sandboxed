@@ -58,6 +58,7 @@ import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
+import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
@@ -181,6 +182,7 @@ async function runSingleAttempt(
 		? resolveProjectLocalPiPackageResources(childCwd)
 		: undefined;
 	const closedSandboxRuntime = Boolean(options.sandbox && options.sandbox.packageDiscovery !== "ambient");
+	const sandboxIntercomBridgeApplies = shared.systemPrompt.includes(INTERCOM_BRIDGE_MARKER);
 	const { args, env: sharedEnv, tempDir } = buildPiArgs({
 		baseArgs: ["--mode", "json", "-p"],
 		task,
@@ -210,6 +212,7 @@ async function runSingleAttempt(
 		parentCapabilityToken: options.nestedRoute?.capabilityToken,
 		structuredOutput: options.structuredOutput,
 		sandbox: closedSandboxRuntime,
+		sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.extensionDir : undefined,
 	});
 
 	const result: SingleResult = {
@@ -297,6 +300,7 @@ async function runSingleAttempt(
 				packageRoots: projectLocalPackageResources?.packageRoots,
 				extraReadOnlyMounts: options.sandbox.extraReadOnlyMounts,
 				extraWritableMounts: options.sandbox.extraWritableMounts,
+				intercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
 			});
 			const wrapped = provider.wrapInvocation({
 				config: options.sandbox,

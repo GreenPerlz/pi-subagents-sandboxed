@@ -25,6 +25,7 @@ import {
 	type ModelAttempt,
 	type NestedRouteInfo,
 	type ResolvedControlConfig,
+	type SandboxIntercomBridge,
 	type SubagentRunMode,
 	type TokenUsage,
 	type Usage,
@@ -57,6 +58,7 @@ import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/c
 import { createStructuredOutputRuntime, readStructuredOutput } from "../shared/structured-output.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
 import { nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
+import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
@@ -128,6 +130,7 @@ interface SubagentRunConfig {
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 	sandbox?: ResolvedSandboxConfig;
 	progressPaths?: string[];
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 }
 
 interface StepResult {
@@ -692,6 +695,7 @@ interface SingleStepContext {
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
 	progressPaths?: string[];
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 	onAttemptStart?: (attempt: { model?: string; thinking?: string }) => void;
 	onChildEvent?: (event: ChildEvent) => void;
 }
@@ -757,6 +761,7 @@ async function runSingleStep(
 		? resolveProjectLocalPiPackageResources(stepCwd)
 		: undefined;
 	const closedSandboxRuntime = Boolean(effectiveSandbox && effectiveSandbox.packageDiscovery !== "ambient");
+	const sandboxIntercomBridgeApplies = step.systemPrompt.includes(INTERCOM_BRIDGE_MARKER);
 	const buildSandboxInput = (input: { args: string[]; tempDir?: string; sessionDir?: string; sessionFile?: string; outputFile: string; structuredOutput?: { schemaPath?: string; outputPath?: string } }): RunPiStreamingSandboxInput | undefined => {
 		const sandbox = effectiveSandbox;
 		if (!sandbox) return undefined;
@@ -776,6 +781,7 @@ async function runSingleStep(
 			piArgs: input.args,
 			packageRoots: projectLocalPackageResources?.packageRoots,
 			authMode: sandbox.auth,
+			intercomStateDir: sandbox.packageDiscovery !== "ambient" && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.stateDir : undefined,
 		};
 	};
 	let finalResult: RunPiStreamingResult | undefined;
@@ -821,6 +827,7 @@ async function runSingleStep(
 			parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
 			structuredOutput: effectiveStructuredOutput,
 			sandbox: closedSandboxRuntime,
+			sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.extensionDir : undefined,
 		});
 		const run = await runPiStreaming(
 			args,
@@ -1886,6 +1893,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					nestedRoute: config.nestedRoute,
 					sandbox: config.sandbox,
 					progressPaths: config.progressPaths,
+					sandboxIntercomBridge: config.sandboxIntercomBridge,
 					registerInterrupt: (interrupt) => {
 						activeChildInterrupt = interrupt;
 					},
@@ -2132,6 +2140,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							nestedRoute: config.nestedRoute,
 							sandbox: config.sandbox,
 							progressPaths: config.progressPaths,
+							sandboxIntercomBridge: config.sandboxIntercomBridge,
 							registerInterrupt: (interrupt) => {
 								activeChildInterrupt = interrupt;
 							},
@@ -2302,6 +2311,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				nestedRoute: config.nestedRoute,
 				sandbox: config.sandbox,
 				progressPaths: config.progressPaths,
+				sandboxIntercomBridge: config.sandboxIntercomBridge,
 				registerInterrupt: (interrupt) => {
 					activeChildInterrupt = interrupt;
 				},

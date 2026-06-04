@@ -200,4 +200,45 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, authPath), "ro");
 		assert.equal(mountMode(mounts, settingsPath), undefined);
 	});
+
+	it("mounts intercom extension package dir read-only without mounting broad node_modules", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const intercomExtDir = mkdirp(path.join(root, "agent", "npm", "node_modules", "pi-intercom"));
+		writeFile(path.join(intercomExtDir, "package.json"), JSON.stringify({ name: "pi-intercom" }));
+		writeFile(path.join(intercomExtDir, "index.ts"), "export default {}" );
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			piArgs: ["--extension", intercomExtDir],
+		});
+
+		assert.equal(mountMode(mounts, intercomExtDir), "ro");
+		assert.equal(mountMode(mounts, path.join(root, "agent", "npm", "node_modules")), undefined);
+	});
+
+	it("mounts intercom state dir writable when intercomStateDir is provided", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const intercomStateDir = path.join(root, "agent", "intercom");
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			intercomStateDir,
+		});
+
+		assert.equal(mountMode(mounts, intercomStateDir), "rw");
+		assert.equal(fs.existsSync(intercomStateDir), true, "writable intercom state dir should be created before bwrap binds it");
+	});
+
+	it("does not mount intercom state dir when intercomStateDir is not provided", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const agentDir = mkdirp(path.join(root, "agent"));
+		const intercomStateDir = path.join(agentDir, "intercom");
+
+		const mounts = buildSubagentSandboxMounts({ cwd });
+
+		assert.equal(mountMode(mounts, intercomStateDir), undefined);
+	});
 });

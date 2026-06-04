@@ -56,6 +56,7 @@ import {
 	type IntercomEventBus,
 	type NestedRouteInfo,
 	type ResolvedControlConfig,
+	type SandboxIntercomBridge,
 	type SingleResult,
 	MAX_CONCURRENCY,
 	resolveChildMaxSubagentDepth,
@@ -140,6 +141,7 @@ interface ParallelChainRunInput {
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
 	sandboxes?: (ResolvedSandboxConfig | undefined)[];
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 	progressPaths?: string[];
 }
 
@@ -296,6 +298,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
 				sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox,
+				sandboxIntercomBridge: input.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? input.progressPaths : undefined,
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
@@ -402,6 +405,7 @@ interface ChainExecutionParams {
 	sandbox?: ResolvedSandboxConfig;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 }
 
 interface ChainExecutionResult {
@@ -695,6 +699,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					maxSubagentDepth: params.maxSubagentDepth,
 					sandbox: params.sandbox,
 					sandboxes: stepSandboxes,
+					sandboxIntercomBridge: params.sandboxIntercomBridge,
 					progressPaths: [path.join(chainDir, "progress.md")],
 				});
 				globalTaskIndex += step.parallel.length;
@@ -891,6 +896,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				maxSubagentDepth: params.maxSubagentDepth,
 				sandbox: params.sandbox,
 				sandboxes: dynamicParallelStep.parallel.map(() => dynamicSandbox),
+				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				progressPaths: [path.join(chainDir, "progress.md")],
 			});
 			globalTaskIndex += dynamicParallelStep.parallel.length;
@@ -1075,6 +1081,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				acceptance: seqStep.acceptance,
 				acceptanceContext: { mode: "chain" },
 				sandbox: stepSandbox,
+				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? [path.join(chainDir, "progress.md")] : undefined,
 				onUpdate: onUpdate
 					? (p) => {

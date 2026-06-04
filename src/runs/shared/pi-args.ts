@@ -69,6 +69,13 @@ interface BuildPiArgsInput {
 	 * This prevents ambient package discovery (e.g. npm root -g) inside sandboxes.
 	 */
 	sandbox?: boolean;
+	/**
+	 * Absolute path to the pi-intercom extension package directory.
+	 * When set and sandbox is true, this is added as an explicit --extension arg
+	 * so the intercom extension is loaded even in closed sandbox mode.
+	 * Only effective when sandbox is true; ignored otherwise.
+	 */
+	sandboxIntercomExtensionDir?: string;
 }
 
 interface BuildPiArgsResult {
@@ -130,7 +137,8 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	if (useExplicitExtensions) {
 		args.push("--no-extensions");
 	}
-	for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.packageExtensions ?? []), ...(input.extensions ?? [])])]) {
+	const sandboxIntercomExtension = input.sandbox && input.sandboxIntercomExtensionDir ? [input.sandboxIntercomExtensionDir] : [];
+	for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.packageExtensions ?? []), ...(input.extensions ?? []), ...sandboxIntercomExtension])]) {
 		args.push("--extension", extPath);
 	}
 

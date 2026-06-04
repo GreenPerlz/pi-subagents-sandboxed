@@ -12,6 +12,7 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
 import {
@@ -257,6 +258,51 @@ process.exit(child.status ?? 0);
 		};
 	}
 
+	function installFakeBwrapWithJsonl(jsonl: unknown[]): { recordDir: string; restore: () => void } {
+		const rootDir = fs.mkdtempSync(path.join(tempDir, "fake-bwrap-jsonl-"));
+		const binDir = path.join(rootDir, "bin");
+		const recordDir = path.join(rootDir, "records");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.mkdirSync(recordDir, { recursive: true });
+		const scriptPath = path.join(binDir, "fake-bwrap-jsonl.mjs");
+		fs.writeFileSync(scriptPath, `
+import fs from "node:fs";
+import path from "node:path";
+
+const args = process.argv.slice(2);
+const recordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+if (!recordDir) {
+  console.error("FAKE_BWRAP_RECORD_DIR is required");
+  process.exit(97);
+}
+fs.mkdirSync(recordDir, { recursive: true });
+fs.writeFileSync(
+  path.join(recordDir, \`call-\${Date.now()}-\${process.pid}.json\`),
+  JSON.stringify({ args, cwd: process.cwd() }),
+  "utf-8",
+);
+const jsonl = ${JSON.stringify(jsonl)};
+for (const event of jsonl) console.log(JSON.stringify(event));
+process.exit(0);
+`, "utf-8");
+		const bwrapPath = path.join(binDir, "bwrap");
+		fs.writeFileSync(bwrapPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`, "utf-8");
+		fs.chmodSync(bwrapPath, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRecordDir = process.env.FAKE_BWRAP_RECORD_DIR;
+		process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+		process.env.FAKE_BWRAP_RECORD_DIR = recordDir;
+		return {
+			recordDir,
+			restore() {
+				if (previousPath === undefined) delete process.env.PATH;
+				else process.env.PATH = previousPath;
+				if (previousRecordDir === undefined) delete process.env.FAKE_BWRAP_RECORD_DIR;
+				else process.env.FAKE_BWRAP_RECORD_DIR = previousRecordDir;
+			},
+		};
+	}
+
 	function installFailingFakeBwrap(stderr: string, exitCode: number): { recordDir: string; restore: () => void } {
 		const rootDir = fs.mkdtempSync(path.join(tempDir, "fake-bwrap-"));
 		const binDir = path.join(rootDir, "bin");
@@ -328,11 +374,18 @@ process.exit(${exitCode});
 		);
 	}
 
-	function makeExecutor(agents = [makeAgent("echo")]) {
+	function makeExecutor(
+		agents = [makeAgent("echo")],
+		overrides: {
+			config?: Record<string, unknown>;
+			getSessionName?: () => string | undefined;
+			events?: ReturnType<typeof createEventBus>;
+		} = {},
+	) {
 		return createSubagentExecutor!({
-			pi: { events: createEventBus(), getSessionName: () => undefined },
+			pi: { events: overrides.events ?? createEventBus(), getSessionName: overrides.getSessionName ?? (() => undefined) },
 			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
-			config: {},
+			config: overrides.config ?? {},
 			asyncByDefault: false,
 			tempArtifactsDir: tempDir,
 			getSubagentSessionRoot: () => tempDir,
@@ -1321,6 +1374,183 @@ process.exit(${exitCode});
 			fakeBwrap.restore();
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
+	it("auto-loads pi-intercom for active intercom bridge in closed sandbox without manual extensions", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-active-agent-"));
+		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		const intercomStateDir = path.join(agentDir, "intercom");
+		const settingsPath = path.join(agentDir, "settings.json");
+		fs.mkdirSync(intercomExtensionDir, { recursive: true });
+		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
+		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		fs.writeFileSync(settingsPath, JSON.stringify({ packages: ["npm:some-ambient-package"] }), "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const fakeBwrap = installFakeBwrapWithJsonl([
+			events.toolStart("contact_supervisor", { reason: "progress_update", message: "UPDATE: sandboxed child started" }),
+			events.toolEnd("contact_supervisor"),
+			events.toolStart("contact_supervisor", { reason: "need_decision", message: "Approve continuing?" }),
+			events.toolEnd("contact_supervisor"),
+			events.assistantMessage("continued after supervisor reply"),
+		]);
+		const seenSupervisorReasons: string[] = [];
+		try {
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false })]);
+			const result = await executor.execute(
+				"single-active-bridge-sandbox",
+				{ agent: "bridge", task: "Use supervisor bridge", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				(update) => {
+					const argPreview = update.details?.progress?.[0]?.currentToolArgs ?? "";
+					const reason = argPreview.match(/reason[=:]\s*['\"]?([a-z_]+)/)?.[1];
+					if (reason) seenSupervisorReasons.push(reason);
+				},
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /continued after supervisor reply/);
+			assert.ok(seenSupervisorReasons.includes("progress_update"), "progress_update contact_supervisor call should flow through child progress events");
+			assert.ok(seenSupervisorReasons.includes("need_decision"), "need_decision contact_supervisor call should flow through child progress events before child continues");
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const separatorIndex = bwrapArgs.indexOf("--");
+			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
+			const piArgs = bwrapArgs.slice(separatorIndex + 3);
+			assert.ok(piArgs.includes("--no-extensions"), "closed sandbox should keep ambient extension discovery disabled");
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,intercom,contact_supervisor"]);
+			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
+			assert.ok(extensionArgs.includes(intercomExtensionDir), "active bridge should pass pi-intercom as an explicit extension");
+			assertMountMode(bwrapArgs, intercomExtensionDir, "ro");
+			assertMountMode(bwrapArgs, intercomStateDir, "rw");
+			assertNotMounted(bwrapArgs, settingsPath);
+			assertNotMounted(bwrapArgs, agentDir);
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not load or mount pi-intercom for inactive bridge sandbox runs", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-inactive-agent-"));
+		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		const intercomStateDir = path.join(agentDir, "intercom");
+		fs.mkdirSync(intercomExtensionDir, { recursive: true });
+		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
+		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const fakeBwrap = installFakeBwrapWithJsonl([events.assistantMessage("inactive bridge ok")]);
+		try {
+			const executor = makeExecutor([makeAgent("quiet", { tools: ["read"], completionGuard: false })], { config: { intercomBridge: { mode: "off" } } });
+			const result = await executor.execute(
+				"single-inactive-bridge-sandbox",
+				{ agent: "quiet", task: "Do not use intercom", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /inactive bridge ok/);
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const separatorIndex = bwrapArgs.indexOf("--");
+			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
+			const piArgs = bwrapArgs.slice(separatorIndex + 3);
+			assert.ok(piArgs.includes("--no-extensions"), "sandboxing alone should not re-enable ambient extension discovery");
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read"]);
+			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
+			assert.equal(extensionArgs.includes(intercomExtensionDir), false, "inactive bridge should not pass pi-intercom as an explicit extension");
+			assertNotMounted(bwrapArgs, intercomExtensionDir);
+			assertNotMounted(bwrapArgs, intercomStateDir);
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("auto-loads pi-intercom for agent-level sandboxed chain steps", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-agent-sandbox-chain-"));
+		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		const intercomStateDir = path.join(agentDir, "intercom");
+		fs.mkdirSync(intercomExtensionDir, { recursive: true });
+		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
+		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const fakeBwrap = installFakeBwrapWithJsonl([events.assistantMessage("agent sandbox chain ok")]);
+		try {
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false, sandbox: { provider: "bubblewrap" } })]);
+			const result = await executor.execute(
+				"chain-agent-level-bridge-sandbox",
+				{ chain: [{ agent: "bridge", task: "Use supervisor bridge" }], clarify: false },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const separatorIndex = bwrapArgs.indexOf("--");
+			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
+			const piArgs = bwrapArgs.slice(separatorIndex + 3);
+			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
+			assert.ok(extensionArgs.includes(intercomExtensionDir), "agent-level sandboxed chain step should pass pi-intercom as an explicit extension");
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,intercom,contact_supervisor"]);
+			assertMountMode(bwrapArgs, intercomExtensionDir, "ro");
+			assertMountMode(bwrapArgs, intercomStateDir, "rw");
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("honors explicit extension allowlists that exclude pi-intercom in sandboxed active bridge runs", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-excluded-agent-"));
+		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		const intercomStateDir = path.join(agentDir, "intercom");
+		const otherExtension = path.join(agentDir, "extensions", "other.ts");
+		fs.mkdirSync(intercomExtensionDir, { recursive: true });
+		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
+		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		fs.writeFileSync(otherExtension, "export default function register() {}\n", "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const fakeBwrap = installFakeBwrapWithJsonl([events.assistantMessage("extension allowlist ok")]);
+		try {
+			const executor = makeExecutor([makeAgent("limited", { tools: ["read"], extensions: [otherExtension], completionGuard: false })]);
+			const result = await executor.execute(
+				"single-active-bridge-extension-allowlist",
+				{ agent: "limited", task: "Do not load bridge extension", sandbox: { provider: "bubblewrap" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /extension allowlist ok/);
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const separatorIndex = bwrapArgs.indexOf("--");
+			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
+			const piArgs = bwrapArgs.slice(separatorIndex + 3);
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read"]);
+			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
+			assert.ok(extensionArgs.includes(otherExtension), "explicit non-intercom extension should still load");
+			assert.equal(extensionArgs.includes(intercomExtensionDir), false, "excluded bridge should not pass pi-intercom as an explicit extension");
+			assertNotMounted(bwrapArgs, intercomExtensionDir);
+			assertNotMounted(bwrapArgs, intercomStateDir);
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
 

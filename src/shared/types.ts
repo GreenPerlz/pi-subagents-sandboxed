@@ -779,6 +779,11 @@ export const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom
 // Execution Options
 // ============================================================================
 
+export interface SandboxIntercomBridge {
+	extensionDir: string;
+	stateDir: string;
+}
+
 export interface RunSyncOptions {
 	cwd?: string;
 	signal?: AbortSignal;
@@ -826,6 +831,8 @@ export interface RunSyncOptions {
 	sandbox?: ResolvedSandboxConfig;
 	/** Progress files the child is instructed to update; parent dirs are mounted writable when sandboxed. */
 	progressPaths?: string[];
+	/** Intercom bridge state for sandboxed children. When set and sandbox is active, the intercom extension is loaded and state mounted. */
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 }
 
 export type IntercomBridgeMode = "off" | "fork-only" | "always";

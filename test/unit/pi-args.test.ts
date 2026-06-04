@@ -692,4 +692,38 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.ok(extensionArgs.includes("./agent-allowed-ext.ts"));
 		assert.equal(env[SUBAGENT_FANOUT_CHILD_ENV], "1");
 	});
+
+	it("includes sandbox intercom extension dir as --extension in sandboxed closed mode", () => {
+		const intercomExtDir = "/home/user/.pi/agent/npm/node_modules/pi-intercom";
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			sandbox: true,
+			sandboxIntercomExtensionDir: intercomExtDir,
+		});
+
+		assert.ok(args.includes("--no-extensions"));
+		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
+		assert.ok(extensionArgs.includes(intercomExtDir), "should include intercom extension dir");
+	});
+
+	it("does not include intercom extension dir when sandbox is false", () => {
+		const intercomExtDir = "/home/user/.pi/agent/npm/node_modules/pi-intercom";
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			sandbox: false,
+			sandboxIntercomExtensionDir: intercomExtDir,
+		});
+
+		assert.ok(!args.includes("--no-extensions"));
+		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
+		assert.ok(!extensionArgs.includes(intercomExtDir), "should not include intercom extension dir in non-sandbox mode");
+	});
 });

@@ -34,6 +34,7 @@ import {
 	type MaxOutputConfig,
 	type NestedRouteInfo,
 	type ResolvedControlConfig,
+	type SandboxIntercomBridge,
 	type SubagentRunMode,
 	ASYNC_DIR,
 	RESULTS_DIR,
@@ -127,6 +128,7 @@ interface AsyncChainParams {
 	sandbox?: ResolvedSandboxConfig;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 }
 
 interface AsyncSingleParams {
@@ -157,6 +159,7 @@ interface AsyncSingleParams {
 	sandbox?: ResolvedSandboxConfig;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 }
 
 interface AsyncExecutionResult {
@@ -520,6 +523,7 @@ export function executeAsyncChain(
 				workflowGraph,
 				sandbox: sharedSandbox,
 				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
+				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
@@ -762,6 +766,7 @@ export function executeAsyncSingle(
 				childIntercomTargets: childIntercomTarget ? [childIntercomTarget(agent, 0)] : undefined,
 				resultMode: "single",
 				sandbox,
+				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,

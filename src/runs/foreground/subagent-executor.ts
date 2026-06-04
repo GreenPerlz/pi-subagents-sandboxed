@@ -40,7 +40,7 @@ import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd } from "../../shared/utils.ts";
+import { compactForegroundDetails, getAgentDir, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd } from "../../shared/utils.ts";
 import {
 	attachNestedChildrenToResultChildren,
 	buildSubagentResultIntercomPayload,
@@ -80,6 +80,7 @@ import {
 	type NestedRouteInfo,
 	type NestedRunSummary,
 	type ResolvedControlConfig,
+	type SandboxIntercomBridge,
 	type SingleResult,
 	type SubagentRunMode,
 	type SubagentState,
@@ -385,6 +386,14 @@ function getAsyncInterruptTarget(state: SubagentState, runId: string | undefined
 		}
 	}
 	return newest ? { asyncId: newest.asyncId, asyncDir: newest.asyncDir } : undefined;
+}
+
+function resolveSandboxIntercomBridge(intercomBridge: IntercomBridgeState): SandboxIntercomBridge | undefined {
+	if (!intercomBridge.active) return undefined;
+	return {
+		extensionDir: intercomBridge.extensionDir,
+		stateDir: path.join(getAgentDir(), "intercom"),
+	};
 }
 
 function emitControlNotification(input: {
@@ -1139,6 +1148,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		settings: sandboxSettings,
 		run: params.sandbox,
 	});
+	const sandboxIntercomBridge = resolveSandboxIntercomBridge(intercomBridge);
 
 	if (hasTasks && params.tasks) {
 		const agentConfigs = params.tasks.map((task) => agents.find((agent) => agent.name === task.agent));
@@ -1186,6 +1196,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sandbox,
 			sandboxSettings,
 			sandboxRun: params.sandbox,
+			sandboxIntercomBridge,
 		});
 	}
 
@@ -1218,6 +1229,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sandbox,
 			sandboxSettings,
 			sandboxRun: params.sandbox,
+			sandboxIntercomBridge,
 		});
 	}
 
@@ -1268,6 +1280,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			nestedRoute,
 			acceptance: params.acceptance,
 			sandbox: singleSandbox,
+			sandboxIntercomBridge: resolveSandboxIntercomBridge(intercomBridge),
 		});
 	}
 
@@ -1303,6 +1316,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		settings: sandboxSettings,
 		run: params.sandbox,
 	});
+	const sandboxIntercomBridge = resolveSandboxIntercomBridge(data.intercomBridge);
 	const chainResult = await executeChain({
 		chain,
 		task: params.task,
@@ -1335,6 +1349,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		sandbox,
 		sandboxSettings,
 		sandboxRun: params.sandbox,
+		sandboxIntercomBridge,
 	});
 
 	if (chainResult.requestedAsync) {
@@ -1378,6 +1393,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			sandbox,
 			sandboxSettings,
 			sandboxRun: params.sandbox,
+			sandboxIntercomBridge,
 		});
 	}
 
@@ -1437,6 +1453,7 @@ interface ForegroundParallelRunInput {
 	worktreeSetup?: WorktreeSetup;
 	sandbox?: ResolvedSandboxConfig;
 	sandboxes?: (ResolvedSandboxConfig | undefined)[];
+	sandboxIntercomBridge?: SandboxIntercomBridge;
 	progressPaths?: string[];
 }
 
@@ -1599,6 +1616,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			acceptance: task.acceptance,
 			acceptanceContext: { mode: "parallel" },
 			sandbox: input.sandboxes?.[index] ?? input.sandbox,
+			sandboxIntercomBridge: input.sandboxIntercomBridge,
 			progressPaths: behavior?.progress ? input.progressPaths : undefined,
 			onUpdate: input.onUpdate
 				? (progressUpdate) => {
@@ -1698,6 +1716,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		settings: sandboxSettings,
 		run: params.sandbox,
 	});
+	const sandboxIntercomBridge = resolveSandboxIntercomBridge(data.intercomBridge);
 	const taskSandboxes = agentConfigs.map((agent) => resolveChildSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox }));
 	if (!params.worktree && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
 		return buildParallelModeError(sandboxParallelWorktreeRequiredMessage());
@@ -1824,6 +1843,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				sandbox,
 				sandboxSettings,
 				sandboxRun: params.sandbox,
+				sandboxIntercomBridge,
 			});
 		}
 	}
@@ -1901,6 +1921,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			worktreeSetup,
 			sandbox,
 			sandboxes: taskSandboxes,
+			sandboxIntercomBridge,
 			progressPaths,
 		});
 		for (let i = 0; i < results.length; i++) {
@@ -2101,6 +2122,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				controlIntercomTarget: data.intercomBridge.active ? data.intercomBridge.orchestratorTarget : undefined,
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
 				sandbox,
+				sandboxIntercomBridge: resolveSandboxIntercomBridge(data.intercomBridge),
 			});
 		}
 	}
@@ -2193,6 +2215,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		acceptance: params.acceptance,
 		acceptanceContext: { mode: "single" },
 		sandbox,
+		sandboxIntercomBridge: resolveSandboxIntercomBridge(data.intercomBridge),
 	});
 	if (foregroundControl?.currentIndex === 0) {
 		foregroundControl.interrupt = undefined;

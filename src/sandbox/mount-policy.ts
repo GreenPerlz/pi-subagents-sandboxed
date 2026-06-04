@@ -35,6 +35,8 @@ export interface SubagentSandboxMountInput {
 	extraReadOnlyMounts?: string[];
 	/** Explicit user-requested writable paths for caches, outputs, or work directories. */
 	extraWritableMounts?: string[];
+	/** Intercom state directory path (e.g. agentDir/intercom/). Mounted writable when the intercom bridge is active in a sandbox. */
+	intercomStateDir?: string;
 }
 
 function addSandboxMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, source: string | undefined, mode: SandboxMount["mode"]): void {
@@ -104,13 +106,28 @@ function addReadonlyRuntimePath(mounts: SandboxMount[], seen: Map<string, Sandbo
 	addSandboxMount(mounts, seen, filePath, "ro");
 }
 
+function addReadonlyExtensionRuntimePath(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, extensionPath: string | undefined): void {
+	if (!extensionPath || !path.isAbsolute(extensionPath)) return;
+	const resolvedExtensionPath = path.resolve(extensionPath);
+	if (existsSync(path.join(resolvedExtensionPath, "package.json"))) {
+		addSandboxMount(mounts, seen, resolvedExtensionPath, "ro");
+		return;
+	}
+	const packageRoot = nearestPackageRoot(extensionPath);
+	if (packageRoot) {
+		addSandboxMount(mounts, seen, packageRoot, "ro");
+		return;
+	}
+	addReadonlyRuntimePath(mounts, seen, extensionPath);
+}
+
 function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, args: string[] | undefined): void {
 	if (!args) return;
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] !== "--extension") continue;
 		const extensionPath = args[i + 1];
 		if (!extensionPath || !path.isAbsolute(extensionPath)) continue;
-		addReadonlyRuntimePath(mounts, seen, extensionPath);
+		addReadonlyExtensionRuntimePath(mounts, seen, extensionPath);
 	}
 }
 
@@ -192,5 +209,10 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 	addSandboxAuthMounts(mounts, seen, input.authMode, input.agentDir);
 	addExplicitMounts(mounts, seen, input.extraReadOnlyMounts, "ro");
 	addExplicitMounts(mounts, seen, input.extraWritableMounts, "rw");
+	if (input.intercomStateDir) {
+		const resolved = path.resolve(input.intercomStateDir);
+		mkdirSync(resolved, { recursive: true });
+		addSandboxMount(mounts, seen, resolved, "rw");
+	}
 	return mounts;
 }

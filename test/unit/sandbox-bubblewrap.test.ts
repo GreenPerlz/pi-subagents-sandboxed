@@ -207,7 +207,7 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.equal(result.invocation.args.includes("/run/systemd/resolve"), false);
 	});
 
-	it("provides /dev so sandboxed child processes can open /dev/null", () => {
+	it("provides /proc and /dev so sandboxed child processes can launch tools and nested sandboxes", () => {
 		const result = availableProvider().wrapInvocation({
 			config: hostToolchainConfig,
 			invocation: {
@@ -219,9 +219,12 @@ describe("Bubblewrap sandbox provider", () => {
 		});
 
 		const args = result.invocation.args;
-		const idx = args.indexOf("/dev");
-		assert.ok(idx !== -1, "expected /dev to be provided via --dev");
-		assert.equal(args[idx - 1], "--dev");
+		const procIdx = args.indexOf("/proc");
+		assert.ok(procIdx !== -1, "expected /proc to be provided via --proc");
+		assert.equal(args[procIdx - 1], "--proc");
+		const devIdx = args.indexOf("/dev");
+		assert.ok(devIdx !== -1, "expected /dev to be provided via --dev");
+		assert.equal(args[devIdx - 1], "--dev");
 	});
 
 	it("does not mount /run/systemd/resolve when network is none", () => {

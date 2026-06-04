@@ -213,6 +213,7 @@ async function runSingleAttempt(
 		structuredOutput: options.structuredOutput,
 		sandbox: closedSandboxRuntime,
 		sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.extensionDir : undefined,
+		sandboxIntercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
 	});
 
 	const result: SingleResult = {
@@ -301,6 +302,7 @@ async function runSingleAttempt(
 				extraReadOnlyMounts: options.sandbox.extraReadOnlyMounts,
 				extraWritableMounts: options.sandbox.extraWritableMounts,
 				intercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
+				nestedRoute: options.nestedRoute,
 			});
 			const wrapped = provider.wrapInvocation({
 				config: options.sandbox,

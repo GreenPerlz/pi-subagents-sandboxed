@@ -217,7 +217,7 @@ spawn(wrapped.command, wrapped.args, { cwd: wrapped.cwd, env: wrapped.env });
 - Fresh child sessions work inside sandbox.
 - Forked child sessions work inside sandbox.
 - Parallel sandboxed writable tasks require `worktree: true`.
-- Read-only scout/reviewer agents with `bash` do not automatically get cwd write access.
+- Read-only researcher/reviewer agents with `bash` do not automatically get cwd write access.
 - Agents with `edit`/`write` get writable cwd/worktree as appropriate.
 - `sandboxBashWrite: true` allows bash-heavy workers to write.
 - Sandbox result output reports provider/profile/network/auth/fallback mode for diagnostics.

@@ -13,6 +13,7 @@ import {
 	resolveIntercomBridgeMode,
 	type IntercomBridgeState,
 } from "../../src/intercom/intercom-bridge.ts";
+import { buildPiArgs, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV } from "../../src/runs/shared/pi-args.ts";
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -331,6 +332,42 @@ describe("applyIntercomBridgeToAgent", () => {
 		assert.deepEqual(updated.tools, ["read", "bash", "intercom", "contact_supervisor"]);
 		assert.match(updated.systemPrompt, /Intercom orchestration channel:/);
 		assert.match(updated.systemPrompt, /contact_supervisor/);
+	});
+
+	it("propagates sandbox bridge env so nested sandboxed fanout agents receive intercom tools", () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-intercom-bridge-test-"));
+		const extensionDir = path.join(tempDir, "pi-intercom");
+		const stateDir = path.join(tempDir, "intercom-state");
+		fs.mkdirSync(extensionDir, { recursive: true });
+		try {
+			const { env } = buildPiArgs({
+				baseArgs: ["-p"],
+				task: "nested",
+				sessionEnabled: false,
+				inheritProjectContext: false,
+				inheritSkills: false,
+				sandbox: true,
+				sandboxIntercomExtensionDir: extensionDir,
+				sandboxIntercomStateDir: stateDir,
+			});
+			assert.equal(env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV], extensionDir);
+			assert.equal(env[SUBAGENT_INTERCOM_STATE_DIR_ENV], stateDir);
+
+			const bridge = resolveIntercomBridge({
+				config: { mode: "always" },
+				context: "fresh",
+				orchestratorTarget: "main",
+				extensionDir: env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV],
+				configPath: path.join(tempDir, "config.json"),
+			});
+			const updated = applyIntercomBridgeToAgent(makeAgent({ tools: ["read"] }), bridge);
+
+			assert.equal(bridge.active, true);
+			assert.deepEqual(updated.tools, ["read", "intercom", "contact_supervisor"]);
+			assert.match(updated.systemPrompt, /Intercom orchestration channel:/);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("is idempotent", () => {

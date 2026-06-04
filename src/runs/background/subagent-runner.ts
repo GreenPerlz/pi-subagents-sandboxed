@@ -782,6 +782,7 @@ async function runSingleStep(
 			packageRoots: projectLocalPackageResources?.packageRoots,
 			authMode: sandbox.auth,
 			intercomStateDir: sandbox.packageDiscovery !== "ambient" && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.stateDir : undefined,
+			nestedRoute: ctx.nestedRoute,
 		};
 	};
 	let finalResult: RunPiStreamingResult | undefined;
@@ -828,6 +829,7 @@ async function runSingleStep(
 			structuredOutput: effectiveStructuredOutput,
 			sandbox: closedSandboxRuntime,
 			sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.extensionDir : undefined,
+			sandboxIntercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.stateDir : undefined,
 		});
 		const run = await runPiStreaming(
 			args,

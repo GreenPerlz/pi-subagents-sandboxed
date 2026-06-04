@@ -52,6 +52,7 @@ import {
 } from "../../intercom/result-intercom.ts";
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../background/async-resume.ts";
 import { createNestedRoute, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV } from "../shared/pi-args.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { inspectSubagentStatus } from "../background/run-status.ts";
@@ -392,7 +393,7 @@ function resolveSandboxIntercomBridge(intercomBridge: IntercomBridgeState): Sand
 	if (!intercomBridge.active) return undefined;
 	return {
 		extensionDir: intercomBridge.extensionDir,
-		stateDir: path.join(getAgentDir(), "intercom"),
+		stateDir: process.env[SUBAGENT_INTERCOM_STATE_DIR_ENV] || path.join(getAgentDir(), "intercom"),
 	};
 }
 
@@ -646,6 +647,7 @@ async function resumeAsyncRun(input: {
 		context: input.params.context,
 		orchestratorTarget: sessionName,
 		cwd: effectiveCwd,
+		extensionDir: process.env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV],
 	});
 	const agents = intercomBridge.active
 		? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))
@@ -2472,6 +2474,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			context: effectiveParams.context,
 			orchestratorTarget: sessionName,
 			cwd: effectiveCwd,
+			extensionDir: process.env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV],
 		});
 		const agents = intercomBridge.active
 			? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))

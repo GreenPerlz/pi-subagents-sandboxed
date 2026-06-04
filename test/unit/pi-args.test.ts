@@ -6,6 +6,8 @@ import { afterEach, describe, it } from "node:test";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
+	SUBAGENT_INTERCOM_EXTENSION_DIR_ENV,
+	SUBAGENT_INTERCOM_STATE_DIR_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
 	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
 	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
@@ -693,9 +695,10 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.equal(env[SUBAGENT_FANOUT_CHILD_ENV], "1");
 	});
 
-	it("includes sandbox intercom extension dir as --extension in sandboxed closed mode", () => {
+	it("includes sandbox intercom extension dir as --extension and preserves intercom env for nested sandboxed children", () => {
 		const intercomExtDir = "/home/user/.pi/agent/npm/node_modules/pi-intercom";
-		const { args } = buildPiArgs({
+		const intercomStateDir = "/home/user/.pi/agent/intercom";
+		const { args, env } = buildPiArgs({
 			baseArgs: ["-p"],
 			task: "hello",
 			sessionEnabled: false,
@@ -703,11 +706,14 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			inheritSkills: false,
 			sandbox: true,
 			sandboxIntercomExtensionDir: intercomExtDir,
+			sandboxIntercomStateDir: intercomStateDir,
 		});
 
 		assert.ok(args.includes("--no-extensions"));
 		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
 		assert.ok(extensionArgs.includes(intercomExtDir), "should include intercom extension dir");
+		assert.equal(env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV], intercomExtDir);
+		assert.equal(env[SUBAGENT_INTERCOM_STATE_DIR_ENV], intercomStateDir);
 	});
 
 	it("does not include intercom extension dir when sandbox is false", () => {

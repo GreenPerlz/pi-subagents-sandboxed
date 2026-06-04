@@ -241,4 +241,20 @@ describe("subagent sandbox mount policy", () => {
 
 		assert.equal(mountMode(mounts, intercomStateDir), undefined);
 	});
+
+	it("mounts nested subagent event route root writable when nested routing is provided", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const routeRoot = mkdirp(path.join(root, "nested-subagent-events", "run-token"));
+		const eventSink = mkdirp(path.join(routeRoot, "events"));
+		const controlInbox = mkdirp(path.join(routeRoot, "controls"));
+		writeFile(path.join(routeRoot, "route.json"), "{}\n");
+
+		const mounts = buildSubagentSandboxMounts({
+			cwd,
+			nestedRoute: { eventSink, controlInbox },
+		});
+
+		assert.equal(mountMode(mounts, routeRoot), "rw");
+	});
 });

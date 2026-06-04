@@ -8,6 +8,11 @@ export interface StructuredOutputMountInput {
 	outputPath?: string;
 }
 
+export interface NestedRouteMountInput {
+	eventSink: string;
+	controlInbox: string;
+}
+
 export interface SubagentSandboxMountInput {
 	cwd: string;
 	tempDir?: string;
@@ -37,6 +42,8 @@ export interface SubagentSandboxMountInput {
 	extraWritableMounts?: string[];
 	/** Intercom state directory path (e.g. agentDir/intercom/). Mounted writable when the intercom bridge is active in a sandbox. */
 	intercomStateDir?: string;
+	/** Nested subagent event route. Mounted writable so sandboxed children can launch/report nested descendants. */
+	nestedRoute?: NestedRouteMountInput;
 }
 
 function addSandboxMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, source: string | undefined, mode: SandboxMount["mode"]): void {
@@ -71,6 +78,14 @@ function addSandboxSessionFileMount(mounts: SandboxMount[], seen: Map<string, Sa
 		return;
 	}
 	addSandboxMountParent(mounts, seen, resolved, "rw");
+}
+
+function addNestedRouteMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, route: NestedRouteMountInput | undefined): void {
+	if (!route) return;
+	const eventRoot = path.dirname(path.resolve(route.eventSink));
+	const controlRoot = path.dirname(path.resolve(route.controlInbox));
+	if (eventRoot !== controlRoot) return;
+	addSandboxMount(mounts, seen, eventRoot, "rw");
 }
 
 function nearestPackageRoot(filePath: string): string | undefined {
@@ -214,5 +229,6 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 		mkdirSync(resolved, { recursive: true });
 		addSandboxMount(mounts, seen, resolved, "rw");
 	}
+	addNestedRouteMount(mounts, seen, input.nestedRoute);
 	return mounts;
 }

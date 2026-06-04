@@ -25,6 +25,8 @@ export const SUBAGENT_PARENT_CHILD_INDEX_ENV = "PI_SUBAGENT_PARENT_CHILD_INDEX";
 export const SUBAGENT_PARENT_DEPTH_ENV = "PI_SUBAGENT_PARENT_DEPTH";
 export const SUBAGENT_PARENT_PATH_ENV = "PI_SUBAGENT_PARENT_PATH";
 export const SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV = "PI_SUBAGENT_PARENT_CAPABILITY_TOKEN";
+export const SUBAGENT_INTERCOM_EXTENSION_DIR_ENV = "PI_SUBAGENT_INTERCOM_EXTENSION_DIR";
+export const SUBAGENT_INTERCOM_STATE_DIR_ENV = "PI_SUBAGENT_INTERCOM_STATE_DIR";
 
 interface BuildPiArgsInput {
 	baseArgs: string[];
@@ -76,6 +78,8 @@ interface BuildPiArgsInput {
 	 * Only effective when sandbox is true; ignored otherwise.
 	 */
 	sandboxIntercomExtensionDir?: string;
+	/** Writable pi-intercom state directory passed through to nested sandboxed fanout children. */
+	sandboxIntercomStateDir?: string;
 }
 
 interface BuildPiArgsResult {
@@ -214,6 +218,12 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	}
 	if (input.orchestratorIntercomTarget) {
 		env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = input.orchestratorIntercomTarget;
+	}
+	if (input.sandbox && input.sandboxIntercomExtensionDir) {
+		env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV] = input.sandboxIntercomExtensionDir;
+	}
+	if (input.sandbox && input.sandboxIntercomStateDir) {
+		env[SUBAGENT_INTERCOM_STATE_DIR_ENV] = input.sandboxIntercomStateDir;
 	}
 	if (input.runId) {
 		env[SUBAGENT_RUN_ID_ENV] = input.runId;

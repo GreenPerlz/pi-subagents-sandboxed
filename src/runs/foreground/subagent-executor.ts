@@ -52,7 +52,7 @@ import {
 } from "../../intercom/result-intercom.ts";
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../background/async-resume.ts";
 import { createNestedRoute, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
-import { SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV } from "../shared/pi-args.ts";
+import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV, SUBAGENT_RUN_ID_ENV } from "../shared/pi-args.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { inspectSubagentStatus } from "../background/run-status.ts";
@@ -79,6 +79,7 @@ import {
 	type IntercomEventBus,
 	type MaxOutputConfig,
 	type NestedRouteInfo,
+	type NestedRunAddress,
 	type NestedRunSummary,
 	type ResolvedControlConfig,
 	type SandboxIntercomBridge,
@@ -786,6 +787,72 @@ async function maybeBuildForegroundIntercomReceipt(input: {
 
 function validationErrorResult(mode: Details["mode"], text: string): AgentToolResult<Details> {
 	return { content: [{ type: "text", text }], isError: true, details: { mode, results: [] } };
+}
+
+function isRalphNestedWorkerAgentName(agent: unknown): boolean {
+	return typeof agent === "string" && (agent === "worker" || agent.endsWith("-worker"));
+}
+
+function ralphNestedLaunchWorkerTargetCount(params: SubagentParamsLike): number {
+	let sawTarget = false;
+	let workerTargets = 0;
+	const visitAgent = (agent: unknown) => {
+		if (typeof agent !== "string") return;
+		sawTarget = true;
+		if (isRalphNestedWorkerAgentName(agent)) workerTargets += 1;
+	};
+
+	if ((params.chain?.length ?? 0) > 0) {
+		for (const step of params.chain ?? []) {
+			if (isParallelStep(step)) {
+				for (const task of step.parallel) visitAgent(task.agent);
+			} else if (isDynamicParallelStep(step)) {
+				visitAgent(step.parallel.agent);
+			} else {
+				visitAgent((step as SequentialStep).agent);
+			}
+		}
+	} else if ((params.tasks?.length ?? 0) > 0) {
+		for (const task of params.tasks ?? []) visitAgent(task.agent);
+	} else {
+		visitAgent(params.agent);
+	}
+
+	if (workerTargets > 0) return workerTargets;
+	return sawTarget ? 0 : 1;
+}
+
+function ralphNestedLaunchGuardResult(input: {
+	state: SubagentState;
+	mode: Details["mode"];
+	params: SubagentParamsLike;
+	inheritedNestedRoute?: NestedRouteInfo;
+	nestedParentAddress?: NestedRunAddress;
+}): AgentToolResult<Details> | null {
+	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "ralph-orchestrator") return null;
+	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return null;
+	const workerTargetCount = ralphNestedLaunchWorkerTargetCount(input.params);
+	if (workerTargetCount === 0) return null;
+	const parentStep = input.nestedParentAddress.parentStepIndex ?? "root";
+	const orchestratorRunId = process.env[SUBAGENT_RUN_ID_ENV] || input.nestedParentAddress.parentRunId;
+	if (workerTargetCount > 1) {
+		const message = `Ralph orchestrator nested worker guard blocked this subagent call: multiple nested worker targets (${workerTargetCount}) are not allowed in one ralph-orchestrator nested call (run ${orchestratorRunId}); launch exactly one worker target at most.`;
+		console.warn(message);
+		return validationErrorResult(input.mode, message);
+	}
+	const key = `${input.inheritedNestedRoute.rootRunId}:${orchestratorRunId}:${parentStep}`;
+	input.state.ralphOrchestratorNestedLaunchGuard ??= new Map();
+	const now = Date.now();
+	const entry = input.state.ralphOrchestratorNestedLaunchGuard.get(key);
+	if (entry) {
+		entry.attempts += 1;
+		entry.lastAttemptAt = now;
+		const message = `Ralph orchestrator nested worker guard blocked this subagent call: exactly one nested worker launch attempt is allowed per ralph-orchestrator run (run ${orchestratorRunId}); this is attempt ${entry.attempts}. Malformed attempts count toward this limit to prevent runaway retries.`;
+		console.warn(message);
+		return validationErrorResult(input.mode, message);
+	}
+	input.state.ralphOrchestratorNestedLaunchGuard.set(key, { attempts: 1, firstAttemptAt: now, lastAttemptAt: now });
+	return null;
 }
 
 function validateAcceptanceForExecution(params: SubagentParamsLike): AgentToolResult<Details> | null {
@@ -2491,6 +2558,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			&& effectiveParams.clarify === true
 			&& ctx.hasUI
 			&& !(effectiveParams.chain?.some(isParallelStep) ?? false);
+
+		const ralphGuardError = ralphNestedLaunchGuardResult({
+			state: deps.state,
+			mode: getRequestedModeLabel(effectiveParams),
+			params: effectiveParams,
+			inheritedNestedRoute,
+			nestedParentAddress,
+		});
+		if (ralphGuardError) return ralphGuardError;
 
 		const validationError = validateExecutionInput(
 			effectiveParams,

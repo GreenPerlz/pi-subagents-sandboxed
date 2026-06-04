@@ -4,18 +4,19 @@
 
 # pi-subagents-sandboxed
 
-`pi-subagents-sandboxed` lets Pi delegate work to focused child agents, with optional Bubblewrap sandboxing for child Pi processes. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
+`pi-subagents-sandboxed` lets Pi delegate work to focused child agents, with Bubblewrap sandboxing enabled by default for the packaged agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
 ## Fork baseline and purpose
 
 This repository is now a standalone fork of [`nicobailon/pi-subagents`](https://github.com/nicobailon/pi-subagents). It was forked from upstream `pi-subagents` **v0.27.0** (`v0.27.0`, commit `e6484719f88625d55e2c26ec7c3e498cda4fe0e6`) and then diverged into a sandbox-focused package.
 
-This repo should be used as a **replacement for upstream `pi-subagents` when you want optional local containment for child Pi processes**. It keeps the upstream delegation/orchestration workflows, but adds a sandbox layer so child agents can be given narrower filesystem, auth, network, and write access.
+This repo should be used as a **replacement for upstream `pi-subagents` when you want local containment for child Pi processes**. It keeps the upstream delegation/orchestration workflows, but adds a sandbox layer so child agents can be given narrower filesystem, auth, network, and write access.
 
 Main changes from the upstream v0.27.0 baseline:
 
 - Renamed/repackaged the extension as `pi-subagents-sandboxed` so it can live as an independent package and repository.
 - Added sandbox configuration resolution from settings, agent frontmatter, and per-run `sandbox` options.
+- Made the packaged builtin agents request a closed Bubblewrap sandbox by default.
 - Added a Bubblewrap provider with a `host-toolchain` profile for local developer machines.
 - Added sandbox mount policy for cwd/worktree, child sessions, artifacts, outputs, prompt temp files, extension/runtime paths, and Pi auth JSON.
 - Added write inference: `edit`/`write` agents get writable cwd mounts; bash-only/read-only agents stay read-only unless `bashWrite: true` is set.
@@ -26,7 +27,7 @@ Main changes from the upstream v0.27.0 baseline:
 - Mounted `/dev` in Bubblewrap so Node child processes and the built-in bash tool can open `/dev/null`.
 - Adjusted bundled worker/reviewer defaults and prompt guidance for this sandbox-focused fork.
 
-This is a local safety/containment feature, not a claim of hostile-code-grade isolation. The current goal is: **make subagent delegation safer by default when sandboxing is requested, while preserving the normal upstream experience when no sandbox is configured.**
+This is a local safety/containment feature, not a claim of hostile-code-grade isolation. The current goal is: **make packaged subagent delegation safer by default, while preserving explicit opt-outs and configurable access when a run needs broader host access.**
 
 https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
 
@@ -38,15 +39,15 @@ pi install npm:pi-subagents-sandboxed
 
 `pi-subagents-sandboxed` is a replacement fork of `pi-subagents`, not a companion package. Do not install or enable both in the same Pi environment; keep only one `subagent` extension active so slash commands, bundled agents, and the `subagent` tool resolve unambiguously.
 
-That is the only required step for ordinary unsandboxed delegation. You can add optional sandboxing pieces later. See the parent design in [docs/prd/sandboxed-subagents.md](docs/prd/sandboxed-subagents.md).
+That installs the extension and the packaged agents. Because those packaged agents request Bubblewrap by default, install `bwrap` before your first run or explicitly opt out with `sandbox: { provider: "none" }` for a run. See the parent design in [docs/prd/sandboxed-subagents.md](docs/prd/sandboxed-subagents.md).
 
 ## Sandboxed subagents
 
-Sandboxing is optional. If no sandbox provider is configured or requested, runs use the same child Pi spawn path as upstream `pi-subagents`.
+The packaged builtin agents (`scout`, `researcher`, `planner`, `worker`, `reviewer`, `context-builder`, `oracle`, and `delegate`) request `bubblewrap` with the `host-toolchain` profile, host networking, `env` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. To opt a specific run out, pass `sandbox: { provider: "none" }`.
 
 ### Bubblewrap requirements
 
-The MVP sandbox provider is `bubblewrap`, which shells out to `bwrap`. Install Bubblewrap with your OS package manager before requesting `sandbox.provider: "bubblewrap"` (for example, `sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, or `sudo pacman -S bubblewrap`). If Bubblewrap is missing, sandboxed runs fail closed by default and the error points back to this section and the [sandbox PRD](docs/prd/sandboxed-subagents.md).
+The MVP sandbox provider is `bubblewrap`, which shells out to `bwrap`. Install Bubblewrap with your OS package manager before running the packaged agents (for example, `sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, or `sudo pacman -S bubblewrap`). If Bubblewrap is missing, sandboxed runs fail closed by default and the error points back to this section and the [sandbox PRD](docs/prd/sandboxed-subagents.md).
 
 The only supported MVP profile is `host-toolchain`. It preserves original host paths and read-only mounts common host toolchain/runtime paths such as `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, and `/etc` where present, plus the Pi/package/temp paths needed to run the child. The child cwd/worktree is mounted read-only or writable according to write inference below.
 
@@ -66,13 +67,13 @@ subagent({
     fallback: "fail",
     bashWrite: true,
     extraReadOnlyMounts: ["/opt/project-toolchain"],
-    extraWritableMounts: [".cache/subagent-build"]
+    extraWritableMounts: [".cache/subagent-build"],
     packageDiscovery: "project-local"
   }
 })
 ```
 
-Per agent frontmatter:
+Per agent frontmatter (the packaged builtin agents already include these defaults):
 
 ```yaml
 sandboxProvider: bubblewrap
@@ -98,7 +99,7 @@ Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
       "auth": "env",
       "fallback": "fail",
       "extraReadOnlyMounts": ["/opt/project-toolchain"],
-      "extraWritableMounts": [".cache/subagent-build"]
+      "extraWritableMounts": [".cache/subagent-build"],
       "packageDiscovery": "closed"
     }
   }
@@ -226,7 +227,7 @@ Those are ordinary Pi requests. Pi decides whether to call `subagent`, which age
 | See running work | “Show active async runs.” |
 | Check setup | “Check whether subagents are configured correctly.” |
 
-The extension ships with builtin agents you can use immediately.
+The extension ships with builtin agents you can use immediately. In this fork, each packaged builtin agent is sandboxed by default; pass `sandbox: { provider: "none" }` for an explicit per-run opt-out.
 
 ## Builtin agents in plain English
 

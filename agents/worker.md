@@ -6,6 +6,12 @@ systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
 tools: read, grep, find, ls, bash, edit, write, contact_supervisor
+sandboxProvider: bubblewrap
+sandboxProfile: host-toolchain
+sandboxNetwork: host
+sandboxAuth: env
+sandboxFallback: fail
+sandboxPackageDiscovery: closed
 defaultContext: fresh
 defaultReads: context.md, plan.md
 defaultProgress: true

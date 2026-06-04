@@ -357,6 +357,30 @@ subagent({ action: "doctor" })
 
 Humans can use `/subagents-doctor` for the same read-only report. It checks runtime paths, discovery counts, async support, current session context, and intercom bridge state.
 
+### Sandboxed subagents
+
+Prefer sandboxed subagent runs when the child can do useful work through the mounted repo/toolchain/auth surface. A good default for AFK workers, reviewers, validators, scouts, and issue workflows is:
+
+```typescript
+subagent({
+  agent: "worker",
+  task: "Implement the accepted issue with validation evidence.",
+  async: true,
+  sandbox: {
+    provider: "bubblewrap",
+    profile: "host-toolchain",
+    network: "host",
+    auth: "pi-json",
+    fallback: "fail",
+    packageDiscovery: "closed"
+  }
+})
+```
+
+Use `fallback: "fail"` for safety-critical workflows so sandbox setup problems are blockers, not silent unsandboxed execution. Use `network: "none"` for local-only audits when practical; keep `network: "host"` when the child must use issue trackers, package registries, or external docs. Use `auth: "pi-json"` when Pi model auth is needed without mounting full settings. Use `packageDiscovery: "project-local"` only when the child must load trusted project-local package extensions.
+
+Sandboxing does not remove the single-writer rule. A single sandboxed writer can edit the active worktree. Parallel sandboxed tasks that have write-capable tools require `worktree: true`; otherwise use read-only agents/tools for parallel review and validation. If a sandboxed child fails to start, inspect `subagent({ action: "doctor" })` or the run status and ask whether to fix sandbox setup or approve a narrow exception.
+
 ### Subagent control
 
 Subagent control is the runtime visibility and intervention layer for delegated runs. It is separate from lifecycle status. Lifecycle status says whether a child is `queued`, `running`, `paused`, `complete`, or `failed`. Activity reporting is factual: it tracks the last observed activity time and the current tool when known. It does not pretend to know that a child is truly stuck.

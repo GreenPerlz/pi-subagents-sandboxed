@@ -2,7 +2,7 @@
 
 ## Summary
 
-Add optional Bubblewrap sandboxing to `pi-subagents-sandboxed` so delegated Pi subagents can run with constrained filesystem, environment, and network access while preserving existing subagent orchestration features: single runs, parallel runs, chains, async/status, worktree isolation, and forked/fresh context.
+Add Bubblewrap sandboxing to `pi-subagents-sandboxed` so delegated Pi subagents can run with constrained filesystem, environment, and network access while preserving existing subagent orchestration features: single runs, parallel runs, chains, async/status, worktree isolation, and forked/fresh context. The packaged builtin agents now request the Bubblewrap sandbox by default; custom agents remain configurable through settings, per-run params, and per-agent frontmatter.
 
 This is the foundation for a later Sandcastle-style workflow: plan issues, run multiple isolated issue workers, review/fix each branch, and merge completed branches with a merge subagent.
 
@@ -10,7 +10,8 @@ This is the foundation for a later Sandcastle-style workflow: plan issues, run m
 
 - Keep `subagent` as the tool/runtime name for drop-in prompt compatibility.
 - Keep package identity distinct: `pi-subagents-sandboxed` replaces `pi-subagents`; it is not meant to run alongside it.
-- Add sandboxing as optional behavior controlled by settings, per-run params, and per-agent frontmatter.
+- Add sandboxing as configurable behavior controlled by settings, per-run params, and per-agent frontmatter.
+- Make the packaged builtin agents sandboxed by default while keeping `sandbox.provider: "none"` as the explicit per-run opt-out.
 - Implement Bubblewrap as the first sandbox provider.
 - Preserve Pi subagent context semantics:
   - `context: "fresh"` creates isolated child sessions.
@@ -80,7 +81,7 @@ sandboxPackageDiscovery: project-local
 }
 ```
 
-If no sandbox provider is configured or requested, behavior remains identical to upstream `pi-subagents`.
+If no sandbox provider is configured or requested, behavior remains identical to upstream `pi-subagents`. Packaged builtin agents do configure a provider in their frontmatter by default.
 
 Sandboxed package discovery modes:
 

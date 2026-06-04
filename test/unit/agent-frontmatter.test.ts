@@ -66,6 +66,23 @@ Do work
 		const worker = agents.find((candidate) => candidate.name === "worker");
 		assert.equal(worker?.defaultContext, "fresh", "worker should default to fresh context");
 	});
+
+	it("loads packaged agents with bubblewrap sandbox defaults", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-sandbox-defaults-"));
+		tempDirs.push(dir);
+		const agents = discoverAgentsAll(dir).builtin;
+
+		for (const agent of agents) {
+			assert.deepEqual(agent.sandbox, {
+				provider: "bubblewrap",
+				profile: "host-toolchain",
+				network: "host",
+				auth: "env",
+				fallback: "fail",
+				packageDiscovery: "closed",
+			}, `${agent.name} should default to a closed bubblewrap sandbox`);
+		}
+	});
 });
 
 describe("chain discovery", () => {

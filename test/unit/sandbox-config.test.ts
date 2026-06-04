@@ -153,4 +153,11 @@ describe("sandbox configuration resolution", () => {
 			},
 		}), undefined);
 	});
+
+	it("lets a per-run provider none opt out of an agent sandbox default", () => {
+		assert.equal(resolveSandboxConfig({
+			agent: { sandbox: { provider: "bubblewrap", profile: "host-toolchain" } },
+			run: { provider: "none" },
+		}), undefined);
+	});
 });

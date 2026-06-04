@@ -6,6 +6,12 @@ thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
+sandboxProvider: bubblewrap
+sandboxProfile: host-toolchain
+sandboxNetwork: host
+sandboxAuth: env
+sandboxFallback: fail
+sandboxPackageDiscovery: closed
 output: plan.md
 defaultReads: context.md
 defaultContext: fork

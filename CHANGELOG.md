@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- Packaged builtin agents now request a closed Bubblewrap `host-toolchain` sandbox by default, with fail-closed fallback and explicit per-run opt-out via `sandbox: { provider: "none" }`.
+
 ## [0.27.0] - 2026-05-30
 
 ### Changed

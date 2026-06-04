@@ -6,6 +6,12 @@ thinking: low
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
+sandboxProvider: bubblewrap
+sandboxProfile: host-toolchain
+sandboxNetwork: host
+sandboxAuth: env
+sandboxFallback: fail
+sandboxPackageDiscovery: closed
 output: context.md
 defaultProgress: true
 ---

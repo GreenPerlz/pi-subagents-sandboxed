@@ -1218,6 +1218,71 @@ process.exit(${exitCode});
 		}
 	});
 
+	it("loads project-local package extensions explicitly in sandbox project-local discovery", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const packageRoot = path.join(tempDir, ".pi", "npm", "node_modules", "local-pi-ext");
+		const localExtensionPath = path.join(packageRoot, "extension.ts");
+		fs.mkdirSync(packageRoot, { recursive: true });
+		fs.writeFileSync(
+			path.join(packageRoot, "package.json"),
+			JSON.stringify({ name: "local-pi-ext", version: "1.0.0", pi: { extensions: ["./extension.ts"] } }, null, 2),
+			"utf-8",
+		);
+		fs.writeFileSync(localExtensionPath, "export default function register() {}\n", "utf-8");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["npm:local-pi-ext"] }, null, 2),
+			"utf-8",
+		);
+
+		const userAgentDir = path.join(tempDir, "agent-home");
+		const userPackageRoot = path.join(userAgentDir, "npm", "node_modules", "local-pi-ext");
+		fs.mkdirSync(userPackageRoot, { recursive: true });
+		fs.writeFileSync(
+			path.join(userPackageRoot, "package.json"),
+			JSON.stringify({ name: "local-pi-ext", version: "9.9.9", pi: { extensions: ["./global-extension.ts"] } }, null, 2),
+			"utf-8",
+		);
+		fs.writeFileSync(path.join(userPackageRoot, "global-extension.ts"), "export default function register() {}\n", "utf-8");
+		fs.writeFileSync(path.join(userAgentDir, "settings.json"), JSON.stringify({ packages: ["npm:local-pi-ext"] }, null, 2), "utf-8");
+
+		const explicitExtensionPath = path.join(tempDir, "explicit-extension.ts");
+		fs.writeFileSync(explicitExtensionPath, "export default function register() {}\n", "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = userAgentDir;
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("echo", { extensions: [explicitExtensionPath] })]);
+			const result = await executor.execute(
+				"single-sandbox-project-local-package-discovery",
+				{ agent: "echo", task: "Use project-local extension", sandbox: { provider: "bubblewrap", packageDiscovery: "project-local" } },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			const resultText = result.content[0]?.text ?? "";
+			assert.doesNotMatch(resultText, /Failed to load extension/, "project-local and explicit extensions should load successfully before any provider/auth failure");
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const separatorIndex = bwrapArgs.indexOf("--");
+			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
+			const piArgs = bwrapArgs.slice(separatorIndex + 3);
+			assert.ok(piArgs.includes("--no-extensions"), "project-local mode should keep ambient extension discovery disabled");
+			assert.ok(piArgs.includes("--no-prompt-templates"), "project-local mode should keep prompt-template discovery disabled");
+			assert.ok(piArgs.includes("--no-themes"), "project-local mode should keep theme discovery disabled");
+			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
+			assert.ok(extensionArgs.includes(localExtensionPath), "project-local package extension should be passed explicitly");
+			assert.equal(extensionArgs.includes(path.join(userPackageRoot, "global-extension.ts")), false, "user/global package with same name should not be loaded");
+			assert.ok(extensionArgs.indexOf(explicitExtensionPath) > extensionArgs.indexOf(localExtensionPath), "explicit agent extensions should remain after package extensions for clear precedence");
+			assertMountMode(bwrapArgs, packageRoot, "ro");
+			assertNotMounted(bwrapArgs, userPackageRoot);
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
 	it("adds closed-runtime flags and mounts auth.json but not settings.json for pi-json sandboxed children", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "SUBAGENT_SANDBOXED_PI_JSON_OK" });
 		const agentDir = path.join(tempDir, "agent-home");

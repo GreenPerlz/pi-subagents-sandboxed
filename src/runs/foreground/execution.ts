@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
+import { resolveProjectLocalPiPackageResources } from "../../agents/pi-packages.ts";
 import {
 	ensureArtifactsDir,
 	getArtifactPaths,
@@ -175,6 +176,11 @@ async function runSingleAttempt(
 	},
 ): Promise<SingleResult> {
 	const modelArg = applyThinkingSuffix(model, agent.thinking);
+	const childCwd = options.cwd ?? runtimeCwd;
+	const projectLocalPackageResources = options.sandbox?.packageDiscovery === "project-local"
+		? resolveProjectLocalPiPackageResources(childCwd)
+		: undefined;
+	const closedSandboxRuntime = Boolean(options.sandbox && options.sandbox.packageDiscovery !== "ambient");
 	const { args, env: sharedEnv, tempDir } = buildPiArgs({
 		baseArgs: ["--mode", "json", "-p"],
 		task,
@@ -188,6 +194,7 @@ async function runSingleAttempt(
 		inheritSkills: agent.inheritSkills,
 		tools: agent.tools,
 		extensions: agent.extensions,
+		packageExtensions: projectLocalPackageResources?.extensions,
 		systemPrompt: shared.systemPrompt,
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
@@ -202,7 +209,7 @@ async function runSingleAttempt(
 		parentRootRunId: options.nestedRoute?.rootRunId,
 		parentCapabilityToken: options.nestedRoute?.capabilityToken,
 		structuredOutput: options.structuredOutput,
-		sandbox: Boolean(options.sandbox),
+		sandbox: closedSandboxRuntime,
 	});
 
 	const result: SingleResult = {
@@ -253,7 +260,6 @@ async function runSingleAttempt(
 	result.progress = progress;
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
 	let observedMutationAttempt = false;
-	const childCwd = options.cwd ?? runtimeCwd;
 	let spawnSpec: SpawnableInvocation;
 	let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
 	try {
@@ -288,6 +294,7 @@ async function runSingleAttempt(
 				spawnCommand: piSpawnSpec.command,
 				spawnArgs: piSpawnSpec.args,
 				authMode: options.sandbox.auth,
+				packageRoots: projectLocalPackageResources?.packageRoots,
 				extraReadOnlyMounts: options.sandbox.extraReadOnlyMounts,
 				extraWritableMounts: options.sandbox.extraWritableMounts,
 			});

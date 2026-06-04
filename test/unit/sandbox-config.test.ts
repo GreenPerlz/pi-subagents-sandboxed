@@ -56,6 +56,7 @@ describe("sandbox configuration resolution", () => {
 					fallback: "settings-fallback",
 					extraReadOnlyMounts: ["/opt/settings-toolchain"],
 					extraWritableMounts: ["/var/cache/settings-cache"],
+					packageDiscovery: "closed",
 				},
 			},
 		});
@@ -69,6 +70,7 @@ describe("sandbox configuration resolution", () => {
 			"sandboxFallback: agent-fallback",
 			"sandboxExtraReadOnlyMounts: /opt/agent-toolchain",
 			"sandboxExtraWritableMounts: /var/cache/agent-cache",
+			"sandboxPackageDiscovery: project-local",
 		].join("\n") + "\n");
 
 		const settings = readSandboxSettings(project, "project");
@@ -84,6 +86,7 @@ describe("sandbox configuration resolution", () => {
 			fallback: "agent-fallback",
 			extraReadOnlyMounts: ["/opt/agent-toolchain"],
 			extraWritableMounts: ["/var/cache/agent-cache"],
+			packageDiscovery: "project-local",
 		});
 		assert.equal(agent.extraFields?.sandboxProvider, undefined);
 
@@ -96,6 +99,7 @@ describe("sandbox configuration resolution", () => {
 			fallback: "settings-fallback",
 			extraReadOnlyMounts: ["/opt/settings-toolchain"],
 			extraWritableMounts: ["/var/cache/settings-cache"],
+			packageDiscovery: "closed",
 		});
 		assert.deepEqual(resolveSandboxConfig({ settings, agent }), {
 			provider: "agent-provider",
@@ -107,6 +111,7 @@ describe("sandbox configuration resolution", () => {
 			fallback: "agent-fallback",
 			extraReadOnlyMounts: ["/opt/settings-toolchain", "/opt/agent-toolchain"],
 			extraWritableMounts: ["/var/cache/settings-cache", "/var/cache/agent-cache"],
+			packageDiscovery: "project-local",
 		});
 		assert.deepEqual(resolveSandboxConfig({
 			settings,
@@ -121,6 +126,7 @@ describe("sandbox configuration resolution", () => {
 				fallback: "run-fallback",
 				extraReadOnlyMounts: ["/opt/run-toolchain"],
 				extraWritableMounts: ["/var/cache/run-cache"],
+				packageDiscovery: "ambient",
 			},
 		}), {
 			provider: "run-provider",
@@ -132,6 +138,7 @@ describe("sandbox configuration resolution", () => {
 			fallback: "run-fallback",
 			extraReadOnlyMounts: ["/opt/settings-toolchain", "/opt/agent-toolchain", "/opt/run-toolchain"],
 			extraWritableMounts: ["/var/cache/settings-cache", "/var/cache/agent-cache", "/var/cache/run-cache"],
+			packageDiscovery: "ambient",
 		});
 	});
 

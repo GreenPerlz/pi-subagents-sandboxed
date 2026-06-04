@@ -45,6 +45,7 @@ const SandboxOverride = Type.Object({
 	fallback: Type.Optional(Type.String({ description: "Fallback policy when sandboxing cannot be applied, e.g. 'fail' or 'none'." })),
 	extraReadOnlyMounts: Type.Optional(Type.Array(Type.String(), { description: "Extra explicit read-only sandbox mounts for installed toolchains or read-only inputs. Use the narrowest path that contains the required executable/files." })),
 	extraWritableMounts: Type.Optional(Type.Array(Type.String(), { description: "Extra explicit writable sandbox mounts for caches, outputs, or work directories only. Use the narrowest writable path." })),
+	packageDiscovery: Type.Optional(Type.String({ enum: ["closed", "project-local", "ambient"], description: "Sandboxed child package discovery mode. 'closed' disables ambient discovery; 'project-local' lets the parent pass project-local Pi package extensions explicitly; 'ambient' is unsafe/legacy and must be requested explicitly." })),
 }, { additionalProperties: false });
 
 const JsonSchemaObject = Type.Unsafe({

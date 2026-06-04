@@ -221,6 +221,7 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 	const fallback = frontmatterString(frontmatter.sandboxFallback);
 	const extraReadOnlyMounts = frontmatterStringList(frontmatter.sandboxExtraReadOnlyMounts);
 	const extraWritableMounts = frontmatterStringList(frontmatter.sandboxExtraWritableMounts);
+	const packageDiscovery = frontmatterString(frontmatter.sandboxPackageDiscovery);
 	if (provider !== undefined) sandbox.provider = provider;
 	if (profile !== undefined) sandbox.profile = profile;
 	if (network !== undefined) sandbox.network = network;
@@ -230,6 +231,7 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 	if (fallback !== undefined) sandbox.fallback = fallback;
 	if (extraReadOnlyMounts !== undefined) sandbox.extraReadOnlyMounts = extraReadOnlyMounts;
 	if (extraWritableMounts !== undefined) sandbox.extraWritableMounts = extraWritableMounts;
+	if (packageDiscovery !== undefined) sandbox.packageDiscovery = packageDiscovery;
 	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
 }
 
@@ -398,6 +400,7 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	const fallback = parseOptionalStringField(input.fallback, { filePath, field: "sandbox.fallback" });
 	const extraReadOnlyMounts = parseOptionalStringArrayField(input.extraReadOnlyMounts, { filePath, field: "sandbox.extraReadOnlyMounts" });
 	const extraWritableMounts = parseOptionalStringArrayField(input.extraWritableMounts, { filePath, field: "sandbox.extraWritableMounts" });
+	const packageDiscovery = parseOptionalStringField(input.packageDiscovery, { filePath, field: "sandbox.packageDiscovery" });
 	if (defaultProvider !== undefined) sandbox.defaultProvider = defaultProvider;
 	if (defaultProfile !== undefined) sandbox.defaultProfile = defaultProfile;
 	if (network !== undefined) sandbox.network = network;
@@ -406,6 +409,7 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	if (fallback !== undefined) sandbox.fallback = fallback;
 	if (extraReadOnlyMounts !== undefined) sandbox.extraReadOnlyMounts = extraReadOnlyMounts;
 	if (extraWritableMounts !== undefined) sandbox.extraWritableMounts = extraWritableMounts;
+	if (packageDiscovery !== undefined) sandbox.packageDiscovery = packageDiscovery;
 	return Object.keys(sandbox).length > 0 ? sandbox : undefined;
 }
 

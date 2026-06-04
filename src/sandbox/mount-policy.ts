@@ -28,6 +28,8 @@ export interface SubagentSandboxMountInput {
 	authMode?: string;
 	/** Pi agent config directory; defaults to PI_CODING_AGENT_DIR or ~/.pi/agent. */
 	agentDir?: string;
+	/** Project-local Pi package roots resolved by the parent and mounted read-only. */
+	packageRoots?: string[];
 	cwdMode?: SandboxMountMode;
 	/** Explicit user-requested read-only paths for installed toolchains/read-only inputs. */
 	extraReadOnlyMounts?: string[];
@@ -184,6 +186,7 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 	for (const statusPath of input.statusPaths ?? []) addSandboxMountParent(mounts, seen, statusPath, "rw");
 	addSandboxMountParent(mounts, seen, input.structuredOutput?.schemaPath, "ro");
 	addSandboxMountParent(mounts, seen, input.structuredOutput?.outputPath, "rw");
+	for (const packageRoot of input.packageRoots ?? []) addSandboxMount(mounts, seen, packageRoot, "ro");
 	addSandboxExtensionMountParents(mounts, seen, input.piArgs);
 	addSandboxSpawnMounts(mounts, seen, input.spawnCommand, input.spawnArgs);
 	addSandboxAuthMounts(mounts, seen, input.authMode, input.agentDir);

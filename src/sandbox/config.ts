@@ -42,6 +42,8 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		extraReadOnlyMounts: string[];
 		extraWritableMounts: string[];
 	} = { extraReadOnlyMounts: [], extraWritableMounts: [] };
+		packageDiscovery?: string;
+	} = {};
 
 	const settings = input.settings;
 	if (settings) {
@@ -53,6 +55,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyStringOverride(resolved, "fallback", settings.fallback);
 		appendPathOverrides(resolved.extraReadOnlyMounts, settings.extraReadOnlyMounts);
 		appendPathOverrides(resolved.extraWritableMounts, settings.extraWritableMounts);
+		applyStringOverride(resolved, "packageDiscovery", settings.packageDiscovery);
 	}
 
 	const agent = input.agent?.sandbox;
@@ -66,6 +69,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyStringOverride(resolved, "fallback", agent.fallback);
 		appendPathOverrides(resolved.extraReadOnlyMounts, agent.extraReadOnlyMounts);
 		appendPathOverrides(resolved.extraWritableMounts, agent.extraWritableMounts);
+		applyStringOverride(resolved, "packageDiscovery", agent.packageDiscovery);
 	}
 
 	const run = input.run;
@@ -79,6 +83,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		applyStringOverride(resolved, "fallback", run.fallback);
 		appendPathOverrides(resolved.extraReadOnlyMounts, run.extraReadOnlyMounts);
 		appendPathOverrides(resolved.extraWritableMounts, run.extraWritableMounts);
+		applyStringOverride(resolved, "packageDiscovery", run.packageDiscovery);
 	}
 
 	const provider = normalizeString(resolved.provider);
@@ -94,5 +99,6 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		...(resolved.fallback !== undefined ? { fallback: resolved.fallback } : {}),
 		...(resolved.extraReadOnlyMounts.length > 0 ? { extraReadOnlyMounts: resolved.extraReadOnlyMounts } : {}),
 		...(resolved.extraWritableMounts.length > 0 ? { extraWritableMounts: resolved.extraWritableMounts } : {}),
+		...(resolved.packageDiscovery !== undefined ? { packageDiscovery: resolved.packageDiscovery } : {}),
 	};
 }

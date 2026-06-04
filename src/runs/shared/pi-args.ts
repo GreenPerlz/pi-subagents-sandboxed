@@ -39,6 +39,7 @@ interface BuildPiArgsInput {
 	inheritSkills: boolean;
 	tools?: string[];
 	extensions?: string[];
+	packageExtensions?: string[];
 	systemPrompt?: string | null;
 	mcpDirectTools?: string[];
 	cwd?: string;
@@ -125,11 +126,11 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	const runtimeExtensions = fanoutAuthorized
 		? [PROMPT_RUNTIME_EXTENSION_PATH, FANOUT_CHILD_EXTENSION_PATH]
 		: [PROMPT_RUNTIME_EXTENSION_PATH];
-	const useExplicitExtensions = input.sandbox || input.extensions !== undefined;
+	const useExplicitExtensions = input.sandbox || input.extensions !== undefined || input.packageExtensions !== undefined;
 	if (useExplicitExtensions) {
 		args.push("--no-extensions");
 	}
-	for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.extensions ?? [])])]) {
+	for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.packageExtensions ?? []), ...(input.extensions ?? [])])]) {
 		args.push("--extension", extPath);
 	}
 

@@ -1,3 +1,5 @@
+export type SandboxPackageDiscoveryMode = "closed" | "project-local" | "ambient";
+
 export interface SandboxRunConfig {
 	provider?: string;
 	profile?: string;
@@ -8,6 +10,7 @@ export interface SandboxRunConfig {
 	fallback?: string;
 	extraReadOnlyMounts?: string[];
 	extraWritableMounts?: string[];
+	packageDiscovery?: SandboxPackageDiscoveryMode | string;
 }
 
 export interface AgentSandboxConfig extends SandboxRunConfig {}
@@ -21,6 +24,7 @@ export interface SandboxSettingsDefaults {
 	fallback?: string;
 	extraReadOnlyMounts?: string[];
 	extraWritableMounts?: string[];
+	packageDiscovery?: SandboxPackageDiscoveryMode | string;
 }
 
 export interface ResolvedSandboxConfig {
@@ -33,6 +37,7 @@ export interface ResolvedSandboxConfig {
 	fallback?: string;
 	extraReadOnlyMounts?: string[];
 	extraWritableMounts?: string[];
+	packageDiscovery?: SandboxPackageDiscoveryMode | string;
 }
 
 export interface SpawnableInvocation {

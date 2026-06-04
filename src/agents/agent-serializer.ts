@@ -31,6 +31,7 @@ export const KNOWN_FIELDS = new Set([
 	"sandboxFallback",
 	"sandboxExtraReadOnlyMounts",
 	"sandboxExtraWritableMounts",
+	"sandboxPackageDiscovery",
 ]);
 
 function joinComma(values: string[] | undefined): string | undefined {
@@ -90,6 +91,7 @@ export function serializeAgent(config: AgentConfig): string {
 	if (config.sandbox?.fallback) lines.push(`sandboxFallback: ${config.sandbox.fallback}`);
 	if (config.sandbox?.extraReadOnlyMounts?.length) lines.push(`sandboxExtraReadOnlyMounts: ${config.sandbox.extraReadOnlyMounts.join(",")}`);
 	if (config.sandbox?.extraWritableMounts?.length) lines.push(`sandboxExtraWritableMounts: ${config.sandbox.extraWritableMounts.join(",")}`);
+	if (config.sandbox?.packageDiscovery) lines.push(`sandboxPackageDiscovery: ${config.sandbox.packageDiscovery}`);
 
 	if (config.extraFields) {
 		for (const [key, value] of Object.entries(config.extraFields)) {

@@ -1537,29 +1537,31 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					error: resultText.split("\n").find((line) => line.trim())?.trim().slice(0, 180) ?? "mutating tool failed",
 					ts: now,
 				}, mutatingFailureWindowMs);
-				if (controlConfig.enabled && shouldEscalateMutatingFailures(state, controlConfig.failedToolAttemptsBeforeAttention) && step.activityState !== "needs_attention") {
-					const previous = step.activityState;
-					step.activityState = "needs_attention";
+				if (controlConfig.enabled && shouldEscalateMutatingFailures(state, controlConfig.failedToolAttemptsBeforeAttention)) {
 					mutatingFailureAttentionSteps[flatIndex] = true;
-					statusPayload.activityState = "needs_attention";
-					appendControlEvent(buildControlEvent({
-						type: "needs_attention",
-						from: previous,
-						to: "needs_attention",
-						runId: id,
-						agent: step.agent,
-						index: flatIndex,
-						ts: now,
-						message: `${step.agent} needs attention after repeated mutating tool failures`,
-						reason: "tool_failures",
-						turns: step.turnCount,
-						tokens: step.tokens?.total,
-						toolCount: step.toolCount,
-						currentTool: toolSnapshot.tool,
-						currentToolDurationMs: toolSnapshot.startedAt ? Math.max(0, now - toolSnapshot.startedAt) : undefined,
-						currentPath: toolSnapshot.path,
-						recentFailureSummary: summarizeRecentMutatingFailures(state),
-					}));
+					if (step.activityState !== "needs_attention") {
+						const previous = step.activityState;
+						step.activityState = "needs_attention";
+						statusPayload.activityState = "needs_attention";
+						appendControlEvent(buildControlEvent({
+							type: "needs_attention",
+							from: previous,
+							to: "needs_attention",
+							runId: id,
+							agent: step.agent,
+							index: flatIndex,
+							ts: now,
+							message: `${step.agent} needs attention after repeated mutating tool failures`,
+							reason: "tool_failures",
+							turns: step.turnCount,
+							tokens: step.tokens?.total,
+							toolCount: step.toolCount,
+							currentTool: toolSnapshot.tool,
+							currentToolDurationMs: toolSnapshot.startedAt ? Math.max(0, now - toolSnapshot.startedAt) : undefined,
+							currentPath: toolSnapshot.path,
+							recentFailureSummary: summarizeRecentMutatingFailures(state),
+						}));
+					}
 				}
 			} else if (toolSnapshot?.mutates) {
 				resetMutatingFailureState(mutatingFailureStates[flatIndex]!);

@@ -2151,6 +2151,167 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("background runs clear needs_attention after resumed activity", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ delay: 500 },
+				{ jsonl: [events.toolStart("read", { path: "src/a.ts" }), events.toolEnd("read"), events.toolResult("read", "export const a = 1;")] },
+				{ delay: 2_000, jsonl: [events.assistantMessage("Done")] },
+			],
+		});
+
+		const id = `async-clear-attention-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Implement the approved fixes",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: {
+				enabled: true,
+				needsAttentionAfterMs: 999_999,
+				activeNoticeAfterTurns: 999_999,
+				activeNoticeAfterMs: 999_999,
+				activeNoticeAfterTokens: 999_999,
+				failedToolAttemptsBeforeAttention: 3,
+				notifyOn: ["active_long_running", "needs_attention"],
+				notifyChannels: ["event", "async", "intercom"],
+			},
+		});
+
+		const statusPath = path.join(asyncDir, "status.json");
+		const deadline = Date.now() + 10_000;
+		let sawNeedsAttention = false;
+		let statusAfterRecovery: AsyncStatusPayload | undefined;
+
+		while (Date.now() < deadline) {
+			if (fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (!sawNeedsAttention && status.activityState === "needs_attention" && status.steps?.[0]?.activityState === "needs_attention") {
+					sawNeedsAttention = true;
+				}
+				if (sawNeedsAttention && status.activityState !== "needs_attention" && status.steps?.[0]?.activityState !== "needs_attention") {
+					statusAfterRecovery = status;
+					break;
+				}
+			}
+			if (fs.existsSync(resultPath)) {
+				if (fs.existsSync(statusPath)) {
+					const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+					if (sawNeedsAttention && status.activityState !== "needs_attention" && status.steps?.[0]?.activityState !== "needs_attention") {
+						statusAfterRecovery = status;
+					}
+				}
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		assert.ok(sawNeedsAttention, "expected status.json to expose needs_attention before recovery");
+		assert.ok(statusAfterRecovery, "expected status.json to clear needs_attention after resumed activity");
+		assert.equal(statusAfterRecovery.activityState, undefined);
+		assert.equal(statusAfterRecovery.steps?.[0]?.activityState, undefined);
+
+		const resultDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > resultDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
+	it("parallel async run clears top-level needs_attention when stale child resumes", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ jsonl: [events.toolStart("edit", { path: "src/a.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found", true)] },
+				{ delay: 500 },
+				{ jsonl: [events.toolStart("read", { path: "src/a.ts" }), events.toolEnd("read"), events.toolResult("read", "export const a = 1;")] },
+				{ delay: 3_000, jsonl: [events.assistantMessage("Done")] },
+			],
+		});
+		mockPi.onCall({
+			steps: [
+				{ delay: 100, jsonl: [events.toolStart("read", { path: "src/b.ts" }), events.toolEnd("read"), events.toolResult("read", "export const b = 2;")] },
+				{ delay: 4_000, jsonl: [events.assistantMessage("Done")] },
+			],
+		});
+
+		const id = `async-parallel-clear-attention-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+
+		executeAsyncChain(id, {
+			chain: [{ parallel: [{ agent: "editor", task: "Edit" }, { agent: "reviewer", task: "Review" }] }],
+			agents: [makeAgent("editor"), makeAgent("reviewer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: {
+				enabled: true,
+				needsAttentionAfterMs: 999_999,
+				activeNoticeAfterTurns: 999_999,
+				activeNoticeAfterMs: 999_999,
+				activeNoticeAfterTokens: 999_999,
+				failedToolAttemptsBeforeAttention: 3,
+				notifyOn: ["active_long_running", "needs_attention"],
+				notifyChannels: ["event", "async", "intercom"],
+			},
+		});
+
+		const statusPath = path.join(asyncDir, "status.json");
+		const deadline = Date.now() + 15_000;
+		let sawNeedsAttention = false;
+		let statusAfterRecovery: AsyncStatusPayload | undefined;
+
+		while (Date.now() < deadline) {
+			if (fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (!sawNeedsAttention) {
+					if (status.activityState === "needs_attention" && status.steps?.some((s) => s.activityState === "needs_attention")) {
+						sawNeedsAttention = true;
+					}
+				} else {
+					if (status.activityState !== "needs_attention" && !status.steps?.some((s) => s.activityState === "needs_attention")) {
+						statusAfterRecovery = status;
+						break;
+					}
+				}
+			}
+			if (fs.existsSync(resultPath)) {
+				if (fs.existsSync(statusPath)) {
+					const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+					if (sawNeedsAttention && status.activityState !== "needs_attention" && !status.steps?.some((s) => s.activityState === "needs_attention")) {
+						statusAfterRecovery = status;
+					}
+				}
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		assert.ok(sawNeedsAttention, "expected at least one step to reach needs_attention");
+		assert.ok(statusAfterRecovery, "expected top-level activityState to clear after stale child resumed");
+		assert.equal(statusAfterRecovery.activityState, undefined);
+
+		const resultDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > resultDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
 	it("background runs stream child events and live output while active", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			steps: [

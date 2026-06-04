@@ -1,10 +1,32 @@
 <p>
-  <img src="https://raw.githubusercontent.com/nicobailon/pi-subagents/main/banner.png" alt="pi-subagents" width="1100">
+  <img src="https://raw.githubusercontent.com/GreenPerlz/pi-subagents-sandboxed/main/banner.png" alt="pi-subagents-sandboxed" width="1100">
 </p>
 
 # pi-subagents-sandboxed
 
 `pi-subagents-sandboxed` lets Pi delegate work to focused child agents, with optional Bubblewrap sandboxing for child Pi processes. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
+
+## Fork baseline and purpose
+
+This repository is now a standalone fork of [`nicobailon/pi-subagents`](https://github.com/nicobailon/pi-subagents). It was forked from upstream `pi-subagents` **v0.27.0** (`v0.27.0`, commit `e6484719f88625d55e2c26ec7c3e498cda4fe0e6`) and then diverged into a sandbox-focused package.
+
+This repo should be used as a **replacement for upstream `pi-subagents` when you want optional local containment for child Pi processes**. It keeps the upstream delegation/orchestration workflows, but adds a sandbox layer so child agents can be given narrower filesystem, auth, network, and write access.
+
+Main changes from the upstream v0.27.0 baseline:
+
+- Renamed/repackaged the extension as `pi-subagents-sandboxed` so it can live as an independent package and repository.
+- Added sandbox configuration resolution from settings, agent frontmatter, and per-run `sandbox` options.
+- Added a Bubblewrap provider with a `host-toolchain` profile for local developer machines.
+- Added sandbox mount policy for cwd/worktree, child sessions, artifacts, outputs, prompt temp files, extension/runtime paths, and Pi auth JSON.
+- Added write inference: `edit`/`write` agents get writable cwd mounts; bash-only/read-only agents stay read-only unless `bashWrite: true` is set.
+- Added sandbox propagation through foreground, async, chain, parallel, and dynamic fanout subagent runs.
+- Added fail-closed fallback behavior and result/status diagnostics that report whether sandboxing actually happened.
+- Added a closed child Pi runtime path for sandboxed children, reducing ambient extension/tool discovery.
+- Mounted systemd-resolved DNS state for host networking where needed.
+- Mounted `/dev` in Bubblewrap so Node child processes and the built-in bash tool can open `/dev/null`.
+- Adjusted bundled worker/reviewer defaults and prompt guidance for this sandbox-focused fork.
+
+This is a local safety/containment feature, not a claim of hostile-code-grade isolation. The current goal is: **make subagent delegation safer by default when sandboxing is requested, while preserving the normal upstream experience when no sandbox is configured.**
 
 https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
 

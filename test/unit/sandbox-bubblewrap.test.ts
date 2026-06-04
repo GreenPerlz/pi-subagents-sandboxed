@@ -13,7 +13,7 @@ const hostToolchainConfig: ResolvedSandboxConfig = {
 function availableProvider(): BubblewrapSandboxProvider {
 	return new BubblewrapSandboxProvider({
 		isBubblewrapAvailable: () => true,
-		pathExists: (candidate) => ["/usr", "/bin", "/etc"].includes(candidate),
+		pathExists: (candidate) => ["/usr", "/bin", "/etc", "/opt/node"].includes(candidate),
 	});
 }
 
@@ -53,6 +53,22 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.equal(args.includes("--unshare-net"), false);
 		assert.equal(args.includes("/workspace"), false);
 		assert.deepEqual(args.slice(-2), ["pi", "--version"]);
+	});
+
+	it("mounts an absolute Node install root so npm/npx are available to sandboxed Pi", () => {
+		const result = availableProvider().wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: {
+				command: "/opt/node/bin/node",
+				args: ["/workspace/pi/dist/cli.js", "--version"],
+				cwd: "/home/alice/project",
+			},
+			mounts: [{ source: "/home/alice/project", mode: "ro" }, { source: "/opt/node", mode: "ro" }],
+		});
+
+		const args = result.invocation.args;
+		assert.deepEqual(args.slice(args.indexOf("/opt/node") - 1, args.indexOf("/opt/node") + 2), ["--ro-bind", "/opt/node", "/opt/node"]);
+		assert.equal(args.filter((arg) => arg === "/opt/node").length, 2, "node install root should only be bound once");
 	});
 
 	it("defaults to host networking and uses Bubblewrap network isolation when network is none", () => {
@@ -122,5 +138,89 @@ describe("Bubblewrap sandbox provider", () => {
 
 		assert.equal(result.invocation.command, "bwrap");
 		assert.deepEqual(result.invocation.args.slice(-2), ["echo", "ok"]);
+	});
+
+	it("mounts /run/systemd/resolve read-only when /etc/resolv.conf resolves into it on host networking", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/usr", "/bin", "/etc", "/etc/resolv.conf", "/run/systemd/resolve"].includes(candidate),
+			realPath: (filePath) =>
+				filePath === "/etc/resolv.conf" ? "/run/systemd/resolve/stub-resolv.conf" : filePath,
+		});
+
+		const result = provider.wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: { command: "node", args: ["script.js"] },
+		});
+
+		const args = result.invocation.args;
+		const idx = args.indexOf("/run/systemd/resolve");
+		assert.ok(idx !== -1, "expected /run/systemd/resolve to be mounted");
+		assert.equal(args[idx - 1], "--ro-bind");
+		assert.equal(args.filter((a) => a === "/run/systemd/resolve").length, 2);
+	});
+
+	it("does not mount /run/systemd/resolve when /etc/resolv.conf is a regular file", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/usr", "/bin", "/etc"].includes(candidate),
+			realPath: (filePath) => filePath,
+		});
+
+		const result = provider.wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: { command: "node", args: ["script.js"] },
+		});
+
+		assert.equal(result.invocation.args.includes("/run/systemd/resolve"), false);
+	});
+
+	it("does not mount /run/systemd/resolve when /etc/resolv.conf symlink points elsewhere", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/usr", "/bin", "/etc", "/etc/resolv.conf", "/run/systemd/resolve"].includes(candidate),
+			realPath: (filePath) =>
+				filePath === "/etc/resolv.conf" ? "/etc/resolv.conf.custom" : filePath,
+		});
+
+		const result = provider.wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: { command: "node", args: ["script.js"] },
+		});
+
+		assert.equal(result.invocation.args.includes("/run/systemd/resolve"), false);
+	});
+
+	it("does not mount /run/systemd/resolve when the directory does not exist", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/usr", "/bin", "/etc", "/etc/resolv.conf"].includes(candidate),
+			realPath: (filePath) =>
+				filePath === "/etc/resolv.conf" ? "/run/systemd/resolve/stub-resolv.conf" : filePath,
+		});
+
+		const result = provider.wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: { command: "node", args: ["script.js"] },
+		});
+
+		assert.equal(result.invocation.args.includes("/run/systemd/resolve"), false);
+	});
+
+	it("does not mount /run/systemd/resolve when network is none", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/usr", "/bin", "/etc", "/etc/resolv.conf", "/run/systemd/resolve"].includes(candidate),
+			realPath: (filePath) =>
+				filePath === "/etc/resolv.conf" ? "/run/systemd/resolve/stub-resolv.conf" : filePath,
+		});
+
+		const result = provider.wrapInvocation({
+			config: { ...hostToolchainConfig, network: "none" },
+			invocation: { command: "node", args: ["script.js"] },
+		});
+
+		assert.equal(result.invocation.args.includes("/run/systemd/resolve"), false);
+		assert.ok(result.invocation.args.includes("--unshare-net"));
 	});
 });

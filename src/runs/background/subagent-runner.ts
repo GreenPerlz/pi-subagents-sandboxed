@@ -1598,8 +1598,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					}));
 					changed = true;
 				}
-			} else if (maybeEmitActiveLongRunning(index, now)) {
-				changed = true;
+			} else {
+				if (step.activityState === "needs_attention") {
+					step.activityState = undefined;
+					changed = true;
+				}
+				if (maybeEmitActiveLongRunning(index, now)) {
+					changed = true;
+				}
 			}
 		}
 		if (statusPayload.lastActivityAt !== runLastActivityAt) {

@@ -131,10 +131,24 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.source, "foreground");
 		assert.strictEqual(runs[0]!.mode, "single");
 		assert.ok(runs[0]!.agents.includes("worker"));
+		assert.strictEqual(runs[0]!.currentTool, "read");
 		// Should have a synthesized step
 		assert.strictEqual(runs[0]!.steps.length, 1);
 		assert.strictEqual(runs[0]!.steps[0]!.agent, "worker");
 		assert.strictEqual(runs[0]!.steps[0]!.currentTool, "read");
+	});
+
+	it("propagates nested child sessionFile and asyncDir to live foreground run", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-live", {
+			currentAgent: "worker",
+			mode: "single",
+			nestedChildren: [makeNestedChild({ id: "nested-1", parentRunId: "fg-live", agent: "worker", sessionFile: "/tmp/nested/session.jsonl", asyncDir: "/tmp/nested" })],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.sessionFile, "/tmp/nested/session.jsonl");
+		assert.strictEqual(runs[0]!.asyncDir, "/tmp/nested");
 	});
 
 	it("attaches nested foreground children to a synthesized current step", () => {

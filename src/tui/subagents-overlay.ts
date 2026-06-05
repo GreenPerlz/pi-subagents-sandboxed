@@ -14,7 +14,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type KeybindingsManager } from "@earendil-works/pi-tui";
 import { collectRunTree, type OverlayNestedChild, type OverlayRun, type OverlayStep } from "./run-tree-collector.ts";
-import { readSessionFile, resolveSessionPath, type FormattedLine } from "./session-reader.ts";
+import { readSessionFile, resolveSessionPathForRun, type FormattedLine } from "./session-reader.ts";
 import type { SubagentState } from "../shared/types.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
@@ -133,9 +133,21 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 		? run.agents.join(", ")
 		: `${run.agents.slice(0, 2).join(", ")} +${run.agents.length - 2}`;
 	const selector = selected ? theme.fg("accent", "> ") : "  ";
-	const header = `${selector}${glyph} ${agents || run.id} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${elapsed}${pathDetail(run, theme)}`;
+	const tool = run.currentTool ? theme.fg("dim", ` · ${run.currentTool}`) : "";
+	const header = `${selector}${glyph} ${agents || run.id} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${tool}${elapsed}${pathDetail(run, theme)}`;
 	lines.push(truncateToWidth(header, width));
 	for (const step of run.steps) {
+		// Skip redundant step for single foreground runs where the step
+		// duplicates the run header (same agent, no nested children)
+		if (
+			run.source === "foreground" &&
+			run.mode === "single" &&
+			run.steps.length === 1 &&
+			step.agent === (run.agents[0] ?? run.id) &&
+			step.children.length === 0
+		) {
+			continue;
+		}
 		renderStep(step, theme, width, 1, lines);
 	}
 }
@@ -225,7 +237,7 @@ export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, s
 // ---------------------------------------------------------------------------
 
 export class SubagentDetailPane {
-	private readonly run: OverlayRun;
+	private run: OverlayRun;
 	private readonly theme: Theme;
 	private readonly requestRender: () => void;
 	private showThinking = false;
@@ -246,8 +258,16 @@ export class SubagentDetailPane {
 		this.refresh();
 	}
 
+	getRunId(): string {
+		return this.run.id;
+	}
+
+	updateRun(run: OverlayRun): void {
+		this.run = run;
+	}
+
 	refresh(): void {
-		const sessionPath = resolveSessionPath(this.run);
+		const sessionPath = resolveSessionPathForRun(this.run);
 		if (!sessionPath) {
 			this.error = "No session file or log available for this run yet.";
 			this.contentLines = [];
@@ -444,8 +464,12 @@ export class SubagentsOverlay {
 			this.viewInitialized = true;
 		}
 		this.clampSelection();
-		// Refresh detail pane content if open (handles growing logs)
+		// Refresh detail pane content if open (handles growing logs and newly
+		// discovered session/log paths on the refreshed run tree).
 		if (this.mode === "detail" && this.detailPane) {
+			const detailRunId = this.detailPane.getRunId();
+			const refreshedRun = this.runs.find((run) => run.id === detailRunId);
+			if (refreshedRun) this.detailPane.updateRun(refreshedRun);
 			this.detailPane.refresh();
 		}
 		this.invalidate();

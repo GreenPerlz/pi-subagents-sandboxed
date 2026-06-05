@@ -63,6 +63,7 @@ export interface OverlayRun {
 	elapsed?: string;
 	startedAt?: number;
 	updatedAt?: number;
+	currentTool?: string;
 	sessionFile?: string;
 	logPath?: string;
 	artifactPath?: string;
@@ -406,6 +407,9 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			});
 		}
 
+		const nestedSessionFile = ctrl.nestedChildren?.find((nc) => nc.sessionFile)?.sessionFile;
+		const nestedAsyncDir = ctrl.nestedChildren?.find((nc) => nc.asyncDir)?.asyncDir;
+
 		runs.push({
 			id,
 			label: `${modeLabel(ctrl.mode)}: ${agents.join(", ")}`,
@@ -416,8 +420,10 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			elapsed,
 			startedAt: ctrl.startedAt,
 			updatedAt: ctrl.updatedAt,
-			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile,
+			currentTool: ctrl.currentTool,
+			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile ?? nestedSessionFile,
 			artifactPath: childInfo.find((child) => child.artifactPath)?.artifactPath,
+			asyncDir: nestedAsyncDir,
 			steps,
 		});
 	}

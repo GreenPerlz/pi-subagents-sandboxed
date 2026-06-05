@@ -214,6 +214,72 @@ describe("subagents overlay rendering", () => {
 		assert.ok(text.includes("fg"), "should show foreground source badge");
 	});
 
+	it("renders a single foreground worker exactly once without redundant step", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "fg-1",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				currentTool: "read",
+				elapsed: "5.2s",
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						currentTool: "read",
+						elapsed: "5.2s",
+						children: [],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		// The worker agent name should appear exactly once (in the run header)
+		const workerMatches = text.match(/\bworker\b/g);
+		assert.strictEqual(workerMatches?.length, 1, "worker should appear exactly once in rendered output");
+		// The run header should include the currentTool
+		assert.ok(text.includes("read"), "run header should include currentTool");
+		// There should be no indented step line
+		const stepLine = lines.find((l) => l.includes("worker") && l.includes("running") && l.replace(/^.*?│/, "").startsWith("  "));
+		assert.strictEqual(stepLine, undefined, "should not render a redundant step line");
+	});
+
+	it("keeps the step when a single foreground run has nested children", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "fg-nested",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-1",
+								agent: "reviewer",
+								state: "running",
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		// Both worker (step) and reviewer (nested child) should appear
+		assert.ok(text.includes("worker"), "should show worker step");
+		assert.ok(text.includes("reviewer"), "should show nested child");
+	});
+
 	it("renders a completed foreground run with correct state glyph", () => {
 		const runs: OverlayRun[] = [
 			{
@@ -590,5 +656,142 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		assert.ok(afterEnter.join("\n").includes("Subagents"), "should remain in list mode when no runs");
 
 		overlay.dispose();
+	});
+
+	it("shows nested child session content in detail view for running foreground worker", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "fg-nested",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-1",
+								agent: "worker",
+								state: "running",
+								sessionFile: p,
+								children: [],
+							},
+						],
+					},
+				],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(!text.includes("No session file or log available"), "should not show empty state when nested child has session file");
+			assert.ok(text.includes("Msg0"), "should show nested child session content");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("shows step session content in detail view when run has no direct session file", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "fg-step",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						sessionFile: p,
+						children: [],
+					},
+				],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(!text.includes("No session file or log available"), "should not show empty state when step has session file");
+			assert.ok(text.includes("Msg0"), "should show step session content");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("refreshes an open detail pane with newly discovered foreground session paths", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `LiveMsg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const control = {
+				runId: "fg-live",
+				mode: "single",
+				currentAgent: "worker",
+				startedAt: 1000,
+				updatedAt: 2000,
+			};
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map(),
+				foregroundControls: new Map([["fg-live", control]]),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+			const keybindings = {
+				matches: (data: string, keyId: string) => {
+					if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+					if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+					if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+					return false;
+				},
+			} as never;
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+			try {
+				overlay.handleInput("\r");
+				assert.ok(overlay.render(WIDTH).join("\n").includes("No session file or log available"), "detail starts empty before path is discovered");
+
+				(control as { nestedChildren?: unknown[] }).nestedChildren = [
+					{
+						id: "nested-live",
+						parentRunId: "fg-live",
+						depth: 1,
+						path: [{ runId: "fg-live" }],
+						state: "running",
+						agent: "worker",
+						sessionFile: p,
+					},
+				];
+				(state as { foregroundControls: Map<string, unknown> }).foregroundControls.set("fg-live", control);
+				(overlay as unknown as { refresh(): void }).refresh();
+
+				const text = overlay.render(WIDTH).join("\n");
+				assert.ok(!text.includes("No session file or log available"), "detail should update without closing/reopening");
+				assert.ok(text.includes("LiveMsg0"), "detail should show newly discovered session content");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(p);
+		}
 	});
 });

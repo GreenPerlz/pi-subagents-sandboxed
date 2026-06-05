@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { OverlayRun, OverlayNestedChild } from "./run-tree-collector.ts";
 
 // Re-export ThinkingContent shape for internal use
 interface ThinkingContent {
@@ -373,6 +374,37 @@ export function resolveSessionPath(run: { sessionFile?: string; logPath?: string
 			if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
 		}
 	}
+	return undefined;
+}
+
+/**
+ * Find the best available session/log file for a run, searching the run itself,
+ * its steps, and nested children recursively.
+ */
+export function resolveSessionPathForRun(run: OverlayRun): string | undefined {
+	const direct = resolveSessionPath(run);
+	if (direct) return direct;
+
+	for (const step of run.steps) {
+		const stepPath = resolveSessionPath(step);
+		if (stepPath) return stepPath;
+	}
+
+	function searchChildren(children: OverlayNestedChild[]): string | undefined {
+		for (const child of children) {
+			const childPath = resolveSessionPath(child);
+			if (childPath) return childPath;
+			const nested = searchChildren(child.children);
+			if (nested) return nested;
+		}
+		return undefined;
+	}
+
+	for (const step of run.steps) {
+		const nested = searchChildren(step.children);
+		if (nested) return nested;
+	}
+
 	return undefined;
 }
 

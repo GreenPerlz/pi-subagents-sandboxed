@@ -18,6 +18,36 @@ import { readSessionFile, resolveSessionPath, type FormattedLine } from "./sessi
 import type { SubagentState } from "../shared/types.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
+export type SubagentsOverlayView = "running" | "completed";
+
+function isRunningViewState(state: OverlayRun["state"]): boolean {
+	return state === "running" || state === "queued";
+}
+
+function runMatchesView(run: OverlayRun, view: SubagentsOverlayView): boolean {
+	const isRunning = isRunningViewState(run.state);
+	return view === "running" ? isRunning : !isRunning;
+}
+
+function countRunsByView(runs: OverlayRun[]): { running: number; completed: number } {
+	let running = 0;
+	let completed = 0;
+	for (const run of runs) {
+		if (isRunningViewState(run.state)) running++;
+		else completed++;
+	}
+	return { running, completed };
+}
+
+export function filterRunsForView(runs: OverlayRun[], view: SubagentsOverlayView): OverlayRun[] {
+	return runs.filter((run) => runMatchesView(run, view));
+}
+
+interface RenderOverlayOptions {
+	view?: SubagentsOverlayView;
+	runningCount?: number;
+	completedCount?: number;
+}
 
 // ---------------------------------------------------------------------------
 // Overlay rendering helpers
@@ -108,7 +138,20 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 	}
 }
 
-function renderEmptyState(theme: Theme, width: number): string[] {
+function renderViewSwitch(theme: Theme, options?: RenderOverlayOptions): string {
+	if (!options?.view) return theme.fg("dim", "· live run tree");
+	const runningCount = options.runningCount ?? 0;
+	const completedCount = options.completedCount ?? 0;
+	const running = options.view === "running"
+		? theme.fg("accent", theme.bold(`running ${runningCount}`))
+		: theme.fg("dim", `running ${runningCount}`);
+	const completed = options.view === "completed"
+		? theme.fg("accent", theme.bold(`completed ${completedCount}`))
+		: theme.fg("dim", `completed ${completedCount}`);
+	return `${theme.fg("dim", "·")} ${running} ${theme.fg("dim", "|")} ${completed}`;
+}
+
+function renderEmptyState(theme: Theme, width: number, options?: RenderOverlayOptions): string[] {
 	const innerW = width - 2;
 	const lines: string[] = [];
 	const pad = (s: string, len: number) => {
@@ -118,22 +161,31 @@ function renderEmptyState(theme: Theme, width: number): string[] {
 	const row = (content: string) => theme.fg("border", "│") + pad(content, innerW) + theme.fg("border", "│");
 
 	lines.push(theme.fg("border", `╭${"─".repeat(innerW)}╮`));
-	lines.push(row(` ${theme.fg("accent", "Subagents")}`));
+	lines.push(row(` ${theme.fg("accent", "Subagents")} ${renderViewSwitch(theme, options)}`));
 	lines.push(row(""));
-	lines.push(row(` ${theme.fg("dim", "No subagents known/running.")}`));
-	lines.push(row(""));
-	lines.push(row(` ${theme.fg("dim", "Use /run, /chain, /parallel, or")}`));
-	lines.push(row(` ${theme.fg("dim", "subagent({ ... }) to start a run.")}`));
-	lines.push(row(""));
-	lines.push(row(` ${theme.fg("dim", "For text-mode status, use:")}`));
-	lines.push(row(` ${theme.fg("dim", '  subagent({ action: "status" })')}`));
-	lines.push(row(""));
-	lines.push(row(` ${theme.fg("dim", "Esc to close")}`));
+	if (options?.view) {
+		const emptyMessage = options.view === "running"
+			? "No running subagents."
+			: "No completed subagent runs.";
+		lines.push(row(` ${theme.fg("dim", emptyMessage)}`));
+		lines.push(row(""));
+		lines.push(row(` ${theme.fg("dim", "Tab/←/→ switch view · Esc close")}`));
+	} else {
+		lines.push(row(` ${theme.fg("dim", "No subagents known/running.")}`));
+		lines.push(row(""));
+		lines.push(row(` ${theme.fg("dim", "Use /run, /chain, /parallel, or")}`));
+		lines.push(row(` ${theme.fg("dim", "subagent({ ... }) to start a run.")}`));
+		lines.push(row(""));
+		lines.push(row(` ${theme.fg("dim", "For text-mode status, use:")}`));
+		lines.push(row(` ${theme.fg("dim", '  subagent({ action: "status" })')}`));
+		lines.push(row(""));
+		lines.push(row(` ${theme.fg("dim", "Esc to close")}`));
+	}
 	lines.push(theme.fg("border", `╰${"─".repeat(innerW)}╯`));
 	return lines;
 }
 
-export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, selectedRunIndex = 0): string[] {
+export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, selectedRunIndex = 0, options?: RenderOverlayOptions): string[] {
 	const innerW = width - 2;
 	const pad = (s: string, len: number) => {
 		const vis = visibleWidth(s);
@@ -141,10 +193,10 @@ export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, s
 	};
 	const row = (content: string) => theme.fg("border", "│") + pad(content, innerW) + theme.fg("border", "│");
 
-	if (runs.length === 0) return renderEmptyState(theme, width);
+	if (runs.length === 0) return renderEmptyState(theme, width, options);
 
 	const contentLines: string[] = [];
-	contentLines.push(` ${theme.fg("accent", "Subagents")} ${theme.fg("dim", "· live run tree")}`);
+	contentLines.push(` ${theme.fg("accent", "Subagents")} ${renderViewSwitch(theme, options)}`);
 	contentLines.push("");
 	for (const [index, run] of runs.entries()) {
 		renderRun(run, theme, innerW - 1, contentLines, index === selectedRunIndex);
@@ -154,7 +206,8 @@ export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, s
 	if (contentLines.length > 0 && contentLines[contentLines.length - 1] === "") {
 		contentLines.pop();
 	}
-	contentLines.push(truncateToWidth(` ${theme.fg("dim", "↑↓ navigate · Enter detail · Esc close")}`, innerW));
+	const switchHint = options?.view ? " · Tab/←/→ switch" : "";
+	contentLines.push(truncateToWidth(` ${theme.fg("dim", `↑↓ navigate · Enter detail${switchHint} · Esc close`)}`, innerW));
 
 	const lines: string[] = [];
 	lines.push(theme.fg("border", `╭${"─".repeat(innerW)}╮`));
@@ -348,6 +401,8 @@ type OverlayMode = "list" | "detail";
 export class SubagentsOverlay {
 	private runs: OverlayRun[] = [];
 	private selectedRunIndex = 0;
+	private view: SubagentsOverlayView = "running";
+	private viewInitialized = false;
 	private mode: OverlayMode = "list";
 	private detailPane?: SubagentDetailPane;
 	private cachedWidth?: number;
@@ -381,17 +436,44 @@ export class SubagentsOverlay {
 
 	private refresh(): void {
 		this.runs = collectRunTree(this.state);
-		if (this.runs.length === 0) {
-			this.selectedRunIndex = 0;
-		} else if (this.selectedRunIndex >= this.runs.length) {
-			this.selectedRunIndex = this.runs.length - 1;
+		if (!this.viewInitialized) {
+			const counts = countRunsByView(this.runs);
+			if (counts.running === 0 && counts.completed > 0) this.view = "completed";
+			this.viewInitialized = true;
 		}
+		this.clampSelection();
 		// Refresh detail pane content if open (handles growing logs)
 		if (this.mode === "detail" && this.detailPane) {
 			this.detailPane.refresh();
 		}
 		this.invalidate();
 		this.requestRender();
+	}
+
+	private visibleRuns(): OverlayRun[] {
+		return filterRunsForView(this.runs, this.view);
+	}
+
+	private clampSelection(): void {
+		const visibleRuns = this.visibleRuns();
+		if (visibleRuns.length === 0) {
+			this.selectedRunIndex = 0;
+		} else if (this.selectedRunIndex >= visibleRuns.length) {
+			this.selectedRunIndex = visibleRuns.length - 1;
+		}
+	}
+
+	private setView(view: SubagentsOverlayView): void {
+		if (this.view === view) return;
+		this.view = view;
+		this.selectedRunIndex = 0;
+		this.clampSelection();
+		this.invalidate();
+		this.requestRender();
+	}
+
+	private toggleView(): void {
+		this.setView(this.view === "running" ? "completed" : "running");
 	}
 
 	dispose(): void {
@@ -415,15 +497,28 @@ export class SubagentsOverlay {
 			this.done();
 			return;
 		}
+		if (matchesKey(data, "tab") || matchesKey(data, "left") || matchesKey(data, "right")) {
+			this.toggleView();
+			return;
+		}
+		if (data === "r" || data === "R") {
+			this.setView("running");
+			return;
+		}
+		if (data === "c" || data === "C") {
+			this.setView("completed");
+			return;
+		}
 		if (this.keybindings.matches(data, "tui.select.up")) {
 			this.selectedRunIndex = Math.max(0, this.selectedRunIndex - 1);
 			this.invalidate();
 			this.requestRender();
 		} else if (this.keybindings.matches(data, "tui.select.down")) {
-			this.selectedRunIndex = Math.min(this.runs.length - 1, this.selectedRunIndex + 1);
+			const visibleRuns = this.visibleRuns();
+			this.selectedRunIndex = visibleRuns.length === 0 ? 0 : Math.min(visibleRuns.length - 1, this.selectedRunIndex + 1);
 			this.invalidate();
 			this.requestRender();
-		} else if (matchesKey(data, "return") || matchesKey(data, "space")) {
+		} else if (matchesKey(data, "return") || matchesKey(data, "enter") || matchesKey(data, "space")) {
 			this.openDetail();
 		}
 	}
@@ -443,8 +538,9 @@ export class SubagentsOverlay {
 	}
 
 	private openDetail(): void {
-		if (this.runs.length === 0) return;
-		const run = this.runs[this.selectedRunIndex];
+		const visibleRuns = this.visibleRuns();
+		if (visibleRuns.length === 0) return;
+		const run = visibleRuns[this.selectedRunIndex];
 		if (!run) return;
 		this.mode = "detail";
 		this.detailPane = new SubagentDetailPane(run, this.theme, this.requestRender);
@@ -470,7 +566,12 @@ export class SubagentsOverlay {
 		if (this.mode === "detail" && this.detailPane) {
 			this.cachedLines = this.detailPane.render(width, height);
 		} else {
-			this.cachedLines = renderOverlay(this.runs, this.theme, width, this.selectedRunIndex);
+			const counts = countRunsByView(this.runs);
+			this.cachedLines = renderOverlay(this.visibleRuns(), this.theme, width, this.selectedRunIndex, {
+				view: this.view,
+				runningCount: counts.running,
+				completedCount: counts.completed,
+			});
 		}
 		return this.cachedLines;
 	}

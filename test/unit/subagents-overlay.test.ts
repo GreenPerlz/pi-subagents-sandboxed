@@ -181,6 +181,20 @@ describe("subagents overlay rendering", () => {
 		assert.ok(workerIdx < reviewerIdx, "first run should appear before second run");
 	});
 
+	it("renders a running/completed switch in filtered overlay mode", () => {
+		const lines = renderOverlay([], theme as never, WIDTH, 0, {
+			view: "running",
+			runningCount: 0,
+			completedCount: 2,
+		});
+		const text = lines.join("\n");
+
+		assert.ok(text.includes("running 0"), "should show running count");
+		assert.ok(text.includes("completed 2"), "should show completed count");
+		assert.ok(text.includes("No running subagents"), "should explain empty running view");
+		assert.ok(text.includes("switch view"), "should show switch hint");
+	});
+
 	it("renders with fg source badge for foreground runs", () => {
 		const runs: OverlayRun[] = [
 			{
@@ -196,6 +210,31 @@ describe("subagents overlay rendering", () => {
 		const lines = renderOverlay(runs, theme as never, WIDTH);
 		const text = lines.join("\n");
 		assert.ok(text.includes("fg"), "should show foreground source badge");
+	});
+
+	it("renders a completed foreground run with correct state glyph", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "fg-done",
+				label: "chain: researcher, worker",
+				state: "complete",
+				mode: "chain",
+				source: "foreground",
+				agents: ["researcher", "worker"],
+				elapsed: "12s",
+				steps: [
+					{ agent: "researcher", state: "complete", elapsed: "8s", children: [] },
+					{ agent: "worker", state: "complete", elapsed: "4s", children: [] },
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		assert.ok(text.includes("researcher"), "should show researcher step");
+		assert.ok(text.includes("worker"), "should show worker step");
+		assert.ok(text.includes("complete"), "should show complete state");
+		assert.ok(text.includes("fg"), "should show foreground source badge");
+		assert.ok(text.includes("12s"), "should show elapsed");
 	});
 
 	it("truncates lines to width", () => {
@@ -433,6 +472,75 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		for (const h of [10, 15, 20]) {
 			const lines = pane.render(80, h);
 			assert.strictEqual(lines.length, h, `error render(80, ${h}) should return exactly ${h} lines`);
+		}
+	});
+
+	it("switches between running and completed run buckets", () => {
+		let renderCount = 0;
+		const requestRender = () => { renderCount++; };
+
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map([
+				["run-running", {
+					asyncId: "run-running",
+					asyncDir: "/tmp/run-running",
+					status: "running",
+					agents: ["worker"],
+					steps: [{ agent: "worker", status: "running" }],
+				}],
+				["run-complete", {
+					asyncId: "run-complete",
+					asyncDir: "/tmp/run-complete",
+					status: "complete",
+					agents: ["reviewer"],
+					steps: [{ agent: "reviewer", status: "completed" }],
+				}],
+			]),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+
+		const keybindings = {
+			matches: (data: string, keyId: string) => {
+				if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+				if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+				if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+				return false;
+			},
+		} as never;
+
+		let doneCalled = false;
+		const done = () => { doneCalled = true; };
+
+		const overlay = new SubagentsOverlay(theme as never, state as never, done, requestRender, keybindings);
+		try {
+			const runningText = overlay.render(WIDTH).join("\n");
+			assert.ok(runningText.includes("running 1"), "should show running count");
+			assert.ok(runningText.includes("completed 1"), "should show completed count");
+			assert.ok(runningText.includes("worker"), "running view should show running agent");
+			assert.ok(!runningText.includes("reviewer complete"), "running view should hide completed agent");
+
+			overlay.handleInput("c");
+			const completedText = overlay.render(WIDTH).join("\n");
+			assert.ok(completedText.includes("reviewer"), "completed view should show completed agent");
+			assert.ok(!completedText.includes("worker running"), "completed view should hide running agent");
+
+			overlay.handleInput("r");
+			const backToRunningText = overlay.render(WIDTH).join("\n");
+			assert.ok(backToRunningText.includes("worker"), "running shortcut should switch back");
+			assert.equal(doneCalled, false, "switching views should not close overlay");
+		} finally {
+			overlay.dispose();
 		}
 	});
 

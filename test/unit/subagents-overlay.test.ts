@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { renderOverlay, SubagentDetailPane, SubagentsOverlay, registerSubagentsOverlayShortcut } from "../../src/tui/subagents-overlay.ts";
+import { renderOverlay, SubagentDetailPane, SubagentsOverlay, registerSubagentsOverlayShortcut, flattenRows } from "../../src/tui/subagents-overlay.ts";
 import type { OverlayRun } from "../../src/tui/run-tree-collector.ts";
 
 function tmpFile(content: string): string {
@@ -1026,6 +1026,7 @@ describe("subagents overlay external terminal (issue #23)", () => {
 						status: "running",
 						agents: ["worker"],
 						steps: [{ agent: "worker", status: "running", sessionFile: p }],
+						sessionFile: p,
 					}],
 				]),
 				foregroundControls: new Map(),
@@ -1824,6 +1825,399 @@ describe("subagents overlay session/logs toggle (issue #28)", () => {
 			assert.ok(text.includes("view:session"), "header should show session view for completed run");
 		} finally {
 			cleanup(p);
+		}
+	});
+});
+
+
+describe("subagents overlay flattened selectable rows (issue #30)", () => {
+	it("flattenRows produces a row for each run, step, and nested child", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "chain-1",
+				label: "chain: researcher, worker",
+				state: "running",
+				mode: "chain",
+				source: "async",
+				agents: ["researcher", "worker"],
+				steps: [
+					{ agent: "researcher", state: "complete", children: [] },
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-1",
+								agent: "reviewer",
+								state: "running",
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		const rows = flattenRows(runs);
+		assert.strictEqual(rows.length, 4, "should have 4 selectable rows");
+		assert.strictEqual(rows[0]!.type, "run");
+		assert.strictEqual(rows[0]!.target.id, "chain-1");
+		assert.strictEqual(rows[1]!.type, "step");
+		assert.strictEqual(rows[1]!.target.id, "chain-1:step:0");
+		assert.strictEqual(rows[2]!.type, "step");
+		assert.strictEqual(rows[2]!.target.id, "chain-1:step:1");
+		assert.strictEqual(rows[3]!.type, "nested");
+		assert.strictEqual(rows[3]!.target.id, "nested-1");
+	});
+
+	it("flattenRows skips redundant step for single foreground run but keeps nested children", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "fg-1",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-1",
+								agent: "reviewer",
+								state: "running",
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		const rows = flattenRows(runs);
+		assert.strictEqual(rows.length, 2, "should have 2 rows: run + nested child");
+		assert.strictEqual(rows[0]!.type, "run");
+		assert.strictEqual(rows[1]!.type, "nested");
+		assert.strictEqual(rows[1]!.target.id, "nested-1");
+	});
+
+	it("renderOverlay shows selection indicator on child rows", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "chain-1",
+				label: "chain: a, b",
+				state: "running",
+				mode: "chain",
+				source: "async",
+				agents: ["a", "b"],
+				steps: [
+					{ agent: "a", state: "complete", children: [] },
+					{ agent: "b", state: "running", children: [] },
+				],
+			},
+		];
+		// Select step 1 (index 1)
+		const lines = renderOverlay(runs, theme as never, WIDTH, 1);
+		// The step line should have the selector
+		const stepLine = lines.find((l) => l.includes("1. a"));
+		assert.ok(stepLine, "step line should exist");
+		assert.ok(stepLine!.includes("> "), "selected step should have selector");
+		// The run header should not have selector
+		const runLine = lines.find((l) => l.includes("chain:"));
+		assert.ok(runLine, "run line should exist");
+		assert.ok(!runLine!.includes("> "), "non-selected run should not have selector");
+	});
+
+	it("renderOverlay shows selection indicator on nested child rows", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "run-1",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-1",
+								agent: "reviewer",
+								state: "running",
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		// Select nested child (index 1: run header is 0, step is redundant for foreground single)
+		const lines = renderOverlay(runs, theme as never, WIDTH, 1);
+		const nestedLine = lines.find((l) => l.includes("nested-1"));
+		assert.ok(nestedLine, "nested line should exist");
+		assert.ok(nestedLine!.includes("> "), "selected nested child should have selector");
+	});
+
+	it("opens detail focused on a specific step when that step is selected", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Step${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const stepP = tmpFile(entries);
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["run-1", {
+						asyncId: "run-1",
+						asyncDir: "/tmp/run-1",
+						status: "running",
+						agents: ["worker"],
+						steps: [
+							{ agent: "researcher", status: "running" },
+							{ agent: "worker", status: "running", sessionFile: stepP },
+						],
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+
+			const keybindings = {
+				matches: (data: string, keyId: string) => {
+					if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+					if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+					if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+					return false;
+				},
+			} as never;
+
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+			try {
+				// Navigate down twice: 0 = run header, 1 = step 0 (researcher), 2 = step 1 (worker)
+				overlay.handleInput("\x1B[B"); // down
+				overlay.handleInput("\x1B[B"); // down
+				overlay.handleInput("\r"); // Enter detail
+				const text = overlay.render(WIDTH).join("\n");
+				assert.ok(text.includes("worker (step 2)"), "detail pane should open focused on worker step");
+				assert.ok(text.includes("Step0"), "detail should show worker step session content");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(stepP);
+		}
+	});
+
+	it("opens detail focused on a nested child when that child is selected", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Nested${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const nestedP = tmpFile(entries);
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["run-1", {
+						asyncId: "run-1",
+						asyncDir: "/tmp/run-1",
+						status: "running",
+						agents: ["worker"],
+						steps: [
+							{
+								agent: "worker",
+								status: "running",
+								children: [
+									{
+										id: "nested-1",
+										agent: "reviewer",
+										status: "running",
+										sessionFile: nestedP,
+									},
+								],
+							},
+						],
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+
+			const keybindings = {
+				matches: (data: string, keyId: string) => {
+					if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+					if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+					if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+					return false;
+				},
+			} as never;
+
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+			try {
+				// Rows are: 0 = run header, 1 = step (worker), 2 = nested child (reviewer)
+				overlay.handleInput("\x1B[B"); // down to step
+				overlay.handleInput("\x1B[B"); // down to nested child
+				overlay.handleInput("\r"); // Enter detail
+				const text = overlay.render(WIDTH).join("\n");
+				assert.ok(text.includes("nested-1"), "detail pane title should show nested child id");
+				assert.ok(text.includes("Nested0"), "detail should show nested child session content");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(nestedP);
+		}
+	});
+
+	it("navigates up and down through flattened rows including children", () => {
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map([
+				["run-1", {
+					asyncId: "run-1",
+					asyncDir: "/tmp/run-1",
+					status: "running",
+					agents: ["worker"],
+					steps: [
+						{ agent: "researcher", status: "running" },
+						{ agent: "worker", status: "running" },
+					],
+				}],
+			]),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+
+		const keybindings = {
+			matches: (data: string, keyId: string) => {
+				if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+				if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+				if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+				return false;
+			},
+		} as never;
+
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+		try {
+			// Start at run header (index 0)
+			let text = overlay.render(WIDTH).join("\n");
+			assert.ok(text.includes("> "), "run header should be selected initially");
+
+			// Down to step 0
+			overlay.handleInput("\x1B[B");
+			text = overlay.render(WIDTH).join("\n");
+			const step0Line = text.split("\n").find((l) => l.includes("1. researcher"));
+			assert.ok(step0Line?.includes("> "), "step 0 should be selected after one down");
+
+			// Down to step 1
+			overlay.handleInput("\x1B[B");
+			text = overlay.render(WIDTH).join("\n");
+			const step1Line = text.split("\n").find((l) => l.includes("2. worker"));
+			assert.ok(step1Line?.includes("> "), "step 1 should be selected after two downs");
+
+			// Up back to step 0
+			overlay.handleInput("\x1B[A");
+			text = overlay.render(WIDTH).join("\n");
+			const step0Line2 = text.split("\n").find((l) => l.includes("1. researcher"));
+			assert.ok(step0Line2?.includes("> "), "step 0 should be selected after one up");
+		} finally {
+			overlay.dispose();
+		}
+	});
+
+	it("preserves auto-select behavior when Enter is pressed on a parent run row without its own session (issue #30)", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Child${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const childP = tmpFile(entries);
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["chain-1", {
+						asyncId: "chain-1",
+						asyncDir: "/tmp/chain-1",
+						status: "running",
+						agents: ["researcher", "worker"],
+						steps: [
+							{ agent: "researcher", status: "complete" },
+							{ agent: "worker", status: "running", sessionFile: childP },
+						],
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+
+			const keybindings = {
+				matches: (data: string, keyId: string) => {
+					if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+					if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+					if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+					return false;
+				},
+			} as never;
+
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+			try {
+				// Run header is selected initially. Press Enter.
+				overlay.handleInput("\r");
+				const parentText = overlay.render(WIDTH).join("\n");
+				// Parent run has no sessionFile/logPath, so detail should auto-select child step
+				assert.ok(parentText.includes("worker (step 2)"), "detail should auto-select child step when parent run has no session");
+				assert.ok(parentText.includes("Child0"), "detail should show child session content");
+				assert.ok(!parentText.includes("No logs available"), "should not show empty state when child has session");
+
+				// Close detail and select the child step explicitly
+				overlay.handleInput("\x1B"); // Esc to close
+				overlay.handleInput("\x1B[B"); // down to step 1 (researcher)
+				overlay.handleInput("\x1B[B"); // down to step 2 (worker)
+				overlay.handleInput("\r"); // Enter detail
+				const childText = overlay.render(WIDTH).join("\n");
+				assert.ok(childText.includes("worker (step 2)"), "detail should open focused on selected child step");
+				assert.ok(childText.includes("Child0"), "detail should show selected child session content");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(childP);
 		}
 	});
 });

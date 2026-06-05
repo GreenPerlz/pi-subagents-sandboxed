@@ -101,44 +101,54 @@ function pathDetail(input: { sessionFile?: string; logPath?: string; artifactPat
 	return parts.length ? theme.fg("dim", ` · ${parts.join(" · ")}`) : "";
 }
 
+interface RowCounter {
+	index: number;
+}
+
 function renderNestedChildren(
 	children: OverlayNestedChild[],
 	theme: Theme,
 	width: number,
 	depth: number,
 	lines: string[],
+	selectedRowIndex: number,
+	counter: RowCounter,
 ): void {
 	for (const child of children) {
 		if (lines.length > 200) return; // line budget
 		const prefix = indent(depth);
+		const selector = counter.index === selectedRowIndex ? theme.fg("accent", "> ") : "  ";
 		const glyph = stateGlyph(child.state, theme);
 		const tool = child.currentTool ? theme.fg("dim", ` · ${child.currentTool}`) : "";
 		const elapsed = child.elapsed ? theme.fg("dim", ` · ${child.elapsed}`) : "";
-		const line = `${prefix}${glyph} ${child.agent} ${stateLabel(child.state, theme)} · ${child.id}${tool}${elapsed}${pathDetail(child, theme)}`;
+		const line = `${selector}${prefix}${glyph} ${child.agent} ${stateLabel(child.state, theme)} · ${child.id}${tool}${elapsed}${pathDetail(child, theme)}`;
 		lines.push(truncateToWidth(line, width));
+		counter.index++;
 		if (child.steps?.length) {
 			for (const [stepIndex, step] of child.steps.entries()) {
-				renderStep(step, stepIndex, theme, width, depth + 1, lines);
+				renderStep(step, stepIndex, theme, width, depth + 1, lines, selectedRowIndex, counter);
 			}
 		}
 		if (child.children.length) {
-			renderNestedChildren(child.children, theme, width, depth + 1, lines);
+			renderNestedChildren(child.children, theme, width, depth + 1, lines, selectedRowIndex, counter);
 		}
 	}
 }
 
-function renderStep(step: OverlayStep, stepIndex: number, theme: Theme, width: number, depth: number, lines: string[]): void {
+function renderStep(step: OverlayStep, stepIndex: number, theme: Theme, width: number, depth: number, lines: string[], selectedRowIndex: number, counter: RowCounter): void {
 	const prefix = indent(depth);
+	const selector = counter.index === selectedRowIndex ? theme.fg("accent", "> ") : "  ";
 	const glyph = stateGlyph(step.state, theme);
 	const stepNum = `${stepIndex + 1}.`;
 	const tool = step.currentTool ? theme.fg("dim", ` · ${step.currentTool}`) : "";
 	const elapsed = step.elapsed ? theme.fg("dim", ` · ${step.elapsed}`) : "";
-	const line = `${prefix}${glyph} ${stepNum} ${step.agent} ${stateLabel(step.state, theme)}${tool}${elapsed}${pathDetail(step, theme)}`;
+	const line = `${selector}${prefix}${glyph} ${stepNum} ${step.agent} ${stateLabel(step.state, theme)}${tool}${elapsed}${pathDetail(step, theme)}`;
 	lines.push(truncateToWidth(line, width));
-	renderNestedChildren(step.children, theme, width, depth + 1, lines);
+	counter.index++;
+	renderNestedChildren(step.children, theme, width, depth + 1, lines, selectedRowIndex, counter);
 }
 
-function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[], selected: boolean): void {
+function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[], selectedRowIndex: number, counter: RowCounter): void {
 	const glyph = stateGlyph(run, theme);
 	const badge = sourceBadge(run.source, theme);
 	const elapsed = run.elapsed ? theme.fg("dim", ` · ${run.elapsed}`) : "";
@@ -146,10 +156,11 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 		? run.agents.join(", ")
 		: `${run.agents.slice(0, 2).join(", ")} +${run.agents.length - 2}`;
 	const modePrefix = run.mode !== "single" ? `${run.mode}: ` : "";
-	const selector = selected ? theme.fg("accent", "> ") : "  ";
+	const selector = counter.index === selectedRowIndex ? theme.fg("accent", "> ") : "  ";
 	const tool = run.currentTool ? theme.fg("dim", ` · ${run.currentTool}`) : "";
 	const header = `${selector}${glyph} ${modePrefix}${agents || run.id} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${tool}${elapsed}${pathDetail(run, theme)}`;
 	lines.push(truncateToWidth(header, width));
+	counter.index++;
 	for (const [stepIndex, step] of run.steps.entries()) {
 		// Skip redundant step line for single foreground runs where the step
 		// duplicates the run header (same agent). Still render nested children
@@ -161,11 +172,11 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 			step.agent === (run.agents[0] ?? run.id);
 		if (isRedundant) {
 			if (step.children.length > 0) {
-				renderNestedChildren(step.children, theme, width, 1, lines);
+				renderNestedChildren(step.children, theme, width, 1, lines, selectedRowIndex, counter);
 			}
 			continue;
 		}
-		renderStep(step, stepIndex, theme, width, 1, lines);
+		renderStep(step, stepIndex, theme, width, 1, lines, selectedRowIndex, counter);
 	}
 }
 
@@ -220,7 +231,7 @@ export function renderOverlay(
 	runs: OverlayRun[],
 	theme: Theme,
 	width: number,
-	selectedRunIndex = 0,
+	selectedRowIndex = 0,
 	options?: RenderOverlayOptions,
 	terminalCommand?: ResolvedTerminalCommand,
 	transientError?: string,
@@ -237,8 +248,9 @@ export function renderOverlay(
 	const contentLines: string[] = [];
 	contentLines.push(` ${theme.fg("accent", "Subagents")} ${renderViewSwitch(theme, options)}`);
 	contentLines.push("");
-	for (const [index, run] of runs.entries()) {
-		renderRun(run, theme, innerW - 1, contentLines, index === selectedRunIndex);
+	const counter: RowCounter = { index: 0 };
+	for (const run of runs) {
+		renderRun(run, theme, innerW - 1, contentLines, selectedRowIndex, counter);
 		contentLines.push("");
 	}
 	// Remove trailing blank
@@ -325,6 +337,105 @@ function buildDetailTargets(run: OverlayRun): DetailPaneTarget[] {
 	return targets;
 }
 
+// ---------------------------------------------------------------------------
+// Flattened selectable rows (issue #30)
+// ---------------------------------------------------------------------------
+
+export interface FlattenedRow {
+	type: "run" | "step" | "nested";
+	run: OverlayRun;
+	target: DetailPaneTarget;
+	stepIndex?: number;
+	step?: OverlayStep;
+	nestedChild?: OverlayNestedChild;
+}
+
+export function flattenRows(runs: OverlayRun[]): FlattenedRow[] {
+	const rows: FlattenedRow[] = [];
+	for (const run of runs) {
+		rows.push({
+			type: "run",
+			run,
+			target: {
+				id: run.id,
+				label: run.agents.join(", ") || run.id,
+				sessionFile: run.sessionFile,
+				logPath: run.logPath,
+				artifactPath: run.artifactPath,
+				asyncDir: run.asyncDir,
+			},
+		});
+		for (const [stepIndex, step] of run.steps.entries()) {
+			const isRedundant =
+				run.source === "foreground" &&
+				run.mode === "single" &&
+				run.steps.length === 1 &&
+				step.agent === (run.agents[0] ?? run.id);
+			if (isRedundant) {
+				flattenNestedChildren(step.children, run, rows, step.agent);
+				continue;
+			}
+			rows.push({
+				type: "step",
+				run,
+				stepIndex,
+				step,
+				target: {
+					id: `${run.id}:step:${stepIndex}`,
+					label: `${step.agent} (step ${stepIndex + 1})`,
+					sessionFile: step.sessionFile,
+					logPath: step.logPath,
+					artifactPath: step.artifactPath,
+					asyncDir: step.asyncDir ?? run.asyncDir,
+				},
+			});
+			flattenNestedChildren(step.children, run, rows, step.agent);
+		}
+	}
+	return rows;
+}
+
+function flattenNestedChildren(children: OverlayNestedChild[], run: OverlayRun, rows: FlattenedRow[], prefix: string): void {
+	for (const child of children) {
+		const childLabel = prefix ? `${prefix} → ${child.agent}` : child.agent;
+		rows.push({
+			type: "nested",
+			run,
+			nestedChild: child,
+			target: {
+				id: child.id,
+				label: childLabel,
+				sessionFile: child.sessionFile,
+				logPath: child.logPath,
+				artifactPath: child.artifactPath,
+				asyncDir: child.asyncDir,
+			},
+		});
+		const childPrefix = childLabel;
+		if (child.steps) {
+			for (const [stepIndex, step] of child.steps.entries()) {
+				const stepLabel = `${childPrefix} → ${step.agent} (step ${stepIndex + 1})`;
+				rows.push({
+					type: "step",
+					run,
+					stepIndex,
+					step,
+					target: {
+						id: `${child.id}:step:${stepIndex}`,
+						label: stepLabel,
+						sessionFile: step.sessionFile,
+						logPath: step.logPath,
+						artifactPath: step.artifactPath,
+						asyncDir: step.asyncDir ?? child.asyncDir,
+					},
+				});
+				flattenNestedChildren(step.children, run, rows, `${childPrefix} → ${step.agent}`);
+			}
+		}
+		flattenNestedChildren(child.children, run, rows, childPrefix);
+	}
+}
+
 export class SubagentDetailPane {
 	private run: OverlayRun;
 	private readonly theme: Theme;
@@ -347,7 +458,7 @@ export class SubagentDetailPane {
 	private transientError?: string;
 	private transientErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
-	constructor(run: OverlayRun, theme: Theme, requestRender: () => void, terminalCommand?: ResolvedTerminalCommand) {
+	constructor(run: OverlayRun, theme: Theme, requestRender: () => void, terminalCommand?: ResolvedTerminalCommand, initialTargetId?: string) {
 		this.run = run;
 		this.theme = theme;
 		this.requestRender = requestRender;
@@ -366,7 +477,13 @@ export class SubagentDetailPane {
 			}
 			if (sessionIndex >= 0 && anyIndex >= 0) break;
 		}
-		this.candidateIndex = sessionIndex >= 0 ? sessionIndex : anyIndex >= 0 ? anyIndex : 0;
+		const defaultIndex = sessionIndex >= 0 ? sessionIndex : anyIndex >= 0 ? anyIndex : 0;
+		if (initialTargetId) {
+			const explicitIndex = this.candidates.findIndex((c) => c.id === initialTargetId);
+			this.candidateIndex = explicitIndex >= 0 ? explicitIndex : defaultIndex;
+		} else {
+			this.candidateIndex = defaultIndex;
+		}
 		// Default to session view when a session file is available; otherwise logs.
 		const initialTarget = this.candidates[this.candidateIndex];
 		this.detailView = initialTarget && resolveSessionPath(initialTarget, "session") ? "session" : "logs";
@@ -619,7 +736,7 @@ type OverlayMode = "list" | "detail";
 
 export class SubagentsOverlay {
 	private runs: OverlayRun[] = [];
-	private selectedRunIndex = 0;
+	private selectedRowIndex = 0;
 	private view: SubagentsOverlayView = "running";
 	private viewInitialized = false;
 	private mode: OverlayMode = "list";
@@ -681,18 +798,18 @@ export class SubagentsOverlay {
 	}
 
 	private clampSelection(): void {
-		const visibleRuns = this.visibleRuns();
-		if (visibleRuns.length === 0) {
-			this.selectedRunIndex = 0;
-		} else if (this.selectedRunIndex >= visibleRuns.length) {
-			this.selectedRunIndex = visibleRuns.length - 1;
+		const rows = flattenRows(this.visibleRuns());
+		if (rows.length === 0) {
+			this.selectedRowIndex = 0;
+		} else if (this.selectedRowIndex >= rows.length) {
+			this.selectedRowIndex = rows.length - 1;
 		}
 	}
 
 	private setView(view: SubagentsOverlayView): void {
 		if (this.view === view) return;
 		this.view = view;
-		this.selectedRunIndex = 0;
+		this.selectedRowIndex = 0;
 		this.clampSelection();
 		this.invalidate();
 		this.requestRender();
@@ -736,12 +853,12 @@ export class SubagentsOverlay {
 			return;
 		}
 		if (this.keybindings.matches(data, "tui.select.up")) {
-			this.selectedRunIndex = Math.max(0, this.selectedRunIndex - 1);
+			this.selectedRowIndex = Math.max(0, this.selectedRowIndex - 1);
 			this.invalidate();
 			this.requestRender();
 		} else if (this.keybindings.matches(data, "tui.select.down")) {
-			const visibleRuns = this.visibleRuns();
-			this.selectedRunIndex = visibleRuns.length === 0 ? 0 : Math.min(visibleRuns.length - 1, this.selectedRunIndex + 1);
+			const rows = flattenRows(this.visibleRuns());
+			this.selectedRowIndex = rows.length === 0 ? 0 : Math.min(rows.length - 1, this.selectedRowIndex + 1);
 			this.invalidate();
 			this.requestRender();
 		} else if (matchesKey(data, "return") || matchesKey(data, "enter") || matchesKey(data, "space")) {
@@ -783,10 +900,16 @@ export class SubagentsOverlay {
 	private openDetail(): void {
 		const visibleRuns = this.visibleRuns();
 		if (visibleRuns.length === 0) return;
-		const run = visibleRuns[this.selectedRunIndex];
-		if (!run) return;
+		const rows = flattenRows(visibleRuns);
+		const row = rows[this.selectedRowIndex];
+		if (!row) return;
 		this.mode = "detail";
-		this.detailPane = new SubagentDetailPane(run, this.theme, this.requestRender, this.terminalCommand);
+		// Only force an explicit initial target for non-run rows (step/nested).
+		// For run rows, let the detail pane auto-select the best resolvable candidate
+		// so that a parent/run without its own session/log falls back to a child/step
+		// that does have content (issue #30).
+		const initialTargetId = row.type === "run" ? undefined : row.target.id;
+		this.detailPane = new SubagentDetailPane(row.run, this.theme, this.requestRender, this.terminalCommand, initialTargetId);
 		this.invalidate();
 		this.requestRender();
 	}
@@ -798,17 +921,14 @@ export class SubagentsOverlay {
 		this.requestRender();
 	}
 
-	private getSelectedRun(): OverlayRun | undefined {
-		const visibleRuns = this.visibleRuns();
-		if (visibleRuns.length === 0) return undefined;
-		return visibleRuns[this.selectedRunIndex];
-	}
-
 	private openSelectedInTerminal(): void {
-		const run = this.getSelectedRun();
-		if (!run || !this.terminalCommand) return;
+		const visibleRuns = this.visibleRuns();
+		if (visibleRuns.length === 0 || !this.terminalCommand) return;
+		const rows = flattenRows(visibleRuns);
+		const row = rows[this.selectedRowIndex];
+		if (!row) return;
 		// Terminal handoff requires a real child session file, not log/artifact fallback.
-		const sessionFile = run.sessionFile;
+		const sessionFile = row.target.sessionFile;
 		const metadata: TerminalLaunchMetadata = {
 			sessionFile: sessionFile ?? undefined,
 			cwd: this.state.baseCwd || process.cwd(),
@@ -860,7 +980,7 @@ export class SubagentsOverlay {
 			this.cachedLines = this.detailPane.render(width, height);
 		} else {
 			const counts = countRunsByView(this.runs);
-			this.cachedLines = renderOverlay(this.visibleRuns(), this.theme, width, this.selectedRunIndex, {
+			this.cachedLines = renderOverlay(this.visibleRuns(), this.theme, width, this.selectedRowIndex, {
 				view: this.view,
 				runningCount: counts.running,
 				completedCount: counts.completed,

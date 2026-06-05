@@ -727,6 +727,7 @@ export interface SubagentState {
 		turnCount?: number;
 		tokens?: number;
 		toolCount?: number;
+		sessionFile?: string;
 		nestedRoute?: NestedRouteInfo;
 		nestedChildren?: NestedRunSummary[];
 		interrupt?: () => boolean;

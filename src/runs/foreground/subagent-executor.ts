@@ -1805,6 +1805,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			input.foregroundControl.currentIndex = index;
 			input.foregroundControl.currentActivityState = undefined;
 			input.foregroundControl.updatedAt = Date.now();
+			input.foregroundControl.sessionFile = input.sessionFileForIndex(index);
 			input.foregroundControl.interrupt = () => {
 				if (interruptController.signal.aborted) return false;
 				interruptController.abort();
@@ -1862,6 +1863,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 						input.foregroundControl.tokens = current?.tokens;
 						input.foregroundControl.toolCount = current?.toolCount;
 						input.foregroundControl.updatedAt = Date.now();
+						input.foregroundControl.sessionFile = input.sessionFileForIndex(index);
 					}
 					if (stepResults.length > 0) input.liveResults[index] = stepResults[0];
 					if (stepProgress.length > 0) input.liveProgress[index] = stepProgress[0];
@@ -2378,6 +2380,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.currentIndex = 0;
 		foregroundControl.currentActivityState = undefined;
 		foregroundControl.updatedAt = Date.now();
+		foregroundControl.sessionFile = sessionFileForIndex(0);
 		foregroundControl.interrupt = () => {
 			if (interruptController.signal.aborted) return false;
 			interruptController.abort();
@@ -2402,6 +2405,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				foregroundControl.tokens = firstProgress?.tokens;
 				foregroundControl.toolCount = firstProgress?.toolCount;
 				foregroundControl.updatedAt = Date.now();
+				foregroundControl.sessionFile = sessionFileForIndex(firstProgress?.index ?? 0);
 			}
 			onUpdate(update);
 		}

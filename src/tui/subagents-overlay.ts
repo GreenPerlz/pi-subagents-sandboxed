@@ -137,15 +137,18 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 	const header = `${selector}${glyph} ${agents || run.id} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${tool}${elapsed}${pathDetail(run, theme)}`;
 	lines.push(truncateToWidth(header, width));
 	for (const step of run.steps) {
-		// Skip redundant step for single foreground runs where the step
-		// duplicates the run header (same agent, no nested children)
-		if (
+		// Skip redundant step line for single foreground runs where the step
+		// duplicates the run header (same agent). Still render nested children
+		// directly under the run header so they are not lost.
+		const isRedundant =
 			run.source === "foreground" &&
 			run.mode === "single" &&
 			run.steps.length === 1 &&
-			step.agent === (run.agents[0] ?? run.id) &&
-			step.children.length === 0
-		) {
+			step.agent === (run.agents[0] ?? run.id);
+		if (isRedundant) {
+			if (step.children.length > 0) {
+				renderNestedChildren(step.children, theme, width, 1, lines);
+			}
 			continue;
 		}
 		renderStep(step, theme, width, 1, lines);
@@ -280,8 +283,13 @@ export class SubagentDetailPane {
 
 		const result = readSessionFile(sessionPath, this.theme, this.lastRenderWidth, this.showThinking);
 		if (result.error) {
-			this.error = result.error;
-			this.contentLines = [];
+			// Preserve prior content during transient read errors (e.g., file
+			// temporarily empty during a model/tool-call transition) so the
+			// detail pane does not flicker to an empty state.
+			if (this.contentLines.length === 0) {
+				this.error = result.error;
+				this.contentLines = [];
+			}
 		} else {
 			this.error = undefined;
 			this.contentLines = result.lines;

@@ -248,7 +248,7 @@ describe("subagents overlay rendering", () => {
 		assert.strictEqual(stepLine, undefined, "should not render a redundant step line");
 	});
 
-	it("keeps the step when a single foreground run has nested children", () => {
+	it("keeps nested children but skips redundant step for single foreground run", () => {
 		const runs: OverlayRun[] = [
 			{
 				id: "fg-nested",
@@ -275,9 +275,17 @@ describe("subagents overlay rendering", () => {
 		];
 		const lines = renderOverlay(runs, theme as never, WIDTH);
 		const text = lines.join("\n");
-		// Both worker (step) and reviewer (nested child) should appear
-		assert.ok(text.includes("worker"), "should show worker step");
+		// Worker should appear exactly once (in the run header)
+		const workerMatches = text.match(/\bworker\b/g);
+		assert.strictEqual(workerMatches?.length, 1, "worker should appear exactly once in rendered output");
 		assert.ok(text.includes("reviewer"), "should show nested child");
+		// Nested child should be indented relative to the run header
+		const nestedLine = lines.find((l) => l.includes("reviewer"));
+		assert.ok(nestedLine, "nested child line should exist");
+		const stripBorder = (l: string) => l.replace(/^.*?│/, "");
+		const nestedContent = stripBorder(nestedLine);
+		const nestedLeadingSpaces = nestedContent.match(/^(\s*)/)?.[1]?.length ?? 0;
+		assert.ok(nestedLeadingSpaces >= 2, "nested child should be indented under the run header");
 	});
 
 	it("renders a completed foreground run with correct state glyph", () => {
@@ -540,6 +548,71 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		for (const h of [10, 15, 20]) {
 			const lines = pane.render(80, h);
 			assert.strictEqual(lines.length, h, `error render(80, ${h}) should return exactly ${h} lines`);
+		}
+	});
+
+	it("shows running foreground worker session content without empty state", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "fg-running",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [],
+					},
+				],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(!text.includes("No session file or log available"), "should not show empty state when session file is present");
+			assert.ok(!text.includes("Session file is empty"), "should not show empty error");
+			assert.ok(text.includes("Msg0"), "should show session content");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("preserves detail content during transient read errors", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "fg-transient",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			// First read succeeds
+			pane.refresh();
+			const linesBefore = pane.render(WIDTH, 20);
+			assert.ok(linesBefore.join("\n").includes("Msg0"), "should have content after first read");
+
+			// Simulate transient empty file by truncating it
+			fs.writeFileSync(p, "", "utf-8");
+			pane.refresh();
+			const linesAfter = pane.render(WIDTH, 20);
+			assert.ok(linesAfter.join("\n").includes("Msg0"), "should preserve content during transient empty file");
+		} finally {
+			cleanup(p);
 		}
 	});
 

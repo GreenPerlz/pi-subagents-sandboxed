@@ -403,6 +403,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 				state: "running",
 				currentTool: ctrl.currentTool,
 				elapsed,
+				sessionFile: ctrl.sessionFile,
 				children: currentStepNested.map(mapNestedRun),
 			});
 		}
@@ -421,7 +422,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			startedAt: ctrl.startedAt,
 			updatedAt: ctrl.updatedAt,
 			currentTool: ctrl.currentTool,
-			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile ?? nestedSessionFile,
+			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile ?? ctrl.sessionFile ?? nestedSessionFile,
 			artifactPath: childInfo.find((child) => child.artifactPath)?.artifactPath,
 			asyncDir: nestedAsyncDir,
 			steps,

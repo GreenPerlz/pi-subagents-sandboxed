@@ -151,6 +151,37 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.asyncDir, "/tmp/nested");
 	});
 
+	it("propagates foregroundControl sessionFile to synthesized step and run", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-session", {
+			currentAgent: "worker",
+			mode: "single",
+			currentTool: "read",
+			sessionFile: "/tmp/fg-session/run-0/session.jsonl",
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.sessionFile, "/tmp/fg-session/run-0/session.jsonl");
+		assert.strictEqual(runs[0]!.steps.length, 1);
+		assert.strictEqual(runs[0]!.steps[0]!.sessionFile, "/tmp/fg-session/run-0/session.jsonl");
+	});
+
+	it("does not duplicate a single active foreground worker in the run tree", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-single", {
+			currentAgent: "worker",
+			mode: "single",
+			currentTool: "read",
+			sessionFile: "/tmp/fg-single/run-0/session.jsonl",
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.id, "fg-single");
+		assert.deepStrictEqual(runs[0]!.agents, ["worker"]);
+		assert.strictEqual(runs[0]!.steps.length, 1);
+		assert.strictEqual(runs[0]!.steps[0]!.agent, "worker");
+	});
+
 	it("attaches nested foreground children to a synthesized current step", () => {
 		const state = baseState();
 		addForegroundControl(state, "fg-nested", {

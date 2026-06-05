@@ -126,6 +126,7 @@ interface ParallelChainRunInput {
 		turnCount?: number;
 		tokens?: number;
 		toolCount?: number;
+		sessionFile?: string;
 		interrupt?: () => boolean;
 	};
 	results: SingleResult[];
@@ -257,6 +258,9 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				input.foregroundControl.currentIndex = input.globalTaskIndex + taskIndex;
 				input.foregroundControl.currentActivityState = undefined;
 				input.foregroundControl.updatedAt = Date.now();
+				if (input.sessionFileForIndex) {
+					input.foregroundControl.sessionFile = input.sessionFileForIndex(input.globalTaskIndex + taskIndex);
+				}
 				input.foregroundControl.interrupt = () => {
 					if (interruptController.signal.aborted) return false;
 					interruptController.abort();
@@ -317,6 +321,9 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 							input.foregroundControl.tokens = current?.tokens;
 							input.foregroundControl.toolCount = current?.toolCount;
 							input.foregroundControl.updatedAt = Date.now();
+							if (input.sessionFileForIndex) {
+								input.foregroundControl.sessionFile = input.sessionFileForIndex(input.globalTaskIndex + taskIndex);
+							}
 						}
 						input.onUpdate?.({
 							...progressUpdate,
@@ -393,6 +400,7 @@ interface ChainExecutionParams {
 		turnCount?: number;
 		tokens?: number;
 		toolCount?: number;
+		sessionFile?: string;
 		interrupt?: () => boolean;
 	};
 	chainSkills?: string[];
@@ -1040,6 +1048,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				foregroundControl.currentIndex = globalTaskIndex;
 				foregroundControl.currentActivityState = undefined;
 				foregroundControl.updatedAt = Date.now();
+				if (params.sessionFileForIndex) {
+					foregroundControl.sessionFile = params.sessionFileForIndex(globalTaskIndex);
+				}
 				foregroundControl.interrupt = () => {
 					if (interruptController.signal.aborted) return false;
 					interruptController.abort();
@@ -1100,6 +1111,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 							foregroundControl.tokens = current?.tokens;
 							foregroundControl.toolCount = current?.toolCount;
 							foregroundControl.updatedAt = Date.now();
+							if (params.sessionFileForIndex) {
+								foregroundControl.sessionFile = params.sessionFileForIndex(globalTaskIndex);
+							}
 						}
 						onUpdate({
 							...p,

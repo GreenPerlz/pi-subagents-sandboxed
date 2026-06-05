@@ -85,10 +85,12 @@ function indent(depth: number): string {
 	return "  ".repeat(depth);
 }
 
-function pathDetail(input: { sessionFile?: string; artifactPath?: string }, theme: Theme): string {
+function pathDetail(input: { sessionFile?: string; logPath?: string; artifactPath?: string; asyncDir?: string }, theme: Theme): string {
 	const parts: string[] = [];
 	if (input.sessionFile) parts.push(`session ${input.sessionFile}`);
+	if (input.logPath && input.logPath !== input.artifactPath) parts.push(`log ${input.logPath}`);
 	if (input.artifactPath) parts.push(`artifact ${input.artifactPath}`);
+	if (input.asyncDir && input.asyncDir !== input.artifactPath && input.asyncDir !== input.logPath) parts.push(`dir ${input.asyncDir}`);
 	return parts.length ? theme.fg("dim", ` · ${parts.join(" · ")}`) : "";
 }
 

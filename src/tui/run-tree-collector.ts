@@ -6,14 +6,19 @@
  * the parent step that launched them.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { listAsyncRuns, formatAsyncRunOutputPath, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { updateForegroundNestedProjection } from "../runs/shared/nested-events.ts";
-import type {
-	AsyncJobState,
-	AsyncJobStep,
-	NestedRunSummary,
-	NestedStepSummary,
-	SubagentRunMode,
-	SubagentState,
+import {
+	ASYNC_DIR,
+	RESULTS_DIR,
+	type AsyncJobState,
+	type AsyncJobStep,
+	type NestedRunSummary,
+	type NestedStepSummary,
+	type SubagentRunMode,
+	type SubagentState,
 } from "../shared/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -30,7 +35,9 @@ export interface OverlayNestedChild {
 	currentTool?: string;
 	elapsed?: string;
 	sessionFile?: string;
+	logPath?: string;
 	artifactPath?: string;
+	asyncDir?: string;
 	children: OverlayNestedChild[];
 }
 
@@ -40,7 +47,9 @@ export interface OverlayStep {
 	currentTool?: string;
 	elapsed?: string;
 	sessionFile?: string;
+	logPath?: string;
 	artifactPath?: string;
+	asyncDir?: string;
 	children: OverlayNestedChild[];
 }
 
@@ -55,13 +64,43 @@ export interface OverlayRun {
 	startedAt?: number;
 	updatedAt?: number;
 	sessionFile?: string;
+	logPath?: string;
 	artifactPath?: string;
+	asyncDir?: string;
 	steps: OverlayStep[];
+}
+
+export interface CollectRunTreeOptions {
+	asyncDirRoot?: string;
+	resultsDir?: string;
+	persistedAsyncLimit?: number;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+const DEFAULT_PERSISTED_ASYNC_LIMIT = 25;
+
+interface PersistedResultChild {
+	agent?: string;
+	state: OverlayRunState;
+	sessionFile?: string;
+	artifactPath?: string;
+}
+
+interface PersistedResultRecord {
+	id: string;
+	sessionId?: string;
+	cwd?: string;
+	mode: SubagentRunMode;
+	state: OverlayRunState;
+	sessionFile?: string;
+	asyncDir?: string;
+	updatedAt?: number;
+	agent?: string;
+	children: PersistedResultChild[];
+}
 
 function mapState(state: string): OverlayRunState {
 	if (state === "running" || state === "queued") return state as OverlayRunState;
@@ -91,13 +130,14 @@ function mapNestedStepChildren(children: NestedRunSummary[] | undefined): Overla
 }
 
 function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
-	const steps: OverlayNestedChild[] = (run.steps ?? []).flatMap((step: NestedStepSummary) => {
+	const steps: OverlayNestedChild[] = (run.steps ?? []).flatMap((step: NestedStepSummary, index) => {
 		const stepChild: OverlayNestedChild = {
-			id: `${run.id}:step:${step.agent}`,
+			id: `${run.id}:step:${step.agent}:${index}`,
 			agent: step.agent,
 			state: mapState(step.status),
 			currentTool: step.currentTool,
 			elapsed: elapsedFromRange(step.startedAt, step.endedAt),
+			sessionFile: step.sessionFile,
 			children: mapNestedStepChildren(step.children),
 		};
 		return stepChild;
@@ -111,7 +151,7 @@ function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
 		currentTool: run.currentTool,
 		elapsed: elapsedFromRange(run.startedAt, run.endedAt),
 		sessionFile: run.sessionFile,
-		artifactPath: run.asyncDir,
+		asyncDir: run.asyncDir,
 		children: [...steps, ...directChildren],
 	};
 }
@@ -125,6 +165,199 @@ function modeLabel(mode: SubagentRunMode | undefined): string {
 function agentsLabel(agents: string[] | undefined): string[] {
 	if (!agents?.length) return [];
 	return agents;
+}
+
+function fileIfExists(filePath: string | undefined): string | undefined {
+	if (!filePath) return undefined;
+	try {
+		return fs.existsSync(filePath) && fs.statSync(filePath).isFile() ? filePath : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function logPathForStep(asyncDir: string | undefined, index: number | undefined): string | undefined {
+	if (!asyncDir || index === undefined) return undefined;
+	return fileIfExists(path.join(asyncDir, `output-${index}.log`));
+}
+
+function logPathForRun(asyncDir: string | undefined, explicit?: string): string | undefined {
+	return fileIfExists(explicit)
+		?? fileIfExists(asyncDir ? path.join(asyncDir, "output.log") : undefined)
+		?? fileIfExists(asyncDir ? path.join(asyncDir, "output-0.log") : undefined);
+}
+
+function stringValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+	return typeof value === "boolean" ? value : undefined;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function modeValue(value: unknown, childCount: number): SubagentRunMode {
+	return value === "single" || value === "parallel" || value === "chain"
+		? value
+		: childCount > 1 ? "chain" : "single";
+}
+
+function resultStateValue(state: unknown, success: unknown): OverlayRunState {
+	if (state === "queued" || state === "running" || state === "paused" || state === "failed" || state === "complete" || state === "completed") {
+		return mapState(state);
+	}
+	if (typeof success === "boolean") return success ? "complete" : "failed";
+	return "complete";
+}
+
+function childResultStateValue(parentState: unknown, success: unknown): OverlayRunState {
+	if (parentState === "paused" || typeof success !== "boolean") return resultStateValue(parentState, success);
+	return success ? "complete" : "failed";
+}
+
+function matchesPersistedScope(entry: { sessionId?: string; cwd?: string }, state: Pick<SubagentState, "currentSessionId" | "baseCwd">): boolean {
+	if (state.currentSessionId) {
+		if (entry.sessionId) return entry.sessionId === state.currentSessionId;
+		if (entry.cwd) return entry.cwd === state.baseCwd;
+		return false;
+	}
+	if (entry.cwd) return entry.cwd === state.baseCwd;
+	if (entry.sessionId) return false;
+	return false;
+}
+
+function readPersistedResultRecord(resultPath: string): PersistedResultRecord | undefined {
+	try {
+		const raw = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as Record<string, unknown>;
+		const results = Array.isArray(raw.results) ? raw.results : [];
+		const children = results.map((entry) => {
+			const child = objectValue(entry) ?? {};
+			const artifactPaths = objectValue(child.artifactPaths);
+			const childSuccess = booleanValue(child.success);
+			return {
+				agent: stringValue(child.agent),
+				state: childResultStateValue(raw.state, childSuccess),
+				sessionFile: stringValue(child.sessionFile),
+				artifactPath: stringValue(artifactPaths?.outputPath),
+			};
+		});
+		const id = stringValue(raw.runId) ?? stringValue(raw.id) ?? path.basename(resultPath, ".json");
+		return {
+			id,
+			sessionId: stringValue(raw.sessionId),
+			cwd: stringValue(raw.cwd),
+			mode: modeValue(raw.mode, children.length),
+			state: resultStateValue(raw.state, raw.success),
+			sessionFile: stringValue(raw.sessionFile),
+			asyncDir: stringValue(raw.asyncDir),
+			agent: stringValue(raw.agent),
+			children,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function listPersistedResultRecords(resultsDir: string, state: Pick<SubagentState, "currentSessionId" | "baseCwd">, limit: number): PersistedResultRecord[] {
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(resultsDir).filter((entry) => entry.endsWith(".json"));
+	} catch {
+		return [];
+	}
+	return entries
+		.map((entry) => {
+			const resultPath = path.join(resultsDir, entry);
+			const record = readPersistedResultRecord(resultPath);
+			if (!record || !matchesPersistedScope(record, state)) return undefined;
+			try {
+				record.updatedAt = fs.statSync(resultPath).mtimeMs;
+			} catch {
+				record.updatedAt = undefined;
+			}
+			return record;
+		})
+		.filter((record): record is PersistedResultRecord => Boolean(record))
+		.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+		.slice(0, limit);
+}
+
+function artifactPathFromResult(result: PersistedResultRecord | undefined): string | undefined {
+	return result?.children.find((child) => child.artifactPath)?.artifactPath;
+}
+
+function sessionFileFromResult(result: PersistedResultRecord | undefined): string | undefined {
+	return result?.sessionFile ?? result?.children.find((child) => child.sessionFile)?.sessionFile;
+}
+
+function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedResultRecord | undefined, now: number): OverlayRun {
+	const agents = agentsLabel(run.steps.map((step) => step.agent));
+	if (!agents.length) {
+		const fallbackAgents = result?.children.map((child) => child.agent).filter((agent): agent is string => Boolean(agent))
+			?? (result?.agent ? [result.agent] : []);
+		agents.push(...fallbackAgents);
+	}
+	const elapsed = elapsedFromRange(run.startedAt, run.endedAt ?? run.lastUpdate, now);
+	const steps: OverlayStep[] = run.steps.map((step) => {
+		const resultChild = result?.children[step.index];
+		return {
+			agent: step.agent,
+			state: mapState(step.status),
+			currentTool: step.currentTool,
+			elapsed: elapsedFromMs(step.durationMs),
+			sessionFile: step.sessionFile ?? resultChild?.sessionFile,
+			logPath: logPathForStep(run.asyncDir, step.index),
+			artifactPath: resultChild?.artifactPath,
+			children: (step.children ?? []).map(mapNestedRun),
+		};
+	});
+	const attachedIds = new Set(run.steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
+	const unattached = (run.nestedChildren ?? []).filter((child) => !attachedIds.has(child.id));
+	if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached.map(mapNestedRun));
+	return {
+		id: run.id,
+		label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
+		state: mapState(run.state),
+		mode: run.mode,
+		source: "async",
+		agents,
+		elapsed,
+		startedAt: run.startedAt,
+		updatedAt: run.lastUpdate ?? run.endedAt ?? run.startedAt,
+		sessionFile: run.sessionFile ?? sessionFileFromResult(result),
+		logPath: logPathForRun(run.asyncDir, formatAsyncRunOutputPath(run)),
+		artifactPath: artifactPathFromResult(result),
+		asyncDir: run.asyncDir,
+		steps,
+	};
+}
+
+function overlayRunFromPersistedResult(result: PersistedResultRecord): OverlayRun {
+	const steps: OverlayStep[] = (result.children.length ? result.children : [{ agent: result.agent, state: result.state }]).map((child, index) => ({
+		agent: child.agent ?? `step-${index + 1}`,
+		state: child.state,
+		sessionFile: child.sessionFile,
+		artifactPath: child.artifactPath,
+		children: [],
+	}));
+	const agents = agentsLabel(steps.map((step) => step.agent));
+	return {
+		id: result.id,
+		label: `${modeLabel(result.mode)}: ${agents.join(", ")}`,
+		state: result.state,
+		mode: result.mode,
+		source: "async",
+		agents,
+		updatedAt: result.updatedAt,
+		sessionFile: result.sessionFile ?? sessionFileFromResult(result),
+		logPath: logPathForRun(result.asyncDir),
+		artifactPath: artifactPathFromResult(result),
+		asyncDir: result.asyncDir,
+		steps,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -147,10 +380,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 		const steps: OverlayStep[] = childInfo.map((child, index) => {
 			const stepElapsed = elapsedFromRange(ctrl.startedAt, ctrl.updatedAt, now);
 			const nestedChildren = ctrl.nestedChildren ?? [];
-			// Find nested children belonging to this step index
-			const stepNested = nestedChildren.filter(
-				(nc) => nc.parentStepIndex === index,
-			);
+			const stepNested = nestedChildren.filter((nc) => nc.parentStepIndex === index);
 			return {
 				agent: child.agent,
 				state: mapState(child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" ? child.status : "running"),
@@ -162,7 +392,6 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			};
 		});
 
-		// If no explicit children, synthesize one step from control data
 		if (steps.length === 0 && ctrl.currentAgent) {
 			const currentIndex = ctrl.currentIndex ?? 0;
 			const currentStepNested = (ctrl.nestedChildren ?? []).filter(
@@ -213,7 +442,6 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 	const liveIds = new Set(state.foregroundControls?.keys() ?? []);
 
 	for (const [id, run] of state.foregroundRuns) {
-		// Skip if still live in foregroundControls
 		if (liveIds.has(id)) continue;
 
 		const agents = run.children.map((c) => c.agent);
@@ -264,11 +492,11 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 				currentTool: step.currentTool,
 				elapsed: elapsedFromMs(step.durationMs),
 				sessionFile: step.sessionFile,
+				logPath: logPathForStep(job.asyncDir, step.index),
 				children: (step.children ?? []).map(mapNestedRun),
 			};
 		});
 
-		// Attach unattached nested children
 		const attachedIds = new Set(
 			(job.steps ?? []).flatMap((s: AsyncJobStep) => (s.children ?? []).map((c) => c.id)),
 		);
@@ -276,7 +504,6 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 			(nc) => !attachedIds.has(nc.id),
 		);
 		if (unattached.length && steps.length) {
-			// Append to a synthetic step or last step
 			const lastStep = steps[steps.length - 1]!;
 			lastStep.children.push(...unattached.map(mapNestedRun));
 		}
@@ -292,10 +519,53 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 			startedAt: job.startedAt,
 			updatedAt: job.updatedAt,
 			sessionFile: job.sessionFile,
-			artifactPath: job.outputFile ?? job.asyncDir,
+			logPath: logPathForRun(job.asyncDir, job.outputFile),
+			asyncDir: job.asyncDir,
 			steps,
 		});
 	}
+	return runs;
+}
+
+function collectPersistedAsyncRuns(state: SubagentState, now: number, options: CollectRunTreeOptions): OverlayRun[] {
+	const asyncDirRoot = options.asyncDirRoot ?? ASYNC_DIR;
+	const resultsDir = options.resultsDir ?? RESULTS_DIR;
+	const limit = options.persistedAsyncLimit ?? DEFAULT_PERSISTED_ASYNC_LIMIT;
+	const terminalStates: Array<AsyncRunSummary["state"]> = ["complete", "failed", "paused"];
+	const liveIds = new Set(state.asyncJobs.keys());
+	const runs: OverlayRun[] = [];
+	const seenIds = new Set<string>();
+	let resultRecords: PersistedResultRecord[] = [];
+	let persistedStatusRuns: AsyncRunSummary[] = [];
+
+	try {
+		resultRecords = listPersistedResultRecords(resultsDir, state, limit * 2);
+		persistedStatusRuns = listAsyncRuns(asyncDirRoot, {
+			states: terminalStates,
+			sessionId: state.currentSessionId ?? undefined,
+			cwd: state.baseCwd,
+			limit: limit + liveIds.size,
+			resultsDir,
+		});
+	} catch {
+		return runs;
+	}
+	const resultById = new Map(resultRecords.map((record) => [record.id, record]));
+
+	for (const run of persistedStatusRuns) {
+		if (liveIds.has(run.id) || seenIds.has(run.id)) continue;
+		runs.push(overlayRunFromPersistedStatus(run, resultById.get(run.id), now));
+		seenIds.add(run.id);
+		if (runs.length >= limit) return runs;
+	}
+
+	for (const result of resultRecords) {
+		if (liveIds.has(result.id) || seenIds.has(result.id)) continue;
+		runs.push(overlayRunFromPersistedResult(result));
+		seenIds.add(result.id);
+		if (runs.length >= limit) break;
+	}
+
 	return runs;
 }
 
@@ -307,13 +577,13 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
  * Collect all known runs from the current Pi session state, returning a flat
  * list of top-level runs with nested children represented in a tree.
  */
-export function collectRunTree(state: SubagentState, now = Date.now()): OverlayRun[] {
+export function collectRunTree(state: SubagentState, now = Date.now(), options: CollectRunTreeOptions = {}): OverlayRun[] {
 	const runs: OverlayRun[] = [
 		...collectForegroundRuns(state, now),
 		...collectFinishedForegroundRuns(state, now),
 		...collectAsyncRuns(state, now),
+		...collectPersistedAsyncRuns(state, now, options),
 	];
-	// Sort: running first, then by most recent start time
 	const rank = (r: OverlayRun): number => {
 		if (r.state === "running") return 0;
 		if (r.state === "queued") return 1;

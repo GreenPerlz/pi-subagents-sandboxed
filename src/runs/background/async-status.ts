@@ -69,6 +69,7 @@ export interface AsyncRunSummary {
 interface AsyncRunListOptions {
 	states?: Array<AsyncRunSummary["state"]>;
 	sessionId?: string;
+	cwd?: string;
 	limit?: number;
 	resultsDir?: string;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
@@ -199,6 +200,20 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	};
 }
 
+function matchesRunScope(summary: Pick<AsyncRunSummary, "sessionId" | "cwd">, options: Pick<AsyncRunListOptions, "sessionId" | "cwd">): boolean {
+	if (options.sessionId) {
+		if (summary.sessionId) return summary.sessionId === options.sessionId;
+		if (options.cwd && summary.cwd) return summary.cwd === options.cwd;
+		return false;
+	}
+	if (options.cwd) {
+		if (summary.cwd) return summary.cwd === options.cwd;
+		if (summary.sessionId) return false;
+		return false;
+	}
+	return true;
+}
+
 function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 	const rank = (state: AsyncRunSummary["state"]): number => {
 		switch (state) {
@@ -247,7 +262,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		}
 		const summary = statusToSummary(asyncDir, status, nestedWarnings);
 		if (allowedStates && !allowedStates.has(summary.state)) continue;
-		if (options.sessionId && summary.sessionId !== options.sessionId) continue;
+		if (!matchesRunScope(summary, options)) continue;
 		runs.push(summary);
 	}
 

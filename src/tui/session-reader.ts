@@ -347,11 +347,14 @@ export function readSessionFile(filePath: string, theme: Theme, width: number, s
 
 /**
  * Find the best available session/log file for a run.
- * Prefers sessionFile, then artifactPath, then constructs from asyncDir.
+ * Prefers sessionFile, then logPath, then artifactPath, then constructs from asyncDir.
  */
-export function resolveSessionPath(run: { sessionFile?: string; artifactPath?: string; asyncDir?: string }): string | undefined {
+export function resolveSessionPath(run: { sessionFile?: string; logPath?: string; artifactPath?: string; asyncDir?: string }): string | undefined {
 	if (run.sessionFile) {
 		if (fs.existsSync(run.sessionFile) && fs.statSync(run.sessionFile).isFile()) return run.sessionFile;
+	}
+	if (run.logPath) {
+		if (fs.existsSync(run.logPath) && fs.statSync(run.logPath).isFile()) return run.logPath;
 	}
 	if (run.artifactPath) {
 		const artifactStat = fs.existsSync(run.artifactPath) ? fs.statSync(run.artifactPath) : undefined;

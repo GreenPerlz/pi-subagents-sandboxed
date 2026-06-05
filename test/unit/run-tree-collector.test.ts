@@ -88,6 +88,28 @@ function addForegroundRun(
 	});
 }
 
+function makePersistedRoots(): { root: string; asyncDirRoot: string; resultsDir: string } {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-run-tree-"));
+	const asyncDirRoot = path.join(root, "async");
+	const resultsDir = path.join(root, "results");
+	fs.mkdirSync(asyncDirRoot, { recursive: true });
+	fs.mkdirSync(resultsDir, { recursive: true });
+	return { root, asyncDirRoot, resultsDir };
+}
+
+function writePersistedAsyncStatus(asyncDirRoot: string, id: string, status: Record<string, unknown>): string {
+	const asyncDir = path.join(asyncDirRoot, id);
+	fs.mkdirSync(asyncDir, { recursive: true });
+	fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify(status, null, 2), "utf-8");
+	return asyncDir;
+}
+
+function writePersistedResult(resultsDir: string, id: string, result: Record<string, unknown>): string {
+	const resultPath = path.join(resultsDir, `${id}.json`);
+	fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), "utf-8");
+	return resultPath;
+}
+
 describe("collectRunTree", () => {
 	it("returns empty array when no runs exist", () => {
 		const state = baseState();
@@ -169,7 +191,7 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.id, "async-1");
 		assert.strictEqual(runs[0]!.source, "async");
 		assert.strictEqual(runs[0]!.agents[0], "reviewer");
-		assert.strictEqual(runs[0]!.artifactPath, "/tmp/async-1");
+		assert.strictEqual(runs[0]!.asyncDir, "/tmp/async-1");
 	});
 
 	it("sorts running before completed", () => {
@@ -555,5 +577,133 @@ describe("collectRunTree", () => {
 		assert.ok(ids.indexOf("queued-1") < ids.indexOf("paused-1"), "queued before paused");
 		assert.ok(ids.indexOf("failed-1") < ids.indexOf("complete-1"), "failed before complete");
 		assert.ok(ids.indexOf("paused-1") < ids.indexOf("complete-1"), "paused before complete");
+	});
+
+	it("loads persisted completed async runs after in-memory cleanup and merges result paths", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			const asyncDir = writePersistedAsyncStatus(asyncDirRoot, "persisted-complete", {
+				runId: "persisted-complete",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				endedAt: 4000,
+				lastUpdate: 4000,
+				outputFile: "output-0.log",
+				steps: [{ agent: "worker", status: "complete", durationMs: 3000 }],
+			});
+			const sessionFile = path.join(asyncDir, "child-session.jsonl");
+			const artifactPath = path.join(asyncDir, "child-output.md");
+			const logPath = path.join(asyncDir, "output-0.log");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			fs.writeFileSync(artifactPath, "done\n", "utf-8");
+			fs.writeFileSync(logPath, "log\n", "utf-8");
+			writePersistedResult(resultsDir, "persisted-complete", {
+				id: "persisted-complete",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				asyncDir,
+				results: [{ agent: "worker", success: true, sessionFile, artifactPaths: { outputPath: artifactPath } }],
+			});
+
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "persisted-complete");
+			assert.strictEqual(runs[0]!.state, "complete");
+			assert.strictEqual(runs[0]!.sessionFile, sessionFile);
+			assert.strictEqual(runs[0]!.logPath, logPath);
+			assert.strictEqual(runs[0]!.artifactPath, artifactPath);
+			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
+			assert.strictEqual(runs[0]!.steps[0]!.artifactPath, artifactPath);
+			assert.strictEqual(runs[0]!.steps[0]!.sessionFile, sessionFile);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("scopes persisted async runs to the current session with cwd fallback", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState({ baseCwd: "/tmp/test", currentSessionId: "session-a" });
+			writePersistedAsyncStatus(asyncDirRoot, "same-session", {
+				runId: "same-session",
+				sessionId: "session-a",
+				cwd: "/tmp/other",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				lastUpdate: 2000,
+				steps: [{ agent: "worker", status: "complete" }],
+			});
+			writePersistedAsyncStatus(asyncDirRoot, "cwd-fallback", {
+				runId: "cwd-fallback",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				lastUpdate: 2100,
+				steps: [{ agent: "worker", status: "complete" }],
+			});
+			writePersistedAsyncStatus(asyncDirRoot, "other-session", {
+				runId: "other-session",
+				sessionId: "session-b",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				lastUpdate: 2200,
+				steps: [{ agent: "worker", status: "complete" }],
+			});
+			writePersistedAsyncStatus(asyncDirRoot, "other-cwd", {
+				runId: "other-cwd",
+				cwd: "/tmp/not-this-project",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				lastUpdate: 2300,
+				steps: [{ agent: "worker", status: "complete" }],
+			});
+
+			const ids = collectRunTree(state, 5000, { asyncDirRoot, resultsDir }).map((run) => run.id);
+			assert.deepStrictEqual(ids, ["cwd-fallback", "same-session"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back to persisted async result files when status directories are gone", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState({ baseCwd: "/tmp/test", currentSessionId: "session-a" });
+			const asyncDir = path.join(asyncDirRoot, "result-only");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const sessionFile = path.join(asyncDir, "session.jsonl");
+			const artifactPath = path.join(asyncDir, "output.md");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			fs.writeFileSync(artifactPath, "done\n", "utf-8");
+			writePersistedResult(resultsDir, "result-only", {
+				id: "result-only",
+				sessionId: "session-a",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				asyncDir,
+				results: [{ agent: "worker", success: true, sessionFile, artifactPaths: { outputPath: artifactPath } }],
+			});
+
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "result-only");
+			assert.strictEqual(runs[0]!.sessionFile, sessionFile);
+			assert.strictEqual(runs[0]!.artifactPath, artifactPath);
+			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

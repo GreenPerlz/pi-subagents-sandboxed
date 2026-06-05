@@ -55,8 +55,9 @@ describe("subagents overlay rendering", () => {
 				source: "async",
 				agents: ["worker"],
 				elapsed: "5.2s",
-				sessionFile: "/s.jsonl",
-				artifactPath: "/a.log",
+				sessionFile: "/s",
+				logPath: "/l",
+				artifactPath: "/a",
 				steps: [
 					{
 						agent: "worker",
@@ -75,8 +76,9 @@ describe("subagents overlay rendering", () => {
 		assert.ok(text.includes("running"), "should show run state");
 		assert.ok(text.includes("bg"), "should show async source badge");
 		assert.ok(text.includes("run-1"), "should show run id");
-		assert.ok(text.includes("/s.jsonl"), "should show session path when available");
-		assert.ok(text.includes("/a.log"), "should show artifact path when available");
+		assert.ok(text.includes("/s"), "should show session path when available");
+		assert.ok(text.includes("/l"), "should show log path when available");
+		assert.ok(text.includes("/a"), "should show artifact path when available");
 		assert.ok(text.includes("read"), "should show current tool");
 		assert.ok(text.includes("5.2s"), "should show elapsed");
 		assert.ok(text.includes("Esc"), "should show escape hint");

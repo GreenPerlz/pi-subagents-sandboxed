@@ -166,10 +166,20 @@ describe("session-reader", () => {
 			}
 		});
 
-		it("falls back to artifactPath when sessionFile missing", () => {
+		it("falls back to logPath when sessionFile missing", () => {
 			const p = tmpFile("test");
 			try {
-				const resolved = resolveSessionPath({ sessionFile: "/nonexistent", artifactPath: p });
+				const resolved = resolveSessionPath({ sessionFile: "/nonexistent", logPath: p, artifactPath: "/other" });
+				assert.strictEqual(resolved, p);
+			} finally {
+				cleanup(p);
+			}
+		});
+
+		it("falls back to artifactPath when sessionFile and logPath are missing", () => {
+			const p = tmpFile("test");
+			try {
+				const resolved = resolveSessionPath({ sessionFile: "/nonexistent", logPath: "/also-missing", artifactPath: p });
 				assert.strictEqual(resolved, p);
 			} finally {
 				cleanup(p);

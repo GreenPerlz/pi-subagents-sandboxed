@@ -22,6 +22,8 @@ function applyBooleanOverride<T extends string>(target: Record<T, boolean | unde
 	target[key] = value;
 }
 
+const DEFAULT_SANDBOX_AUTH = "pi-json";
+
 function appendPathOverrides(target: string[], value: string[] | undefined): void {
 	if (!value) return;
 	for (const item of value) {
@@ -94,7 +96,7 @@ export function resolveSandboxConfig(input: SandboxResolutionInput = {}): Resolv
 		...(resolved.network !== undefined ? { network: resolved.network } : {}),
 		...(resolved.trustProject !== undefined ? { trustProject: resolved.trustProject } : {}),
 		...(resolved.bashWrite !== undefined ? { bashWrite: resolved.bashWrite } : {}),
-		...(resolved.auth !== undefined ? { auth: resolved.auth } : {}),
+		auth: resolved.auth ?? DEFAULT_SANDBOX_AUTH,
 		...(resolved.fallback !== undefined ? { fallback: resolved.fallback } : {}),
 		...(resolved.extraReadOnlyMounts.length > 0 ? { extraReadOnlyMounts: resolved.extraReadOnlyMounts } : {}),
 		...(resolved.extraWritableMounts.length > 0 ? { extraWritableMounts: resolved.extraWritableMounts } : {}),

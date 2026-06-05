@@ -43,7 +43,7 @@ subagent({
     network: "host",
     trustProject: true,
     bashWrite: true,
-    auth: "env",
+    auth: "pi-json",
     fallback: "fail",
     packageDiscovery: "project-local"
   }
@@ -58,7 +58,7 @@ sandboxProfile: host-toolchain
 sandboxNetwork: host
 sandboxTrustProject: true
 sandboxBashWrite: true
-sandboxAuth: env
+sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxPackageDiscovery: project-local
 ```
@@ -72,7 +72,7 @@ sandboxPackageDiscovery: project-local
       "defaultProvider": "bubblewrap",
       "defaultProfile": "host-toolchain",
       "network": "host",
-      "auth": "env",
+      "auth": "pi-json",
       "trustProject": true,
       "fallback": "fail",
       "packageDiscovery": "closed"
@@ -136,14 +136,15 @@ Mount host toolchain and runtime paths read-only where present:
 
 ### Auth
 
-Default `auth: "env"`:
+Default `auth: "pi-json"`:
 
-- Pass only allowed environment variables, e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, `GITLAB_TOKEN`.
+- Mount Pi's `auth.json` read-only so OAuth/API-key provider credentials work inside sandboxed child Pi processes.
+- Do not mount `settings.json`; sandboxed children should not inherit ambient packages or other user configuration.
 - Do not mount secret directories like `~/.ssh`, `~/.aws`, `~/.gnupg`.
 
-Optional future/auth modes:
+Optional auth modes:
 
-- `pi-readonly`: mount selected Pi auth/config files read-only for users relying on Pi OAuth/subscription auth.
+- `env`: rely on provider credentials passed through the child process environment.
 - `gh-readonly` / `glab-readonly`: mount selected CLI auth config read-only.
 
 ## Writable cwd inference
@@ -225,7 +226,7 @@ spawn(wrapped.command, wrapped.args, { cwd: wrapped.cwd, env: wrapped.env });
 ## Later roadmap
 
 1. Add `/sandbox-doctor` diagnostics.
-2. Add `pi-readonly`, `gh-readonly`, and `glab-readonly` auth modes.
+2. Add `gh-readonly` and `glab-readonly` auth modes.
 3. Add optional cache mounts for npm/pnpm/bun/cargo/etc.
 4. Add Docker/Podman providers if reproducible toolchains are needed.
 5. Add full Sandcastle-style workflow:

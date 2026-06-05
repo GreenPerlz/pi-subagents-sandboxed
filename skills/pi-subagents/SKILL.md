@@ -91,7 +91,7 @@ sandbox: {
   provider: "bubblewrap",
   profile: "host-toolchain",
   network: "host",
-  auth: "env",
+  auth: "pi-json",
   fallback: "fail",
   packageDiscovery: "closed"
 }

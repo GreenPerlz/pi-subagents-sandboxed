@@ -40,7 +40,7 @@ export function sandboxResultDetails(config: ResolvedSandboxConfig, wrapResult?:
 		provider: config.provider,
 		profile: config.profile ?? "host-toolchain",
 		network: config.network ?? "host",
-		auth: config.auth ?? "env",
+		auth: config.auth ?? "pi-json",
 		fallbackMode: config.fallback ?? "fail",
 		fallbackOccurred: wrapResult?.fallbackOccurred === true,
 		...(diagnostics ? { diagnostics: diagnostics.map((diagnostic): SandboxDiagnostic => ({ ...diagnostic })) } : {}),

@@ -9,7 +9,7 @@ tools: read, grep, find, ls, bash, edit, write, contact_supervisor
 sandboxProvider: bubblewrap
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: env
+sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh

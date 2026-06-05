@@ -1215,7 +1215,7 @@ process.exit(${exitCode});
 				{
 					agent: "echo",
 					task: "Keep the same task",
-					sandbox: { provider: "bubblewrap" },
+					sandbox: { provider: "bubblewrap", auth: "env" },
 					sessionDir,
 				},
 				new AbortController().signal,
@@ -1670,7 +1670,7 @@ process.exit(${exitCode});
 			assert.equal(sandboxDetails?.provider, "bubblewrap");
 			assert.equal(sandboxDetails?.profile, "host-toolchain");
 			assert.equal(sandboxDetails?.network, "host");
-			assert.equal(sandboxDetails?.auth, "env");
+			assert.equal(sandboxDetails?.auth, "pi-json");
 			assert.equal(sandboxDetails?.fallbackMode, "none");
 			assert.equal(sandboxDetails?.fallbackOccurred, true);
 			assert.match(sandboxDetails?.diagnostics?.[0]?.message ?? "", /running without sandbox/);

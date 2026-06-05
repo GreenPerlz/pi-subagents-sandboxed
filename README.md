@@ -43,7 +43,7 @@ That installs the extension and the packaged agents. Because those packaged agen
 
 ## Sandboxed subagents
 
-The packaged builtin agents (`researcher`, `reviewer`, and `worker`) request `bubblewrap` with the `host-toolchain` profile, host networking, `env` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. To opt a specific run out, pass `sandbox: { provider: "none" }`.
+The packaged builtin agents (`researcher`, `reviewer`, and `worker`) request `bubblewrap` with the `host-toolchain` profile, host networking, `pi-json` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. To opt a specific run out, pass `sandbox: { provider: "none" }`.
 
 ### Bubblewrap requirements
 
@@ -63,7 +63,7 @@ subagent({
     provider: "bubblewrap",
     profile: "host-toolchain",
     network: "host",
-    auth: "env",
+    auth: "pi-json",
     fallback: "fail",
     bashWrite: true,
     extraReadOnlyMounts: ["/opt/project-toolchain"],
@@ -79,7 +79,7 @@ Per agent frontmatter (the packaged builtin agents already include these default
 sandboxProvider: bubblewrap
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: env
+sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxBashWrite: true
 sandboxExtraReadOnlyMounts: /opt/project-toolchain
@@ -96,7 +96,7 @@ Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
       "defaultProvider": "bubblewrap",
       "defaultProfile": "host-toolchain",
       "network": "host",
-      "auth": "env",
+      "auth": "pi-json",
       "fallback": "fail",
       "extraReadOnlyMounts": ["/opt/project-toolchain"],
       "extraWritableMounts": [".cache/subagent-build"],
@@ -113,7 +113,7 @@ Run-level sandbox options override agent frontmatter, which overrides settings d
 - Provider: `bubblewrap` wraps child Pi invocations with `bwrap`; provider `none` or an omitted provider means no sandbox.
 - Profile: `host-toolchain` is for local developer machines that already have the repo toolchain installed on the host.
 - Network: `host` is the default so child Pi processes can reach model/API providers; `none` passes Bubblewrap `--unshare-net` for offline tasks.
-- Auth: `env` is the default MVP mode and uses the child process environment. Future modes such as Pi/GitHub readonly config mounts are tracked in the [sandbox PRD](docs/prd/sandboxed-subagents.md).
+- Auth: `pi-json` is the default mode and mounts Pi's `auth.json` read-only without mounting `settings.json`; use `env` only when you explicitly want the child process to rely on provider credentials from its environment.
 - Fallback: `fail` is the default and refuses to run when Bubblewrap cannot be applied. Explicit `fallback: "none"` runs the original unsandboxed invocation and records a warning/result marker.
 - Package discovery: `closed` is the default for sandboxed children and starts child Pi with `--no-extensions`, `--no-prompt-templates`, and `--no-themes`, loading only runtime/explicit extension flags. `project-local` keeps those closed-runtime flags, but the parent resolves project-local Pi package declarations before Bubblewrap, passes their `package.json -> pi.extensions` as explicit `--extension` flags, and mounts those package roots read-only. It reads project `.pi/settings.json` package declarations and the nearest cwd package; it intentionally does not load user/global packages or mount user settings/global npm roots. `ambient` is unsafe/legacy and must be requested explicitly; it can re-enable Pi's normal discovery inside the sandbox and may require broader mounts, so it is not recommended for untrusted work.
 - Write inference: agents with `edit` or `write` tools get writable cwd/worktree mounts. `bash` alone stays read-only unless `bashWrite: true` is set. Parallel sandboxed writers require `worktree: true` so each writer gets an isolated writable worktree.
@@ -126,7 +126,7 @@ Returned result details and async status steps include a `sandbox` diagnostic ob
   "provider": "bubblewrap",
   "profile": "host-toolchain",
   "network": "host",
-  "auth": "env",
+  "auth": "pi-json",
   "fallbackMode": "fail",
   "fallbackOccurred": false,
   "mounts": [

@@ -391,7 +391,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				provider: "bubblewrap",
 				profile: "host-toolchain",
 				network: "host",
-				auth: "env",
+				auth: "pi-json",
 				fallbackMode: "fail",
 				fallbackOccurred: false,
 			});

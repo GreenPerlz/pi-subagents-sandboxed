@@ -74,7 +74,7 @@ Do work
 				provider: "bubblewrap",
 				profile: "host-toolchain",
 				network: "host",
-				auth: "env",
+				auth: "pi-json",
 				fallback: "fail",
 				packageDiscovery: "closed",
 			}, `${agent.name} should default to a closed bubblewrap sandbox`);

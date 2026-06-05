@@ -9,7 +9,7 @@ inheritSkills: false
 sandboxProvider: bubblewrap
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: env
+sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh

@@ -154,6 +154,15 @@ describe("sandbox configuration resolution", () => {
 		}), undefined);
 	});
 
+	it("defaults sandbox auth to pi-json when provider is configured", () => {
+		assert.deepEqual(resolveSandboxConfig({
+			run: { provider: "bubblewrap" },
+		}), {
+			provider: "bubblewrap",
+			auth: "pi-json",
+		});
+	});
+
 	it("lets a per-run provider none opt out of an agent sandbox default", () => {
 		assert.equal(resolveSandboxConfig({
 			agent: { sandbox: { provider: "bubblewrap", profile: "host-toolchain" } },

@@ -868,3 +868,156 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		}
 	});
 });
+
+describe("subagents overlay chain/nested hierarchy (issue #29)", () => {
+	it("renders chain mode prefix in run header", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "chain-1",
+				label: "chain: researcher, worker",
+				state: "running",
+				mode: "chain",
+				source: "async",
+				agents: ["researcher", "worker"],
+				steps: [],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		assert.ok(text.includes("chain:"), "should show chain mode prefix");
+	});
+
+	it("renders parallel mode prefix in run header", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "par-1",
+				label: "parallel: reviewer, reviewer",
+				state: "running",
+				mode: "parallel",
+				source: "async",
+				agents: ["reviewer", "reviewer"],
+				steps: [],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		assert.ok(text.includes("parallel:"), "should show parallel mode prefix");
+	});
+
+	it("does not render mode prefix for single runs", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "single-1",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				steps: [],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		assert.ok(!text.includes("single:"), "should not show single mode prefix");
+		assert.ok(text.includes("worker"), "should still show agent");
+	});
+
+	it("renders step numbers under chain header", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "chain-1",
+				label: "chain: a, b",
+				state: "running",
+				mode: "chain",
+				source: "async",
+				agents: ["a", "b"],
+				steps: [
+					{ agent: "a", state: "complete", children: [] },
+					{ agent: "b", state: "running", children: [] },
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		assert.ok(text.includes("1. a"), "should show step 1");
+		assert.ok(text.includes("2. b"), "should show step 2");
+	});
+
+	it("cycles detail pane candidates with left/right arrows", () => {
+		const runEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Run${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const stepEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Step${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(runEntries);
+		const stepP = tmpFile(stepEntries);
+		try {
+			const run: OverlayRun = {
+				id: "cycle-run",
+				label: "chain: a, b",
+				state: "running",
+				mode: "chain",
+				source: "async",
+				agents: ["a", "b"],
+				sessionFile: p,
+				steps: [
+					{ agent: "a", state: "running", sessionFile: stepP, children: [] },
+					{ agent: "b", state: "pending", children: [] },
+				],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			const lines1 = pane.render(WIDTH, 20);
+			const text1 = lines1.join("\n");
+			assert.ok(text1.includes("Run0"), "should start with run session");
+
+			pane.nextCandidate();
+			const lines2 = pane.render(WIDTH, 20);
+			const text2 = lines2.join("\n");
+			assert.ok(text2.includes("Step0"), "should show step session after next");
+			assert.ok(text2.includes("a (step 1)"), "should show step label in title");
+
+			pane.prevCandidate();
+			const lines3 = pane.render(WIDTH, 20);
+			const text3 = lines3.join("\n");
+			assert.ok(text3.includes("Run0"), "should return to run session");
+		} finally {
+			cleanup(p);
+			cleanup(stepP);
+		}
+	});
+
+	it("renders nested run steps as indented hierarchy", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "run-1",
+				label: "single: orchestrator",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["orchestrator"],
+				steps: [
+					{
+						agent: "orchestrator",
+						state: "running",
+						children: [
+							{
+								id: "nested-1",
+								agent: "reviewer",
+								state: "running",
+								children: [],
+								steps: [
+									{ agent: "leaf", state: "running", children: [] },
+								],
+							},
+						],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		assert.ok(text.includes("reviewer"), "should show nested run");
+		assert.ok(text.includes("1. leaf"), "should show nested run step with step number");
+	});
+});

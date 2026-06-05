@@ -39,6 +39,7 @@ export interface OverlayNestedChild {
 	artifactPath?: string;
 	asyncDir?: string;
 	children: OverlayNestedChild[];
+	steps?: OverlayStep[];
 }
 
 export interface OverlayStep {
@@ -108,7 +109,22 @@ function mapState(state: string): OverlayRunState {
 	if (state === "complete" || state === "completed") return "complete";
 	if (state === "paused") return "paused";
 	if (state === "failed") return "failed";
+	if (state === "pending") return "queued";
 	return "complete";
+}
+
+function deriveRunState(topLevel: OverlayRunState, steps: OverlayStep[], nestedChildren: OverlayNestedChild[] = []): OverlayRunState {
+	const allStates = new Set<OverlayRunState>([
+		topLevel,
+		...steps.map((s) => s.state),
+		...steps.flatMap((s) => s.children).map((c) => c.state),
+		...nestedChildren.map((c) => c.state),
+	]);
+	if (allStates.has("running")) return "running";
+	if (allStates.has("failed")) return "failed";
+	if (allStates.has("paused")) return "paused";
+	if (allStates.has("queued")) return "queued";
+	return topLevel;
 }
 
 function elapsedFromMs(ms: number | undefined): string | undefined {
@@ -131,29 +147,26 @@ function mapNestedStepChildren(children: NestedRunSummary[] | undefined): Overla
 }
 
 function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
-	const steps: OverlayNestedChild[] = (run.steps ?? []).flatMap((step: NestedStepSummary, index) => {
-		const stepChild: OverlayNestedChild = {
-			id: `${run.id}:step:${step.agent}:${index}`,
-			agent: step.agent,
-			state: mapState(step.status),
-			currentTool: step.currentTool,
-			elapsed: elapsedFromRange(step.startedAt, step.endedAt),
-			sessionFile: step.sessionFile,
-			children: mapNestedStepChildren(step.children),
-		};
-		return stepChild;
-	});
+	const steps: OverlayStep[] = (run.steps ?? []).map((step) => ({
+		agent: step.agent,
+		state: mapState(step.status),
+		currentTool: step.currentTool,
+		elapsed: elapsedFromRange(step.startedAt, step.endedAt),
+		sessionFile: step.sessionFile,
+		children: mapNestedStepChildren(step.children),
+	}));
 	const directChildren: OverlayNestedChild[] = (run.children ?? []).map(mapNestedRun);
 	return {
 		id: run.id,
 		agent: run.agent ?? run.agents?.join(", ") ?? run.id,
-		state: mapState(run.state),
+		state: deriveRunState(mapState(run.state), steps, directChildren),
 		mode: run.mode,
 		currentTool: run.currentTool,
 		elapsed: elapsedFromRange(run.startedAt, run.endedAt),
 		sessionFile: run.sessionFile,
 		asyncDir: run.asyncDir,
-		children: [...steps, ...directChildren],
+		children: directChildren,
+		steps: steps.length ? steps : undefined,
 	};
 }
 
@@ -302,6 +315,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 		agents.push(...fallbackAgents);
 	}
 	const elapsed = elapsedFromRange(run.startedAt, run.endedAt ?? run.lastUpdate, now);
+	const mappedNestedChildren = (run.nestedChildren ?? []).map(mapNestedRun);
 	const steps: OverlayStep[] = run.steps.map((step) => {
 		const resultChild = result?.children[step.index];
 		return {
@@ -316,12 +330,12 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 		};
 	});
 	const attachedIds = new Set(run.steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
-	const unattached = (run.nestedChildren ?? []).filter((child) => !attachedIds.has(child.id));
-	if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached.map(mapNestedRun));
+	const unattached = mappedNestedChildren.filter((child) => !attachedIds.has(child.id));
+	if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached);
 	return {
 		id: run.id,
 		label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
-		state: mapState(run.state),
+		state: deriveRunState(mapState(run.state), steps, mappedNestedChildren),
 		mode: run.mode,
 		source: "async",
 		agents,
@@ -439,6 +453,7 @@ function resolveForegroundRunState(children: { status: string }[]): OverlayRunSt
 	const statuses = children.map((c) => c.status);
 	if (statuses.some((s) => s === "failed")) return "failed";
 	if (statuses.some((s) => s === "paused")) return "paused";
+	if (statuses.some((s) => s === "pending")) return "queued";
 	return "complete";
 }
 
@@ -465,7 +480,7 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 		runs.push({
 			id,
 			label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
-			state: resolveForegroundRunState(run.children),
+			state: deriveRunState(resolveForegroundRunState(run.children), steps),
 			mode: run.mode,
 			source: "foreground",
 			agents,
@@ -492,6 +507,7 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 		const agents = agentsLabel(job.agents);
 		const elapsed = elapsedFromRange(job.startedAt, job.updatedAt, now);
 
+		const mappedNestedChildren = (job.nestedChildren ?? []).map(mapNestedRun);
 		const steps: OverlayStep[] = (job.steps ?? []).map((step: AsyncJobStep) => {
 			return {
 				agent: step.agent,
@@ -507,18 +523,18 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 		const attachedIds = new Set(
 			(job.steps ?? []).flatMap((s: AsyncJobStep) => (s.children ?? []).map((c) => c.id)),
 		);
-		const unattached = (job.nestedChildren ?? []).filter(
+		const unattached = mappedNestedChildren.filter(
 			(nc) => !attachedIds.has(nc.id),
 		);
 		if (unattached.length && steps.length) {
 			const lastStep = steps[steps.length - 1]!;
-			lastStep.children.push(...unattached.map(mapNestedRun));
+			lastStep.children.push(...unattached);
 		}
 
 		runs.push({
 			id: job.asyncId,
 			label: `${modeLabel(job.mode)}: ${agents.join(", ")}`,
-			state: mapState(job.status ?? "running"),
+			state: deriveRunState(mapState(job.status ?? "running"), steps, mappedNestedChildren),
 			mode: job.mode ?? "single",
 			source: "async",
 			agents,

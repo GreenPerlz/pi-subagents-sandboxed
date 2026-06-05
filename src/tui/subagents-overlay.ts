@@ -14,7 +14,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type KeybindingsManager } from "@earendil-works/pi-tui";
 import { collectRunTree, type OverlayNestedChild, type OverlayRun, type OverlayStep } from "./run-tree-collector.ts";
-import { readSessionFile, resolveSessionPathForRun, type FormattedLine } from "./session-reader.ts";
+import { readSessionFile, resolveSessionPath, type FormattedLine } from "./session-reader.ts";
 import type { SubagentState } from "../shared/types.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
@@ -109,18 +109,24 @@ function renderNestedChildren(
 		const elapsed = child.elapsed ? theme.fg("dim", ` · ${child.elapsed}`) : "";
 		const line = `${prefix}${glyph} ${child.agent} ${stateLabel(child.state, theme)} · ${child.id}${tool}${elapsed}${pathDetail(child, theme)}`;
 		lines.push(truncateToWidth(line, width));
+		if (child.steps?.length) {
+			for (const [stepIndex, step] of child.steps.entries()) {
+				renderStep(step, stepIndex, theme, width, depth + 1, lines);
+			}
+		}
 		if (child.children.length) {
 			renderNestedChildren(child.children, theme, width, depth + 1, lines);
 		}
 	}
 }
 
-function renderStep(step: OverlayStep, theme: Theme, width: number, depth: number, lines: string[]): void {
+function renderStep(step: OverlayStep, stepIndex: number, theme: Theme, width: number, depth: number, lines: string[]): void {
 	const prefix = indent(depth);
 	const glyph = stateGlyph(step.state, theme);
+	const stepNum = `${stepIndex + 1}.`;
 	const tool = step.currentTool ? theme.fg("dim", ` · ${step.currentTool}`) : "";
 	const elapsed = step.elapsed ? theme.fg("dim", ` · ${step.elapsed}`) : "";
-	const line = `${prefix}${glyph} ${step.agent} ${stateLabel(step.state, theme)}${tool}${elapsed}${pathDetail(step, theme)}`;
+	const line = `${prefix}${glyph} ${stepNum} ${step.agent} ${stateLabel(step.state, theme)}${tool}${elapsed}${pathDetail(step, theme)}`;
 	lines.push(truncateToWidth(line, width));
 	renderNestedChildren(step.children, theme, width, depth + 1, lines);
 }
@@ -132,11 +138,12 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 	const agents = run.agents.length <= 3
 		? run.agents.join(", ")
 		: `${run.agents.slice(0, 2).join(", ")} +${run.agents.length - 2}`;
+	const modePrefix = run.mode !== "single" ? `${run.mode}: ` : "";
 	const selector = selected ? theme.fg("accent", "> ") : "  ";
 	const tool = run.currentTool ? theme.fg("dim", ` · ${run.currentTool}`) : "";
-	const header = `${selector}${glyph} ${agents || run.id} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${tool}${elapsed}${pathDetail(run, theme)}`;
+	const header = `${selector}${glyph} ${modePrefix}${agents || run.id} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${tool}${elapsed}${pathDetail(run, theme)}`;
 	lines.push(truncateToWidth(header, width));
-	for (const step of run.steps) {
+	for (const [stepIndex, step] of run.steps.entries()) {
 		// Skip redundant step line for single foreground runs where the step
 		// duplicates the run header (same agent). Still render nested children
 		// directly under the run header so they are not lost.
@@ -151,7 +158,7 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 			}
 			continue;
 		}
-		renderStep(step, theme, width, 1, lines);
+		renderStep(step, stepIndex, theme, width, 1, lines);
 	}
 }
 
@@ -239,10 +246,72 @@ export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, s
 // Detail pane
 // ---------------------------------------------------------------------------
 
+interface DetailPaneTarget {
+	id: string;
+	label: string;
+	sessionFile?: string;
+	logPath?: string;
+	artifactPath?: string;
+	asyncDir?: string;
+}
+
+function buildDetailTargets(run: OverlayRun): DetailPaneTarget[] {
+	const targets: DetailPaneTarget[] = [];
+	targets.push({
+		id: run.id,
+		label: run.agents.join(", ") || run.id,
+		sessionFile: run.sessionFile,
+		logPath: run.logPath,
+		artifactPath: run.artifactPath,
+		asyncDir: run.asyncDir,
+	});
+	for (const [stepIndex, step] of run.steps.entries()) {
+		targets.push({
+			id: `${run.id}:step:${stepIndex}`,
+			label: `${step.agent} (step ${stepIndex + 1})`,
+			sessionFile: step.sessionFile,
+			logPath: step.logPath,
+			artifactPath: step.artifactPath,
+			asyncDir: step.asyncDir ?? run.asyncDir,
+		});
+		addNestedChildren(step.children, `${step.agent}`, targets);
+	}
+	function addNestedChildren(children: OverlayNestedChild[], prefix: string, acc: DetailPaneTarget[]): void {
+		for (const child of children) {
+			acc.push({
+				id: child.id,
+				label: prefix ? `${prefix} → ${child.agent}` : child.agent,
+				sessionFile: child.sessionFile,
+				logPath: child.logPath,
+				artifactPath: child.artifactPath,
+				asyncDir: child.asyncDir,
+			});
+			const childPrefix = prefix ? `${prefix} → ${child.agent}` : child.agent;
+			if (child.steps) {
+				for (const [stepIndex, step] of child.steps.entries()) {
+					acc.push({
+						id: `${child.id}:step:${stepIndex}`,
+						label: `${childPrefix} → ${step.agent} (step ${stepIndex + 1})`,
+						sessionFile: step.sessionFile,
+						logPath: step.logPath,
+						artifactPath: step.artifactPath,
+						asyncDir: step.asyncDir ?? child.asyncDir,
+					});
+					addNestedChildren(step.children, `${childPrefix} → ${step.agent}`, acc);
+				}
+			}
+			addNestedChildren(child.children, childPrefix, acc);
+		}
+	}
+	return targets;
+}
+
 export class SubagentDetailPane {
 	private run: OverlayRun;
 	private readonly theme: Theme;
 	private readonly requestRender: () => void;
+	private candidates: DetailPaneTarget[];
+	private candidateIndex: number;
 	private showThinking = false;
 	private scrollOffset = 0;
 	private contentLines: FormattedLine[] = [];
@@ -258,6 +327,15 @@ export class SubagentDetailPane {
 		this.run = run;
 		this.theme = theme;
 		this.requestRender = requestRender;
+		this.candidates = buildDetailTargets(run);
+		// Start at the first candidate with a resolvable session path
+		this.candidateIndex = 0;
+		for (let i = 0; i < this.candidates.length; i++) {
+			if (resolveSessionPath(this.candidates[i]!)) {
+				this.candidateIndex = i;
+				break;
+			}
+		}
 		this.refresh();
 	}
 
@@ -266,11 +344,35 @@ export class SubagentDetailPane {
 	}
 
 	updateRun(run: OverlayRun): void {
+		const oldId = this.candidates[this.candidateIndex]?.id;
 		this.run = run;
+		this.candidates = buildDetailTargets(run);
+		const newIndex = this.candidates.findIndex((c) => c.id === oldId);
+		this.candidateIndex = newIndex >= 0 ? newIndex : Math.min(this.candidateIndex, Math.max(0, this.candidates.length - 1));
+		this.invalidate();
+	}
+
+	private currentTarget(): DetailPaneTarget {
+		return this.candidates[this.candidateIndex] ?? { id: this.run.id, label: this.run.agents.join(", ") || "subagent" };
+	}
+
+	nextCandidate(): void {
+		if (this.candidates.length <= 1) return;
+		this.candidateIndex = (this.candidateIndex + 1) % this.candidates.length;
+		this.scrollOffset = 0;
+		this.refresh();
+	}
+
+	prevCandidate(): void {
+		if (this.candidates.length <= 1) return;
+		this.candidateIndex = (this.candidateIndex - 1 + this.candidates.length) % this.candidates.length;
+		this.scrollOffset = 0;
+		this.refresh();
 	}
 
 	refresh(): void {
-		const sessionPath = resolveSessionPathForRun(this.run);
+		const target = this.currentTarget();
+		const sessionPath = resolveSessionPath(target);
 		if (!sessionPath) {
 			this.error = "No session file or log available for this run yet.";
 			this.contentLines = [];
@@ -366,7 +468,8 @@ export class SubagentDetailPane {
 		const row = (content: string) => this.theme.fg("border", "│") + pad(content, innerW) + this.theme.fg("border", "│");
 
 		const lines: string[] = [];
-		const title = `${this.run.id} · ${this.run.agents.join(", ") || "subagent"}`;
+		const target = this.currentTarget();
+		const title = `${target.id} · ${target.label}`;
 		const titleTrunc = truncateToWidth(title, innerW);
 		const titlePad = Math.max(0, innerW - visibleWidth(titleTrunc));
 		lines.push(this.theme.fg("border", "╭") + this.theme.fg("accent", titleTrunc) + this.theme.fg("border", "─".repeat(titlePad) + "╮"));
@@ -375,7 +478,9 @@ export class SubagentDetailPane {
 		const thinkingStatus = this.showThinking
 			? this.theme.fg("dim", "thinking: shown")
 			: this.theme.fg("dim", "thinking: hidden");
-		const headerLine = ` ${thinkingStatus} ${this.theme.fg("dim", "· t toggle · ↑↓ scroll · ← back")}`;
+		const hasMultiple = this.candidates.length > 1;
+		const navHint = hasMultiple ? ` · ←/→ ${this.candidateIndex + 1}/${this.candidates.length}` : "";
+		const headerLine = ` ${thinkingStatus} ${this.theme.fg("dim", `· t toggle · ↑↓ scroll${navHint} · Esc back`)}`;
 		lines.push(row(truncateToWidth(headerLine, innerW)));
 		lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
 
@@ -558,8 +663,16 @@ export class SubagentsOverlay {
 	}
 
 	private handleDetailInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "backspace") || matchesKey(data, "left")) {
+		if (matchesKey(data, "escape") || matchesKey(data, "backspace")) {
 			this.closeDetail();
+			return;
+		}
+		if (matchesKey(data, "left")) {
+			this.detailPane?.prevCandidate();
+			return;
+		}
+		if (matchesKey(data, "right")) {
+			this.detailPane?.nextCandidate();
 			return;
 		}
 		if (this.keybindings.matches(data, "tui.select.up")) {

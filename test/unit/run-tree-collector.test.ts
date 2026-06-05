@@ -751,4 +751,153 @@ describe("collectRunTree", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("maps pending step status to queued in overlay", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-pending",
+			asyncDir: "/tmp/pending",
+			status: "running",
+			mode: "chain",
+			agents: ["researcher", "worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			steps: [
+				{ agent: "researcher", status: "complete", index: 0, durationMs: 500 },
+				{ agent: "worker", status: "pending", index: 1 },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.steps[1]!.state, "queued");
+	});
+
+	it("derives queued run state when chain has pending steps", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-mixed",
+			asyncDir: "/tmp/mixed",
+			status: "complete",
+			mode: "chain",
+			agents: ["a", "b"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			steps: [
+				{ agent: "a", status: "complete", index: 0 },
+				{ agent: "b", status: "pending", index: 1 },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.state, "queued");
+	});
+
+	it("resolves finished foreground run with pending children as queued", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-pending", {
+			mode: "chain",
+			children: [
+				{ agent: "a", index: 0, status: "completed" },
+				{ agent: "b", index: 1, status: "pending" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.state, "queued");
+		assert.strictEqual(runs[0]!.steps[0]!.state, "complete");
+		assert.strictEqual(runs[0]!.steps[1]!.state, "queued");
+	});
+
+	it("derives nested run state from its steps, not stale stored state", () => {
+		const nested = makeNestedChild({
+			id: "nested-chain",
+			parentRunId: "async-parent",
+			state: "complete",
+			mode: "chain",
+			steps: [
+				{ agent: "a", status: "complete" },
+				{ agent: "b", status: "pending" },
+			],
+		});
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-parent",
+			asyncDir: "/tmp/parent",
+			status: "complete",
+			mode: "single",
+			agents: ["parent"],
+			steps: [
+				{ agent: "parent", status: "complete", index: 0, children: [nested] },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		// Top header should not be complete because nested child has a pending step
+		assert.strictEqual(runs[0]!.state, "queued");
+		// Nested row should not be complete
+		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.state, "queued");
+	});
+
+	it("derives nested run state from its descendants, not stale stored state", () => {
+		const deepChild = makeNestedChild({
+			id: "deep-child",
+			parentRunId: "nested-chain",
+			state: "running",
+			agent: "deep",
+		});
+		const nested = makeNestedChild({
+			id: "nested-chain",
+			parentRunId: "async-parent",
+			state: "complete",
+			mode: "chain",
+			children: [deepChild],
+		});
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-parent",
+			asyncDir: "/tmp/parent",
+			status: "complete",
+			mode: "single",
+			agents: ["parent"],
+			steps: [
+				{ agent: "parent", status: "complete", index: 0, children: [nested] },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		// Top header should not be complete because nested child has a running descendant
+		assert.strictEqual(runs[0]!.state, "running");
+		// Nested row should not be complete
+		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.state, "running");
+	});
+
+	it("derives nested run state from step children, not stale stored state", () => {
+		const stepChild = makeNestedChild({
+			id: "step-child",
+			parentRunId: "nested-chain",
+			state: "running",
+			agent: "step-child",
+		});
+		const nested = makeNestedChild({
+			id: "nested-chain",
+			parentRunId: "async-parent",
+			state: "complete",
+			mode: "chain",
+			steps: [
+				{ agent: "a", status: "complete", children: [stepChild] },
+			],
+		});
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-parent",
+			asyncDir: "/tmp/parent",
+			status: "complete",
+			mode: "single",
+			agents: ["parent"],
+			steps: [
+				{ agent: "parent", status: "complete", index: 0, children: [nested] },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.state, "running");
+		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.state, "running");
+	});
 });

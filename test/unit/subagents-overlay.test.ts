@@ -6,8 +6,23 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import { renderOverlay, SubagentDetailPane, SubagentsOverlay } from "../../src/tui/subagents-overlay.ts";
 import type { OverlayRun } from "../../src/tui/run-tree-collector.ts";
+
+function tmpFile(content: string): string {
+	const dir = os.tmpdir();
+	const name = `pi-subagents-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`;
+	const p = path.join(dir, name);
+	fs.writeFileSync(p, content, "utf-8");
+	return p;
+}
+
+function cleanup(p: string): void {
+	try { fs.unlinkSync(p); } catch { /* ignore */ }
+}
 
 const theme = {
 	fg: (_name: string, text: string) => text,
@@ -263,6 +278,33 @@ describe("subagents overlay detail pane (issue #21)", () => {
 
 		// The scroll hint should change to show lines above
 		assert.ok(textAfter.includes("↑") || textAfter.includes("end of content"), "scroll hint should reflect scrolled state");
+	});
+
+	it("scroll hint reflects actual render height, not hardcoded 20", () => {
+		// 3 user messages produce 6 formatted lines (header + content each)
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "h-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			// height 9 gives viewport = 5 lines; 6 lines total => 1 below
+			const lines = pane.render(80, 9);
+			const text = lines.join("\n");
+			assert.ok(text.includes("↓ 1 more"), "scroll hint should reflect height-based viewport");
+		} finally {
+			cleanup(p);
+		}
 	});
 
 	it("preserves list selection when going back from detail", () => {

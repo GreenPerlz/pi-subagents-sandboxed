@@ -350,24 +350,27 @@ export function readSessionFile(filePath: string, theme: Theme, width: number, s
  * Prefers sessionFile, then artifactPath, then constructs from asyncDir.
  */
 export function resolveSessionPath(run: { sessionFile?: string; artifactPath?: string; asyncDir?: string }): string | undefined {
-	if (run.sessionFile && fs.existsSync(run.sessionFile)) return run.sessionFile;
+	if (run.sessionFile) {
+		if (fs.existsSync(run.sessionFile) && fs.statSync(run.sessionFile).isFile()) return run.sessionFile;
+	}
 	if (run.artifactPath) {
-		if (fs.existsSync(run.artifactPath)) return run.artifactPath;
-		// Try common artifact names under asyncDir
+		const artifactStat = fs.existsSync(run.artifactPath) ? fs.statSync(run.artifactPath) : undefined;
+		if (artifactStat?.isFile()) return run.artifactPath;
+		// Treat artifactPath as a search root (directory or non-existent path stub)
 		const candidates = ["output.log", "output-0.log", "session.jsonl"];
 		for (const candidate of candidates) {
 			const p = run.artifactPath + (run.artifactPath.endsWith("/") ? "" : "/") + candidate;
-			if (fs.existsSync(p)) return p;
+			if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
 		}
 	}
 	if (run.asyncDir) {
 		const candidates = ["session.jsonl", "output.log", "output-0.log"];
 		for (const candidate of candidates) {
 			const p = run.asyncDir + (run.asyncDir.endsWith("/") ? "" : "/") + candidate;
-			if (fs.existsSync(p)) return p;
+			if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
 		}
 	}
-	return run.sessionFile ?? run.artifactPath ?? run.asyncDir;
+	return undefined;
 }
 
 function localVisibleWidth(s: string): number {

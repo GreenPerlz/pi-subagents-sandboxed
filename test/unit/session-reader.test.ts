@@ -146,13 +146,23 @@ describe("session-reader", () => {
 	});
 
 	describe("resolveSessionPath", () => {
-		it("prefers sessionFile when it exists", () => {
+		it("prefers sessionFile when it exists and is a file", () => {
 			const p = tmpFile("test");
 			try {
 				const resolved = resolveSessionPath({ sessionFile: p, artifactPath: "/other", asyncDir: "/other2" });
 				assert.strictEqual(resolved, p);
 			} finally {
 				cleanup(p);
+			}
+		});
+
+		it("does not return sessionFile when it is a directory", () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+			try {
+				const resolved = resolveSessionPath({ sessionFile: dir });
+				assert.strictEqual(resolved, undefined);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
 			}
 		});
 
@@ -163,6 +173,28 @@ describe("session-reader", () => {
 				assert.strictEqual(resolved, p);
 			} finally {
 				cleanup(p);
+			}
+		});
+
+		it("does not return a directory artifactPath, but searches inside it", () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+			const logFile = path.join(dir, "output.log");
+			fs.writeFileSync(logFile, "test", "utf-8");
+			try {
+				const resolved = resolveSessionPath({ artifactPath: dir });
+				assert.strictEqual(resolved, logFile);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("returns undefined when artifactPath is a directory with no candidate files", () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+			try {
+				const resolved = resolveSessionPath({ artifactPath: dir });
+				assert.strictEqual(resolved, undefined);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
 			}
 		});
 

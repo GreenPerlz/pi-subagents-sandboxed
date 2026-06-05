@@ -176,7 +176,9 @@ export class SubagentDetailPane {
 	private showThinking = false;
 	private scrollOffset = 0;
 	private contentLines: FormattedLine[] = [];
-	private lastFileSize = 0;
+	private lastLineCount = 0;
+	private lastRenderWidth = 200;
+	private lastRenderHeight = 24;
 	private cachedWidth?: number;
 	private cachedHeight?: number;
 	private cachedLines?: string[];
@@ -198,7 +200,7 @@ export class SubagentDetailPane {
 			return;
 		}
 
-		const result = readSessionFile(sessionPath, this.theme, 200, this.showThinking);
+		const result = readSessionFile(sessionPath, this.theme, this.lastRenderWidth, this.showThinking);
 		if (result.error) {
 			this.error = result.error;
 			this.contentLines = [];
@@ -208,20 +210,20 @@ export class SubagentDetailPane {
 		}
 
 		// Auto-scroll to bottom on first load or if user was already at bottom
-		if (this.lastFileSize === 0 || this.isAtBottom()) {
+		if (this.lastLineCount === 0 || this.isAtBottom()) {
 			this.scrollToBottom();
 		}
-		this.lastFileSize = this.contentLines.length;
+		this.lastLineCount = this.contentLines.length;
 		this.invalidate();
 		this.requestRender();
 	}
 
 	private isAtBottom(): boolean {
-		return this.scrollOffset >= Math.max(0, this.contentLines.length - this.viewportLines(20));
+		return this.scrollOffset >= Math.max(0, this.contentLines.length - this.viewportLines(this.lastRenderHeight));
 	}
 
 	private scrollToBottom(): void {
-		const viewport = this.viewportLines(20);
+		const viewport = this.viewportLines(this.lastRenderHeight);
 		this.scrollOffset = Math.max(0, this.contentLines.length - viewport);
 	}
 
@@ -242,7 +244,7 @@ export class SubagentDetailPane {
 	}
 
 	scrollDown(amount = 3): void {
-		const viewport = this.viewportLines(20);
+		const viewport = this.viewportLines(this.lastRenderHeight);
 		const maxOffset = Math.max(0, this.contentLines.length - viewport);
 		this.scrollOffset = Math.min(maxOffset, this.scrollOffset + amount);
 		this.invalidate();
@@ -254,6 +256,12 @@ export class SubagentDetailPane {
 	}
 
 	render(width: number, height: number): string[] {
+		const widthChanged = this.lastRenderWidth !== width;
+		this.lastRenderWidth = width;
+		this.lastRenderHeight = height;
+		if (widthChanged) {
+			this.refresh();
+		}
 		if (this.cachedLines && this.cachedWidth === width && this.cachedHeight === height) {
 			return this.cachedLines;
 		}
@@ -298,8 +306,7 @@ export class SubagentDetailPane {
 			for (let i = 0; i < contentHeight; i++) {
 				if (i < visible.length) {
 					const line = visible[i]!;
-					const prefix = line.isThinking ? " " : " ";
-					lines.push(row(truncateToWidth(prefix + line.text, innerW)));
+					lines.push(row(truncateToWidth(" " + line.text, innerW)));
 				} else {
 					lines.push(row(""));
 				}
@@ -315,7 +322,7 @@ export class SubagentDetailPane {
 	private buildScrollHint(): string {
 		const parts: string[] = [];
 		if (this.scrollOffset > 0) parts.push(`↑ ${this.scrollOffset} more`);
-		const viewport = this.viewportLines(20);
+		const viewport = this.viewportLines(this.lastRenderHeight);
 		const below = Math.max(0, this.contentLines.length - this.scrollOffset - viewport);
 		if (below > 0) parts.push(`↓ ${below} more`);
 		if (parts.length === 0) parts.push("end of content");
@@ -341,6 +348,7 @@ export class SubagentsOverlay {
 	private mode: OverlayMode = "list";
 	private detailPane?: SubagentDetailPane;
 	private cachedWidth?: number;
+	private cachedHeight?: number;
 	private cachedLines?: string[];
 	private refreshTimer: ReturnType<typeof setInterval> | null = null;
 	private readonly theme: Theme;
@@ -449,14 +457,14 @@ export class SubagentsOverlay {
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
+		const height = process.stdout.rows || 24;
+		if (this.cachedLines && this.cachedWidth === width && this.cachedHeight === height) {
 			return this.cachedLines;
 		}
 		this.cachedWidth = width;
+		this.cachedHeight = height;
 
 		if (this.mode === "detail" && this.detailPane) {
-			// Use terminal height if available; default to a reasonable value
-			const height = process.stdout.rows || 24;
 			this.cachedLines = this.detailPane.render(width, height);
 		} else {
 			this.cachedLines = renderOverlay(this.runs, this.theme, width, this.selectedRunIndex);
@@ -466,6 +474,7 @@ export class SubagentsOverlay {
 
 	invalidate(): void {
 		this.cachedWidth = undefined;
+		this.cachedHeight = undefined;
 		this.cachedLines = undefined;
 		this.detailPane?.invalidate();
 	}

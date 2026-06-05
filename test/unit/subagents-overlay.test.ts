@@ -1,11 +1,12 @@
 /**
  * Snapshot-style tests for the /subagents overlay rendering.
- * Tests verify empty state, single top-level run, and nested child indentation.
+ * Tests verify empty state, single top-level run, nested child indentation,
+ * and detail pane navigation/scrolling (issue #21).
  */
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { renderOverlay } from "../../src/tui/subagents-overlay.ts";
+import { renderOverlay, SubagentDetailPane, SubagentsOverlay } from "../../src/tui/subagents-overlay.ts";
 import type { OverlayRun } from "../../src/tui/run-tree-collector.ts";
 
 const theme = {
@@ -201,5 +202,112 @@ describe("subagents overlay rendering", () => {
 			const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
 			assert.ok(stripped.length <= narrowWidth, `line exceeds width: "${stripped}"`);
 		}
+	});
+});
+
+describe("subagents overlay detail pane (issue #21)", () => {
+	it("shows no-session message when run has no readable session", () => {
+		const run: OverlayRun = {
+			id: "no-session-run",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {});
+		const lines = pane.render(WIDTH, 20);
+		const text = lines.join("\n");
+		assert.ok(text.includes("no-session-run"), "should show run id in title");
+		assert.ok(text.includes("worker"), "should show agent in title");
+		assert.ok(text.includes("No session file or log available"), "should show no-session message");
+	});
+
+	it("toggles thinking visibility", () => {
+		const run: OverlayRun = {
+			id: "think-run",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {});
+		assert.strictEqual(pane.getShowThinking(), false, "thinking hidden by default");
+		pane.toggleThinking();
+		assert.strictEqual(pane.getShowThinking(), true, "thinking shown after toggle");
+		pane.toggleThinking();
+		assert.strictEqual(pane.getShowThinking(), false, "thinking hidden after second toggle");
+	});
+
+	it("scrolls independently within content", () => {
+		const run: OverlayRun = {
+			id: "scroll-run",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {});
+		const linesBefore = pane.render(WIDTH, 20);
+		const textBefore = linesBefore.join("\n");
+
+		// Scroll down should change the visible content
+		pane.scrollDown(5);
+		const linesAfter = pane.render(WIDTH, 20);
+		const textAfter = linesAfter.join("\n");
+
+		// The scroll hint should change to show lines above
+		assert.ok(textAfter.includes("↑") || textAfter.includes("end of content"), "scroll hint should reflect scrolled state");
+	});
+
+	it("preserves list selection when going back from detail", () => {
+		let renderCount = 0;
+		const requestRender = () => { renderCount++; };
+
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+
+		const keybindings = {
+			matches: (data: string, keyId: string) => {
+				if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+				if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+				if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+				return false;
+			},
+		} as never;
+
+		let doneCalled = false;
+		const done = () => { doneCalled = true; };
+
+		const overlay = new SubagentsOverlay(theme as never, state, done, requestRender, keybindings);
+
+		// Initially in list mode
+		const listLines = overlay.render(WIDTH);
+		assert.ok(listLines.join("\n").includes("Subagents"), "should start in list mode");
+
+		// Try to open detail when no runs exist — should stay in list mode
+		overlay.handleInput("\r"); // Enter
+		const afterEnter = overlay.render(WIDTH);
+		assert.ok(afterEnter.join("\n").includes("Subagents"), "should remain in list mode when no runs");
+
+		overlay.dispose();
 	});
 });

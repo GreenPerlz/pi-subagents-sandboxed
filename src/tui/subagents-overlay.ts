@@ -4,11 +4,17 @@
  * Non-TUI modes receive a short message pointing to `subagent({ action: "status" })`.
  * In TUI mode the overlay renders as a border-box list that refreshes via `requestRender()`
  * while the user navigates with the configured selection keybindings; Escape closes.
+ *
+ * Detail pane (issue #21):
+ *   Enter/Space on a run opens an in-overlay detail pane showing that child session's
+ *   persisted session file or best available log. Detail pane has independent scrolling,
+ *   a thinking toggle (t), and Back/Left returns to the list without closing the overlay.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type KeybindingsManager } from "@earendil-works/pi-tui";
 import { collectRunTree, type OverlayNestedChild, type OverlayRun, type OverlayStep } from "./run-tree-collector.ts";
+import { readSessionFile, resolveSessionPath, type FormattedLine } from "./session-reader.ts";
 import type { SubagentState } from "../shared/types.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
@@ -148,7 +154,7 @@ export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, s
 	if (contentLines.length > 0 && contentLines[contentLines.length - 1] === "") {
 		contentLines.pop();
 	}
-	contentLines.push(` ${theme.fg("dim", "↑↓ navigate · Esc close")}`);
+	contentLines.push(truncateToWidth(` ${theme.fg("dim", "↑↓ navigate · Enter detail · Esc close")}`, innerW));
 
 	const lines: string[] = [];
 	lines.push(theme.fg("border", `╭${"─".repeat(innerW)}╮`));
@@ -160,12 +166,180 @@ export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, s
 }
 
 // ---------------------------------------------------------------------------
+// Detail pane
+// ---------------------------------------------------------------------------
+
+export class SubagentDetailPane {
+	private readonly run: OverlayRun;
+	private readonly theme: Theme;
+	private readonly requestRender: () => void;
+	private showThinking = false;
+	private scrollOffset = 0;
+	private contentLines: FormattedLine[] = [];
+	private lastFileSize = 0;
+	private cachedWidth?: number;
+	private cachedHeight?: number;
+	private cachedLines?: string[];
+	private error?: string;
+
+	constructor(run: OverlayRun, theme: Theme, requestRender: () => void) {
+		this.run = run;
+		this.theme = theme;
+		this.requestRender = requestRender;
+		this.refresh();
+	}
+
+	refresh(): void {
+		const sessionPath = resolveSessionPath(this.run);
+		if (!sessionPath) {
+			this.error = "No session file or log available for this run yet.";
+			this.contentLines = [];
+			this.invalidate();
+			return;
+		}
+
+		const result = readSessionFile(sessionPath, this.theme, 200, this.showThinking);
+		if (result.error) {
+			this.error = result.error;
+			this.contentLines = [];
+		} else {
+			this.error = undefined;
+			this.contentLines = result.lines;
+		}
+
+		// Auto-scroll to bottom on first load or if user was already at bottom
+		if (this.lastFileSize === 0 || this.isAtBottom()) {
+			this.scrollToBottom();
+		}
+		this.lastFileSize = this.contentLines.length;
+		this.invalidate();
+		this.requestRender();
+	}
+
+	private isAtBottom(): boolean {
+		return this.scrollOffset >= Math.max(0, this.contentLines.length - this.viewportLines(20));
+	}
+
+	private scrollToBottom(): void {
+		const viewport = this.viewportLines(20);
+		this.scrollOffset = Math.max(0, this.contentLines.length - viewport);
+	}
+
+	private viewportLines(height: number): number {
+		// Account for header/footer borders: ~4 lines
+		return Math.max(1, height - 4);
+	}
+
+	toggleThinking(): void {
+		this.showThinking = !this.showThinking;
+		this.refresh();
+	}
+
+	scrollUp(amount = 3): void {
+		this.scrollOffset = Math.max(0, this.scrollOffset - amount);
+		this.invalidate();
+		this.requestRender();
+	}
+
+	scrollDown(amount = 3): void {
+		const viewport = this.viewportLines(20);
+		const maxOffset = Math.max(0, this.contentLines.length - viewport);
+		this.scrollOffset = Math.min(maxOffset, this.scrollOffset + amount);
+		this.invalidate();
+		this.requestRender();
+	}
+
+	getShowThinking(): boolean {
+		return this.showThinking;
+	}
+
+	render(width: number, height: number): string[] {
+		if (this.cachedLines && this.cachedWidth === width && this.cachedHeight === height) {
+			return this.cachedLines;
+		}
+		this.cachedWidth = width;
+		this.cachedHeight = height;
+		this.cachedLines = this.doRender(width, height);
+		return this.cachedLines;
+	}
+
+	private doRender(width: number, height: number): string[] {
+		const innerW = width - 2;
+		const pad = (s: string, len: number) => {
+			const vis = visibleWidth(s);
+			return s + " ".repeat(Math.max(0, len - vis));
+		};
+		const row = (content: string) => this.theme.fg("border", "│") + pad(content, innerW) + this.theme.fg("border", "│");
+
+		const lines: string[] = [];
+		const title = `${this.run.id} · ${this.run.agents.join(", ") || "subagent"}`;
+		const titleTrunc = truncateToWidth(title, innerW);
+		const titlePad = Math.max(0, innerW - visibleWidth(titleTrunc));
+		lines.push(this.theme.fg("border", "╭") + this.theme.fg("accent", titleTrunc) + this.theme.fg("border", "─".repeat(titlePad) + "╮"));
+
+		// Show thinking indicator in header
+		const thinkingStatus = this.showThinking
+			? this.theme.fg("dim", "thinking: shown")
+			: this.theme.fg("dim", "thinking: hidden");
+		const headerLine = ` ${thinkingStatus} ${this.theme.fg("dim", "· t toggle · ↑↓ scroll · ← back")}`;
+		lines.push(row(truncateToWidth(headerLine, innerW)));
+		lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
+
+		const contentHeight = Math.max(1, height - 4);
+
+		if (this.error) {
+			lines.push(row(this.theme.fg("warning", ` ${this.error}`)));
+			for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+		} else if (this.contentLines.length === 0) {
+			lines.push(row(this.theme.fg("dim", " No session content available yet.")));
+			for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+		} else {
+			const visible = this.contentLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
+			for (let i = 0; i < contentHeight; i++) {
+				if (i < visible.length) {
+					const line = visible[i]!;
+					const prefix = line.isThinking ? " " : " ";
+					lines.push(row(truncateToWidth(prefix + line.text, innerW)));
+				} else {
+					lines.push(row(""));
+				}
+			}
+		}
+
+		const scrollHint = this.buildScrollHint();
+		lines.push(row(truncateToWidth(scrollHint, innerW)));
+		lines.push(this.theme.fg("border", `╰${"─".repeat(innerW)}╯`));
+		return lines;
+	}
+
+	private buildScrollHint(): string {
+		const parts: string[] = [];
+		if (this.scrollOffset > 0) parts.push(`↑ ${this.scrollOffset} more`);
+		const viewport = this.viewportLines(20);
+		const below = Math.max(0, this.contentLines.length - this.scrollOffset - viewport);
+		if (below > 0) parts.push(`↓ ${below} more`);
+		if (parts.length === 0) parts.push("end of content");
+		return ` ${this.theme.fg("dim", parts.join("  "))}`;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedHeight = undefined;
+		this.cachedLines = undefined;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Overlay component
 // ---------------------------------------------------------------------------
+
+type OverlayMode = "list" | "detail";
 
 export class SubagentsOverlay {
 	private runs: OverlayRun[] = [];
 	private selectedRunIndex = 0;
+	private mode: OverlayMode = "list";
+	private detailPane?: SubagentDetailPane;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 	private refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -201,6 +375,10 @@ export class SubagentsOverlay {
 		} else if (this.selectedRunIndex >= this.runs.length) {
 			this.selectedRunIndex = this.runs.length - 1;
 		}
+		// Refresh detail pane content if open (handles growing logs)
+		if (this.mode === "detail" && this.detailPane) {
+			this.detailPane.refresh();
+		}
 		this.invalidate();
 		this.requestRender();
 	}
@@ -213,6 +391,14 @@ export class SubagentsOverlay {
 	}
 
 	handleInput(data: string): void {
+		if (this.mode === "detail" && this.detailPane) {
+			this.handleDetailInput(data);
+			return;
+		}
+		this.handleListInput(data);
+	}
+
+	private handleListInput(data: string): void {
 		if (this.keybindings.matches(data, "tui.select.cancel") || matchesKey(data, "escape")) {
 			this.dispose();
 			this.done();
@@ -226,7 +412,40 @@ export class SubagentsOverlay {
 			this.selectedRunIndex = Math.min(this.runs.length - 1, this.selectedRunIndex + 1);
 			this.invalidate();
 			this.requestRender();
+		} else if (matchesKey(data, "return") || matchesKey(data, "space")) {
+			this.openDetail();
 		}
+	}
+
+	private handleDetailInput(data: string): void {
+		if (matchesKey(data, "escape") || matchesKey(data, "backspace") || matchesKey(data, "left")) {
+			this.closeDetail();
+			return;
+		}
+		if (this.keybindings.matches(data, "tui.select.up")) {
+			this.detailPane?.scrollUp();
+		} else if (this.keybindings.matches(data, "tui.select.down")) {
+			this.detailPane?.scrollDown();
+		} else if (data === "t" || data === "T") {
+			this.detailPane?.toggleThinking();
+		}
+	}
+
+	private openDetail(): void {
+		if (this.runs.length === 0) return;
+		const run = this.runs[this.selectedRunIndex];
+		if (!run) return;
+		this.mode = "detail";
+		this.detailPane = new SubagentDetailPane(run, this.theme, this.requestRender);
+		this.invalidate();
+		this.requestRender();
+	}
+
+	private closeDetail(): void {
+		this.mode = "list";
+		this.detailPane = undefined;
+		this.invalidate();
+		this.requestRender();
 	}
 
 	render(width: number): string[] {
@@ -234,13 +453,21 @@ export class SubagentsOverlay {
 			return this.cachedLines;
 		}
 		this.cachedWidth = width;
-		this.cachedLines = renderOverlay(this.runs, this.theme, width, this.selectedRunIndex);
+
+		if (this.mode === "detail" && this.detailPane) {
+			// Use terminal height if available; default to a reasonable value
+			const height = process.stdout.rows || 24;
+			this.cachedLines = this.detailPane.render(width, height);
+		} else {
+			this.cachedLines = renderOverlay(this.runs, this.theme, width, this.selectedRunIndex);
+		}
 		return this.cachedLines;
 	}
 
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.detailPane?.invalidate();
 	}
 }
 

@@ -52,6 +52,8 @@ export interface OverlayRun {
 	source: "foreground" | "async";
 	agents: string[];
 	elapsed?: string;
+	startedAt?: number;
+	updatedAt?: number;
 	sessionFile?: string;
 	artifactPath?: string;
 	steps: OverlayStep[];
@@ -155,6 +157,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 				currentTool: ctrl.currentIndex === index ? ctrl.currentTool : undefined,
 				elapsed: stepElapsed,
 				sessionFile: child.sessionFile,
+				artifactPath: child.artifactPath,
 				children: stepNested.map(mapNestedRun),
 			};
 		});
@@ -182,7 +185,60 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			source: "foreground",
 			agents,
 			elapsed,
+			startedAt: ctrl.startedAt,
+			updatedAt: ctrl.updatedAt,
 			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile,
+			artifactPath: childInfo.find((child) => child.artifactPath)?.artifactPath,
+			steps,
+		});
+	}
+	return runs;
+}
+
+// ---------------------------------------------------------------------------
+// Finished foreground run collection
+// ---------------------------------------------------------------------------
+
+function resolveForegroundRunState(children: { status: string }[]): OverlayRunState {
+	const statuses = children.map((c) => c.status);
+	if (statuses.some((s) => s === "failed")) return "failed";
+	if (statuses.some((s) => s === "paused")) return "paused";
+	return "complete";
+}
+
+function collectFinishedForegroundRuns(state: SubagentState, now: number): OverlayRun[] {
+	const runs: OverlayRun[] = [];
+	if (!state.foregroundRuns?.size) return runs;
+
+	const liveIds = new Set(state.foregroundControls?.keys() ?? []);
+
+	for (const [id, run] of state.foregroundRuns) {
+		// Skip if still live in foregroundControls
+		if (liveIds.has(id)) continue;
+
+		const agents = run.children.map((c) => c.agent);
+		const elapsed = elapsedFromRange(run.startedAt, run.updatedAt, now);
+
+		const steps: OverlayStep[] = run.children.map((child) => ({
+			agent: child.agent,
+			state: mapState(child.status),
+			sessionFile: child.sessionFile,
+			artifactPath: child.artifactPath,
+			children: [],
+		}));
+
+		runs.push({
+			id,
+			label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
+			state: resolveForegroundRunState(run.children),
+			mode: run.mode,
+			source: "foreground",
+			agents,
+			elapsed,
+			startedAt: run.startedAt,
+			updatedAt: run.updatedAt,
+			sessionFile: run.children.find((c) => c.sessionFile)?.sessionFile,
+			artifactPath: run.children.find((c) => c.artifactPath)?.artifactPath,
 			steps,
 		});
 	}
@@ -233,6 +289,8 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 			source: "async",
 			agents,
 			elapsed,
+			startedAt: job.startedAt,
+			updatedAt: job.updatedAt,
 			sessionFile: job.sessionFile,
 			artifactPath: job.outputFile ?? job.asyncDir,
 			steps,
@@ -252,6 +310,7 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 export function collectRunTree(state: SubagentState, now = Date.now()): OverlayRun[] {
 	const runs: OverlayRun[] = [
 		...collectForegroundRuns(state, now),
+		...collectFinishedForegroundRuns(state, now),
 		...collectAsyncRuns(state, now),
 	];
 	// Sort: running first, then by most recent start time
@@ -262,6 +321,12 @@ export function collectRunTree(state: SubagentState, now = Date.now()): OverlayR
 		if (r.state === "paused") return 2;
 		return 3;
 	};
-	runs.sort((a, b) => rank(a) - rank(b));
+	runs.sort((a, b) => {
+		const rankDiff = rank(a) - rank(b);
+		if (rankDiff !== 0) return rankDiff;
+		const aTs = a.updatedAt ?? a.startedAt ?? 0;
+		const bTs = b.updatedAt ?? b.startedAt ?? 0;
+		return bTs - aTs;
+	});
 	return runs;
 }

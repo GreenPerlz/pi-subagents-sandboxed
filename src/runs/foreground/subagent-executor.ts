@@ -257,18 +257,20 @@ function foregroundStatusResult(control: SubagentState["foregroundControls"] ext
 	return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "management", results: [] } };
 }
 
-function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; results: SingleResult[] }): void {
+function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; startedAt?: number; results: SingleResult[] }): void {
 	state.foregroundRuns ??= new Map();
 	state.foregroundRuns.set(input.runId, {
 		runId: input.runId,
 		mode: input.mode,
 		cwd: input.cwd,
+		...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
 		updatedAt: Date.now(),
 		children: input.results.map((result, index) => ({
 			agent: result.agent,
 			index,
 			status: resolveSubagentResultStatus({ exitCode: result.exitCode, interrupted: result.interrupted, detached: result.detached }),
 			...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
+			...(result.artifactPaths?.outputPath ? { artifactPath: result.artifactPaths.outputPath } : {}),
 		})),
 	});
 	while (state.foregroundRuns.size > 50) {
@@ -1624,7 +1626,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 
 	const chainDetails = chainResult.details ? compactForegroundDetails({ ...chainResult.details, runId }) : undefined;
 	if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
-	if (chainDetails) rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, results: chainDetails.results });
+	if (chainDetails) rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, startedAt: foregroundControl?.startedAt, results: chainDetails.results });
 	const intercomReceipt = chainDetails && !chainDetails.results.some((result) => result.interrupted || result.detached)
 		? await maybeBuildForegroundIntercomReceipt({
 			pi: deps.pi,
@@ -2167,7 +2169,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			progress: params.includeProgress ? allProgress : undefined,
 			artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		});
-		rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: effectiveCwd, results: details.results });
+		rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: effectiveCwd, startedAt: foregroundControl?.startedAt, results: details.results });
 		if (interrupted) {
 			return {
 				content: [{ type: "text", text: `Parallel run paused after interrupt (${interrupted.agent}). Waiting for explicit next action.` }],
@@ -2478,7 +2480,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		truncation: r.truncation,
 	});
-	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, results: details.results });
+	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, startedAt: foregroundControl?.startedAt, results: details.results });
 
 	if (!r.detached && !r.interrupted) {
 		if (foregroundControl) updateForegroundNestedProjection(foregroundControl);

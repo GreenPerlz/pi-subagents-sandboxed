@@ -6,7 +6,11 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import { collectRunTree, type OverlayRun } from "../../src/tui/run-tree-collector.ts";
+import { resolveSessionPath } from "../../src/tui/session-reader.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import type { SubagentState, AsyncJobState, NestedRunSummary } from "../../src/shared/types.ts";
 
@@ -66,6 +70,22 @@ function makeNestedChild(overrides: Partial<NestedRunSummary> = {}): NestedRunSu
 		agent: "worker",
 		...overrides,
 	};
+}
+
+function addForegroundRun(
+	state: SubagentState,
+	id: string,
+	overrides: Partial<SubagentState["foregroundRuns"] extends Map<string, infer V> ? V : never> = {},
+): void {
+	state.foregroundRuns!.set(id, {
+		runId: id,
+		mode: "single",
+		cwd: "/tmp",
+		startedAt: 1000,
+		updatedAt: 2000,
+		children: [{ agent: "worker", index: 0, status: "completed" }],
+		...overrides,
+	});
 }
 
 describe("collectRunTree", () => {
@@ -313,5 +333,227 @@ describe("collectRunTree", () => {
 		const states = runs.map((r) => r.state);
 		assert.ok(states.includes("failed"), "should include failed");
 		assert.ok(states.includes("paused"), "should include paused");
+	});
+
+	it("collects a finished foreground run from foregroundRuns", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-done", {
+			mode: "single",
+			children: [{ agent: "worker", index: 0, status: "completed", sessionFile: "/tmp/worker.jsonl" }],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.id, "fg-done");
+		assert.strictEqual(runs[0]!.state, "complete");
+		assert.strictEqual(runs[0]!.source, "foreground");
+		assert.strictEqual(runs[0]!.mode, "single");
+		assert.deepStrictEqual(runs[0]!.agents, ["worker"]);
+		assert.strictEqual(runs[0]!.steps.length, 1);
+		assert.strictEqual(runs[0]!.steps[0]!.agent, "worker");
+		assert.strictEqual(runs[0]!.steps[0]!.state, "complete");
+		assert.strictEqual(runs[0]!.sessionFile, "/tmp/worker.jsonl");
+	});
+
+	it("computes elapsed for finished foreground runs when startedAt is present", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-elapsed", {
+			startedAt: 1000,
+			updatedAt: 5500,
+			children: [{ agent: "worker", index: 0, status: "completed" }],
+		});
+		const runs = collectRunTree(state, 6000);
+		assert.strictEqual(runs[0]!.elapsed, "4.5s");
+	});
+
+	it("deduplicates live foregroundControls against finished foregroundRuns", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-live", {
+			currentAgent: "worker",
+			mode: "single",
+			startedAt: 1000,
+			updatedAt: 2000,
+		});
+		addForegroundRun(state, "fg-live", {
+			mode: "single",
+			children: [{ agent: "worker", index: 0, status: "completed" }],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.id, "fg-live");
+		assert.strictEqual(runs[0]!.state, "running");
+	});
+
+	it("shows finished foreground runs with failed state when any child failed", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-fail", {
+			mode: "chain",
+			children: [
+				{ agent: "researcher", index: 0, status: "completed" },
+				{ agent: "worker", index: 1, status: "failed" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.state, "failed");
+		assert.strictEqual(runs[0]!.steps[0]!.state, "complete");
+		assert.strictEqual(runs[0]!.steps[1]!.state, "failed");
+	});
+
+	it("shows finished foreground runs with paused state when any child paused", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-pause", {
+			mode: "parallel",
+			children: [
+				{ agent: "worker-a", index: 0, status: "completed" },
+				{ agent: "worker-b", index: 1, status: "paused" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.state, "paused");
+	});
+
+	it("sorts live foreground before finished foreground and async", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-done", {
+			children: [{ agent: "worker", index: 0, status: "completed" }],
+		});
+		addAsyncJob(state, {
+			asyncId: "async-done",
+			asyncDir: "/tmp/done",
+			status: "complete",
+			mode: "single",
+			agents: ["reviewer"],
+			startedAt: 500,
+			updatedAt: 600,
+		});
+		addForegroundControl(state, "fg-live", {
+			currentAgent: "live-agent",
+			mode: "single",
+			startedAt: 1000,
+			updatedAt: 2000,
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 3);
+		assert.strictEqual(runs[0]!.id, "fg-live");
+		assert.strictEqual(runs[0]!.state, "running");
+		assert.strictEqual(runs[1]!.id, "fg-done");
+		assert.strictEqual(runs[1]!.state, "complete");
+		assert.strictEqual(runs[2]!.id, "async-done");
+		assert.strictEqual(runs[2]!.state, "complete");
+	});
+
+	it("propagates child artifactPath into finished foreground run and steps", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-artifacts", {
+			mode: "chain",
+			children: [
+				{ agent: "worker-a", index: 0, status: "completed", artifactPath: "/tmp/a/output.log" },
+				{ agent: "worker-b", index: 1, status: "completed", artifactPath: "/tmp/b/output.log" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.id, "fg-artifacts");
+		assert.strictEqual(runs[0]!.artifactPath, "/tmp/a/output.log");
+		assert.strictEqual(runs[0]!.steps[0]!.artifactPath, "/tmp/a/output.log");
+		assert.strictEqual(runs[0]!.steps[1]!.artifactPath, "/tmp/b/output.log");
+	});
+
+	it("falls back to artifactPath for detail pane when session file is missing", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fg-artifact-"));
+		const artifactFile = path.join(dir, "output.log");
+		fs.writeFileSync(artifactFile, "log line\n", "utf-8");
+		try {
+			const run: OverlayRun = {
+				id: "fg-fallback",
+				label: "single: worker",
+				state: "complete",
+				mode: "single",
+				source: "foreground",
+				agents: ["worker"],
+				sessionFile: "/nonexistent/session.jsonl",
+				artifactPath: artifactFile,
+				steps: [],
+			};
+			const resolved = resolveSessionPath(run);
+			assert.strictEqual(resolved, artifactFile);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("sorts finished runs newest-first by updatedAt within the same rank", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-oldest", {
+			updatedAt: 1000,
+			children: [{ agent: "worker", index: 0, status: "completed" }],
+		});
+		addForegroundRun(state, "fg-newer", {
+			updatedAt: 3000,
+			children: [{ agent: "worker", index: 0, status: "completed" }],
+		});
+		addForegroundRun(state, "fg-newest", {
+			updatedAt: 5000,
+			children: [{ agent: "worker", index: 0, status: "completed" }],
+		});
+		const runs = collectRunTree(state);
+		assert.deepStrictEqual(runs.map((r) => r.id), ["fg-newest", "fg-newer", "fg-oldest"]);
+	});
+
+	it("ranks running, queued, failed, and paused before complete", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "complete-1",
+			asyncDir: "/tmp/c1",
+			status: "complete",
+			mode: "single",
+			agents: ["a"],
+			startedAt: 100,
+			updatedAt: 200,
+		});
+		addAsyncJob(state, {
+			asyncId: "paused-1",
+			asyncDir: "/tmp/p1",
+			status: "paused",
+			mode: "single",
+			agents: ["a"],
+			startedAt: 100,
+			updatedAt: 200,
+		});
+		addAsyncJob(state, {
+			asyncId: "failed-1",
+			asyncDir: "/tmp/f1",
+			status: "failed",
+			mode: "single",
+			agents: ["a"],
+			startedAt: 100,
+			updatedAt: 200,
+		});
+		addAsyncJob(state, {
+			asyncId: "queued-1",
+			asyncDir: "/tmp/q1",
+			status: "queued",
+			mode: "single",
+			agents: ["a"],
+			startedAt: 100,
+			updatedAt: 200,
+		});
+		addAsyncJob(state, {
+			asyncId: "running-1",
+			asyncDir: "/tmp/r1",
+			status: "running",
+			mode: "single",
+			agents: ["a"],
+			startedAt: 100,
+			updatedAt: 200,
+		});
+		const runs = collectRunTree(state);
+		const ids = runs.map((r) => r.id);
+		assert.ok(ids.indexOf("running-1") < ids.indexOf("queued-1"), "running before queued");
+		assert.ok(ids.indexOf("queued-1") < ids.indexOf("failed-1"), "queued before failed");
+		assert.ok(ids.indexOf("queued-1") < ids.indexOf("paused-1"), "queued before paused");
+		assert.ok(ids.indexOf("failed-1") < ids.indexOf("complete-1"), "failed before complete");
+		assert.ok(ids.indexOf("paused-1") < ids.indexOf("complete-1"), "paused before complete");
 	});
 });

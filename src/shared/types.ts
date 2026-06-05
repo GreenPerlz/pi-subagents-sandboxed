@@ -694,6 +694,7 @@ export interface ForegroundResumeChild {
 	agent: string;
 	index: number;
 	sessionFile?: string;
+	artifactPath?: string;
 	status: SubagentResultStatus;
 }
 
@@ -701,6 +702,7 @@ export interface ForegroundResumeRun {
 	runId: string;
 	mode: SubagentRunMode;
 	cwd: string;
+	startedAt?: number;
 	updatedAt: number;
 	children: ForegroundResumeChild[];
 }

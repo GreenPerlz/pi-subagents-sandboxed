@@ -200,6 +200,9 @@ export class SubagentDetailPane {
 			return;
 		}
 
+		// Capture whether user was at bottom BEFORE content changes
+		const wasAtBottom = this.lastLineCount === 0 || this.scrollOffset >= Math.max(0, this.lastLineCount - this.viewportLines(this.lastRenderHeight));
+
 		const result = readSessionFile(sessionPath, this.theme, this.lastRenderWidth, this.showThinking);
 		if (result.error) {
 			this.error = result.error;
@@ -210,7 +213,7 @@ export class SubagentDetailPane {
 		}
 
 		// Auto-scroll to bottom on first load or if user was already at bottom
-		if (this.lastLineCount === 0 || this.isAtBottom()) {
+		if (wasAtBottom) {
 			this.scrollToBottom();
 		}
 		this.lastLineCount = this.contentLines.length;
@@ -228,8 +231,8 @@ export class SubagentDetailPane {
 	}
 
 	private viewportLines(height: number): number {
-		// Account for header/footer borders: ~4 lines
-		return Math.max(1, height - 4);
+		// Account for header/footer borders: 5 lines (top border, header, separator, scroll hint, bottom border)
+		return Math.max(1, height - 5);
 	}
 
 	toggleThinking(): void {
@@ -293,7 +296,7 @@ export class SubagentDetailPane {
 		lines.push(row(truncateToWidth(headerLine, innerW)));
 		lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
 
-		const contentHeight = Math.max(1, height - 4);
+		const contentHeight = Math.max(1, height - 5);
 
 		if (this.error) {
 			lines.push(row(this.theme.fg("warning", ` ${this.error}`)));

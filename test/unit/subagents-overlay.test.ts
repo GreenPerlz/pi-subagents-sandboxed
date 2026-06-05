@@ -298,12 +298,141 @@ describe("subagents overlay detail pane (issue #21)", () => {
 				steps: [],
 			};
 			const pane = new SubagentDetailPane(run, theme as never, () => {});
-			// height 9 gives viewport = 5 lines; 6 lines total => 1 below
+			// height 9 gives viewport = 4 lines (5 non-content lines); 6 lines total => 2 below
 			const lines = pane.render(80, 9);
 			const text = lines.join("\n");
-			assert.ok(text.includes("↓ 1 more"), "scroll hint should reflect height-based viewport");
+			assert.ok(text.includes("↓ 2 more"), "scroll hint should reflect height-based viewport");
 		} finally {
 			cleanup(p);
+		}
+	});
+
+	it("auto-scrolls to bottom when content grows while user was at bottom", () => {
+		const entries = Array.from({ length: 10 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "grow-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			// Establish a known render size and scroll to bottom explicitly
+			pane.render(80, 15);
+			pane.scrollDown(1000);
+			const lines1 = pane.render(80, 15);
+			const scrollHint1 = lines1[lines1.length - 2]!;
+			assert.ok(!scrollHint1.includes("↓"), "should be at bottom before growth");
+
+			// Grow the file by appending more entries
+			const moreEntries = Array.from({ length: 5 }, (_, i) =>
+				JSON.stringify({ type: "message", id: String(10 + i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `More${i}`, timestamp: Date.now() } })
+			).join("\n");
+			fs.appendFileSync(p, "\n" + moreEntries, "utf-8");
+
+			// Refresh should stay pinned at bottom
+			pane.refresh();
+			const lines2 = pane.render(80, 15);
+			const scrollHint2 = lines2[lines2.length - 2]!;
+			assert.ok(!scrollHint2.includes("↓"), "should stay pinned at bottom after growth");
+			assert.ok(lines2.join("\n").includes("More4"), "should show latest content");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("does not auto-scroll when content grows if user scrolled away from bottom", () => {
+		const entries = Array.from({ length: 10 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "stay-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			// Establish a known render size and scroll to bottom explicitly
+			pane.render(80, 15);
+			pane.scrollDown(1000);
+
+			// Scroll up away from bottom
+			pane.scrollUp(5);
+			const linesAfterScroll = pane.render(80, 15);
+			const scrollHintAfterScroll = linesAfterScroll[linesAfterScroll.length - 2]!;
+			assert.ok(scrollHintAfterScroll.includes("↓"), "should show scroll-down indicator after scrolling up");
+
+			// Grow the file
+			const moreEntries = Array.from({ length: 5 }, (_, i) =>
+				JSON.stringify({ type: "message", id: String(10 + i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `More${i}`, timestamp: Date.now() } })
+			).join("\n");
+			fs.appendFileSync(p, "\n" + moreEntries, "utf-8");
+
+			pane.refresh();
+			const linesAfterRefresh = pane.render(80, 15);
+			const scrollHintAfterRefresh = linesAfterRefresh[linesAfterRefresh.length - 2]!;
+			// Should still show downward indicator, meaning we didn't jump to bottom
+			assert.ok(scrollHintAfterRefresh.includes("↓"), "should remain scrolled up after refresh");
+			// Should NOT show the latest content since we didn't jump
+			assert.ok(!linesAfterRefresh.join("\n").includes("More4"), "should not show latest content when not at bottom");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("returns exactly the requested height lines", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "height-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			for (const h of [10, 15, 20, 25]) {
+				const lines = pane.render(80, h);
+				assert.strictEqual(lines.length, h, `render(80, ${h}) should return exactly ${h} lines`);
+			}
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("returns exactly the requested height lines for error state", () => {
+		const run: OverlayRun = {
+			id: "err-run",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {});
+		for (const h of [10, 15, 20]) {
+			const lines = pane.render(80, h);
+			assert.strictEqual(lines.length, h, `error render(80, ${h}) should return exactly ${h} lines`);
 		}
 	});
 

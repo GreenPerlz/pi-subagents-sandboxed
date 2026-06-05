@@ -332,6 +332,8 @@ export class SubagentDetailPane {
 	private candidates: DetailPaneTarget[];
 	private candidateIndex: number;
 	private showThinking = false;
+	private detailView: "session" | "logs";
+	private detailViewExplicit = false;
 	private scrollOffset = 0;
 	private contentLines: FormattedLine[] = [];
 	private lastLineCount = 0;
@@ -351,14 +353,24 @@ export class SubagentDetailPane {
 		this.requestRender = requestRender;
 		this.terminalCommand = terminalCommand;
 		this.candidates = buildDetailTargets(run);
-		// Start at the first candidate with a resolvable session path
-		this.candidateIndex = 0;
+		// Prefer a candidate with a real session file; fall back to any resolvable path.
+		let sessionIndex = -1;
+		let anyIndex = -1;
 		for (let i = 0; i < this.candidates.length; i++) {
-			if (resolveSessionPath(this.candidates[i]!)) {
-				this.candidateIndex = i;
-				break;
+			const c = this.candidates[i]!;
+			if (sessionIndex < 0 && resolveSessionPath(c, "session")) {
+				sessionIndex = i;
 			}
+			if (anyIndex < 0 && resolveSessionPath(c)) {
+				anyIndex = i;
+			}
+			if (sessionIndex >= 0 && anyIndex >= 0) break;
 		}
+		this.candidateIndex = sessionIndex >= 0 ? sessionIndex : anyIndex >= 0 ? anyIndex : 0;
+		// Default to session view when a session file is available; otherwise logs.
+		const initialTarget = this.candidates[this.candidateIndex];
+		this.detailView = initialTarget && resolveSessionPath(initialTarget, "session") ? "session" : "logs";
+		this.detailViewExplicit = false;
 		this.refresh();
 	}
 
@@ -376,6 +388,9 @@ export class SubagentDetailPane {
 		this.candidates = buildDetailTargets(run);
 		const newIndex = this.candidates.findIndex((c) => c.id === oldId);
 		this.candidateIndex = newIndex >= 0 ? newIndex : Math.min(this.candidateIndex, Math.max(0, this.candidates.length - 1));
+		if (!this.detailViewExplicit) {
+			this.setDefaultDetailView();
+		}
 		this.invalidate();
 	}
 
@@ -383,10 +398,17 @@ export class SubagentDetailPane {
 		return this.candidates[this.candidateIndex] ?? { id: this.run.id, label: this.run.agents.join(", ") || "subagent" };
 	}
 
+	private setDefaultDetailView(): void {
+		const target = this.currentTarget();
+		this.detailView = resolveSessionPath(target, "session") ? "session" : "logs";
+	}
+
 	nextCandidate(): void {
 		if (this.candidates.length <= 1) return;
 		this.candidateIndex = (this.candidateIndex + 1) % this.candidates.length;
 		this.scrollOffset = 0;
+		this.setDefaultDetailView();
+		this.detailViewExplicit = false;
 		this.refresh();
 	}
 
@@ -394,14 +416,18 @@ export class SubagentDetailPane {
 		if (this.candidates.length <= 1) return;
 		this.candidateIndex = (this.candidateIndex - 1 + this.candidates.length) % this.candidates.length;
 		this.scrollOffset = 0;
+		this.setDefaultDetailView();
+		this.detailViewExplicit = false;
 		this.refresh();
 	}
 
 	refresh(): void {
 		const target = this.currentTarget();
-		const sessionPath = resolveSessionPath(target);
+		const sessionPath = resolveSessionPath(target, this.detailView);
 		if (!sessionPath) {
-			this.error = "No session file or log available for this run yet.";
+			this.error = this.detailView === "session"
+				? "No session transcript available for this run yet."
+				: "No logs available for this run yet.";
 			this.contentLines = [];
 			this.invalidate();
 			return;
@@ -450,6 +476,17 @@ export class SubagentDetailPane {
 	toggleThinking(): void {
 		this.showThinking = !this.showThinking;
 		this.refresh();
+	}
+
+	toggleDetailView(): void {
+		this.detailView = this.detailView === "session" ? "logs" : "session";
+		this.detailViewExplicit = true;
+		this.scrollOffset = 0;
+		this.refresh();
+	}
+
+	getDetailView(): "session" | "logs" {
+		return this.detailView;
 	}
 
 	scrollUp(amount = 3): void {
@@ -515,15 +552,16 @@ export class SubagentDetailPane {
 		const titlePad = Math.max(0, innerW - visibleWidth(titleTrunc));
 		lines.push(this.theme.fg("border", "╭") + this.theme.fg("accent", titleTrunc) + this.theme.fg("border", "─".repeat(titlePad) + "╮"));
 
-		// Show thinking indicator in header
+		// Show view mode and thinking indicator in header
+		const viewStatus = this.theme.fg("dim", `view:${this.detailView}`);
 		const thinkingStatus = this.showThinking
-			? this.theme.fg("dim", "thinking: shown")
-			: this.theme.fg("dim", "thinking: hidden");
+			? this.theme.fg("dim", "thinking:shown")
+			: this.theme.fg("dim", "thinking:hidden");
 		const hasMultiple = this.candidates.length > 1;
 		const navHint = hasMultiple ? ` · ←/→ ${this.candidateIndex + 1}/${this.candidates.length}` : "";
 		const terminalHint = this.terminalCommand ? " · o open terminal" : "";
 		const errorHint = this.transientError ? ` · ${this.transientError}` : "";
-		const headerLine = ` ${thinkingStatus} ${this.theme.fg("dim", `· t toggle · ↑↓ scroll${navHint}${terminalHint} · Esc back`)}${this.theme.fg("error", errorHint)}`;
+		const headerLine = `${viewStatus} · ${thinkingStatus} ${this.theme.fg("dim", `· t think · l view · ↑↓${navHint}${terminalHint} · Esc`)}${this.theme.fg("error", errorHint)}`;
 		lines.push(row(truncateToWidth(headerLine, innerW)));
 		lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
 
@@ -720,10 +758,12 @@ export class SubagentsOverlay {
 		}
 		if (matchesKey(data, "left")) {
 			this.detailPane?.prevCandidate();
+			this.invalidate();
 			return;
 		}
 		if (matchesKey(data, "right")) {
 			this.detailPane?.nextCandidate();
+			this.invalidate();
 			return;
 		}
 		if (this.keybindings.matches(data, "tui.select.up")) {
@@ -732,9 +772,12 @@ export class SubagentsOverlay {
 			this.detailPane?.scrollDown();
 		} else if (data === "t" || data === "T") {
 			this.detailPane?.toggleThinking();
+		} else if (data === "l" || data === "L") {
+			this.detailPane?.toggleDetailView();
 		} else if (data === "o" || data === "O") {
 			this.openDetailInTerminal();
 		}
+		this.invalidate();
 	}
 
 	private openDetail(): void {

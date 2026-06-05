@@ -349,26 +349,44 @@ export function readSessionFile(filePath: string, theme: Theme, width: number, s
 /**
  * Find the best available session/log file for a run.
  * Prefers sessionFile, then logPath, then artifactPath, then constructs from asyncDir.
+ *
+ * `preferred` filters the search:
+ * - `"session"` only returns session files.
+ * - `"logs"` only returns log/output files.
+ * - `"auto"` (default) prefers session, then falls back to logs.
  */
-export function resolveSessionPath(run: { sessionFile?: string; logPath?: string; artifactPath?: string; asyncDir?: string }): string | undefined {
-	if (run.sessionFile) {
-		if (fs.existsSync(run.sessionFile) && fs.statSync(run.sessionFile).isFile()) return run.sessionFile;
+export function resolveSessionPath(run: { sessionFile?: string; logPath?: string; artifactPath?: string; asyncDir?: string }, preferred: "session" | "logs" | "auto" = "auto"): string | undefined {
+	if (preferred === "session" || preferred === "auto") {
+		if (run.sessionFile) {
+			if (fs.existsSync(run.sessionFile) && fs.statSync(run.sessionFile).isFile()) return run.sessionFile;
+		}
 	}
-	if (run.logPath) {
-		if (fs.existsSync(run.logPath) && fs.statSync(run.logPath).isFile()) return run.logPath;
+	if (preferred === "logs" || preferred === "auto") {
+		if (run.logPath) {
+			if (fs.existsSync(run.logPath) && fs.statSync(run.logPath).isFile()) return run.logPath;
+		}
 	}
 	if (run.artifactPath) {
 		const artifactStat = fs.existsSync(run.artifactPath) ? fs.statSync(run.artifactPath) : undefined;
-		if (artifactStat?.isFile()) return run.artifactPath;
-		// Treat artifactPath as a search root (directory or non-existent path stub)
-		const candidates = ["output.log", "output-0.log", "session.jsonl"];
+		if (artifactStat?.isFile() && preferred !== "session") {
+			return run.artifactPath;
+		}
+		const candidates = preferred === "session"
+			? ["session.jsonl"]
+			: preferred === "logs"
+				? ["output.log", "output-0.log"]
+				: ["output.log", "output-0.log", "session.jsonl"];
 		for (const candidate of candidates) {
 			const p = run.artifactPath + (run.artifactPath.endsWith("/") ? "" : "/") + candidate;
 			if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
 		}
 	}
 	if (run.asyncDir) {
-		const candidates = ["session.jsonl", "output.log", "output-0.log"];
+		const candidates = preferred === "session"
+			? ["session.jsonl"]
+			: preferred === "logs"
+				? ["output.log", "output-0.log"]
+				: ["session.jsonl", "output.log", "output-0.log"];
 		for (const candidate of candidates) {
 			const p = run.asyncDir + (run.asyncDir.endsWith("/") ? "" : "/") + candidate;
 			if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;

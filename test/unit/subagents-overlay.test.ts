@@ -351,7 +351,7 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		const text = lines.join("\n");
 		assert.ok(text.includes("no-session-run"), "should show run id in title");
 		assert.ok(text.includes("worker"), "should show agent in title");
-		assert.ok(text.includes("No session file or log available"), "should show no-session message");
+		assert.ok(text.includes("No logs available"), "should show no-session message");
 	});
 
 	it("toggles thinking visibility", () => {
@@ -576,7 +576,7 @@ describe("subagents overlay detail pane (issue #21)", () => {
 			const pane = new SubagentDetailPane(run, theme as never, () => {});
 			const lines = pane.render(WIDTH, 20);
 			const text = lines.join("\n");
-			assert.ok(!text.includes("No session file or log available"), "should not show empty state when session file is present");
+			assert.ok(!text.includes("No logs available"), "should not show empty state when session file is present");
 			assert.ok(!text.includes("Session file is empty"), "should not show empty error");
 			assert.ok(text.includes("Msg0"), "should show session content");
 		} finally {
@@ -763,7 +763,7 @@ describe("subagents overlay detail pane (issue #21)", () => {
 			const pane = new SubagentDetailPane(run, theme as never, () => {});
 			const lines = pane.render(WIDTH, 20);
 			const text = lines.join("\n");
-			assert.ok(!text.includes("No session file or log available"), "should not show empty state when nested child has session file");
+			assert.ok(!text.includes("No logs available"), "should not show empty state when nested child has session file");
 			assert.ok(text.includes("Msg0"), "should show nested child session content");
 		} finally {
 			cleanup(p);
@@ -795,7 +795,7 @@ describe("subagents overlay detail pane (issue #21)", () => {
 			const pane = new SubagentDetailPane(run, theme as never, () => {});
 			const lines = pane.render(WIDTH, 20);
 			const text = lines.join("\n");
-			assert.ok(!text.includes("No session file or log available"), "should not show empty state when step has session file");
+			assert.ok(!text.includes("No logs available"), "should not show empty state when step has session file");
 			assert.ok(text.includes("Msg0"), "should show step session content");
 		} finally {
 			cleanup(p);
@@ -841,7 +841,7 @@ describe("subagents overlay detail pane (issue #21)", () => {
 			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
 			try {
 				overlay.handleInput("\r");
-				assert.ok(overlay.render(WIDTH).join("\n").includes("No session file or log available"), "detail starts empty before path is discovered");
+				assert.ok(overlay.render(WIDTH).join("\n").includes("No logs available"), "detail starts empty before path is discovered");
 
 				(control as { nestedChildren?: unknown[] }).nestedChildren = [
 					{
@@ -858,7 +858,7 @@ describe("subagents overlay detail pane (issue #21)", () => {
 				(overlay as unknown as { refresh(): void }).refresh();
 
 				const text = overlay.render(WIDTH).join("\n");
-				assert.ok(!text.includes("No session file or log available"), "detail should update without closing/reopening");
+				assert.ok(!text.includes("No logs available"), "detail should update without closing/reopening");
 				assert.ok(text.includes("LiveMsg0"), "detail should show newly discovered session content");
 			} finally {
 				overlay.dispose();
@@ -1487,5 +1487,343 @@ describe("subagents overlay shortcut (issue #22)", () => {
 		registerSubagentsOverlayShortcut(fakePi, state as never, { overlayShortcut: "ctrl+shift+s", externalTerminal: terminalConfig });
 		await new Promise((r) => setImmediate(r));
 		assert.strictEqual(passedTerminalConfig, terminalConfig, "should propagate externalTerminal config");
+	});
+});
+
+
+describe("subagents overlay session/logs toggle (issue #28)", () => {
+	it("prefers step session file over aggregate log path for async runs (regression)", () => {
+		const stepEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `StepMsg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const logP = tmpFile("aggregate log line\n");
+		const stepP = tmpFile(stepEntries);
+		try {
+			const run: OverlayRun = {
+				id: "async-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				logPath: logP,
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						sessionFile: stepP,
+						children: [],
+					},
+				],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getDetailView(), "session", "should default to session view when step has session file");
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(text.includes("view:session"), "header should show session view mode");
+			assert.ok(text.includes("StepMsg0"), "should show step session content, not aggregate logs");
+			assert.ok(!text.includes("aggregate log line"), "should not show aggregate log content by default");
+
+			// Logs should still be toggleable via candidate cycling to the aggregate run
+			pane.prevCandidate();
+			const logLines = pane.render(WIDTH, 20);
+			const logText = logLines.join("\n");
+			assert.ok(logText.includes("aggregate log line"), "should show aggregate logs after cycling to run candidate");
+		} finally {
+			cleanup(logP);
+			cleanup(stepP);
+		}
+	});
+
+	it("defaults to session view when session file exists", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "session-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getDetailView(), "session", "should default to session view when session file exists");
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(text.includes("view:session"), "header should show session view mode");
+			assert.ok(text.includes("Msg0"), "should show session content");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("defaults to logs view when no session file exists but log file does", () => {
+		const p = tmpFile("log line one\nlog line two\n");
+		try {
+			const run: OverlayRun = {
+				id: "log-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				logPath: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getDetailView(), "logs", "should default to logs view when no session file exists");
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(text.includes("view:logs"), "header should show logs view mode");
+			assert.ok(text.includes("log line one"), "should show log content");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("toggles between session and logs views with l", () => {
+		const sessionEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Session${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const sessionP = tmpFile(sessionEntries);
+		const logP = tmpFile("log line one\nlog line two\n");
+		try {
+			const run: OverlayRun = {
+				id: "toggle-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: sessionP,
+				logPath: logP,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getDetailView(), "session");
+			let lines = pane.render(WIDTH, 20);
+			let text = lines.join("\n");
+			assert.ok(text.includes("Session0"), "should show session content initially");
+			assert.ok(!text.includes("log line one"), "should not show log content initially");
+
+			pane.toggleDetailView();
+			assert.strictEqual(pane.getDetailView(), "logs");
+			lines = pane.render(WIDTH, 20);
+			text = lines.join("\n");
+			assert.ok(text.includes("view:logs"), "header should show logs view after toggle");
+			assert.ok(text.includes("log line one"), "should show log content after toggle");
+			assert.ok(!text.includes("Session0"), "should not show session content after toggle");
+
+			pane.toggleDetailView();
+			assert.strictEqual(pane.getDetailView(), "session");
+			lines = pane.render(WIDTH, 20);
+			text = lines.join("\n");
+			assert.ok(text.includes("view:session"), "header should show session view after second toggle");
+			assert.ok(text.includes("Session0"), "should show session content after second toggle");
+		} finally {
+			cleanup(sessionP);
+			cleanup(logP);
+		}
+	});
+
+	it("shows distinct empty state for missing session transcript", () => {
+		const run: OverlayRun = {
+			id: "empty-session",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			sessionFile: "/nonexistent/session.jsonl",
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {});
+		// No session file exists, so it defaults to logs; but no logs either
+		assert.strictEqual(pane.getDetailView(), "logs");
+		const lines = pane.render(WIDTH, 20);
+		const text = lines.join("\n");
+		assert.ok(text.includes("No logs available"), "should show logs empty state when no logs exist");
+	});
+
+	it("shows distinct empty state for missing logs when explicitly in logs view", () => {
+		const sessionEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Session${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const sessionP = tmpFile(sessionEntries);
+		try {
+			const run: OverlayRun = {
+				id: "empty-logs",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: sessionP,
+				logPath: "/nonexistent/output.log",
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getDetailView(), "session");
+			pane.toggleDetailView();
+			assert.strictEqual(pane.getDetailView(), "logs");
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(text.includes("No logs available"), "should show logs empty state when no logs exist in logs view");
+			assert.ok(!text.includes("No session transcript"), "should not show session empty state in logs view");
+		} finally {
+			cleanup(sessionP);
+		}
+	});
+
+	it("shows session empty state when explicitly in session view and session file is missing", () => {
+		const run: OverlayRun = {
+			id: "missing-session",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			sessionFile: "/nonexistent/session.jsonl",
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {});
+		// Default is logs because session is missing; force session view
+		pane.toggleDetailView();
+		assert.strictEqual(pane.getDetailView(), "session");
+		const lines = pane.render(WIDTH, 20);
+		const text = lines.join("\n");
+		assert.ok(text.includes("No session transcript available"), "should show session empty state when session file is missing");
+		assert.ok(!text.includes("No logs available"), "should not show logs empty state in session view");
+	});
+
+	it("refresh respects current view mode and updates content as file grows", () => {
+		const sessionEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(sessionEntries);
+		try {
+			const run: OverlayRun = {
+				id: "refresh-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getDetailView(), "session");
+			let lines = pane.render(WIDTH, 20);
+			assert.ok(lines.join("\n").includes("Msg0"), "should show initial session content");
+
+			// Grow the session file
+			const moreEntries = Array.from({ length: 2 }, (_, i) =>
+				JSON.stringify({ type: "message", id: String(10 + i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `More${i}`, timestamp: Date.now() } })
+			).join("\n");
+			fs.appendFileSync(p, "\n" + moreEntries, "utf-8");
+
+			pane.refresh();
+			lines = pane.render(WIDTH, 20);
+			assert.ok(lines.join("\n").includes("More1"), "should show updated session content after refresh in session view");
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("overlay detail input handles l to toggle view mode", () => {
+		const sessionEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Session${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const sessionP = tmpFile(sessionEntries);
+		const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-overlay-log-toggle-"));
+		const logP = path.join(asyncDir, "output.log");
+		fs.writeFileSync(logP, "log line one\n", "utf-8");
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["run-1", {
+						asyncId: "run-1",
+						asyncDir,
+						status: "running",
+						agents: ["worker"],
+						steps: [],
+						sessionFile: sessionP,
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+
+			const keybindings = {
+				matches: (data: string, keyId: string) => {
+					if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+					if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+					if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+					return false;
+				},
+			} as never;
+
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+			try {
+				overlay.handleInput("\r"); // Enter detail
+				let text = overlay.render(WIDTH).join("\n");
+				assert.ok(text.includes("view:session"), "detail should start in session view");
+				assert.ok(text.includes("Session0"), "should show session content");
+
+				overlay.handleInput("l"); // Toggle view
+				text = overlay.render(WIDTH).join("\n");
+				assert.ok(text.includes("view:logs"), "detail should switch to logs view");
+				assert.ok(text.includes("log line one"), "should show log content");
+				assert.ok(!text.includes("Session0"), "should not show session content in logs view");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(sessionP);
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+		}
+	});
+
+	it("completed subagents still show final transcript in session view", () => {
+		const sessionEntries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Done${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(sessionEntries);
+		try {
+			const run: OverlayRun = {
+				id: "completed-run",
+				label: "single: worker",
+				state: "complete",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getDetailView(), "session");
+			const lines = pane.render(WIDTH, 20);
+			const text = lines.join("\n");
+			assert.ok(text.includes("Done0"), "completed run should still show final session transcript");
+			assert.ok(text.includes("view:session"), "header should show session view for completed run");
+		} finally {
+			cleanup(p);
+		}
 	});
 });

@@ -224,5 +224,101 @@ describe("session-reader", () => {
 			const resolved = resolveSessionPath({});
 			assert.strictEqual(resolved, undefined);
 		});
+
+		it("preferred 'session' returns sessionFile when available", () => {
+			const p = tmpFile("test");
+			try {
+				const resolved = resolveSessionPath({ sessionFile: p, logPath: "/other" }, "session");
+				assert.strictEqual(resolved, p);
+			} finally {
+				cleanup(p);
+			}
+		});
+
+		it("preferred 'session' ignores logPath when sessionFile missing", () => {
+			const p = tmpFile("test");
+			try {
+				const resolved = resolveSessionPath({ sessionFile: "/nonexistent", logPath: p }, "session");
+				assert.strictEqual(resolved, undefined);
+			} finally {
+				cleanup(p);
+			}
+		});
+
+		it("preferred 'logs' returns logPath when available", () => {
+			const p = tmpFile("test");
+			try {
+				const resolved = resolveSessionPath({ sessionFile: "/nonexistent", logPath: p }, "logs");
+				assert.strictEqual(resolved, p);
+			} finally {
+				cleanup(p);
+			}
+		});
+
+		it("preferred 'logs' ignores sessionFile when it exists", () => {
+			const p = tmpFile("test");
+			try {
+				const resolved = resolveSessionPath({ sessionFile: p, logPath: "/nonexistent" }, "logs");
+				assert.strictEqual(resolved, undefined);
+			} finally {
+				cleanup(p);
+			}
+		});
+
+		it("preferred 'logs' searches artifactPath directory for log files only", () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+			const logFile = path.join(dir, "output.log");
+			const sessionFile = path.join(dir, "session.jsonl");
+			fs.writeFileSync(logFile, "test", "utf-8");
+			fs.writeFileSync(sessionFile, "test", "utf-8");
+			try {
+				const resolved = resolveSessionPath({ artifactPath: dir }, "logs");
+				assert.strictEqual(resolved, logFile);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("preferred 'session' searches artifactPath directory for session.jsonl only", () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+			const logFile = path.join(dir, "output.log");
+			const sessionFile = path.join(dir, "session.jsonl");
+			fs.writeFileSync(logFile, "test", "utf-8");
+			fs.writeFileSync(sessionFile, "test", "utf-8");
+			try {
+				const resolved = resolveSessionPath({ artifactPath: dir }, "session");
+				assert.strictEqual(resolved, sessionFile);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("preferred 'logs' searches asyncDir for log files only", () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+			const logFile = path.join(dir, "output.log");
+			const sessionFile = path.join(dir, "session.jsonl");
+			fs.writeFileSync(logFile, "test", "utf-8");
+			fs.writeFileSync(sessionFile, "test", "utf-8");
+			try {
+				const resolved = resolveSessionPath({ asyncDir: dir }, "logs");
+				assert.strictEqual(resolved, logFile);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("preferred 'session' searches asyncDir for session.jsonl only", () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+			const logFile = path.join(dir, "output.log");
+			const sessionFile = path.join(dir, "session.jsonl");
+			fs.writeFileSync(logFile, "test", "utf-8");
+			fs.writeFileSync(sessionFile, "test", "utf-8");
+			try {
+				const resolved = resolveSessionPath({ asyncDir: dir }, "session");
+				assert.strictEqual(resolved, sessionFile);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
 	});
 });

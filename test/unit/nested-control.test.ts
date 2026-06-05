@@ -20,6 +20,7 @@ import {
 	SUBAGENT_RUN_ID_ENV,
 } from "../../src/runs/shared/pi-args.ts";
 import { ASYNC_DIR, TEMP_ROOT_DIR, type AsyncStatus, type NestedRunSummary, type SubagentState } from "../../src/shared/types.ts";
+import { createMockPi } from "../support/mock-pi.ts";
 
 const routeRoots: string[] = [];
 const savedEnv = {
@@ -526,39 +527,104 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("allows the first ralph-orchestrator nested worker attempt and blocks the second", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-first-guard-"));
+	it("blocks ralph-orchestrator dynamic fanout worker targets before execution", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-dynamic-worker-fanout-"));
 		try {
+			const route = createNestedRoute("root-ralph-dynamic-worker-fanout");
+			routeRoots.push(path.dirname(route.eventSink));
+			setRalphOrchestratorNestedEnv(route, "ralph-dynamic-worker-fanout-run");
+			const throwingCtx = {
+				...ctx(root),
+				modelRegistry: { getAvailable() { throw new Error("dynamic fanout attempt reached execution"); } },
+			};
+			const executor = createExecutor(createState(), [{ name: "worker", description: "Worker", prompt: "Do work" }]);
+
+			const result = await executor.execute("run", {
+				chain: [{
+					expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
+					parallel: { agent: "worker", task: "go {item}" },
+					collect: { as: "done" },
+				}],
+			}, new AbortController().signal, undefined, throwingCtx);
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), /Ralph orchestrator nested worker guard blocked/);
+			assert.match(text(result), /dynamic fanout/i);
+			assert.doesNotMatch(text(result), /dynamic fanout attempt reached execution/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("allows sequential ralph-orchestrator nested worker launches after the previous worker returns", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-sequential-worker-guard-"));
+		const mockPi = createMockPi();
+		try {
+			mockPi.install();
+			mockPi.onCall({ output: "first worker done" });
+			mockPi.onCall({ output: "second worker done" });
 			git(root, ["init"]);
 			git(root, ["config", "user.email", "tests@example.com"]);
 			git(root, ["config", "user.name", "Nested Control Tests"]);
 			fs.writeFileSync(path.join(root, "README.md"), "initial\n", "utf-8");
 			git(root, ["add", "-A"]);
 			git(root, ["commit", "-m", "init"]);
-			const route = createNestedRoute("root-ralph-first");
+			const route = createNestedRoute("root-ralph-sequential-worker");
 			routeRoots.push(path.dirname(route.eventSink));
-			setRalphOrchestratorNestedEnv(route, "ralph-first-run");
+			setRalphOrchestratorNestedEnv(route, "ralph-sequential-worker-run");
 			const state = createState();
-			const throwingCtx = {
-				...ctx(root),
-				modelRegistry: { getAvailable() { throw new Error("first attempt reached execution"); } },
-			};
 			const executor = createExecutor(state, [{ name: "worker", description: "Worker", prompt: "Do work" }]);
 
-			const first = await executor.execute("run", { agent: "worker", task: "go" }, new AbortController().signal, undefined, throwingCtx);
-			const second = await executor.execute("run", { agent: "worker", task: "go again" }, new AbortController().signal, undefined, throwingCtx);
+			const first = await executor.execute("run", { agent: "worker", task: "Summarize first step" }, new AbortController().signal, undefined, ctx(root));
+			const second = await executor.execute("run", { agent: "worker", task: "Summarize follow-up step" }, new AbortController().signal, undefined, ctx(root));
 
-			assert.equal(first.isError, true);
-			assert.match(text(first), /first attempt reached execution/);
-			assert.equal(second.isError, true);
-			assert.match(text(second), /Ralph orchestrator nested worker guard blocked/);
-			assert.match(text(second), /attempt 2/);
+			assert.equal(first.isError, undefined);
+			assert.match(text(first), /first worker done/);
+			assert.equal(second.isError, undefined);
+			assert.match(text(second), /second worker done/);
+			assert.equal(mockPi.callCount(), 2);
 		} finally {
+			mockPi.uninstall();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
-	it("counts malformed ralph-orchestrator nested acceptance attempts toward the guard", async () => {
+	it("blocks a second ralph-orchestrator nested worker while the first worker is still active", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-active-worker-guard-"));
+		const mockPi = createMockPi();
+		try {
+			mockPi.install();
+			mockPi.onCall({ output: "slow worker done", delay: 300 });
+			git(root, ["init"]);
+			git(root, ["config", "user.email", "tests@example.com"]);
+			git(root, ["config", "user.name", "Nested Control Tests"]);
+			fs.writeFileSync(path.join(root, "README.md"), "initial\n", "utf-8");
+			git(root, ["add", "-A"]);
+			git(root, ["commit", "-m", "init"]);
+			const route = createNestedRoute("root-ralph-active-worker");
+			routeRoots.push(path.dirname(route.eventSink));
+			setRalphOrchestratorNestedEnv(route, "ralph-active-worker-run");
+			const state = createState();
+			const executor = createExecutor(state, [{ name: "worker", description: "Worker", prompt: "Do work" }]);
+
+			const first = executor.execute("run", { agent: "worker", task: "Summarize slow step" }, new AbortController().signal, undefined, ctx(root));
+			await waitFor(() => mockPi.callCount() === 1);
+			const second = await executor.execute("run", { agent: "worker", task: "Summarize overlapping step" }, new AbortController().signal, undefined, ctx(root));
+			const firstResult = await first;
+
+			assert.equal(second.isError, true);
+			assert.match(text(second), /Ralph orchestrator nested worker guard blocked/);
+			assert.match(text(second), /already active|currently active/);
+			assert.equal(firstResult.isError, undefined);
+			assert.match(text(firstResult), /slow worker done/);
+			assert.equal(mockPi.callCount(), 1);
+		} finally {
+			mockPi.uninstall();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not mark malformed ralph-orchestrator nested acceptance attempts as active workers", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-malformed-guard-"));
 		try {
 			git(root, ["init"]);
@@ -578,14 +644,14 @@ describe("nested control routing", () => {
 			assert.equal(first.isError, true);
 			assert.match(text(first), /acceptance must be an object/);
 			assert.equal(second.isError, true);
-			assert.match(text(second), /Malformed attempts count toward this limit/);
-			assert.doesNotMatch(text(second), /acceptance must be an object/);
+			assert.match(text(second), /acceptance must be an object/);
+			assert.doesNotMatch(text(second), /Ralph orchestrator nested worker guard blocked/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
-	it("counts malformed ralph-orchestrator nested attempts with no visible target toward the guard", async () => {
+	it("does not treat malformed ralph-orchestrator nested attempts with no visible target as active workers", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-unknown-target-guard-"));
 		try {
 			const route = createNestedRoute("root-ralph-unknown-target");
@@ -599,8 +665,8 @@ describe("nested control routing", () => {
 			assert.equal(first.isError, true);
 			assert.match(text(first), /Provide exactly one mode/);
 			assert.equal(second.isError, true);
-			assert.match(text(second), /Ralph orchestrator nested worker guard blocked/);
-			assert.match(text(second), /Malformed attempts count toward this limit/);
+			assert.match(text(second), /Provide exactly one mode/);
+			assert.doesNotMatch(text(second), /Ralph orchestrator nested worker guard blocked/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

@@ -12,7 +12,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth, type KeybindingsManager } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth, type KeybindingsManager, type KeyId } from "@earendil-works/pi-tui";
 import { collectRunTree, type OverlayNestedChild, type OverlayRun, type OverlayStep } from "./run-tree-collector.ts";
 import { readSessionFile, resolveSessionPath, type FormattedLine } from "./session-reader.ts";
 import type { SubagentState, ExtensionConfig } from "../shared/types.ts";
@@ -838,6 +838,30 @@ export class SubagentsOverlay {
 // Command registration
 // ---------------------------------------------------------------------------
 
+async function openSubagentsOverlay(
+	ctx: ExtensionContext,
+	state: SubagentState,
+	terminalConfig?: ExtensionConfig["externalTerminal"],
+): Promise<void> {
+	await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+		const requestRender = () => { (tui as { requestRender?: () => void }).requestRender?.(); };
+		const overlay = new SubagentsOverlay(
+			theme,
+			state,
+			done,
+			requestRender,
+			keybindings,
+			terminalConfig,
+		);
+		return {
+			render: (w: number) => overlay.render(w),
+			invalidate: () => overlay.invalidate(),
+			handleInput: (data: string) => overlay.handleInput(data),
+			dispose: () => overlay.dispose(),
+		};
+	}, { overlay: true });
+}
+
 export function registerSubagentsOverlayCommand(
 	pi: ExtensionAPI,
 	state: SubagentState,
@@ -853,24 +877,30 @@ export function registerSubagentsOverlayCommand(
 				);
 				return;
 			}
+			await openSubagentsOverlay(ctx, state, terminalConfig);
+		},
+	});
+}
 
-			await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
-				const requestRender = () => { (tui as { requestRender?: () => void }).requestRender?.(); };
-				const overlay = new SubagentsOverlay(
-					theme,
-					state,
-					done,
-					requestRender,
-					keybindings,
-					terminalConfig,
+export function registerSubagentsOverlayShortcut(
+	pi: ExtensionAPI,
+	state: SubagentState,
+	config?: ExtensionConfig,
+): void {
+	const shortcut = config?.overlayShortcut;
+	if (!shortcut) return;
+
+	pi.registerShortcut(shortcut as KeyId, {
+		description: "Open subagents overlay",
+		handler: (ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify(
+					`Subagents overlay shortcut requires TUI mode. For text status, use: subagent({ action: "status" })`,
+					"info",
 				);
-				return {
-					render: (w: number) => overlay.render(w),
-					invalidate: () => overlay.invalidate(),
-					handleInput: (data: string) => overlay.handleInput(data),
-					dispose: () => overlay.dispose(),
-				};
-			}, { overlay: true });
+				return;
+			}
+			return openSubagentsOverlay(ctx, state, config?.externalTerminal);
 		},
 	});
 }

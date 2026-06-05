@@ -1087,6 +1087,25 @@ Limitations:
 - Placeholder substitution is literal; `{sessionFile}` and `{cwd}` are the only supported replacements.
 - The feature is overlay-only; text-mode status does not offer terminal handoff.
 
+### `overlayShortcut`
+
+Configure a keyboard shortcut to open the `/subagents` overlay directly in TUI mode.
+
+```json
+{
+  "overlayShortcut": "ctrl+shift+s"
+}
+```
+
+Behavior:
+
+- The shortcut is registered only when `overlayShortcut` is explicitly set.
+- In TUI mode, pressing the shortcut opens the same overlay as typing `/subagents`.
+- In non-TUI modes, the shortcut shows an informational notification and does nothing else.
+- No default shortcut is provided to avoid conflicts with existing keybindings.
+
+Supported key identifiers include single keys (`f12`, `escape`), modifiers (`ctrl+s`, `alt+s`), and combined modifiers (`ctrl+shift+s`, `alt+ctrl+s`). Use the Pi keybindings documentation or `~/.pi/agent/keybindings.json` for reference.
+
 ## Files, logs, and observability
 
 Each chain run creates a user-scoped temp directory like:

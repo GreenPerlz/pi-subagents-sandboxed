@@ -877,6 +877,8 @@ export interface ExtensionConfig {
 	worktreeSetupHookTimeoutMs?: number;
 	intercomBridge?: IntercomBridgeConfig;
 	externalTerminal?: ExternalTerminalConfig;
+	/** Keyboard shortcut to open the /subagents overlay in TUI mode. Examples: "ctrl+shift+s", "alt+s", "f12". */
+	overlayShortcut?: string;
 }
 
 // ============================================================================

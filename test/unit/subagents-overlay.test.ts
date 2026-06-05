@@ -869,6 +869,261 @@ describe("subagents overlay detail pane (issue #21)", () => {
 	});
 });
 
+describe("subagents overlay external terminal (issue #23)", () => {
+	it("shows terminal hint in list view when terminal is configured", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "run-1",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				steps: [],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH, 0, undefined, { command: "xterm", args: [] });
+		const text = lines.join("\n");
+		assert.ok(text.includes("o open terminal"), "should show terminal hint");
+	});
+
+	it("does not show terminal hint in list view when terminal is not configured", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "run-1",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				steps: [],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const text = lines.join("\n");
+		assert.ok(!text.includes("o open terminal"), "should not show terminal hint");
+	});
+
+	it("shows terminal hint in detail view when terminal is configured", () => {
+		const run: OverlayRun = {
+			id: "run-1",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {}, { command: "xterm", args: [] });
+		const lines = pane.render(WIDTH, 20);
+		const text = lines.join("\n");
+		assert.ok(text.includes("o open terminal"), "should show terminal hint in detail");
+	});
+
+	it("shows transient error when pressing 'o' with no session file in list view", () => {
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map([
+				["run-1", {
+					asyncId: "run-1",
+					asyncDir: "/tmp/run-1",
+					status: "running",
+					agents: ["worker"],
+					steps: [{ agent: "worker", status: "running" }],
+				}],
+			]),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+
+		const keybindings = {
+			matches: (data: string, keyId: string) => {
+				if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+				if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+				if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+				return false;
+			},
+		} as never;
+
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings, { command: "xterm", args: ["{sessionFile}"] });
+		try {
+			overlay.handleInput("o");
+			const text = overlay.render(WIDTH).join("\n");
+			assert.ok(text.includes("No session file available"), "should show transient error for missing session");
+		} finally {
+			overlay.dispose();
+		}
+	});
+
+	it("shows transient error when pressing 'o' with no session file in detail view", () => {
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map([
+				["run-1", {
+					asyncId: "run-1",
+					asyncDir: "/tmp/run-1",
+					status: "running",
+					agents: ["worker"],
+					steps: [{ agent: "worker", status: "running" }],
+				}],
+			]),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+
+		const keybindings = {
+			matches: (data: string, keyId: string) => {
+				if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+				if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+				if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+				return false;
+			},
+		} as never;
+
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings, { command: "xterm", args: ["{sessionFile}"] });
+		try {
+			overlay.handleInput("\r"); // Enter detail
+			overlay.handleInput("o"); // Try open terminal
+			const text = overlay.render(WIDTH).join("\n");
+			assert.ok(text.includes("No session file available"), "should show transient error in detail for missing session");
+			assert.ok(text.includes("run-1"), "overlay should stay open in detail mode");
+		} finally {
+			overlay.dispose();
+		}
+	});
+
+	it("stays open and falls back to viewer when terminal launch fails", async () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["run-1", {
+						asyncId: "run-1",
+						asyncDir: "/tmp/run-1",
+						status: "running",
+						agents: ["worker"],
+						steps: [{ agent: "worker", status: "running", sessionFile: p }],
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+
+			const keybindings = {
+				matches: (data: string, keyId: string) => {
+					if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+					if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+					if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+					return false;
+				},
+			} as never;
+
+			// Use a command that definitely does not exist to force failure
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings, { command: "definitely-not-real-12345", args: ["{sessionFile}"] });
+			try {
+				overlay.handleInput("\r"); // Enter detail
+				overlay.handleInput("o"); // Try open terminal
+				// Allow async launchTerminal failure to propagate to the overlay
+				await new Promise((r) => setImmediate(r));
+				const text = overlay.render(WIDTH).join("\n");
+				assert.ok(text.includes("not found"), "should show failure error");
+				assert.ok(text.includes("run-1"), "overlay should stay open in detail mode as fallback");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("falls back to detail viewer on async terminal launch failure from list view with real session file", async () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["run-1", {
+						asyncId: "run-1",
+						asyncDir: "/tmp/run-1",
+						status: "running",
+						agents: ["worker"],
+						steps: [],
+						sessionFile: p,
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+
+			const keybindings = {
+				matches: (data: string, keyId: string) => {
+					if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+					if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+					if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+					return false;
+				},
+			} as never;
+
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings, { command: "definitely-not-real-12345", args: [] });
+			try {
+				overlay.handleInput("o"); // Try open terminal from list view
+				await new Promise((r) => setImmediate(r));
+				const text = overlay.render(WIDTH).join("\n");
+				assert.ok(text.includes("not found"), "should show failure error");
+				assert.ok(text.includes("run-1"), "overlay should stay open in detail mode as fallback");
+				assert.ok(!text.includes("Subagents"), "should have switched to detail view");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(p);
+		}
+	});
+});
+
 describe("subagents overlay chain/nested hierarchy (issue #29)", () => {
 	it("renders chain mode prefix in run header", () => {
 		const runs: OverlayRun[] = [

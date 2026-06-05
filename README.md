@@ -1055,6 +1055,38 @@ stdin is a JSON object with `repoRoot`, `worktreePath`, `agentCwd`, `branch`, `i
 
 `syntheticPaths` must be relative to the worktree root. They are removed before diff capture so helper files do not pollute patches. Tracked files are never excluded; marking a tracked path as synthetic fails setup. Default timeout is `30000` ms.
 
+### `externalTerminal`
+
+Configure an external terminal emulator to open selected subagent sessions from the `/subagents` overlay.
+
+```json
+{
+  "externalTerminal": {
+    "command": "kitty",
+    "args": ["-e", "pi", "--session", "{sessionFile}", "--cwd", "{cwd}"]
+  }
+}
+```
+
+Fields:
+
+- `command`: Terminal emulator command. Must be an absolute path or a name resolvable on `PATH`.
+- `args`: Optional argument list. Use `{sessionFile}` and `{cwd}` as placeholders; they are replaced with the selected subagent's best available session file and the base working directory. Arguments are passed as an array to `child_process.spawn`, so no shell escaping is needed.
+
+Behavior:
+
+- The `/subagents` overlay shows an `o open terminal` hint when a terminal command is configured.
+- Press `o` on a selected run in list view or on a detail pane target to launch the terminal.
+- If the selected run has no usable session file yet, the overlay shows a transient message explaining why the handoff is unavailable.
+- If the terminal launch fails (command not found, session file missing, spawn error), the overlay stays open and falls back to the in-overlay viewer.
+- Terminal processes are launched with `detached: true` so they outlive the parent Pi session.
+
+Limitations:
+
+- Terminal handoff requires a real child `sessionFile`. It is unavailable if the selected run or detail target has no `sessionFile`, regardless of whether the terminal command uses the `{sessionFile}` placeholder.
+- Placeholder substitution is literal; `{sessionFile}` and `{cwd}` are the only supported replacements.
+- The feature is overlay-only; text-mode status does not offer terminal handoff.
+
 ## Files, logs, and observability
 
 Each chain run creates a user-scoped temp directory like:

@@ -15,7 +15,14 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { matchesKey, truncateToWidth, visibleWidth, type KeybindingsManager } from "@earendil-works/pi-tui";
 import { collectRunTree, type OverlayNestedChild, type OverlayRun, type OverlayStep } from "./run-tree-collector.ts";
 import { readSessionFile, resolveSessionPath, type FormattedLine } from "./session-reader.ts";
-import type { SubagentState } from "../shared/types.ts";
+import type { SubagentState, ExtensionConfig } from "../shared/types.ts";
+import {
+	resolveTerminalCommand,
+	launchTerminal,
+	terminalUnavailableReason,
+	type TerminalLaunchMetadata,
+	type ResolvedTerminalCommand,
+} from "./terminal-launcher.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
 export type SubagentsOverlayView = "running" | "completed";
@@ -209,7 +216,15 @@ function renderEmptyState(theme: Theme, width: number, options?: RenderOverlayOp
 	return lines;
 }
 
-export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, selectedRunIndex = 0, options?: RenderOverlayOptions): string[] {
+export function renderOverlay(
+	runs: OverlayRun[],
+	theme: Theme,
+	width: number,
+	selectedRunIndex = 0,
+	options?: RenderOverlayOptions,
+	terminalCommand?: ResolvedTerminalCommand,
+	transientError?: string,
+): string[] {
 	const innerW = width - 2;
 	const pad = (s: string, len: number) => {
 		const vis = visibleWidth(s);
@@ -231,12 +246,16 @@ export function renderOverlay(runs: OverlayRun[], theme: Theme, width: number, s
 		contentLines.pop();
 	}
 	const switchHint = options?.view ? " · Tab/←/→ switch" : "";
-	contentLines.push(truncateToWidth(` ${theme.fg("dim", `↑↓ navigate · Enter detail${switchHint} · Esc close`)}`, innerW));
+	const terminalHint = terminalCommand ? " · o open terminal" : "";
+	contentLines.push(truncateToWidth(` ${theme.fg("dim", `↑↓ navigate · Enter detail${switchHint}${terminalHint} · Esc close`)}`, innerW));
 
 	const lines: string[] = [];
 	lines.push(theme.fg("border", `╭${"─".repeat(innerW)}╮`));
 	for (const line of contentLines) {
 		lines.push(row(line));
+	}
+	if (transientError) {
+		lines.push(row(theme.fg("error", ` ${truncateToWidth(transientError, innerW - 1)}`)));
 	}
 	lines.push(theme.fg("border", `╰${"─".repeat(innerW)}╯`));
 	return lines;
@@ -322,11 +341,15 @@ export class SubagentDetailPane {
 	private cachedHeight?: number;
 	private cachedLines?: string[];
 	private error?: string;
+	private readonly terminalCommand?: ResolvedTerminalCommand;
+	private transientError?: string;
+	private transientErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
-	constructor(run: OverlayRun, theme: Theme, requestRender: () => void) {
+	constructor(run: OverlayRun, theme: Theme, requestRender: () => void, terminalCommand?: ResolvedTerminalCommand) {
 		this.run = run;
 		this.theme = theme;
 		this.requestRender = requestRender;
+		this.terminalCommand = terminalCommand;
 		this.candidates = buildDetailTargets(run);
 		// Start at the first candidate with a resolvable session path
 		this.candidateIndex = 0;
@@ -341,6 +364,10 @@ export class SubagentDetailPane {
 
 	getRunId(): string {
 		return this.run.id;
+	}
+
+	getCurrentTarget(): DetailPaneTarget {
+		return this.currentTarget();
 	}
 
 	updateRun(run: OverlayRun): void {
@@ -459,6 +486,20 @@ export class SubagentDetailPane {
 		return this.cachedLines;
 	}
 
+	setTransientError(message: string): void {
+		this.transientError = message;
+		this.invalidate();
+		this.requestRender();
+		if (this.transientErrorTimer) {
+			clearTimeout(this.transientErrorTimer);
+		}
+		this.transientErrorTimer = setTimeout(() => {
+			this.transientError = undefined;
+			this.invalidate();
+			this.requestRender();
+		}, 3000);
+	}
+
 	private doRender(width: number, height: number): string[] {
 		const innerW = width - 2;
 		const pad = (s: string, len: number) => {
@@ -480,13 +521,18 @@ export class SubagentDetailPane {
 			: this.theme.fg("dim", "thinking: hidden");
 		const hasMultiple = this.candidates.length > 1;
 		const navHint = hasMultiple ? ` · ←/→ ${this.candidateIndex + 1}/${this.candidates.length}` : "";
-		const headerLine = ` ${thinkingStatus} ${this.theme.fg("dim", `· t toggle · ↑↓ scroll${navHint} · Esc back`)}`;
+		const terminalHint = this.terminalCommand ? " · o open terminal" : "";
+		const errorHint = this.transientError ? ` · ${this.transientError}` : "";
+		const headerLine = ` ${thinkingStatus} ${this.theme.fg("dim", `· t toggle · ↑↓ scroll${navHint}${terminalHint} · Esc back`)}${this.theme.fg("error", errorHint)}`;
 		lines.push(row(truncateToWidth(headerLine, innerW)));
 		lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
 
 		const contentHeight = Math.max(1, height - 5);
 
-		if (this.error) {
+		if (this.transientError) {
+			lines.push(row(this.theme.fg("error", ` ${truncateToWidth(this.transientError, innerW - 1)}`)));
+			for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+		} else if (this.error) {
 			lines.push(row(this.theme.fg("warning", ` ${this.error}`)));
 			for (let i = 1; i < contentHeight; i++) lines.push(row(""));
 		} else if (this.contentLines.length === 0) {
@@ -549,6 +595,7 @@ export class SubagentsOverlay {
 	private readonly done: () => void;
 	private readonly requestRender: () => void;
 	private readonly keybindings: KeybindingsManager;
+	private readonly terminalCommand?: ResolvedTerminalCommand;
 
 	constructor(
 		theme: Theme,
@@ -556,12 +603,14 @@ export class SubagentsOverlay {
 		done: () => void,
 		requestRender: () => void,
 		keybindings: KeybindingsManager,
+		terminalConfig?: ExtensionConfig["externalTerminal"],
 	) {
 		this.theme = theme;
 		this.state = state;
 		this.done = done;
 		this.requestRender = requestRender;
 		this.keybindings = keybindings;
+		this.terminalCommand = resolveTerminalCommand(terminalConfig);
 		this.refresh();
 		// Periodic refresh while overlay is open
 		this.refreshTimer = setInterval(() => {
@@ -659,6 +708,8 @@ export class SubagentsOverlay {
 			this.requestRender();
 		} else if (matchesKey(data, "return") || matchesKey(data, "enter") || matchesKey(data, "space")) {
 			this.openDetail();
+		} else if (data === "o" || data === "O") {
+			this.openSelectedInTerminal();
 		}
 	}
 
@@ -681,6 +732,8 @@ export class SubagentsOverlay {
 			this.detailPane?.scrollDown();
 		} else if (data === "t" || data === "T") {
 			this.detailPane?.toggleThinking();
+		} else if (data === "o" || data === "O") {
+			this.openDetailInTerminal();
 		}
 	}
 
@@ -690,7 +743,7 @@ export class SubagentsOverlay {
 		const run = visibleRuns[this.selectedRunIndex];
 		if (!run) return;
 		this.mode = "detail";
-		this.detailPane = new SubagentDetailPane(run, this.theme, this.requestRender);
+		this.detailPane = new SubagentDetailPane(run, this.theme, this.requestRender, this.terminalCommand);
 		this.invalidate();
 		this.requestRender();
 	}
@@ -700,6 +753,56 @@ export class SubagentsOverlay {
 		this.detailPane = undefined;
 		this.invalidate();
 		this.requestRender();
+	}
+
+	private getSelectedRun(): OverlayRun | undefined {
+		const visibleRuns = this.visibleRuns();
+		if (visibleRuns.length === 0) return undefined;
+		return visibleRuns[this.selectedRunIndex];
+	}
+
+	private openSelectedInTerminal(): void {
+		const run = this.getSelectedRun();
+		if (!run || !this.terminalCommand) return;
+		// Terminal handoff requires a real child session file, not log/artifact fallback.
+		const sessionFile = run.sessionFile;
+		const metadata: TerminalLaunchMetadata = {
+			sessionFile: sessionFile ?? undefined,
+			cwd: this.state.baseCwd || process.cwd(),
+		};
+		const reason = terminalUnavailableReason(this.terminalCommand, metadata);
+		if (reason) {
+			this.openDetail();
+			this.detailPane?.setTransientError(reason);
+			return;
+		}
+		launchTerminal(this.terminalCommand, metadata).then((result) => {
+			if (!result.success) {
+				this.openDetail();
+				this.detailPane?.setTransientError(result.error ?? "Failed to open terminal.");
+			}
+		});
+	}
+
+	private openDetailInTerminal(): void {
+		if (!this.detailPane || !this.terminalCommand) return;
+		const target = this.detailPane.getCurrentTarget();
+		// Terminal handoff requires a real child session file, not log/artifact fallback.
+		const sessionFile = target.sessionFile;
+		const metadata: TerminalLaunchMetadata = {
+			sessionFile: sessionFile ?? undefined,
+			cwd: this.state.baseCwd || process.cwd(),
+		};
+		const reason = terminalUnavailableReason(this.terminalCommand, metadata);
+		if (reason) {
+			this.detailPane.setTransientError(reason);
+			return;
+		}
+		launchTerminal(this.terminalCommand, metadata).then((result) => {
+			if (!result.success) {
+				this.detailPane.setTransientError(result.error ?? "Failed to open terminal.");
+			}
+		});
 	}
 
 	render(width: number): string[] {
@@ -718,7 +821,7 @@ export class SubagentsOverlay {
 				view: this.view,
 				runningCount: counts.running,
 				completedCount: counts.completed,
-			});
+			}, this.terminalCommand);
 		}
 		return this.cachedLines;
 	}
@@ -738,6 +841,7 @@ export class SubagentsOverlay {
 export function registerSubagentsOverlayCommand(
 	pi: ExtensionAPI,
 	state: SubagentState,
+	terminalConfig?: ExtensionConfig["externalTerminal"],
 ): void {
 	pi.registerCommand("subagents", {
 		description: "Show live subagent run tree overlay",
@@ -758,6 +862,7 @@ export function registerSubagentsOverlayCommand(
 					done,
 					requestRender,
 					keybindings,
+					terminalConfig,
 				);
 				return {
 					render: (w: number) => overlay.render(w),

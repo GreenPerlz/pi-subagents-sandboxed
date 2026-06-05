@@ -468,7 +468,7 @@ DIAGNOSTICS:
 
 	pi.registerTool(tool);
 	registerSlashCommands(pi, state);
-	registerSubagentsOverlayCommand(pi, state);
+	registerSubagentsOverlayCommand(pi, state, config.externalTerminal);
 
 	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
 	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";

@@ -858,6 +858,13 @@ interface ExtensionChainConfig {
 	};
 }
 
+export interface ExternalTerminalConfig {
+	/** Terminal emulator command (absolute path or PATH-resolvable name). */
+	command: string;
+	/** Argument list; use {sessionFile} and {cwd} as placeholders. */
+	args?: string[];
+}
+
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
 	forceTopLevelAsync?: boolean;
@@ -869,6 +876,7 @@ export interface ExtensionConfig {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	intercomBridge?: IntercomBridgeConfig;
+	externalTerminal?: ExternalTerminalConfig;
 }
 
 // ============================================================================

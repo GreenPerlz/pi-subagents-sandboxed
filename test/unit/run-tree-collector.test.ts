@@ -88,13 +88,15 @@ function addForegroundRun(
 	});
 }
 
-function makePersistedRoots(): { root: string; asyncDirRoot: string; resultsDir: string } {
+function makePersistedRoots(): { root: string; asyncDirRoot: string; foregroundDirRoot: string; resultsDir: string } {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-run-tree-"));
 	const asyncDirRoot = path.join(root, "async");
+	const foregroundDirRoot = path.join(root, "foreground");
 	const resultsDir = path.join(root, "results");
 	fs.mkdirSync(asyncDirRoot, { recursive: true });
+	fs.mkdirSync(foregroundDirRoot, { recursive: true });
 	fs.mkdirSync(resultsDir, { recursive: true });
-	return { root, asyncDirRoot, resultsDir };
+	return { root, asyncDirRoot, foregroundDirRoot, resultsDir };
 }
 
 function writePersistedAsyncStatus(asyncDirRoot: string, id: string, status: Record<string, unknown>): string {
@@ -102,6 +104,13 @@ function writePersistedAsyncStatus(asyncDirRoot: string, id: string, status: Rec
 	fs.mkdirSync(asyncDir, { recursive: true });
 	fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify(status, null, 2), "utf-8");
 	return asyncDir;
+}
+
+function writePersistedForegroundStatus(foregroundDirRoot: string, id: string, status: Record<string, unknown>): string {
+	const foregroundDir = path.join(foregroundDirRoot, id);
+	fs.mkdirSync(foregroundDir, { recursive: true });
+	fs.writeFileSync(path.join(foregroundDir, "status.json"), JSON.stringify(status, null, 2), "utf-8");
+	return foregroundDir;
 }
 
 function writePersistedResult(resultsDir: string, id: string, result: Record<string, unknown>): string {
@@ -450,6 +459,89 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.state, "running");
 	});
 
+	it("hydrates interrupted persisted foreground runs after parent session resume", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-interrupted", {
+				runId: "fg-interrupted",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "running",
+				startedAt: 1000,
+				updatedAt: 2000,
+				currentAgent: "file-reader-demo",
+				currentIndex: 0,
+				children: [{ agent: "file-reader-demo", index: 0, status: "running", sessionFile: "/tmp/fg/session.jsonl" }],
+			});
+
+			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "fg-interrupted");
+			assert.strictEqual(runs[0]!.source, "foreground");
+			assert.strictEqual(runs[0]!.state, "paused");
+			assert.deepStrictEqual(runs[0]!.agents, ["file-reader-demo"]);
+			assert.strictEqual(runs[0]!.steps[0]!.state, "paused");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("hydrates completed persisted foreground runs after parent session resume", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-complete", {
+				runId: "fg-complete",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				updatedAt: 2000,
+				children: [{ agent: "worker", index: 0, status: "completed", sessionFile: "/tmp/fg-complete/session.jsonl" }],
+			});
+
+			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "fg-complete");
+			assert.strictEqual(runs[0]!.source, "foreground");
+			assert.strictEqual(runs[0]!.state, "complete");
+			assert.strictEqual(runs[0]!.steps[0]!.agent, "worker");
+			assert.strictEqual(runs[0]!.steps[0]!.state, "complete");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves persisted foreground session files for detail view resolution", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			const sessionFile = path.join(root, "sessions", "fg-session.jsonl");
+			fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+			fs.writeFileSync(sessionFile, "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n", "utf-8");
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-session", {
+				runId: "fg-session",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				updatedAt: 2000,
+				children: [{ agent: "worker", index: 0, status: "completed", sessionFile }],
+			});
+
+			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
+			assert.strictEqual(runs[0]!.sessionFile, sessionFile);
+			assert.strictEqual(runs[0]!.steps[0]!.sessionFile, sessionFile);
+			assert.strictEqual(resolveSessionPath(runs[0]!, "session"), sessionFile);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("shows finished foreground runs with failed state when any child failed", () => {
 		const state = baseState();
 		addForegroundRun(state, "fg-fail", {
@@ -666,6 +758,99 @@ describe("collectRunTree", () => {
 			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
 			assert.strictEqual(runs[0]!.steps[0]!.artifactPath, artifactPath);
 			assert.strictEqual(runs[0]!.steps[0]!.sessionFile, sessionFile);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("hydrates queued async runs from disk after parent session resume", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			const asyncDir = writePersistedAsyncStatus(asyncDirRoot, "persisted-queued", {
+				runId: "persisted-queued",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "queued",
+				startedAt: 1000,
+				lastUpdate: 2000,
+				steps: [{ agent: "worker", status: "pending" }],
+			});
+
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "persisted-queued");
+			assert.strictEqual(runs[0]!.state, "queued");
+			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("hydrates interrupted running async runs from disk after parent session resume", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			const asyncDir = writePersistedAsyncStatus(asyncDirRoot, "persisted-interrupted", {
+				runId: "persisted-interrupted",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "running",
+				pid: 999999,
+				startedAt: 1000,
+				lastUpdate: 2000,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			// Mock kill so the PID is always considered dead (ESRCH)
+			const mockKill = (_pid: number, _signal?: NodeJS.Signals | 0) => {
+				const err = new Error("No such process") as NodeJS.ErrnoException;
+				err.code = "ESRCH";
+				throw err;
+			};
+
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir, kill: mockKill });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "persisted-interrupted");
+			// Reconciliation should mark the dead run as failed
+			assert.strictEqual(runs[0]!.state, "failed");
+			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("deduplicates live async jobs against persisted running status on disk", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			addAsyncJob(state, {
+				asyncId: "live-and-persisted",
+				asyncDir: "/tmp/does-not-matter",
+				status: "running",
+				mode: "single",
+				agents: ["worker"],
+				startedAt: 1000,
+				updatedAt: 2000,
+			});
+			writePersistedAsyncStatus(asyncDirRoot, "live-and-persisted", {
+				runId: "live-and-persisted",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "running",
+				startedAt: 1000,
+				lastUpdate: 2000,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "live-and-persisted");
+			assert.strictEqual(runs[0]!.state, "running");
+			// Should come from in-memory asyncJobs, not disk
+			assert.strictEqual(runs[0]!.asyncDir, "/tmp/does-not-matter");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

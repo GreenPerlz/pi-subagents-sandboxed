@@ -36,6 +36,7 @@ import {
 import { runSandboxPreflight } from "../../sandbox/preflight.ts";
 import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skills.ts";
 import { executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable } from "../background/async-execution.ts";
+import { writePersistedForegroundStatus, type PersistedForegroundStep } from "./foreground-status.ts";
 import { createForkContextResolver } from "../../shared/fork-context.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
@@ -89,6 +90,7 @@ import {
 	type SubagentRunMode,
 	type SubagentState,
 	DEFAULT_ARTIFACT_CONFIG,
+	FOREGROUND_DIR,
 	SUBAGENT_ACTIONS,
 	SUBAGENT_CONTROL_EVENT,
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
@@ -257,21 +259,99 @@ function foregroundStatusResult(control: SubagentState["foregroundControls"] ext
 	return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "management", results: [] } };
 }
 
-function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; startedAt?: number; results: SingleResult[] }): void {
+function foregroundResultState(results: SingleResult[]): "complete" | "failed" | "paused" {
+	const statuses = results.map((result) => resolveSubagentResultStatus({ exitCode: result.exitCode, interrupted: result.interrupted, detached: result.detached }));
+	if (statuses.some((status) => status === "failed")) return "failed";
+	if (statuses.some((status) => status === "paused" || status === "detached")) return "paused";
+	return "complete";
+}
+
+function foregroundChildrenFromResults(results: SingleResult[]): PersistedForegroundStep[] {
+	return results.map((result, index) => ({
+		agent: result.agent,
+		index,
+		status: resolveSubagentResultStatus({ exitCode: result.exitCode, interrupted: result.interrupted, detached: result.detached }),
+		...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
+		...(result.artifactPaths?.outputPath ? { artifactPath: result.artifactPaths.outputPath } : {}),
+	}));
+}
+
+function initialForegroundChildren(params: SubagentParamsLike, sessionFileForIndex: (idx?: number) => string | undefined): PersistedForegroundStep[] {
+	const agents: string[] = [];
+	if (params.tasks?.length) agents.push(...params.tasks.map((task) => task.agent));
+	else if (params.chain?.length) {
+		for (const step of params.chain) {
+			if (isParallelStep(step)) agents.push(...step.parallel.map((task) => task.agent));
+			else if ("agent" in step && typeof step.agent === "string") agents.push(step.agent);
+		}
+	} else if (params.agent) agents.push(params.agent);
+	return agents.map((agent, index) => ({
+		agent,
+		index,
+		status: index === 0 ? "running" : "pending",
+		...(sessionFileForIndex(index) ? { sessionFile: sessionFileForIndex(index) } : {}),
+	}));
+}
+
+function persistForegroundStatus(input: {
+	runId: string;
+	mode: "single" | "parallel" | "chain";
+	cwd: string;
+	sessionId?: string | null;
+	state: "queued" | "running" | "complete" | "failed" | "paused";
+	startedAt?: number;
+	updatedAt?: number;
+	children: PersistedForegroundStep[];
+	currentAgent?: string;
+	currentIndex?: number;
+	currentTool?: string;
+	sessionFile?: string;
+	nestedChildren?: NestedRunSummary[];
+	foregroundDirRoot?: string;
+}): void {
+	try {
+		writePersistedForegroundStatus(input.foregroundDirRoot ?? FOREGROUND_DIR, {
+			runId: input.runId,
+			...(input.sessionId ? { sessionId: input.sessionId } : {}),
+			cwd: input.cwd,
+			mode: input.mode,
+			state: input.state,
+			...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
+			updatedAt: input.updatedAt ?? Date.now(),
+			...(input.currentAgent ? { currentAgent: input.currentAgent } : {}),
+			...(input.currentIndex !== undefined ? { currentIndex: input.currentIndex } : {}),
+			...(input.currentTool ? { currentTool: input.currentTool } : {}),
+			...(input.sessionFile ? { sessionFile: input.sessionFile } : {}),
+			children: input.children,
+			...(input.nestedChildren?.length ? { nestedChildren: input.nestedChildren } : {}),
+		});
+	} catch {
+		// Foreground persistence should never fail the user-visible subagent run.
+	}
+}
+
+function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId?: string | null; startedAt?: number; results: SingleResult[] }): void {
+	const updatedAt = Date.now();
+	const children = foregroundChildrenFromResults(input.results);
 	state.foregroundRuns ??= new Map();
 	state.foregroundRuns.set(input.runId, {
 		runId: input.runId,
 		mode: input.mode,
 		cwd: input.cwd,
 		...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
-		updatedAt: Date.now(),
-		children: input.results.map((result, index) => ({
-			agent: result.agent,
-			index,
-			status: resolveSubagentResultStatus({ exitCode: result.exitCode, interrupted: result.interrupted, detached: result.detached }),
-			...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
-			...(result.artifactPaths?.outputPath ? { artifactPath: result.artifactPaths.outputPath } : {}),
-		})),
+		updatedAt,
+		children,
+	});
+	persistForegroundStatus({
+		runId: input.runId,
+		mode: input.mode,
+		cwd: input.cwd,
+		sessionId: input.sessionId,
+		state: foregroundResultState(input.results),
+		startedAt: input.startedAt,
+		updatedAt,
+		children,
+		sessionFile: children.find((child) => child.sessionFile)?.sessionFile,
 	});
 	while (state.foregroundRuns.size > 50) {
 		const oldest = [...state.foregroundRuns.values()].sort((left, right) => left.updatedAt - right.updatedAt)[0];
@@ -921,14 +1001,6 @@ function collectRalphNestedLaunchAgentTargets(params: SubagentParamsLike): strin
 	return targets;
 }
 
-function ralphNestedLaunchWorkerTargetCount(params: SubagentParamsLike): number {
-	return collectRalphNestedLaunchAgentTargets(params).filter(isRalphNestedWorkerAgentName).length;
-}
-
-function hasRalphNestedWorkerDynamicFanout(params: SubagentParamsLike): boolean {
-	return (params.chain ?? []).some((step) => isDynamicParallelStep(step) && isRalphNestedWorkerAgentName(step.parallel.agent));
-}
-
 function isRalphOrchestratorNestedWorkerLaunch(input: {
 	params: SubagentParamsLike;
 	inheritedNestedRoute?: NestedRouteInfo;
@@ -937,80 +1009,6 @@ function isRalphOrchestratorNestedWorkerLaunch(input: {
 	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "ralph-orchestrator") return false;
 	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return false;
 	return collectRalphNestedLaunchAgentTargets(input.params).some(isRalphNestedWorkerAgentName);
-}
-
-function ralphNestedWorkerGuardKey(input: {
-	inheritedNestedRoute: NestedRouteInfo;
-	nestedParentAddress: NestedRunAddress;
-}): { key: string; orchestratorRunId: string } {
-	const parentStep = input.nestedParentAddress.parentStepIndex ?? "root";
-	const orchestratorRunId = process.env[SUBAGENT_RUN_ID_ENV] || input.nestedParentAddress.parentRunId;
-	return { key: `${input.inheritedNestedRoute.rootRunId}:${orchestratorRunId}:${parentStep}`, orchestratorRunId };
-}
-
-function ralphNestedLaunchGuardResult(input: {
-	state: SubagentState;
-	mode: Details["mode"];
-	params: SubagentParamsLike;
-	inheritedNestedRoute?: NestedRouteInfo;
-	nestedParentAddress?: NestedRunAddress;
-}): AgentToolResult<Details> | null {
-	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "ralph-orchestrator") return null;
-	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return null;
-	const workerTargetCount = ralphNestedLaunchWorkerTargetCount(input.params);
-	const hasDynamicWorkerFanout = hasRalphNestedWorkerDynamicFanout(input.params);
-	if (workerTargetCount === 0 && !hasDynamicWorkerFanout) return null;
-	const { orchestratorRunId, key } = ralphNestedWorkerGuardKey({
-		inheritedNestedRoute: input.inheritedNestedRoute,
-		nestedParentAddress: input.nestedParentAddress,
-	});
-	if (hasDynamicWorkerFanout) {
-		const message = `Ralph orchestrator nested worker guard blocked this subagent call: dynamic fanout worker targets are not allowed in a ralph-orchestrator nested call (run ${orchestratorRunId}); launch exactly one worker target at most and wait for it before any follow-up worker.`;
-		console.warn(message);
-		return validationErrorResult(input.mode, message);
-	}
-	if (input.params.async === true && isRalphOrchestratorNestedWorkerLaunch(input)) {
-		const message = `Ralph orchestrator nested worker async guard blocked this subagent call: ralph-orchestrator nested worker launches must be synchronous/awaited by default (run ${orchestratorRunId}); omit async:true and wait for the worker result before launching another worker.`;
-		console.warn(message);
-		return validationErrorResult(input.mode, message);
-	}
-	if (workerTargetCount > 1) {
-		const message = `Ralph orchestrator nested worker guard blocked this subagent call: multiple nested worker targets (${workerTargetCount}) are not allowed in one ralph-orchestrator nested call (run ${orchestratorRunId}); launch exactly one worker target at most.`;
-		console.warn(message);
-		return validationErrorResult(input.mode, message);
-	}
-	const active = input.state.ralphOrchestratorNestedWorkerActiveGuard?.get(key);
-	if (active) {
-		active.lastSeenAt = Date.now();
-		const message = `Ralph orchestrator nested worker guard blocked this subagent call: another nested worker is already active for ralph-orchestrator run ${orchestratorRunId} (child run ${active.runId}${active.agent ? `, agent ${active.agent}` : ""}); wait for that worker to finish before launching a follow-up worker.`;
-		console.warn(message);
-		return validationErrorResult(input.mode, message);
-	}
-	return null;
-}
-
-function reserveRalphNestedActiveWorker(input: {
-	state: SubagentState;
-	params: SubagentParamsLike;
-	runId: string;
-	inheritedNestedRoute?: NestedRouteInfo;
-	nestedParentAddress?: NestedRunAddress;
-}): (() => void) | undefined {
-	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "ralph-orchestrator") return undefined;
-	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return undefined;
-	if (!isRalphOrchestratorNestedWorkerLaunch(input)) return undefined;
-	const { key } = ralphNestedWorkerGuardKey({
-		inheritedNestedRoute: input.inheritedNestedRoute,
-		nestedParentAddress: input.nestedParentAddress,
-	});
-	const agent = collectRalphNestedLaunchAgentTargets(input.params).find(isRalphNestedWorkerAgentName);
-	const now = Date.now();
-	input.state.ralphOrchestratorNestedWorkerActiveGuard ??= new Map();
-	input.state.ralphOrchestratorNestedWorkerActiveGuard.set(key, { runId: input.runId, ...(agent ? { agent } : {}), startedAt: now, lastSeenAt: now });
-	return () => {
-		const current = input.state.ralphOrchestratorNestedWorkerActiveGuard?.get(key);
-		if (current?.runId === input.runId) input.state.ralphOrchestratorNestedWorkerActiveGuard?.delete(key);
-	};
 }
 
 function validateAcceptanceForExecution(params: SubagentParamsLike): AgentToolResult<Details> | null {
@@ -1626,7 +1624,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 
 	const chainDetails = chainResult.details ? compactForegroundDetails({ ...chainResult.details, runId }) : undefined;
 	if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
-	if (chainDetails) rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, startedAt: foregroundControl?.startedAt, results: chainDetails.results });
+	if (chainDetails) rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: chainDetails.results });
 	const intercomReceipt = chainDetails && !chainDetails.results.some((result) => result.interrupted || result.detached)
 		? await maybeBuildForegroundIntercomReceipt({
 			pi: deps.pi,
@@ -2171,7 +2169,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			progress: params.includeProgress ? allProgress : undefined,
 			artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		});
-		rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: effectiveCwd, startedAt: foregroundControl?.startedAt, results: details.results });
+		rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: details.results });
 		if (interrupted) {
 			return {
 				content: [{ type: "text", text: `Parallel run paused after interrupt (${interrupted.agent}). Waiting for explicit next action.` }],
@@ -2484,7 +2482,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		truncation: r.truncation,
 	});
-	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, startedAt: foregroundControl?.startedAt, results: details.results });
+	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: details.results });
 
 	if (!r.detached && !r.interrupted) {
 		if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
@@ -2727,14 +2725,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			&& ctx.hasUI
 			&& !(effectiveParams.chain?.some(isParallelStep) ?? false);
 
-		const ralphGuardError = ralphNestedLaunchGuardResult({
-			state: deps.state,
-			mode: getRequestedModeLabel(effectiveParams),
-			params: effectiveParams,
-			inheritedNestedRoute,
-			nestedParentAddress,
-		});
-		if (ralphGuardError) return ralphGuardError;
 		const ralphNestedWorkerLaunch = isRalphOrchestratorNestedWorkerLaunch({
 			params: effectiveParams,
 			inheritedNestedRoute,
@@ -2865,6 +2855,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (foregroundControl) {
 			deps.state.foregroundControls.set(runId, foregroundControl);
 			deps.state.lastForegroundControlId = runId;
+			persistForegroundStatus({
+				runId,
+				mode: foregroundMode,
+				cwd: effectiveCwd,
+				sessionId: deps.state.currentSessionId,
+				state: "running",
+				startedAt: foregroundControl.startedAt,
+				updatedAt: foregroundControl.updatedAt,
+				children: initialForegroundChildren(effectiveParams, childSessionFileForIndex),
+			});
 		}
 
 		const writeNestedForegroundEvent = (type: "subagent.nested.started" | "subagent.nested.completed", result?: AgentToolResult<Details>): void => {
@@ -2937,15 +2937,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		};
 
 		let nestedForegroundStarted = false;
-		let releaseRalphNestedWorker: (() => void) | undefined;
 		try {
-			releaseRalphNestedWorker = reserveRalphNestedActiveWorker({
-				state: deps.state,
-				params: effectiveParams,
-				runId,
-				inheritedNestedRoute,
-				nestedParentAddress,
-			});
 			const asyncResult = runAsyncPath(execData, deps);
 			if (asyncResult) return withForkContext(withPreflightSummary(asyncResult), effectiveParams.context);
 			if (foregroundControl) {
@@ -2976,7 +2968,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (nestedForegroundStarted) writeNestedForegroundEvent("subagent.nested.completed", wrappedErrorResult);
 			return wrappedErrorResult;
 		} finally {
-			releaseRalphNestedWorker?.();
 			if (foregroundControl) {
 				clearPendingForegroundControlNotices(deps.state, runId);
 				deps.state.foregroundControls.delete(runId);

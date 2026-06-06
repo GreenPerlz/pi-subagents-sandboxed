@@ -2,7 +2,7 @@
  * Session file reader for the /subagents overlay detail pane.
  *
  * Reads JSONL session files (or plain text log/artifact files), parses entries,
- * and formats them into display lines with optional thinking-block filtering.
+ * and formats them into display lines with optional thinking-block and tool-result filtering.
  */
 
 import * as fs from "node:fs";
@@ -98,6 +98,7 @@ type Theme = ExtensionContext["ui"]["theme"];
 export interface FormattedLine {
 	text: string;
 	isThinking: boolean;
+	isToolResult?: boolean;
 }
 
 function parseJsonlLine(line: string): SessionEntry | undefined {
@@ -232,24 +233,28 @@ function formatAssistantMessage(entry: MessageEntry, theme: Theme, width: number
 	return lines;
 }
 
-function formatToolResultMessage(entry: MessageEntry, theme: Theme, width: number): FormattedLine[] {
+function formatToolResultMessage(entry: MessageEntry, theme: Theme, width: number, showToolResults: boolean): FormattedLine[] {
 	const msg = entry.message;
 	const text = extractText(msg.content);
 	const ts = formatTimestamp(msg.timestamp);
 	const errorTag = msg.isError ? theme.fg("error", " [error]") : "";
 	const header = `${theme.fg("warning", `Tool result${msg.toolName ? `: ${msg.toolName}` : ""}`)}${errorTag}${ts ? theme.fg("dim", ` · ${ts}`) : ""}`;
-	const lines: FormattedLine[] = [{ text: header, isThinking: false }];
+	if (!showToolResults) {
+		const hidden = `${header} ${theme.fg("dim", "[hidden — press r to show]")}`;
+		return [{ text: truncateToWidth(hidden, width), isThinking: false, isToolResult: true }];
+	}
+	const lines: FormattedLine[] = [{ text: header, isThinking: false, isToolResult: true }];
 	for (const wrapped of wrapLines(text, "  ", width)) {
-		lines.push({ text: truncateToWidth(wrapped, width), isThinking: false });
+		lines.push({ text: truncateToWidth(wrapped, width), isThinking: false, isToolResult: true });
 	}
 	return lines;
 }
 
-function formatMessageEntry(entry: MessageEntry, theme: Theme, width: number, showThinking: boolean): FormattedLine[] {
+function formatMessageEntry(entry: MessageEntry, theme: Theme, width: number, showThinking: boolean, showToolResults: boolean): FormattedLine[] {
 	switch (entry.message.role) {
 		case "user": return formatUserMessage(entry, theme, width);
 		case "assistant": return formatAssistantMessage(entry, theme, width, showThinking);
-		case "toolResult": return formatToolResultMessage(entry, theme, width);
+		case "toolResult": return formatToolResultMessage(entry, theme, width, showToolResults);
 		default: return [];
 	}
 }
@@ -280,9 +285,9 @@ function formatActiveToolsChange(entry: ActiveToolsChangeEntry, theme: Theme, wi
 	return [{ text: truncateToWidth(text, width), isThinking: false }];
 }
 
-function formatEntry(entry: SessionEntry, theme: Theme, width: number, showThinking: boolean): FormattedLine[] {
+function formatEntry(entry: SessionEntry, theme: Theme, width: number, showThinking: boolean, showToolResults: boolean): FormattedLine[] {
 	switch (entry.type) {
-		case "message": return formatMessageEntry(entry, theme, width, showThinking);
+		case "message": return formatMessageEntry(entry, theme, width, showThinking, showToolResults);
 		case "compaction": return formatCompactionEntry(entry, theme, width);
 		case "custom_message": return formatCustomMessageEntry(entry, theme, width);
 		case "thinking_level_change": return formatThinkingLevelChange(entry, theme, width);
@@ -303,9 +308,9 @@ export interface ReadSessionResult {
 
 /**
  * Read a session file (JSONL) or plain text log file and format entries.
- * Returns display lines with optional thinking-block filtering.
+ * Returns display lines with optional thinking-block and tool-result filtering.
  */
-export function readSessionFile(filePath: string, theme: Theme, width: number, showThinking: boolean): ReadSessionResult {
+export function readSessionFile(filePath: string, theme: Theme, width: number, showThinking: boolean, showToolResults = true): ReadSessionResult {
 	try {
 		if (!fs.existsSync(filePath)) {
 			return { lines: [], error: `Session file not found: ${filePath}` };
@@ -329,7 +334,7 @@ export function readSessionFile(filePath: string, theme: Theme, width: number, s
 			const entry = parseJsonlLine(line);
 			if (entry) {
 				parsedCount++;
-				result.push(...formatEntry(entry, theme, width, showThinking));
+				result.push(...formatEntry(entry, theme, width, showThinking, showToolResults));
 			}
 		}
 

@@ -43,6 +43,7 @@ import {
 	type SubagentState,
 	ASYNC_DIR,
 	DEFAULT_ARTIFACT_CONFIG,
+	FOREGROUND_DIR,
 	RESULTS_DIR,
 	SLASH_RESULT_TYPE,
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
@@ -229,6 +230,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	ensureAccessibleDir(RESULTS_DIR);
 	ensureAccessibleDir(ASYNC_DIR);
+	ensureAccessibleDir(FOREGROUND_DIR);
 	cleanupOldChainDirs();
 
 	const config = loadConfig();

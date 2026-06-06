@@ -9,9 +9,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { listAsyncRuns, formatAsyncRunOutputPath, type AsyncRunSummary } from "../runs/background/async-status.ts";
+import { listPersistedForegroundRuns, type PersistedForegroundStatus } from "../runs/foreground/foreground-status.ts";
 import { updateForegroundNestedProjection } from "../runs/shared/nested-events.ts";
 import {
 	ASYNC_DIR,
+	FOREGROUND_DIR,
 	RESULTS_DIR,
 	type AsyncJobState,
 	type AsyncJobStep,
@@ -74,8 +76,11 @@ export interface OverlayRun {
 
 export interface CollectRunTreeOptions {
 	asyncDirRoot?: string;
+	foregroundDirRoot?: string;
 	resultsDir?: string;
 	persistedAsyncLimit?: number;
+	persistedForegroundLimit?: number;
+	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +88,7 @@ export interface CollectRunTreeOptions {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_PERSISTED_ASYNC_LIMIT = 25;
+const DEFAULT_PERSISTED_FOREGROUND_LIMIT = 25;
 
 interface PersistedResultChild {
 	agent?: string;
@@ -495,6 +501,64 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 	return runs;
 }
 
+function staleForegroundState(state: OverlayRunState): OverlayRunState {
+	return state === "running" || state === "queued" ? "paused" : state;
+}
+
+function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, now: number): OverlayRun {
+	const staleState = staleForegroundState(mapState(status.state));
+	const children = status.children.length
+		? status.children
+		: status.currentAgent
+			? [{ agent: status.currentAgent, index: status.currentIndex ?? 0, status: status.state, sessionFile: status.sessionFile }]
+			: [];
+	const steps: OverlayStep[] = children.map((child) => ({
+		agent: child.agent,
+		state: staleForegroundState(mapState(child.status)),
+		sessionFile: child.sessionFile,
+		artifactPath: child.artifactPath,
+		children: [],
+	}));
+	const nestedChildren = (status.nestedChildren ?? []).map(mapNestedRun);
+	if (nestedChildren.length && steps.length) steps[steps.length - 1]!.children.push(...nestedChildren);
+	const agents = agentsLabel(steps.map((step) => step.agent));
+	const elapsed = elapsedFromRange(status.startedAt, status.updatedAt, now);
+	return {
+		id: status.runId,
+		label: `${modeLabel(status.mode)}: ${agents.join(", ")}`,
+		state: deriveRunState(staleState, steps, nestedChildren),
+		mode: status.mode,
+		source: "foreground",
+		agents,
+		elapsed,
+		startedAt: status.startedAt,
+		updatedAt: status.updatedAt,
+		currentTool: staleState === "running" ? status.currentTool : undefined,
+		sessionFile: status.sessionFile ?? children.find((child) => child.sessionFile)?.sessionFile,
+		artifactPath: children.find((child) => child.artifactPath)?.artifactPath,
+		steps,
+	};
+}
+
+function collectPersistedForegroundRuns(state: SubagentState, now: number, options: CollectRunTreeOptions): OverlayRun[] {
+	const foregroundDirRoot = options.foregroundDirRoot ?? FOREGROUND_DIR;
+	const limit = options.persistedForegroundLimit ?? DEFAULT_PERSISTED_FOREGROUND_LIMIT;
+	const liveIds = new Set(state.foregroundControls?.keys() ?? []);
+	const rememberedIds = new Set(state.foregroundRuns?.keys() ?? []);
+	try {
+		return listPersistedForegroundRuns(foregroundDirRoot, {
+			sessionId: state.currentSessionId ?? undefined,
+			cwd: state.baseCwd,
+			limit: limit + liveIds.size + rememberedIds.size,
+		})
+			.filter((run) => !liveIds.has(run.runId) && !rememberedIds.has(run.runId))
+			.slice(0, limit)
+			.map((run) => overlayRunFromPersistedForeground(run, now));
+	} catch {
+		return [];
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Async run collection
 // ---------------------------------------------------------------------------
@@ -554,7 +618,9 @@ function collectPersistedAsyncRuns(state: SubagentState, now: number, options: C
 	const asyncDirRoot = options.asyncDirRoot ?? ASYNC_DIR;
 	const resultsDir = options.resultsDir ?? RESULTS_DIR;
 	const limit = options.persistedAsyncLimit ?? DEFAULT_PERSISTED_ASYNC_LIMIT;
-	const terminalStates: Array<AsyncRunSummary["state"]> = ["complete", "failed", "paused"];
+	// Include non-terminal states so that runs interrupted by a parent Ctrl-C
+	// (still "running" or "queued" on disk) are recovered on resume.
+	const persistedStates: Array<AsyncRunSummary["state"]> = ["complete", "failed", "paused", "running", "queued"];
 	const liveIds = new Set(state.asyncJobs.keys());
 	const runs: OverlayRun[] = [];
 	const seenIds = new Set<string>();
@@ -564,11 +630,12 @@ function collectPersistedAsyncRuns(state: SubagentState, now: number, options: C
 	try {
 		resultRecords = listPersistedResultRecords(resultsDir, state, limit * 2);
 		persistedStatusRuns = listAsyncRuns(asyncDirRoot, {
-			states: terminalStates,
+			states: persistedStates,
 			sessionId: state.currentSessionId ?? undefined,
 			cwd: state.baseCwd,
 			limit: limit + liveIds.size,
 			resultsDir,
+			kill: options.kill,
 		});
 	} catch {
 		return runs;
@@ -604,6 +671,7 @@ export function collectRunTree(state: SubagentState, now = Date.now(), options: 
 	const runs: OverlayRun[] = [
 		...collectForegroundRuns(state, now),
 		...collectFinishedForegroundRuns(state, now),
+		...collectPersistedForegroundRuns(state, now, options),
 		...collectAsyncRuns(state, now),
 		...collectPersistedAsyncRuns(state, now, options),
 	];

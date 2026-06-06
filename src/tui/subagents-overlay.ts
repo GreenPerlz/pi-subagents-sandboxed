@@ -8,7 +8,7 @@
  * Detail pane (issue #21):
  *   Enter/Space on a run opens an in-overlay detail pane showing that child session's
  *   persisted session file or best available log. Detail pane has independent scrolling,
- *   a thinking toggle (t), and Back/Left returns to the list without closing the overlay.
+ *   thinking/tool-result toggles (t/r), and Back/Left returns to the list without closing the overlay.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -55,6 +55,30 @@ interface RenderOverlayOptions {
 	runningCount?: number;
 	completedCount?: number;
 }
+
+const SUBAGENTS_OVERLAY_OPTIONS = {
+	anchor: "center" as const,
+	width: "90%" as const,
+	minWidth: 84,
+	maxHeight: "80%" as const,
+};
+
+function resolvePercent(value: string): number | undefined {
+	if (!value.endsWith("%")) return undefined;
+	const percent = Number(value.slice(0, -1));
+	return Number.isFinite(percent) && percent > 0 ? percent : undefined;
+}
+
+function resolveOverlayRenderHeight(terminalRows: number): number {
+	const rows = Number.isFinite(terminalRows) && terminalRows > 0 ? terminalRows : 24;
+	const maxHeight = SUBAGENTS_OVERLAY_OPTIONS.maxHeight;
+	if (typeof maxHeight === "string") {
+		const percent = resolvePercent(maxHeight);
+		if (percent !== undefined) return Math.max(1, Math.floor(rows * percent / 100));
+	}
+	return Math.max(1, rows);
+}
+
 
 // ---------------------------------------------------------------------------
 // Overlay rendering helpers
@@ -193,14 +217,28 @@ function renderViewSwitch(theme: Theme, options?: RenderOverlayOptions): string 
 	return `${theme.fg("dim", "·")} ${running} ${theme.fg("dim", "|")} ${completed}`;
 }
 
-function renderEmptyState(theme: Theme, width: number, options?: RenderOverlayOptions): string[] {
+function capOverlayLines(lines: string[], maxHeight?: number): string[] {
+	// Pi TUI slices overlay lines above overlayOptions.maxHeight. Keep our
+	// returned line count within that cap so the bottom border/footer is not
+	// sliced off by the compositor, including tiny terminals.
+	if (maxHeight === undefined || lines.length <= maxHeight) return lines;
+	const bottom = lines.pop()!;
+	lines.length = Math.max(0, maxHeight - 1);
+	if (maxHeight > 0) lines.push(bottom);
+	return lines;
+}
+
+function renderEmptyState(theme: Theme, width: number, options?: RenderOverlayOptions, maxHeight?: number): string[] {
 	const innerW = width - 2;
 	const lines: string[] = [];
 	const pad = (s: string, len: number) => {
 		const vis = visibleWidth(s);
 		return s + " ".repeat(Math.max(0, len - vis));
 	};
-	const row = (content: string) => theme.fg("border", "│") + pad(content, innerW) + theme.fg("border", "│");
+	const row = (content: string) => {
+		const truncated = truncateToWidth(content, innerW);
+		return theme.fg("border", "│") + pad(truncated, innerW) + theme.fg("border", "│");
+	};
 
 	lines.push(theme.fg("border", `╭${"─".repeat(innerW)}╮`));
 	lines.push(row(` ${theme.fg("accent", "Subagents")} ${renderViewSwitch(theme, options)}`));
@@ -224,7 +262,7 @@ function renderEmptyState(theme: Theme, width: number, options?: RenderOverlayOp
 		lines.push(row(` ${theme.fg("dim", "Esc to close")}`));
 	}
 	lines.push(theme.fg("border", `╰${"─".repeat(innerW)}╯`));
-	return lines;
+	return capOverlayLines(lines, maxHeight);
 }
 
 export function renderOverlay(
@@ -235,15 +273,19 @@ export function renderOverlay(
 	options?: RenderOverlayOptions,
 	terminalCommand?: ResolvedTerminalCommand,
 	transientError?: string,
+	maxHeight?: number,
 ): string[] {
 	const innerW = width - 2;
 	const pad = (s: string, len: number) => {
 		const vis = visibleWidth(s);
 		return s + " ".repeat(Math.max(0, len - vis));
 	};
-	const row = (content: string) => theme.fg("border", "│") + pad(content, innerW) + theme.fg("border", "│");
+	const row = (content: string) => {
+		const truncated = truncateToWidth(content, innerW);
+		return theme.fg("border", "│") + pad(truncated, innerW) + theme.fg("border", "│");
+	};
 
-	if (runs.length === 0) return renderEmptyState(theme, width, options);
+	if (runs.length === 0) return renderEmptyState(theme, width, options, maxHeight);
 
 	const contentLines: string[] = [];
 	contentLines.push(` ${theme.fg("accent", "Subagents")} ${renderViewSwitch(theme, options)}`);
@@ -259,7 +301,22 @@ export function renderOverlay(
 	}
 	const switchHint = options?.view ? " · Tab/←/→ switch" : "";
 	const terminalHint = terminalCommand ? " · o open terminal" : "";
-	contentLines.push(truncateToWidth(` ${theme.fg("dim", `↑↓ navigate · Enter detail${switchHint}${terminalHint} · Esc close`)}`, innerW));
+	const navHint = truncateToWidth(` ${theme.fg("dim", `↑↓ navigate · Enter detail${switchHint}${terminalHint} · Esc close`)}`, innerW);
+	contentLines.push(navHint);
+	const errorRows = transientError ? 1 : 0;
+	const maxContentLines = maxHeight ? Math.max(0, maxHeight - 2 - errorRows) : undefined;
+	if (maxContentLines !== undefined && contentLines.length > maxContentLines) {
+		if (maxContentLines >= 2) {
+			const omitted = contentLines.length - maxContentLines;
+			const keep = Math.max(0, maxContentLines - 2);
+			contentLines.splice(keep, contentLines.length - keep, truncateToWidth(` ${theme.fg("dim", `… ${omitted} more rows hidden`)}`, innerW), navHint);
+		} else if (maxContentLines === 1) {
+			contentLines.length = 1;
+			contentLines[0] = navHint;
+		} else {
+			contentLines.length = 0;
+		}
+	}
 
 	const lines: string[] = [];
 	lines.push(theme.fg("border", `╭${"─".repeat(innerW)}╮`));
@@ -270,7 +327,7 @@ export function renderOverlay(
 		lines.push(row(theme.fg("error", ` ${truncateToWidth(transientError, innerW - 1)}`)));
 	}
 	lines.push(theme.fg("border", `╰${"─".repeat(innerW)}╯`));
-	return lines;
+	return capOverlayLines(lines, maxHeight);
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +500,7 @@ export class SubagentDetailPane {
 	private candidates: DetailPaneTarget[];
 	private candidateIndex: number;
 	private showThinking = false;
+	private showToolResults = false;
 	private detailView: "session" | "logs";
 	private detailViewExplicit = false;
 	private scrollOffset = 0;
@@ -553,7 +611,7 @@ export class SubagentDetailPane {
 		// Capture whether user was at bottom BEFORE content changes
 		const wasAtBottom = this.lastLineCount === 0 || this.scrollOffset >= Math.max(0, this.lastLineCount - this.viewportLines(this.lastRenderHeight));
 
-		const result = readSessionFile(sessionPath, this.theme, this.lastRenderWidth, this.showThinking);
+		const result = readSessionFile(sessionPath, this.theme, this.lastRenderWidth, this.showThinking, this.showToolResults);
 		if (result.error) {
 			// Preserve prior content during transient read errors (e.g., file
 			// temporarily empty during a model/tool-call transition) so the
@@ -567,9 +625,13 @@ export class SubagentDetailPane {
 			this.contentLines = result.lines;
 		}
 
-		// Auto-scroll to bottom on first load or if user was already at bottom
+		// Auto-scroll to bottom on first load or if user was already at bottom;
+		// otherwise clamp the offset in case filters shrink the visible content.
 		if (wasAtBottom) {
 			this.scrollToBottom();
+		} else {
+			const viewport = this.viewportLines(this.lastRenderHeight);
+			this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, this.contentLines.length - viewport));
 		}
 		this.lastLineCount = this.contentLines.length;
 		this.invalidate();
@@ -586,12 +648,20 @@ export class SubagentDetailPane {
 	}
 
 	private viewportLines(height: number): number {
-		// Account for header/footer borders: 5 lines (top border, header, separator, scroll hint, bottom border)
-		return Math.max(1, height - 5);
+		const needsHeader = height >= 4;
+		const needsSeparator = height >= 5;
+		const needsScrollHint = height >= 6;
+		const overhead = 2 + (needsHeader ? 1 : 0) + (needsSeparator ? 1 : 0) + (needsScrollHint ? 1 : 0);
+		return Math.max(0, height - overhead);
 	}
 
 	toggleThinking(): void {
 		this.showThinking = !this.showThinking;
+		this.refresh();
+	}
+
+	toggleToolResults(): void {
+		this.showToolResults = !this.showToolResults;
 		this.refresh();
 	}
 
@@ -622,6 +692,10 @@ export class SubagentDetailPane {
 
 	getShowThinking(): boolean {
 		return this.showThinking;
+	}
+
+	getShowToolResults(): boolean {
+		return this.showToolResults;
 	}
 
 	render(width: number, height: number): string[] {
@@ -660,7 +734,10 @@ export class SubagentDetailPane {
 			const vis = visibleWidth(s);
 			return s + " ".repeat(Math.max(0, len - vis));
 		};
-		const row = (content: string) => this.theme.fg("border", "│") + pad(content, innerW) + this.theme.fg("border", "│");
+		const row = (content: string) => {
+			const truncated = truncateToWidth(content, innerW);
+			return this.theme.fg("border", "│") + pad(truncated, innerW) + this.theme.fg("border", "│");
+		};
 
 		const lines: string[] = [];
 		const target = this.currentTarget();
@@ -669,30 +746,47 @@ export class SubagentDetailPane {
 		const titlePad = Math.max(0, innerW - visibleWidth(titleTrunc));
 		lines.push(this.theme.fg("border", "╭") + this.theme.fg("accent", titleTrunc) + this.theme.fg("border", "─".repeat(titlePad) + "╮"));
 
-		// Show view mode and thinking indicator in header
-		const viewStatus = this.theme.fg("dim", `view:${this.detailView}`);
-		const thinkingStatus = this.showThinking
-			? this.theme.fg("dim", "thinking:shown")
-			: this.theme.fg("dim", "thinking:hidden");
-		const hasMultiple = this.candidates.length > 1;
-		const navHint = hasMultiple ? ` · ←/→ ${this.candidateIndex + 1}/${this.candidates.length}` : "";
-		const terminalHint = this.terminalCommand ? " · o open terminal" : "";
-		const errorHint = this.transientError ? ` · ${this.transientError}` : "";
-		const headerLine = `${viewStatus} · ${thinkingStatus} ${this.theme.fg("dim", `· t think · l view · ↑↓${navHint}${terminalHint} · Esc`)}${this.theme.fg("error", errorHint)}`;
-		lines.push(row(truncateToWidth(headerLine, innerW)));
-		lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
+		const needsHeader = height >= 4;
+		const needsSeparator = height >= 5;
+		const needsScrollHint = height >= 6;
 
-		const contentHeight = Math.max(1, height - 5);
+		if (needsHeader) {
+			const viewStatus = this.theme.fg("dim", `view:${this.detailView}`);
+			const thinkingStatus = this.showThinking
+				? this.theme.fg("dim", "think:shown")
+				: this.theme.fg("dim", "think:hidden");
+			const toolStatus = this.showToolResults
+				? this.theme.fg("dim", "results:shown")
+				: this.theme.fg("dim", "results:hidden");
+			const hasMultiple = this.candidates.length > 1;
+			const navHint = hasMultiple ? ` · ←/→ ${this.candidateIndex + 1}/${this.candidates.length}` : "";
+			const terminalHint = this.terminalCommand ? " · o open terminal" : "";
+			const errorHint = this.transientError ? ` · ${this.transientError}` : "";
+			const headerLine = `${viewStatus} · ${thinkingStatus} · ${toolStatus}${terminalHint} ${this.theme.fg("dim", `· t/r/l · ↑↓${navHint} · Esc`)}${this.theme.fg("error", errorHint)}`;
+			lines.push(row(truncateToWidth(headerLine, innerW)));
+		}
+		if (needsSeparator) {
+			lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
+		}
+
+		const overhead = 2 + (needsHeader ? 1 : 0) + (needsSeparator ? 1 : 0) + (needsScrollHint ? 1 : 0);
+		const contentHeight = Math.max(0, height - overhead);
 
 		if (this.transientError) {
-			lines.push(row(this.theme.fg("error", ` ${truncateToWidth(this.transientError, innerW - 1)}`)));
-			for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+			if (contentHeight > 0) {
+				lines.push(row(this.theme.fg("error", ` ${truncateToWidth(this.transientError, innerW - 1)}`)));
+				for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+			}
 		} else if (this.error) {
-			lines.push(row(this.theme.fg("warning", ` ${this.error}`)));
-			for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+			if (contentHeight > 0) {
+				lines.push(row(this.theme.fg("warning", ` ${this.error}`)));
+				for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+			}
 		} else if (this.contentLines.length === 0) {
-			lines.push(row(this.theme.fg("dim", " No session content available yet.")));
-			for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+			if (contentHeight > 0) {
+				lines.push(row(this.theme.fg("dim", " No session content available yet.")));
+				for (let i = 1; i < contentHeight; i++) lines.push(row(""));
+			}
 		} else {
 			const visible = this.contentLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
 			for (let i = 0; i < contentHeight; i++) {
@@ -705,9 +799,17 @@ export class SubagentDetailPane {
 			}
 		}
 
-		const scrollHint = this.buildScrollHint();
-		lines.push(row(truncateToWidth(scrollHint, innerW)));
+		if (needsScrollHint) {
+			const scrollHint = this.buildScrollHint();
+			lines.push(row(truncateToWidth(scrollHint, innerW)));
+		}
 		lines.push(this.theme.fg("border", `╰${"─".repeat(innerW)}╯`));
+		// Safety: never exceed requested height, but preserve bottom border when possible
+		if (lines.length > height) {
+			const bottom = lines.pop()!;
+			lines.length = Math.max(0, height - 1);
+			if (height > 0) lines.push(bottom);
+		}
 		return lines;
 	}
 
@@ -889,6 +991,8 @@ export class SubagentsOverlay {
 			this.detailPane?.scrollDown();
 		} else if (data === "t" || data === "T") {
 			this.detailPane?.toggleThinking();
+		} else if (data === "r" || data === "R") {
+			this.detailPane?.toggleToolResults();
 		} else if (data === "l" || data === "L") {
 			this.detailPane?.toggleDetailView();
 		} else if (data === "o" || data === "O") {
@@ -969,7 +1073,7 @@ export class SubagentsOverlay {
 	}
 
 	render(width: number): string[] {
-		const height = process.stdout.rows || 24;
+		const height = resolveOverlayRenderHeight(process.stdout.rows || 24);
 		if (this.cachedLines && this.cachedWidth === width && this.cachedHeight === height) {
 			return this.cachedLines;
 		}
@@ -984,7 +1088,7 @@ export class SubagentsOverlay {
 				view: this.view,
 				runningCount: counts.running,
 				completedCount: counts.completed,
-			}, this.terminalCommand);
+			}, this.terminalCommand, undefined, height);
 		}
 		return this.cachedLines;
 	}
@@ -1022,7 +1126,7 @@ async function openSubagentsOverlay(
 			handleInput: (data: string) => overlay.handleInput(data),
 			dispose: () => overlay.dispose(),
 		};
-	}, { overlay: true });
+	}, { overlay: true, overlayOptions: SUBAGENTS_OVERLAY_OPTIONS });
 }
 
 export function registerSubagentsOverlayCommand(

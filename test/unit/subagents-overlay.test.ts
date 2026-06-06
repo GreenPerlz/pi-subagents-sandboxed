@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { renderOverlay, SubagentDetailPane, SubagentsOverlay, registerSubagentsOverlayShortcut, flattenRows } from "../../src/tui/subagents-overlay.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import type { OverlayRun } from "../../src/tui/run-tree-collector.ts";
 
 function tmpFile(content: string): string {
@@ -22,6 +23,17 @@ function tmpFile(content: string): string {
 
 function cleanup(p: string): void {
 	try { fs.unlinkSync(p); } catch { /* ignore */ }
+}
+
+function withStdoutRows<T>(rows: number, fn: () => T): T {
+	const original = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+	Object.defineProperty(process.stdout, "rows", { value: rows, configurable: true });
+	try {
+		return fn();
+	} finally {
+		if (original) Object.defineProperty(process.stdout, "rows", original);
+		else delete (process.stdout as { rows?: number }).rows;
+	}
 }
 
 const theme = {
@@ -372,6 +384,38 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		assert.strictEqual(pane.getShowThinking(), false, "thinking hidden after second toggle");
 	});
 
+	it("hides tool results by default and toggles them visible", () => {
+		const entries = JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "tc1", toolName: "bash", content: [{ type: "text", text: "noisy output" }], isError: false, timestamp: Date.now() } });
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "tool-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			assert.strictEqual(pane.getShowToolResults(), false, "tool results hidden by default");
+			let text = pane.render(WIDTH, 20).join("\n");
+			assert.ok(text.includes("results:hidden"), "header should show hidden tool-result state");
+			assert.ok(text.includes("Tool result: bash"), "should keep tool result header visible");
+			assert.ok(text.includes("hidden"), "should show hidden indicator");
+			assert.ok(!text.includes("noisy output"), "should hide tool output");
+
+			pane.toggleToolResults();
+			assert.strictEqual(pane.getShowToolResults(), true, "tool results shown after toggle");
+			text = pane.render(WIDTH, 20).join("\n");
+			assert.ok(text.includes("results:shown"), "header should show visible tool-result state");
+			assert.ok(text.includes("noisy output"), "should show tool output after toggle");
+		} finally {
+			cleanup(p);
+		}
+	});
+
 	it("scrolls independently within content", () => {
 		const run: OverlayRun = {
 			id: "scroll-run",
@@ -548,6 +592,294 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		for (const h of [10, 15, 20]) {
 			const lines = pane.render(80, h);
 			assert.strictEqual(lines.length, h, `error render(80, ${h}) should return exactly ${h} lines`);
+		}
+	});
+
+	it("caps overlay detail height to configured maxHeight so the bottom border remains visible", () => {
+		const entries = Array.from({ length: 80 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["run-tall", {
+						asyncId: "run-tall",
+						asyncDir: "/tmp/run-tall",
+						status: "running",
+						agents: ["worker"],
+						sessionFile: p,
+						steps: [{ agent: "worker", status: "running", sessionFile: p }],
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+			const keybindings = { matches: () => false } as never;
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+			try {
+				overlay.handleInput("\r");
+				const lines = withStdoutRows(50, () => overlay.render(200));
+				assert.strictEqual(lines.length, 40, "50-row terminal with 80% maxHeight should render 40 lines");
+				assert.ok(lines.every((line) => line.length === 200), "every detail row should fill the provided width exactly so stale session content is cleared");
+				assert.ok(lines.every((line) => visibleWidth(line) === 200), "every detail row visible width should equal the provided width");
+				assert.ok(lines[lines.length - 1]!.startsWith("╰"), "bottom border should be inside rendered lines");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("detail pane returns exactly requested height for small terminals including bottom border", () => {
+		const entries = Array.from({ length: 3 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const run: OverlayRun = {
+				id: "short-run",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: p,
+				steps: [],
+			};
+			const pane = new SubagentDetailPane(run, theme as never, () => {});
+			for (const h of [1, 2, 3, 4, 5, 6, 7]) {
+				const lines = pane.render(80, h);
+				assert.strictEqual(lines.length, h, `detail pane render(80, ${h}) should return exactly ${h} lines`);
+				assert.ok(lines[lines.length - 1]!.startsWith("╰"), `height ${h} should include bottom border`);
+				assert.ok(lines.every((line) => visibleWidth(line) === 80), `height ${h}: every row should fill width`);
+			}
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("detail pane returns exactly requested height for error state with small terminals", () => {
+		const run: OverlayRun = {
+			id: "err-run",
+			label: "single: worker",
+			state: "running",
+			mode: "single",
+			source: "async",
+			agents: ["worker"],
+			steps: [],
+		};
+		const pane = new SubagentDetailPane(run, theme as never, () => {});
+		for (const h of [1, 2, 3, 4, 5]) {
+			const lines = pane.render(80, h);
+			assert.strictEqual(lines.length, h, `error detail render(80, ${h}) should return exactly ${h} lines`);
+			assert.ok(lines[lines.length - 1]!.startsWith("╰"), `height ${h} should include bottom border`);
+			assert.ok(lines.every((line) => visibleWidth(line) === 80), `height ${h}: every row should fill width`);
+		}
+	});
+
+	it("caps overlay detail height for very short terminals matching TUI maxHeight", () => {
+		const entries = Array.from({ length: 10 }, (_, i) =>
+			JSON.stringify({ type: "message", id: String(i), parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `Msg${i}`, timestamp: Date.now() } })
+		).join("\n");
+		const p = tmpFile(entries);
+		try {
+			const state = {
+				baseCwd: "/tmp",
+				currentSessionId: null,
+				asyncJobs: new Map([
+					["run-short", {
+						asyncId: "run-short",
+						asyncDir: "/tmp/run-short",
+						status: "running",
+						agents: ["worker"],
+						sessionFile: p,
+						steps: [{ agent: "worker", status: "running", sessionFile: p }],
+					}],
+				]),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+				pendingForegroundControlNotices: new Map(),
+				cleanupTimers: new Map(),
+				lastUiContext: null,
+				poller: null,
+				completionSeen: new Map(),
+				watcher: null,
+				watcherRestartTimer: null,
+				resultFileCoalescer: { schedule: () => false, clear: () => {} },
+			};
+			const keybindings = { matches: () => false } as never;
+			const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+			try {
+				overlay.handleInput("\r");
+				// 5 rows * 80% = 4, max(1,4) = 4
+				const lines5 = withStdoutRows(5, () => overlay.render(200));
+				assert.strictEqual(lines5.length, 4, "5-row terminal with 80% maxHeight should render 4 lines");
+				assert.ok(lines5.every((line) => visibleWidth(line) === 200), "every row should fill width");
+				assert.ok(lines5[lines5.length - 1]!.startsWith("╰"), "bottom border should be visible");
+
+				// 7 rows * 80% = 5, max(1,5) = 5
+				const lines7 = withStdoutRows(7, () => overlay.render(200));
+				assert.strictEqual(lines7.length, 5, "7-row terminal with 80% maxHeight should render 5 lines");
+				assert.ok(lines7.every((line) => visibleWidth(line) === 200), "every row should fill width");
+				assert.ok(lines7[lines7.length - 1]!.startsWith("╰"), "bottom border should be visible");
+			} finally {
+				overlay.dispose();
+			}
+		} finally {
+			cleanup(p);
+		}
+	});
+
+	it("caps overlay list height for very short terminals matching TUI maxHeight", () => {
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map([
+				["run-short", {
+					asyncId: "run-short",
+					asyncDir: "/tmp/run-short",
+					status: "running",
+					agents: ["worker"],
+					steps: [{ agent: "worker", status: "running" }],
+				}],
+			]),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+		const keybindings = { matches: () => false } as never;
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+		try {
+			// 5 rows * 80% = 4, max(1,4) = 4
+			const lines5 = withStdoutRows(5, () => overlay.render(200));
+			assert.strictEqual(lines5.length, 4, "5-row terminal list should render 4 lines");
+			assert.ok(lines5.every((line) => visibleWidth(line) === 200), "every row should fill width");
+			assert.ok(lines5[lines5.length - 1]!.startsWith("╰"), "bottom border should be visible");
+
+			// 7 rows * 80% = 5, max(1,5) = 5
+			const lines7 = withStdoutRows(7, () => overlay.render(200));
+			assert.strictEqual(lines7.length, 5, "7-row terminal list should render 5 lines");
+			assert.ok(lines7.every((line) => visibleWidth(line) === 200), "every row should fill width");
+			assert.ok(lines7[lines7.length - 1]!.startsWith("╰"), "bottom border should be visible");
+		} finally {
+			overlay.dispose();
+		}
+	});
+
+	it("caps empty overlay height for very short terminals matching TUI maxHeight", () => {
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+		const keybindings = { matches: () => false } as never;
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+		try {
+			const lines5 = withStdoutRows(5, () => overlay.render(200));
+			assert.strictEqual(lines5.length, 4, "5-row terminal empty state should render 4 lines");
+			assert.ok(lines5.every((line) => visibleWidth(line) === 200), "every row should fill width");
+			assert.ok(lines5[lines5.length - 1]!.startsWith("╰"), "bottom border should be visible");
+
+			const lines7 = withStdoutRows(7, () => overlay.render(200));
+			assert.strictEqual(lines7.length, 5, "7-row terminal empty state should render 5 lines");
+			assert.ok(lines7.every((line) => visibleWidth(line) === 200), "every row should fill width");
+			assert.ok(lines7[lines7.length - 1]!.startsWith("╰"), "bottom border should be visible");
+		} finally {
+			overlay.dispose();
+		}
+	});
+
+	it("truncates narrow empty overlay rows to the provided width", () => {
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+		const keybindings = { matches: () => false } as never;
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+		try {
+			const lines = withStdoutRows(10, () => overlay.render(30));
+			assert.ok(lines.length <= 8, "10-row terminal should respect 80% maxHeight");
+			assert.ok(lines.every((line) => visibleWidth(line) === 30), "every empty row should fill but not exceed narrow width");
+			assert.ok(lines[lines.length - 1]!.startsWith("╰"), "bottom border should be visible");
+		} finally {
+			overlay.dispose();
+		}
+	});
+
+	it("truncates narrow detail error rows to the provided width", () => {
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map([
+				["run-no-session", {
+					asyncId: "run-no-session",
+					asyncDir: "/tmp/run-no-session",
+					status: "running",
+					agents: ["worker-with-long-name"],
+					steps: [{ agent: "worker-with-long-name", status: "running" }],
+				}],
+			]),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+		const keybindings = { matches: () => false } as never;
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, () => {}, keybindings);
+		try {
+			overlay.handleInput("\r");
+			const lines = withStdoutRows(5, () => overlay.render(30));
+			assert.strictEqual(lines.length, 4, "5-row terminal detail error should render 4 lines");
+			assert.ok(lines.every((line) => visibleWidth(line) === 30), "every detail error row should fill but not exceed narrow width");
+			assert.ok(lines[lines.length - 1]!.startsWith("╰"), "bottom border should be visible");
+		} finally {
+			overlay.dispose();
 		}
 	});
 

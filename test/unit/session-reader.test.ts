@@ -99,6 +99,24 @@ describe("session-reader", () => {
 				assert.ok(text.includes("Tool result"), "should show tool result header");
 				assert.ok(text.includes("bash"), "should show tool name");
 				assert.ok(text.includes("output"), "should show tool output");
+				const toolLines = result.lines.filter((l) => l.isToolResult);
+				assert.ok(toolLines.length > 0, "should mark tool result lines");
+			} finally {
+				cleanup(p);
+			}
+		});
+
+		it("hides tool result output when showToolResults is false", () => {
+			const content = JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "tc1", toolName: "bash", content: [{ type: "text", text: "very noisy output" }], isError: false, timestamp: Date.now() } });
+			const p = tmpFile(content);
+			try {
+				const result = readSessionFile(p, theme as never, 80, false, false);
+				assert.ok(!result.error);
+				const text = result.lines.map((l) => l.text).join("\n");
+				assert.ok(text.includes("Tool result"), "should keep tool result header");
+				assert.ok(text.includes("bash"), "should keep tool name");
+				assert.ok(text.includes("hidden"), "should show hidden indicator");
+				assert.ok(!text.includes("very noisy output"), "should hide tool output");
 			} finally {
 				cleanup(p);
 			}

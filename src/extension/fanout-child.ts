@@ -5,13 +5,20 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import { discoverAgents } from "../agents/agents.ts";
 import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
+import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
 import { readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
 import { loadConfig } from "./config.ts";
-import { type Details, type SubagentState } from "../shared/types.ts";
+import {
+	ASYNC_DIR,
+	SUBAGENT_ASYNC_STARTED_EVENT,
+	SUBAGENT_ASYNC_COMPLETE_EVENT,
+	 type Details,
+	 type SubagentState,
+} from "../shared/types.ts";
 
 function getSubagentSessionRoot(parentSessionFile: string | null): string {
 	if (parentSessionFile) {
@@ -45,6 +52,7 @@ function createChildSafeState(): SubagentState {
 			schedule: () => false,
 			clear: () => {},
 		},
+		asyncDuplicateConfirmations: new Map(),
 	};
 }
 
@@ -165,6 +173,10 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 			return executor.execute(id, params as SubagentParamsLike, signal, onUpdate, ctx);
 		},
 	};
+
+	const { handleStarted, handleComplete } = createAsyncJobTracker(pi, state, ASYNC_DIR);
+	pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted);
+	pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete);
 
 	pi.registerTool(tool);
 	startNestedControlInboxListener(pi, state);

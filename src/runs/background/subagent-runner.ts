@@ -128,6 +128,7 @@ interface SubagentRunConfig {
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
+	duplicateConfirmationReason?: string;
 	sandbox?: ResolvedSandboxConfig;
 	progressPaths?: string[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
@@ -1321,6 +1322,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		chainStepCount: steps.length,
 		parallelGroups,
 		workflowGraph: config.workflowGraph,
+		...(config.duplicateConfirmationReason ? { duplicateConfirmationReason: config.duplicateConfirmationReason } : {}),
 		steps: initialStatusSteps,
 		artifactsDir,
 		sessionDir: config.sessionDir,

@@ -261,6 +261,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			activeParallelGroup: Boolean(firstGroupCount && firstGroupCount > 0),
 			startedAt: now,
 			updatedAt: now,
+			...(info.duplicateFingerprint !== undefined ? { duplicateFingerprint: info.duplicateFingerprint } : {}),
+			...(info.duplicateConfirmationReason ? { duplicateConfirmationReason: info.duplicateConfirmationReason } : {}),
 		});
 		ensurePoller();
 		if (state.lastUiContext) {

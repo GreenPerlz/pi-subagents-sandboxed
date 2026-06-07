@@ -441,7 +441,7 @@ process.exit(child.status ?? 0);
 	});
 
 	it("prefers the parent session provider for ambiguous bare chain step models", async () => {
-		mockPi.onCall({ output: "Step 1 ran" });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Step 1 ran", "github-copilot/gpt-5-mini")] });
 		mockPi.onCall({ output: "Step 2 ran" });
 		const agents = [makeAgent("step1", { model: "gpt-5-mini" }), makeAgent("step2")];
 
@@ -503,6 +503,44 @@ process.exit(child.status ?? 0);
 			step2Task.includes("MARKER_ABC_123"),
 			`step 2 task should contain step 1 output via {previous}: ${step2Task.slice(0, 200)}`,
 		);
+	});
+
+	it("updates foregroundControl currentModel from runtime child result during live chain step", async () => {
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("read", { path: "package.json" }),
+				events.assistantMessage("step 1 output", "runtime/claude-sonnet"),
+			],
+		});
+		const agents = [makeAgent("step1", { model: "configured/claude-sonnet" })];
+		const foregroundControl = {
+			runId: "test-chain-model",
+			mode: "chain" as const,
+			startedAt: Date.now(),
+			updatedAt: Date.now(),
+			currentAgent: undefined as string | undefined,
+			currentIndex: undefined as number | undefined,
+			currentActivityState: undefined as string | undefined,
+		};
+		const liveModels: (string | undefined)[] = [];
+
+		await executeChain(
+			makeChainParams(
+				[{ agent: "step1", task: "Do step 1" }],
+				agents,
+				{
+					foregroundControl,
+					runId: "test-chain-model",
+					onUpdate: () => {
+						liveModels.push(foregroundControl.currentModel);
+					},
+				},
+			),
+		);
+
+		assert.ok(liveModels.includes("configured/claude-sonnet"), "foregroundControl should start with the configured fallback model");
+		assert.ok(liveModels.includes("runtime/claude-sonnet"), "live updates should replace the configured fallback with the runtime model");
+		assert.equal(foregroundControl.currentModel, "runtime/claude-sonnet");
 	});
 
 	it("passes named sequential outputs through {outputs.name}", async () => {

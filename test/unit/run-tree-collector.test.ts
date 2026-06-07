@@ -132,6 +132,8 @@ describe("collectRunTree", () => {
 			currentAgent: "worker",
 			mode: "single",
 			currentTool: "read",
+			currentModel: "review-model",
+			tokens: 1200,
 		});
 		const runs = collectRunTree(state);
 		assert.strictEqual(runs.length, 1);
@@ -141,10 +143,62 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.mode, "single");
 		assert.ok(runs[0]!.agents.includes("worker"));
 		assert.strictEqual(runs[0]!.currentTool, "read");
+		assert.strictEqual(runs[0]!.model, "review-model");
+		assert.deepStrictEqual(runs[0]!.tokens, { input: 0, output: 1200, total: 1200 });
 		// Should have a synthesized step
 		assert.strictEqual(runs[0]!.steps.length, 1);
 		assert.strictEqual(runs[0]!.steps[0]!.agent, "worker");
 		assert.strictEqual(runs[0]!.steps[0]!.currentTool, "read");
+		assert.strictEqual(runs[0]!.steps[0]!.model, "review-model");
+		assert.deepStrictEqual(runs[0]!.steps[0]!.tokens, { input: 0, output: 1200, total: 1200 });
+	});
+
+	it("shows runtime-resolved model on live foreground single run when agent has no configured model", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-runtime-model", {
+			currentAgent: "echo",
+			mode: "single",
+			currentModel: "runtime/gpt-4o",
+			tokens: 1500,
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.model, "runtime/gpt-4o");
+		assert.deepStrictEqual(runs[0]!.tokens, { input: 0, output: 1500, total: 1500 });
+		assert.strictEqual(runs[0]!.steps.length, 1);
+		assert.strictEqual(runs[0]!.steps[0]!.model, "runtime/gpt-4o");
+	});
+
+	it("shows runtime-resolved model on live foreground chain run", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-chain-runtime", {
+			currentAgent: "worker",
+			mode: "chain",
+			currentIndex: 1,
+			currentModel: "runtime/claude-sonnet",
+			tokens: 2000,
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.model, "runtime/claude-sonnet");
+		assert.strictEqual(runs[0]!.steps.length, 1);
+		assert.strictEqual(runs[0]!.steps[0]!.model, "runtime/claude-sonnet");
+	});
+
+	it("shows runtime-resolved model on live foreground parallel run", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-parallel-runtime", {
+			currentAgent: "reviewer",
+			mode: "parallel",
+			currentIndex: 0,
+			currentModel: "runtime/gpt-4o-mini",
+			tokens: 800,
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.model, "runtime/gpt-4o-mini");
+		assert.strictEqual(runs[0]!.steps.length, 1);
+		assert.strictEqual(runs[0]!.steps[0]!.model, "runtime/gpt-4o-mini");
 	});
 
 	it("propagates nested child sessionFile and asyncDir to live foreground run", () => {
@@ -389,6 +443,45 @@ describe("collectRunTree", () => {
 		assert.strictEqual(step.children[0]!.children[0]!.currentTool, "edit");
 	});
 
+	it("maps nested run model and tokens to overlay rows", () => {
+		const nested = makeNestedChild({
+			id: "nested-model",
+			parentRunId: "async-1",
+			depth: 1,
+			path: [{ runId: "async-1" }],
+			state: "running",
+			agent: "reviewer",
+			model: "claude-sonnet",
+			totalTokens: { input: 1000, output: 500, total: 1500 },
+			steps: [
+				{ agent: "reviewer", status: "running", model: "claude-sonnet", totalTokens: { input: 1000, output: 500, total: 1500 } },
+			],
+		});
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-1",
+			asyncDir: "/tmp/a1",
+			status: "running",
+			mode: "single",
+			agents: ["worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			steps: [
+				{ agent: "worker", status: "complete", index: 0, durationMs: 500 },
+				{ agent: "worker", status: "running", index: 1, children: [nested] },
+			],
+		});
+		const runs = collectRunTree(state);
+		const workerStep = runs[0]!.steps[1]!;
+		assert.strictEqual(workerStep.children.length, 1);
+		const nestedRow = workerStep.children[0]!;
+		assert.strictEqual(nestedRow.model, "claude-sonnet");
+		assert.deepStrictEqual(nestedRow.tokens, { input: 1000, output: 500, total: 1500 });
+		assert.strictEqual(nestedRow.steps?.length, 1);
+		assert.strictEqual(nestedRow.steps![0]!.model, "claude-sonnet");
+		assert.deepStrictEqual(nestedRow.steps![0]!.tokens, { input: 1000, output: 500, total: 1500 });
+	});
+
 	it("maps async state strings to overlay states", () => {
 		const state = baseState();
 		addAsyncJob(state, {
@@ -415,7 +508,8 @@ describe("collectRunTree", () => {
 		const state = baseState();
 		addForegroundRun(state, "fg-done", {
 			mode: "single",
-			children: [{ agent: "worker", index: 0, status: "completed", sessionFile: "/tmp/worker.jsonl" }],
+			children: [{ agent: "worker", index: 0, status: "completed", sessionFile: "/tmp/worker.jsonl", model: "done-model", totalTokens: { input: 10, output: 5, total: 15 } }],
+			nestedChildren: [makeNestedChild({ id: "nested-done", parentRunId: "fg-done", parentStepIndex: 0, state: "complete", agent: "reviewer", model: "review-model", totalTokens: { input: 4, output: 3, total: 7 } })],
 		});
 		const runs = collectRunTree(state);
 		assert.strictEqual(runs.length, 1);
@@ -424,9 +518,15 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.source, "foreground");
 		assert.strictEqual(runs[0]!.mode, "single");
 		assert.deepStrictEqual(runs[0]!.agents, ["worker"]);
+		assert.strictEqual(runs[0]!.model, "done-model");
+		assert.deepStrictEqual(runs[0]!.tokens, { input: 10, output: 5, total: 15 });
 		assert.strictEqual(runs[0]!.steps.length, 1);
 		assert.strictEqual(runs[0]!.steps[0]!.agent, "worker");
 		assert.strictEqual(runs[0]!.steps[0]!.state, "complete");
+		assert.strictEqual(runs[0]!.steps[0]!.model, "done-model");
+		assert.deepStrictEqual(runs[0]!.steps[0]!.tokens, { input: 10, output: 5, total: 15 });
+		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.id, "nested-done");
+		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.model, "review-model");
 		assert.strictEqual(runs[0]!.sessionFile, "/tmp/worker.jsonl");
 	});
 
@@ -660,7 +760,7 @@ describe("collectRunTree", () => {
 		assert.deepStrictEqual(runs.map((r) => r.id), ["fg-newest", "fg-newer", "fg-oldest"]);
 	});
 
-	it("ranks running, queued, failed, and paused before complete", () => {
+	it("sorts runs by start time latest first regardless of state", () => {
 		const state = baseState();
 		addAsyncJob(state, {
 			asyncId: "complete-1",
@@ -668,8 +768,8 @@ describe("collectRunTree", () => {
 			status: "complete",
 			mode: "single",
 			agents: ["a"],
-			startedAt: 100,
-			updatedAt: 200,
+			startedAt: 500,
+			updatedAt: 600,
 		});
 		addAsyncJob(state, {
 			asyncId: "paused-1",
@@ -677,8 +777,8 @@ describe("collectRunTree", () => {
 			status: "paused",
 			mode: "single",
 			agents: ["a"],
-			startedAt: 100,
-			updatedAt: 200,
+			startedAt: 400,
+			updatedAt: 600,
 		});
 		addAsyncJob(state, {
 			asyncId: "failed-1",
@@ -686,8 +786,8 @@ describe("collectRunTree", () => {
 			status: "failed",
 			mode: "single",
 			agents: ["a"],
-			startedAt: 100,
-			updatedAt: 200,
+			startedAt: 300,
+			updatedAt: 600,
 		});
 		addAsyncJob(state, {
 			asyncId: "queued-1",
@@ -695,8 +795,8 @@ describe("collectRunTree", () => {
 			status: "queued",
 			mode: "single",
 			agents: ["a"],
-			startedAt: 100,
-			updatedAt: 200,
+			startedAt: 200,
+			updatedAt: 600,
 		});
 		addAsyncJob(state, {
 			asyncId: "running-1",
@@ -705,15 +805,10 @@ describe("collectRunTree", () => {
 			mode: "single",
 			agents: ["a"],
 			startedAt: 100,
-			updatedAt: 200,
+			updatedAt: 600,
 		});
 		const runs = collectRunTree(state);
-		const ids = runs.map((r) => r.id);
-		assert.ok(ids.indexOf("running-1") < ids.indexOf("queued-1"), "running before queued");
-		assert.ok(ids.indexOf("queued-1") < ids.indexOf("failed-1"), "queued before failed");
-		assert.ok(ids.indexOf("queued-1") < ids.indexOf("paused-1"), "queued before paused");
-		assert.ok(ids.indexOf("failed-1") < ids.indexOf("complete-1"), "failed before complete");
-		assert.ok(ids.indexOf("paused-1") < ids.indexOf("complete-1"), "paused before complete");
+		assert.deepStrictEqual(runs.map((r) => r.id), ["complete-1", "paused-1", "failed-1", "queued-1", "running-1"]);
 	});
 
 	it("loads persisted completed async runs after in-memory cleanup and merges result paths", () => {
@@ -758,6 +853,34 @@ describe("collectRunTree", () => {
 			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
 			assert.strictEqual(runs[0]!.steps[0]!.artifactPath, artifactPath);
 			assert.strictEqual(runs[0]!.steps[0]!.sessionFile, sessionFile);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("carries persisted async step sessionFile from status into collected rows", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			const asyncDir = writePersistedAsyncStatus(asyncDirRoot, "persisted-step-session", {
+				runId: "persisted-step-session",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				lastUpdate: 2000,
+				steps: [{ agent: "worker", status: "complete", sessionFile: path.join(root, "worker-session.jsonl") }],
+			});
+			const sessionFile = path.join(root, "worker-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+
+			const runs = collectRunTree(state, 3000, { asyncDirRoot, resultsDir });
+
+			assert.strictEqual(runs[0]!.id, "persisted-step-session");
+			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
+			assert.strictEqual(runs[0]!.steps[0]!.sessionFile, sessionFile);
+			assert.strictEqual(runs[0]!.sessionFile, sessionFile);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

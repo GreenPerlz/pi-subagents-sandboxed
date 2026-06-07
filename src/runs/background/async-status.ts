@@ -162,6 +162,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.turnCount !== undefined ? { turnCount: step.turnCount } : {}),
 			...(step.toolCount !== undefined ? { toolCount: step.toolCount } : {}),
 			...(step.durationMs !== undefined ? { durationMs: step.durationMs } : {}),
+			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 			...(step.tokens ? { tokens: step.tokens } : {}),
 			...(step.skills ? { skills: step.skills } : {}),
 			...(step.model ? { model: step.model } : {}),

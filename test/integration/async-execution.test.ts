@@ -1103,7 +1103,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			}],
 			exitCode: 1,
 		});
-		mockPi.onCall({ output: "Recovered asynchronously" });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Recovered asynchronously", "anthropic/claude-sonnet-4:low")] });
 		const id = `async-fallback-${Date.now().toString(36)}`;
 		const sessionRoot = path.join(tempDir, "sessions");
 		const asyncDir = path.join(ASYNC_DIR, id);
@@ -1155,6 +1155,60 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(statusPayload.steps[0]?.tokens!.total > 0);
 		assert.match(fs.readFileSync(path.join(asyncDir, "output-0.log"), "utf-8"), /Recovered asynchronously/);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("background runs expose the runtime model in live status even without a configured model", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ delay: 200, jsonl: [events.toolStart("bash", { command: "sleep 1" })] },
+				{ delay: 300, jsonl: [events.assistantMessage("still working", "runtime/gpt-4o")] },
+				{ delay: 1200, jsonl: [events.toolEnd("bash"), events.toolResult("bash", "(no output)"), events.assistantMessage("done", "runtime/gpt-4o")] },
+			],
+		});
+		const id = `async-live-runtime-model-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Show the runtime model while still running",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const liveDeadline = Date.now() + 10_000;
+		let liveStatus: AsyncStatusPayload | undefined;
+		while (Date.now() < liveDeadline) {
+			const statusPath = path.join(asyncDir, "status.json");
+			if (fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (status.state === "running" && status.steps?.[0]?.model === "runtime/gpt-4o") {
+					liveStatus = status;
+					break;
+				}
+			}
+			assert.equal(fs.existsSync(resultPath), false, "run finished before live runtime model reached status.json");
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		assert.ok(liveStatus, "expected status.json to expose the runtime model before the run completed");
+		assert.equal(liveStatus?.steps?.[0]?.currentTool, "bash");
+
+		const doneDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > doneDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
 	});
 
 	it("background runs fail zero-exit provider errors when no fallback succeeds", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1501,7 +1555,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	});
 
 	it("background runs prefer the parent session provider for ambiguous bare model ids", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		mockPi.onCall({ output: "Done asynchronously" });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Done asynchronously", "github-copilot/gpt-5-mini")] });
 
 		const id = `async-provider-${Date.now().toString(36)}`;
 		const resultPath = path.join(RESULTS_DIR, `${id}.json`);

@@ -1585,6 +1585,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
 			appendRecentStepOutput(step, stripAcceptanceReport(extractTextFromContent(event.message.content)).split("\n").slice(-10));
+			if (event.message.model) step.model = event.message.model;
 			step.turnCount = (step.turnCount ?? 0) + 1;
 			const usage = event.message.usage;
 			if (usage) {

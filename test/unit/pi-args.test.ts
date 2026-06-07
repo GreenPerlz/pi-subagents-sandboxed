@@ -495,6 +495,38 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.deepEqual(JSON.parse(env[SUBAGENT_PARENT_PATH_ENV] ?? "[]"), [{ runId: "parent-run", stepIndex: 1 }]);
 		assert.equal(env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV], "token-1");
 		assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "extension", "fanout-child.ts"))));
+		assert.ok(args.includes("--no-extensions"), "fanout-authorized child should suppress ambient extension discovery to avoid tool conflicts");
+	});
+
+	it("suppresses ambient extension discovery for fanout-authorized children to prevent tool conflicts", () => {
+		const { args, env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["subagent"],
+		});
+
+		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
+		assert.equal(env[SUBAGENT_FANOUT_CHILD_ENV], "1");
+		assert.ok(args.includes("--no-extensions"), "fanout-authorized child must suppress ambient extension discovery");
+		assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "extension", "fanout-child.ts"))), "fanout-child.ts must be loaded via explicit --extension");
+		assert.ok(extensionArgs.some((arg) => arg.endsWith(path.join("src", "runs", "shared", "subagent-prompt-runtime.ts"))), "prompt runtime must still be loaded");
+	});
+
+	it("does not suppress ambient extension discovery for non-fanout children", () => {
+		const { args, env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["read", "bash"],
+		});
+
+		assert.equal(env[SUBAGENT_FANOUT_CHILD_ENV], "0");
+		assert.ok(!args.includes("--no-extensions"), "non-fanout children should allow ambient extension discovery");
 	});
 
 	it("clears all fanout routing env values for non-fanout children", () => {

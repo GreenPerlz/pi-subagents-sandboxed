@@ -6,6 +6,7 @@ import type { AsyncJobState, SubagentState } from "../../src/shared/types.ts";
 import {
 	createNestedRoute,
 	hasLiveNestedDescendants,
+	nestedSummaryFromAsyncStatus,
 	parseNestedEventRecords,
 	projectNestedEvents,
 	resolveNestedParentAddressFromEnv,
@@ -297,5 +298,75 @@ describe("nested event parsing and projection", () => {
 		})}\n{"type":"subagent.nested.started"`, route);
 		assert.equal(records.length, 1);
 		assert.equal(records[0]?.child.id, "jsonl-good");
+	});
+});
+
+describe("nestedSummaryFromAsyncStatus", () => {
+	it("carries model from the current step at top level and in steps", () => {
+		const status = {
+			runId: "run-1",
+			mode: "chain" as const,
+			state: "running" as const,
+			startedAt: 1000,
+			lastUpdate: 2000,
+			currentStep: 1,
+			steps: [
+				{ agent: "researcher", status: "complete" as const, model: "gpt-4" },
+				{ agent: "worker", status: "running" as const, model: "claude-sonnet", tokens: { input: 100, output: 50, total: 150 } },
+			],
+			totalTokens: { input: 200, output: 100, total: 300 },
+		};
+		const summary = nestedSummaryFromAsyncStatus(status, "/tmp/run-1", {
+			id: "run-1",
+			parentRunId: "parent-1",
+			depth: 1,
+			ts: 2000,
+		});
+		assert.equal(summary.model, "claude-sonnet");
+		assert.deepEqual(summary.totalTokens, { input: 200, output: 100, total: 300 });
+		assert.equal(summary.steps?.length, 2);
+		assert.equal(summary.steps?.[0]?.model, "gpt-4");
+		assert.equal(summary.steps?.[1]?.model, "claude-sonnet");
+		assert.deepEqual(summary.steps?.[1]?.totalTokens, { input: 100, output: 50, total: 150 });
+	});
+
+	it("falls back to first step with model when currentStep is undefined", () => {
+		const status = {
+			runId: "run-1",
+			mode: "single" as const,
+			state: "running" as const,
+			startedAt: 1000,
+			lastUpdate: 2000,
+			steps: [
+				{ agent: "worker", status: "running" as const, model: "gemini-pro" },
+			],
+		};
+		const summary = nestedSummaryFromAsyncStatus(status, "/tmp/run-1", {
+			id: "run-1",
+			parentRunId: "parent-1",
+			depth: 1,
+			ts: 2000,
+		});
+		assert.equal(summary.model, "gemini-pro");
+	});
+
+	it("omits model when no step has a model", () => {
+		const status = {
+			runId: "run-1",
+			mode: "single" as const,
+			state: "running" as const,
+			startedAt: 1000,
+			lastUpdate: 2000,
+			steps: [
+				{ agent: "worker", status: "running" as const },
+			],
+		};
+		const summary = nestedSummaryFromAsyncStatus(status, "/tmp/run-1", {
+			id: "run-1",
+			parentRunId: "parent-1",
+			depth: 1,
+			ts: 2000,
+		});
+		assert.equal(summary.model, undefined);
 	});
 });

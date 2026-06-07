@@ -609,7 +609,7 @@ async function runSingleAttempt(
 						result.usage.cost += u.cost?.total || 0;
 						progress.tokens = result.usage.input + result.usage.output;
 					}
-					if (!result.model && evt.message.model) result.model = evt.message.model;
+					if (evt.message.model) result.model = evt.message.model;
 					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
 					const assistantText = extractTextFromContent(evt.message.content);
 					appendRecentOutput(progress, assistantText.split("\n").slice(-10));

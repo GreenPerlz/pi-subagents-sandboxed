@@ -662,21 +662,18 @@ process.exit(${exitCode});
 		assert.equal(output, "Got it");
 	});
 
-	it("uses agent model config", async () => {
-		mockPi.onCall({ output: "Done" });
+	it("uses runtime child model metadata when it matches the configured agent model", async () => {
+		mockPi.onCall({ jsonl: [events.assistantMessage("Done", "anthropic/claude-sonnet-4")] });
 		const agents = [makeAgent("echo", { model: "anthropic/claude-sonnet-4" })];
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {});
 
 		assert.equal(result.exitCode, 0);
-		// result.model is set from agent config via applyThinkingSuffix, then
-		// overwritten by the first message_end event only if result.model is unset.
-		// Since agent has model config, it stays as the configured value.
 		assert.equal(result.model, "anthropic/claude-sonnet-4");
 	});
 
 	it("model override from options takes precedence", async () => {
-		mockPi.onCall({ output: "Done" });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Done", "openai/gpt-4o")] });
 		const agents = [makeAgent("echo", { model: "anthropic/claude-sonnet-4" })];
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {
@@ -688,7 +685,7 @@ process.exit(${exitCode});
 	});
 
 	it("prefers the parent session provider for ambiguous bare model ids", async () => {
-		mockPi.onCall({ output: "Done" });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Done", "github-copilot/gpt-5-mini")] });
 		const agents = [makeAgent("echo", { model: "gpt-5-mini" })];
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {
@@ -729,7 +726,7 @@ process.exit(${exitCode});
 			}],
 			exitCode: 1,
 		});
-		mockPi.onCall({ output: "Recovered on fallback" });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Recovered on fallback", "anthropic/claude-sonnet-4")] });
 		const agents = [makeAgent("echo", {
 			model: "openai/gpt-5-mini",
 			fallbackModels: ["anthropic/claude-sonnet-4"],
@@ -763,7 +760,7 @@ process.exit(${exitCode});
 			}],
 			exitCode: 0,
 		});
-		mockPi.onCall({ output: "Recovered on fallback" });
+		mockPi.onCall({ jsonl: [events.assistantMessage("Recovered on fallback", "anthropic/claude-sonnet-4")] });
 		const agents = [makeAgent("echo", {
 			model: "openai/gpt-5-mini",
 			fallbackModels: ["anthropic/claude-sonnet-4"],
@@ -1012,6 +1009,48 @@ process.exit(${exitCode});
 		assert.equal(typeof runningToolUpdate?.details?.progress?.[0]?.currentToolStartedAt, "number");
 		assert.equal(typeof result.progress.lastActivityAt, "number");
 		assert.equal(result.progress.currentToolStartedAt, undefined);
+	});
+
+	it("updates foregroundControl currentModel from runtime child result during live single run", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("read", { path: "package.json" })] },
+				{ delay: 100, jsonl: [events.assistantMessage("first", "runtime/gpt-4o"), events.assistantMessage("second", "runtime/gpt-4o")] },
+			],
+		});
+		const state = {
+			baseCwd: tempDir,
+			currentSessionId: null,
+			asyncJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		};
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents: [makeAgent("echo", { model: "configured/gpt-4o-mini" })] }),
+		});
+		const currentControl = () => [...state.foregroundControls.values()][0];
+		const liveModels: (string | undefined)[] = [];
+		const executePromise = executor.execute(
+			"single-runtime-model",
+			{ agent: "echo", task: "Task" },
+			new AbortController().signal,
+			() => {
+				liveModels.push(currentControl()?.currentModel);
+			},
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(currentControl()?.currentModel, "configured/gpt-4o-mini", "foregroundControl should start with the configured fallback model");
+		await executePromise;
+
+		assert.ok(liveModels.includes("runtime/gpt-4o"), "live updates should replace the configured fallback with the runtime model");
+		assert.equal(liveModels.at(-1), "runtime/gpt-4o");
 	});
 
 	it("sets progress.status to failed on non-zero exit", async () => {

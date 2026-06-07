@@ -46,7 +46,7 @@ function nestedChildToRun(parent: OverlayRun, child: OverlayNestedChild): Overla
 		agents: [child.agent],
 		elapsed: child.elapsed,
 		currentTool: child.currentTool,
-		sessionFile: child.sessionFile,
+		sessionFile: nestedChildSessionFile(child),
 		logPath: child.logPath,
 		artifactPath: child.artifactPath,
 		asyncDir: child.asyncDir,
@@ -157,12 +157,41 @@ function indent(depth: number): string {
 	return "  ".repeat(depth);
 }
 
-function pathDetail(input: { sessionFile?: string; logPath?: string; artifactPath?: string; asyncDir?: string }, theme: Theme): string {
+function pathParts(input: { sessionFile?: string; logPath?: string; artifactPath?: string; asyncDir?: string }): string[] {
 	const parts: string[] = [];
 	if (input.sessionFile) parts.push(`session ${input.sessionFile}`);
 	if (input.logPath && input.logPath !== input.artifactPath) parts.push(`log ${input.logPath}`);
 	if (input.artifactPath) parts.push(`artifact ${input.artifactPath}`);
 	if (input.asyncDir && input.asyncDir !== input.artifactPath && input.asyncDir !== input.logPath) parts.push(`dir ${input.asyncDir}`);
+	return parts;
+}
+
+function pathDetail(input: { sessionFile?: string; logPath?: string; artifactPath?: string; asyncDir?: string }, theme: Theme): string {
+	const parts = pathParts(input);
+	return parts.length ? theme.fg("dim", ` · ${parts.join(" · ")}`) : "";
+}
+
+function formatStartTime(ts: number | undefined): string | undefined {
+	return ts ? new Date(ts).toISOString().replace("T", " ").slice(0, 19) : undefined;
+}
+
+function formatTokenTotal(tokens: { total?: number } | undefined): string | undefined {
+	const total = tokens?.total;
+	if (total === undefined) return undefined;
+	if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(1)}M tokens`;
+	if (total >= 1_000) return `${(total / 1_000).toFixed(1)}k tokens`;
+	return `${total} tokens`;
+}
+
+function overviewMeta(input: { currentTool?: string; elapsed?: string; startedAt?: number; model?: string; tokens?: { total?: number } }, theme: Theme): string {
+	const parts: string[] = [];
+	if (input.currentTool) parts.push(input.currentTool);
+	if (input.elapsed) parts.push(`ran ${input.elapsed}`);
+	const start = formatStartTime(input.startedAt);
+	if (start) parts.push(`started ${start}`);
+	if (input.model) parts.push(`model ${input.model}`);
+	const tokenTotal = formatTokenTotal(input.tokens);
+	if (tokenTotal) parts.push(tokenTotal);
 	return parts.length ? theme.fg("dim", ` · ${parts.join(" · ")}`) : "";
 }
 
@@ -181,17 +210,34 @@ function renderNestedChildren(
 ): void {
 	for (const child of children) {
 		if (lines.length > 200) return; // line budget
+		if (isSoloNestedChildHeaderRedundant(child)) {
+			const onlyStep = child.steps![0]!;
+			const mergedStep: OverlayStep = {
+				...onlyStep,
+				currentTool: onlyStep.currentTool ?? child.currentTool,
+				elapsed: onlyStep.elapsed ?? child.elapsed,
+				startedAt: onlyStep.startedAt ?? child.startedAt,
+				model: onlyStep.model ?? child.model,
+				tokens: onlyStep.tokens ?? child.tokens,
+				sessionFile: onlyStep.sessionFile ?? nestedChildSessionFile(child),
+				logPath: onlyStep.logPath ?? child.logPath,
+				artifactPath: onlyStep.artifactPath ?? child.artifactPath,
+				asyncDir: onlyStep.asyncDir ?? child.asyncDir,
+			};
+			renderStep(mergedStep, 0, child.mode ?? "single", theme, width, depth, lines, selectedRowIndex, counter);
+			if (child.children.length) renderNestedChildren(child.children, theme, width, depth + 1, lines, selectedRowIndex, counter);
+			continue;
+		}
 		const prefix = indent(depth);
 		const selector = counter.index === selectedRowIndex ? theme.fg("accent", "> ") : "  ";
 		const glyph = stateGlyph(child.state, theme);
-		const tool = child.currentTool ? theme.fg("dim", ` · ${child.currentTool}`) : "";
-		const elapsed = child.elapsed ? theme.fg("dim", ` · ${child.elapsed}`) : "";
-		const line = `${selector}${prefix}${glyph} ${child.agent} ${stateLabel(child.state, theme)} · ${child.id}${tool}${elapsed}${pathDetail(child, theme)}`;
+		const meta = overviewMeta(child, theme);
+		const line = `${selector}${prefix}${glyph} ${child.agent} ${stateLabel(child.state, theme)} · ${child.id}${meta}`;
 		lines.push(truncateToWidth(line, width));
 		counter.index++;
 		if (child.steps?.length) {
 			for (const [stepIndex, step] of child.steps.entries()) {
-				renderStep(step, stepIndex, theme, width, depth + 1, lines, selectedRowIndex, counter);
+				renderStep(step, stepIndex, child.mode ?? "single", theme, width, depth + 1, lines, selectedRowIndex, counter);
 			}
 		}
 		if (child.children.length) {
@@ -200,30 +246,52 @@ function renderNestedChildren(
 	}
 }
 
-function renderStep(step: OverlayStep, stepIndex: number, theme: Theme, width: number, depth: number, lines: string[], selectedRowIndex: number, counter: RowCounter): void {
+function isSoloAsyncRunHeaderRedundant(run: OverlayRun): boolean {
+	const onlyStep = run.steps.length === 1 ? run.steps[0] : undefined;
+	return run.source === "async"
+		&& run.mode === "single"
+		&& onlyStep !== undefined
+		&& onlyStep.agent === (run.agents[0] ?? run.id);
+}
+
+function isSoloNestedChildHeaderRedundant(child: OverlayNestedChild): boolean {
+	const onlyStep = child.steps?.length === 1 ? child.steps[0] : undefined;
+	return (child.mode === undefined || child.mode === "single")
+		&& onlyStep !== undefined
+		&& onlyStep.agent === child.agent;
+}
+
+function groupRunLabel(run: OverlayRun): string {
+	const agents = run.agents.length <= 3
+		? run.agents.join(", ")
+		: `${run.agents.slice(0, 2).join(", ")} +${run.agents.length - 2}`;
+	if (run.mode === "chain" || run.mode === "parallel") return `${run.mode}(${agents || run.id})`;
+	return agents || run.id;
+}
+
+function renderStep(step: OverlayStep, stepIndex: number, parentMode: OverlayRun["mode"] | undefined, theme: Theme, width: number, depth: number, lines: string[], selectedRowIndex: number, counter: RowCounter): void {
 	const prefix = indent(depth);
 	const selector = counter.index === selectedRowIndex ? theme.fg("accent", "> ") : "  ";
 	const glyph = stateGlyph(step.state, theme);
-	const stepNum = `${stepIndex + 1}.`;
-	const tool = step.currentTool ? theme.fg("dim", ` · ${step.currentTool}`) : "";
-	const elapsed = step.elapsed ? theme.fg("dim", ` · ${step.elapsed}`) : "";
-	const line = `${selector}${prefix}${glyph} ${stepNum} ${step.agent} ${stateLabel(step.state, theme)}${tool}${elapsed}${pathDetail(step, theme)}`;
+	const stepMarker = parentMode === "chain" ? `${stepIndex + 1}.` : "*";
+	const meta = overviewMeta(step, theme);
+	const line = `${selector}${prefix}${glyph} ${stepMarker} ${step.agent} ${stateLabel(step.state, theme)}${meta}`;
 	lines.push(truncateToWidth(line, width));
 	counter.index++;
 	renderNestedChildren(step.children, theme, width, depth + 1, lines, selectedRowIndex, counter);
 }
 
 function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[], selectedRowIndex: number, counter: RowCounter): void {
+	if (isSoloAsyncRunHeaderRedundant(run)) {
+		renderStep(run.steps[0]!, 0, run.mode, theme, width, 0, lines, selectedRowIndex, counter);
+		return;
+	}
 	const glyph = stateGlyph(run, theme);
 	const badge = sourceBadge(run.source, theme);
-	const elapsed = run.elapsed ? theme.fg("dim", ` · ${run.elapsed}`) : "";
-	const agents = run.agents.length <= 3
-		? run.agents.join(", ")
-		: `${run.agents.slice(0, 2).join(", ")} +${run.agents.length - 2}`;
-	const modePrefix = run.mode !== "single" ? `${run.mode}: ` : "";
+	const label = groupRunLabel(run);
 	const selector = counter.index === selectedRowIndex ? theme.fg("accent", "> ") : "  ";
-	const tool = run.currentTool ? theme.fg("dim", ` · ${run.currentTool}`) : "";
-	const header = `${selector}${glyph} ${modePrefix}${agents || run.id} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${tool}${elapsed}${pathDetail(run, theme)}`;
+	const meta = overviewMeta(run, theme);
+	const header = `${selector}${glyph} ${label} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${meta}`;
 	lines.push(truncateToWidth(header, width));
 	counter.index++;
 	for (const [stepIndex, step] of run.steps.entries()) {
@@ -241,7 +309,7 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 			}
 			continue;
 		}
-		renderStep(step, stepIndex, theme, width, 1, lines, selectedRowIndex, counter);
+		renderStep(step, stepIndex, run.mode, theme, width, 1, lines, selectedRowIndex, counter);
 	}
 }
 
@@ -384,6 +452,12 @@ interface DetailPaneTarget {
 	asyncDir?: string;
 }
 
+function nestedChildSessionFile(child: OverlayNestedChild): string | undefined {
+	return child.sessionFile
+		?? (child.steps?.length === 1 ? child.steps[0]?.sessionFile : undefined)
+		?? (child.children.length === 1 ? nestedChildSessionFile(child.children[0]!) : undefined);
+}
+
 function buildDetailTargets(run: OverlayRun): DetailPaneTarget[] {
 	const targets: DetailPaneTarget[] = [];
 	targets.push({
@@ -410,7 +484,7 @@ function buildDetailTargets(run: OverlayRun): DetailPaneTarget[] {
 			acc.push({
 				id: child.id,
 				label: prefix ? `${prefix} → ${child.agent}` : child.agent,
-				sessionFile: child.sessionFile,
+				sessionFile: nestedChildSessionFile(child),
 				logPath: child.logPath,
 				artifactPath: child.artifactPath,
 				asyncDir: child.asyncDir,
@@ -451,18 +525,20 @@ export interface FlattenedRow {
 export function flattenRows(runs: OverlayRun[]): FlattenedRow[] {
 	const rows: FlattenedRow[] = [];
 	for (const run of runs) {
-		rows.push({
-			type: "run",
-			run,
-			target: {
-				id: run.id,
-				label: run.agents.join(", ") || run.id,
-				sessionFile: run.sessionFile,
-				logPath: run.logPath,
-				artifactPath: run.artifactPath,
-				asyncDir: run.asyncDir,
-			},
-		});
+		if (!isSoloAsyncRunHeaderRedundant(run)) {
+			rows.push({
+				type: "run",
+				run,
+				target: {
+					id: run.id,
+					label: run.agents.join(", ") || run.id,
+					sessionFile: run.sessionFile,
+					logPath: run.logPath,
+					artifactPath: run.artifactPath,
+					asyncDir: run.asyncDir,
+				},
+			});
+		}
 		for (const [stepIndex, step] of run.steps.entries()) {
 			const isRedundant =
 				run.source === "foreground" &&
@@ -496,20 +572,22 @@ export function flattenRows(runs: OverlayRun[]): FlattenedRow[] {
 function flattenNestedChildren(children: OverlayNestedChild[], run: OverlayRun, rows: FlattenedRow[], prefix: string): void {
 	for (const child of children) {
 		const childLabel = prefix ? `${prefix} → ${child.agent}` : child.agent;
-		rows.push({
-			type: "nested",
-			run,
-			nestedChild: child,
-			target: {
-				id: child.id,
-				label: childLabel,
-				sessionFile: child.sessionFile,
-				logPath: child.logPath,
-				artifactPath: child.artifactPath,
-				asyncDir: child.asyncDir,
-			},
-		});
 		const childPrefix = childLabel;
+		if (!isSoloNestedChildHeaderRedundant(child)) {
+			rows.push({
+				type: "nested",
+				run,
+				nestedChild: child,
+				target: {
+					id: child.id,
+					label: childLabel,
+					sessionFile: nestedChildSessionFile(child),
+					logPath: child.logPath,
+					artifactPath: child.artifactPath,
+					asyncDir: child.asyncDir,
+				},
+			});
+		}
 		if (child.steps) {
 			for (const [stepIndex, step] of child.steps.entries()) {
 				const stepLabel = `${childPrefix} → ${step.agent} (step ${stepIndex + 1})`;
@@ -689,10 +767,12 @@ export class SubagentDetailPane {
 	}
 
 	private viewportLines(height: number): number {
+		const targetPaths = pathParts(this.currentTarget());
 		const needsHeader = height >= 4;
-		const needsSeparator = height >= 5;
-		const needsScrollHint = height >= 6;
-		const overhead = 2 + (needsHeader ? 1 : 0) + (needsSeparator ? 1 : 0) + (needsScrollHint ? 1 : 0);
+		const needsPathHeader = targetPaths.length > 0 && height >= 5;
+		const needsSeparator = height >= (needsPathHeader ? 6 : 5);
+		const needsScrollHint = height >= (needsPathHeader ? 7 : 6);
+		const overhead = 2 + (needsHeader ? 1 : 0) + (needsPathHeader ? 1 : 0) + (needsSeparator ? 1 : 0) + (needsScrollHint ? 1 : 0);
 		return Math.max(0, height - overhead);
 	}
 
@@ -787,9 +867,11 @@ export class SubagentDetailPane {
 		const titlePad = Math.max(0, innerW - visibleWidth(titleTrunc));
 		lines.push(this.theme.fg("border", "╭") + this.theme.fg("accent", titleTrunc) + this.theme.fg("border", "─".repeat(titlePad) + "╮"));
 
+		const targetPaths = pathParts(target);
 		const needsHeader = height >= 4;
-		const needsSeparator = height >= 5;
-		const needsScrollHint = height >= 6;
+		const needsPathHeader = targetPaths.length > 0 && height >= 5;
+		const needsSeparator = height >= (needsPathHeader ? 6 : 5);
+		const needsScrollHint = height >= (needsPathHeader ? 7 : 6);
 
 		if (needsHeader) {
 			const viewStatus = this.theme.fg("dim", `view:${this.detailView}`);
@@ -806,11 +888,14 @@ export class SubagentDetailPane {
 			const headerLine = `${viewStatus} · ${thinkingStatus} · ${toolStatus}${terminalHint} ${this.theme.fg("dim", `· t/r/l · ↑↓${navHint} · Esc`)}${this.theme.fg("error", errorHint)}`;
 			lines.push(row(truncateToWidth(headerLine, innerW)));
 		}
+		if (needsPathHeader) {
+			lines.push(row(this.theme.fg("dim", `files · ${targetPaths.join(" · ")}`)));
+		}
 		if (needsSeparator) {
 			lines.push(row(this.theme.fg("border", "─".repeat(innerW))));
 		}
 
-		const overhead = 2 + (needsHeader ? 1 : 0) + (needsSeparator ? 1 : 0) + (needsScrollHint ? 1 : 0);
+		const overhead = 2 + (needsHeader ? 1 : 0) + (needsPathHeader ? 1 : 0) + (needsSeparator ? 1 : 0) + (needsScrollHint ? 1 : 0);
 		const contentHeight = Math.max(0, height - overhead);
 
 		if (this.transientError) {

@@ -21,6 +21,7 @@ import {
 	type NestedStepSummary,
 	type SubagentRunMode,
 	type SubagentState,
+	type TokenUsage,
 } from "../shared/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,9 @@ export interface OverlayNestedChild {
 	mode?: SubagentRunMode;
 	currentTool?: string;
 	elapsed?: string;
+	startedAt?: number;
+	model?: string;
+	tokens?: TokenUsage;
 	sessionFile?: string;
 	logPath?: string;
 	artifactPath?: string;
@@ -49,6 +53,9 @@ export interface OverlayStep {
 	state: OverlayRunState;
 	currentTool?: string;
 	elapsed?: string;
+	startedAt?: number;
+	model?: string;
+	tokens?: TokenUsage;
 	sessionFile?: string;
 	logPath?: string;
 	artifactPath?: string;
@@ -67,6 +74,8 @@ export interface OverlayRun {
 	startedAt?: number;
 	updatedAt?: number;
 	currentTool?: string;
+	model?: string;
+	tokens?: TokenUsage;
 	sessionFile?: string;
 	logPath?: string;
 	artifactPath?: string;
@@ -147,9 +156,41 @@ function elapsedFromRange(start: number | undefined, end: number | undefined, no
 	return elapsedFromMs((end ?? now) - start);
 }
 
+function approximateTokenUsage(total: number | undefined): TokenUsage | undefined {
+	return typeof total === "number" && Number.isFinite(total) && total > 0
+		? { input: 0, output: total, total }
+		: undefined;
+}
+
+function sumTokenUsage(values: Array<TokenUsage | undefined>): TokenUsage | undefined {
+	let input = 0;
+	let output = 0;
+	let total = 0;
+	let seen = false;
+	for (const value of values) {
+		if (!value) continue;
+		input += value.input;
+		output += value.output;
+		total += value.total;
+		seen = true;
+	}
+	return seen ? { input, output, total } : undefined;
+}
+
 function mapNestedStepChildren(children: NestedRunSummary[] | undefined): OverlayNestedChild[] {
 	if (!children?.length) return [];
 	return children.map(mapNestedRun);
+}
+
+function inferSessionFileFromAsyncDir(asyncDir: string | undefined): string | undefined {
+	return fileIfExists(asyncDir ? path.join(asyncDir, "session.jsonl") : undefined);
+}
+
+function inferNestedSessionFile(run: NestedRunSummary, steps: OverlayStep[], directChildren: OverlayNestedChild[]): string | undefined {
+	return run.sessionFile
+		?? (steps.length === 1 ? steps[0]?.sessionFile : undefined)
+		?? inferSessionFileFromAsyncDir(run.asyncDir)
+		?? (directChildren.length === 1 ? directChildren[0]?.sessionFile : undefined);
 }
 
 function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
@@ -158,6 +199,9 @@ function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
 		state: mapState(step.status),
 		currentTool: step.currentTool,
 		elapsed: elapsedFromRange(step.startedAt, step.endedAt),
+		startedAt: step.startedAt,
+		model: step.model,
+		tokens: step.totalTokens,
 		sessionFile: step.sessionFile,
 		children: mapNestedStepChildren(step.children),
 	}));
@@ -169,7 +213,10 @@ function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
 		mode: run.mode,
 		currentTool: run.currentTool,
 		elapsed: elapsedFromRange(run.startedAt, run.endedAt),
-		sessionFile: run.sessionFile,
+		startedAt: run.startedAt,
+		model: run.model,
+		tokens: run.totalTokens,
+		sessionFile: inferNestedSessionFile(run, steps, directChildren),
 		asyncDir: run.asyncDir,
 		children: directChildren,
 		steps: steps.length ? steps : undefined,
@@ -313,6 +360,10 @@ function sessionFileFromResult(result: PersistedResultRecord | undefined): strin
 	return result?.sessionFile ?? result?.children.find((child) => child.sessionFile)?.sessionFile;
 }
 
+function sessionFileFromSoloStep(steps: OverlayStep[]): string | undefined {
+	return steps.length === 1 ? steps[0]?.sessionFile : undefined;
+}
+
 function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedResultRecord | undefined, now: number): OverlayRun {
 	const agents = agentsLabel(run.steps.map((step) => step.agent));
 	if (!agents.length) {
@@ -329,6 +380,9 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 			state: mapState(step.status),
 			currentTool: step.currentTool,
 			elapsed: elapsedFromMs(step.durationMs),
+			startedAt: step.startedAt,
+			model: step.model,
+			tokens: step.tokens,
 			sessionFile: step.sessionFile ?? resultChild?.sessionFile,
 			logPath: logPathForStep(run.asyncDir, step.index),
 			artifactPath: resultChild?.artifactPath,
@@ -348,7 +402,8 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 		elapsed,
 		startedAt: run.startedAt,
 		updatedAt: run.lastUpdate ?? run.endedAt ?? run.startedAt,
-		sessionFile: run.sessionFile ?? sessionFileFromResult(result),
+		tokens: run.totalTokens,
+		sessionFile: run.sessionFile ?? sessionFileFromSoloStep(steps) ?? sessionFileFromResult(result),
 		logPath: logPathForRun(run.asyncDir, formatAsyncRunOutputPath(run)),
 		artifactPath: artifactPathFromResult(result),
 		asyncDir: run.asyncDir,
@@ -407,6 +462,9 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 				state: mapState(child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" ? child.status : "running"),
 				currentTool: ctrl.currentIndex === index ? ctrl.currentTool : undefined,
 				elapsed: stepElapsed,
+				startedAt: ctrl.startedAt,
+				model: ctrl.currentIndex === index ? ctrl.currentModel ?? child.model : child.model,
+				tokens: ctrl.currentIndex === index ? approximateTokenUsage(ctrl.tokens) ?? child.totalTokens : child.totalTokens,
 				sessionFile: child.sessionFile,
 				artifactPath: child.artifactPath,
 				children: stepNested.map(mapNestedRun),
@@ -423,6 +481,9 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 				state: "running",
 				currentTool: ctrl.currentTool,
 				elapsed,
+				startedAt: ctrl.startedAt,
+				model: ctrl.currentModel,
+				tokens: approximateTokenUsage(ctrl.tokens),
 				sessionFile: ctrl.sessionFile,
 				children: currentStepNested.map(mapNestedRun),
 			});
@@ -442,6 +503,8 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			startedAt: ctrl.startedAt,
 			updatedAt: ctrl.updatedAt,
 			currentTool: ctrl.currentTool,
+			model: ctrl.currentModel ?? childInfo.find((child) => child.model)?.model,
+			tokens: approximateTokenUsage(ctrl.tokens) ?? sumTokenUsage(childInfo.map((child) => child.totalTokens)),
 			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile ?? ctrl.sessionFile ?? nestedSessionFile,
 			artifactPath: childInfo.find((child) => child.artifactPath)?.artifactPath,
 			asyncDir: nestedAsyncDir,
@@ -475,24 +538,32 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 		const agents = run.children.map((c) => c.agent);
 		const elapsed = elapsedFromRange(run.startedAt, run.updatedAt, now);
 
-		const steps: OverlayStep[] = run.children.map((child) => ({
+		const nestedChildren = (run.nestedChildren ?? []).map(mapNestedRun);
+		const steps: OverlayStep[] = run.children.map((child, index) => ({
 			agent: child.agent,
 			state: mapState(child.status),
+			model: child.model,
+			tokens: child.totalTokens,
 			sessionFile: child.sessionFile,
 			artifactPath: child.artifactPath,
-			children: [],
+			children: nestedChildren.filter((nested) => run.nestedChildren?.find((raw) => raw.id === nested.id)?.parentStepIndex === index),
 		}));
+		const attachedIds = new Set(steps.flatMap((step) => step.children.map((child) => child.id)));
+		const unattached = nestedChildren.filter((child) => !attachedIds.has(child.id));
+		if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached);
 
 		runs.push({
 			id,
 			label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
-			state: deriveRunState(resolveForegroundRunState(run.children), steps),
+			state: deriveRunState(resolveForegroundRunState(run.children), steps, nestedChildren),
 			mode: run.mode,
 			source: "foreground",
 			agents,
 			elapsed,
 			startedAt: run.startedAt,
 			updatedAt: run.updatedAt,
+			model: run.children.find((child) => child.model)?.model,
+			tokens: sumTokenUsage(run.children.map((child) => child.totalTokens)),
 			sessionFile: run.children.find((c) => c.sessionFile)?.sessionFile,
 			artifactPath: run.children.find((c) => c.artifactPath)?.artifactPath,
 			steps,
@@ -512,15 +583,19 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		: status.currentAgent
 			? [{ agent: status.currentAgent, index: status.currentIndex ?? 0, status: status.state, sessionFile: status.sessionFile }]
 			: [];
-	const steps: OverlayStep[] = children.map((child) => ({
+	const nestedChildren = (status.nestedChildren ?? []).map(mapNestedRun);
+	const steps: OverlayStep[] = children.map((child, index) => ({
 		agent: child.agent,
 		state: staleForegroundState(mapState(child.status)),
+		model: child.model,
+		tokens: child.totalTokens,
 		sessionFile: child.sessionFile,
 		artifactPath: child.artifactPath,
-		children: [],
+		children: nestedChildren.filter((nested) => status.nestedChildren?.find((raw) => raw.id === nested.id)?.parentStepIndex === index),
 	}));
-	const nestedChildren = (status.nestedChildren ?? []).map(mapNestedRun);
-	if (nestedChildren.length && steps.length) steps[steps.length - 1]!.children.push(...nestedChildren);
+	const attachedIds = new Set(steps.flatMap((step) => step.children.map((child) => child.id)));
+	const unattached = nestedChildren.filter((child) => !attachedIds.has(child.id));
+	if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached);
 	const agents = agentsLabel(steps.map((step) => step.agent));
 	const elapsed = elapsedFromRange(status.startedAt, status.updatedAt, now);
 	return {
@@ -534,6 +609,8 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		startedAt: status.startedAt,
 		updatedAt: status.updatedAt,
 		currentTool: staleState === "running" ? status.currentTool : undefined,
+		model: children.find((child) => child.model)?.model,
+		tokens: sumTokenUsage(children.map((child) => child.totalTokens)),
 		sessionFile: status.sessionFile ?? children.find((child) => child.sessionFile)?.sessionFile,
 		artifactPath: children.find((child) => child.artifactPath)?.artifactPath,
 		steps,
@@ -578,6 +655,9 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 				state: mapState(step.status),
 				currentTool: step.currentTool,
 				elapsed: elapsedFromMs(step.durationMs),
+				startedAt: step.startedAt,
+				model: step.model,
+				tokens: step.tokens,
 				sessionFile: step.sessionFile,
 				logPath: logPathForStep(job.asyncDir, step.index),
 				children: (step.children ?? []).map(mapNestedRun),
@@ -605,7 +685,8 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 			elapsed,
 			startedAt: job.startedAt,
 			updatedAt: job.updatedAt,
-			sessionFile: job.sessionFile,
+			tokens: job.totalTokens,
+			sessionFile: job.sessionFile ?? sessionFileFromSoloStep(steps),
 			logPath: logPathForRun(job.asyncDir, job.outputFile),
 			asyncDir: job.asyncDir,
 			steps,
@@ -675,19 +756,10 @@ export function collectRunTree(state: SubagentState, now = Date.now(), options: 
 		...collectAsyncRuns(state, now),
 		...collectPersistedAsyncRuns(state, now, options),
 	];
-	const rank = (r: OverlayRun): number => {
-		if (r.state === "running") return 0;
-		if (r.state === "queued") return 1;
-		if (r.state === "failed") return 2;
-		if (r.state === "paused") return 2;
-		return 3;
-	};
 	runs.sort((a, b) => {
-		const rankDiff = rank(a) - rank(b);
-		if (rankDiff !== 0) return rankDiff;
-		const aTs = a.updatedAt ?? a.startedAt ?? 0;
-		const bTs = b.updatedAt ?? b.startedAt ?? 0;
-		return bTs - aTs;
+		const startDiff = (b.startedAt ?? 0) - (a.startedAt ?? 0);
+		if (startDiff !== 0) return startDiff;
+		return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
 	});
 	return runs;
 }

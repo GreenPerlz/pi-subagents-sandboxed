@@ -11,6 +11,8 @@ export interface PersistedForegroundStep {
 	status: ForegroundResumeChild["status"] | "running" | "pending";
 	sessionFile?: string;
 	artifactPath?: string;
+	model?: string;
+	totalTokens?: ForegroundResumeChild["totalTokens"];
 }
 
 export interface PersistedForegroundStatus {

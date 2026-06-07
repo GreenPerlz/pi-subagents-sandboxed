@@ -137,7 +137,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	const runtimeExtensions = fanoutAuthorized
 		? [PROMPT_RUNTIME_EXTENSION_PATH, FANOUT_CHILD_EXTENSION_PATH]
 		: [PROMPT_RUNTIME_EXTENSION_PATH];
-	const useExplicitExtensions = input.sandbox || input.extensions !== undefined || input.packageExtensions !== undefined;
+	const useExplicitExtensions = input.sandbox || fanoutAuthorized || input.extensions !== undefined || input.packageExtensions !== undefined;
 	if (useExplicitExtensions) {
 		args.push("--no-extensions");
 	}

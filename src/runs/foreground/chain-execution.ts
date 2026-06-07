@@ -126,6 +126,7 @@ interface ParallelChainRunInput {
 		turnCount?: number;
 		tokens?: number;
 		toolCount?: number;
+		currentModel?: string;
 		sessionFile?: string;
 		interrupt?: () => boolean;
 	};
@@ -257,6 +258,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				input.foregroundControl.currentAgent = task.agent;
 				input.foregroundControl.currentIndex = input.globalTaskIndex + taskIndex;
 				input.foregroundControl.currentActivityState = undefined;
+				input.foregroundControl.currentModel = effectiveModel;
 				input.foregroundControl.updatedAt = Date.now();
 				if (input.sessionFileForIndex) {
 					input.foregroundControl.sessionFile = input.sessionFileForIndex(input.globalTaskIndex + taskIndex);
@@ -313,6 +315,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 							input.foregroundControl.currentAgent = task.agent;
 							input.foregroundControl.currentIndex = input.globalTaskIndex + taskIndex;
 							input.foregroundControl.currentActivityState = current?.activityState;
+							input.foregroundControl.currentModel = stepResults[0]?.model ?? effectiveModel;
 							input.foregroundControl.lastActivityAt = current?.lastActivityAt;
 							input.foregroundControl.currentTool = current?.currentTool;
 							input.foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
@@ -353,6 +356,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			});
 			if (input.foregroundControl?.currentIndex === input.globalTaskIndex + taskIndex) {
 				input.foregroundControl.interrupt = undefined;
+				input.foregroundControl.currentModel = result.model ?? effectiveModel;
 				input.foregroundControl.updatedAt = Date.now();
 			}
 
@@ -400,6 +404,7 @@ interface ChainExecutionParams {
 		turnCount?: number;
 		tokens?: number;
 		toolCount?: number;
+		currentModel?: string;
 		sessionFile?: string;
 		interrupt?: () => boolean;
 	};
@@ -1047,6 +1052,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				foregroundControl.currentAgent = seqStep.agent;
 				foregroundControl.currentIndex = globalTaskIndex;
 				foregroundControl.currentActivityState = undefined;
+				foregroundControl.currentModel = effectiveModel;
 				foregroundControl.updatedAt = Date.now();
 				if (params.sessionFileForIndex) {
 					foregroundControl.sessionFile = params.sessionFileForIndex(globalTaskIndex);
@@ -1103,6 +1109,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 							foregroundControl.currentAgent = seqStep.agent;
 							foregroundControl.currentIndex = globalTaskIndex;
 							foregroundControl.currentActivityState = current?.activityState;
+							foregroundControl.currentModel = stepResults[0]?.model ?? effectiveModel;
 							foregroundControl.lastActivityAt = current?.lastActivityAt;
 							foregroundControl.currentTool = current?.currentTool;
 							foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
@@ -1143,6 +1150,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			});
 			if (foregroundControl?.currentIndex === globalTaskIndex) {
 				foregroundControl.interrupt = undefined;
+				foregroundControl.currentModel = r.model ?? effectiveModel;
 				foregroundControl.updatedAt = Date.now();
 			}
 			recordRun(seqStep.agent, cleanTask, r.exitCode, r.progressSummary?.durationMs ?? 0);

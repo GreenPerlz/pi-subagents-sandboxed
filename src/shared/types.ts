@@ -155,7 +155,7 @@ export type PublicNestedStepSummary = Pick<
 
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "totalTokens" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "summary"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "model" | "totalTokens" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "summary"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -524,6 +524,8 @@ export interface NestedStepSummary {
 	currentPath?: string;
 	turnCount?: number;
 	toolCount?: number;
+	model?: string;
+	totalTokens?: TokenUsage;
 	startedAt?: number;
 	endedAt?: number;
 	error?: string;
@@ -545,6 +547,7 @@ export interface NestedRunSummary extends NestedRunAddress {
 	state: NestedRunState;
 	agent?: string;
 	agents?: string[];
+	model?: string;
 	currentStep?: number;
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
@@ -696,6 +699,8 @@ export interface ForegroundResumeChild {
 	sessionFile?: string;
 	artifactPath?: string;
 	status: SubagentResultStatus;
+	model?: string;
+	totalTokens?: TokenUsage;
 }
 
 export interface ForegroundResumeRun {
@@ -705,6 +710,7 @@ export interface ForegroundResumeRun {
 	startedAt?: number;
 	updatedAt: number;
 	children: ForegroundResumeChild[];
+	nestedChildren?: NestedRunSummary[];
 }
 
 export interface SubagentState {
@@ -727,6 +733,7 @@ export interface SubagentState {
 		turnCount?: number;
 		tokens?: number;
 		toolCount?: number;
+		currentModel?: string;
 		sessionFile?: string;
 		nestedRoute?: NestedRouteInfo;
 		nestedChildren?: NestedRunSummary[];

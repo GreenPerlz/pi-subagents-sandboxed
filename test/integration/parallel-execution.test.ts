@@ -24,6 +24,7 @@ import {
 	makeMinimalCtx,
 	removeTempDir,
 	tryImport,
+	events,
 } from "../support/helpers.ts";
 
 // Top-level await: try importing pi-dependent modules
@@ -251,6 +252,48 @@ process.exit(child.status ?? 0);
 		assert.equal(results[1].agent, "b");
 		const ok = results.filter((r: any) => r.exitCode === 0).length;
 		assert.equal(ok, 2);
+	});
+
+	it("updates foregroundControl currentModel from runtime child result during live parallel run", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("read", { path: "package.json" })] },
+				{ delay: 100, jsonl: [events.assistantMessage("task output", "runtime/gpt-4o-mini")] },
+			],
+		});
+		const state = {
+			baseCwd: tempDir,
+			currentSessionId: null,
+			asyncJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		};
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents: [makeAgent("echo", { model: "configured/gpt-4o" })] }),
+		});
+		const currentControl = () => [...state.foregroundControls.values()][0];
+		const liveModels: (string | undefined)[] = [];
+		const executePromise = executor.execute(
+			"parallel-runtime-model",
+			{ tasks: [{ agent: "echo", task: "Task" }] },
+			new AbortController().signal,
+			() => {
+				liveModels.push(currentControl()?.currentModel);
+			},
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(currentControl()?.currentModel, "configured/gpt-4o", "foregroundControl should start with the configured fallback model");
+		await executePromise;
+
+		assert.ok(liveModels.includes("runtime/gpt-4o-mini"), "live updates should replace the configured fallback with the runtime model");
+		assert.equal(liveModels.at(-1), "runtime/gpt-4o-mini");
 	});
 
 	it("top-level parallel output saves use per-task output paths", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

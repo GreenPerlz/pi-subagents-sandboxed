@@ -70,13 +70,13 @@ import {
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import {
-	type AgentProgress,
 	type AcceptanceInput,
 	type ArtifactConfig,
 	type ArtifactPaths,
 	type AsyncStatus,
 	type ControlConfig,
 	type ControlEvent,
+	type AgentProgress,
 	type Details,
 	type ExtensionConfig,
 	type IntercomEventBus,
@@ -89,6 +89,7 @@ import {
 	type SingleResult,
 	type SubagentRunMode,
 	type SubagentState,
+	type TokenUsage,
 	DEFAULT_ARTIFACT_CONFIG,
 	FOREGROUND_DIR,
 	SUBAGENT_ACTIONS,
@@ -267,6 +268,19 @@ function foregroundResultState(results: SingleResult[]): "complete" | "failed" |
 	return "complete";
 }
 
+function tokenUsageFromSingleResult(result: SingleResult): TokenUsage | undefined {
+	const input = result.usage?.input ?? result.usage?.inputTokens;
+	const output = result.usage?.output ?? result.usage?.outputTokens;
+	if (typeof input !== "number" || typeof output !== "number") return undefined;
+	return { input, output, total: input + output };
+}
+
+function approximateTokenUsage(total: number | undefined): TokenUsage | undefined {
+	return typeof total === "number" && Number.isFinite(total) && total > 0
+		? { input: 0, output: total, total }
+		: undefined;
+}
+
 function foregroundChildrenFromResults(results: SingleResult[]): PersistedForegroundStep[] {
 	return results.map((result, index) => ({
 		agent: result.agent,
@@ -274,6 +288,8 @@ function foregroundChildrenFromResults(results: SingleResult[]): PersistedForegr
 		status: resolveSubagentResultStatus({ exitCode: result.exitCode, interrupted: result.interrupted, detached: result.detached }),
 		...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
 		...(result.artifactPaths?.outputPath ? { artifactPath: result.artifactPaths.outputPath } : {}),
+		...(result.model ? { model: result.model } : {}),
+		...(tokenUsageFromSingleResult(result) ? { totalTokens: tokenUsageFromSingleResult(result) } : {}),
 	}));
 }
 
@@ -331,7 +347,7 @@ function persistForegroundStatus(input: {
 	}
 }
 
-function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId?: string | null; startedAt?: number; results: SingleResult[] }): void {
+function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId?: string | null; startedAt?: number; results: SingleResult[]; nestedChildren?: NestedRunSummary[] }): void {
 	const updatedAt = Date.now();
 	const children = foregroundChildrenFromResults(input.results);
 	state.foregroundRuns ??= new Map();
@@ -342,6 +358,7 @@ function rememberForegroundRun(state: SubagentState, input: { runId: string; mod
 		...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
 		updatedAt,
 		children,
+		...(input.nestedChildren?.length ? { nestedChildren: input.nestedChildren } : {}),
 	});
 	persistForegroundStatus({
 		runId: input.runId,
@@ -353,6 +370,7 @@ function rememberForegroundRun(state: SubagentState, input: { runId: string; mod
 		updatedAt,
 		children,
 		sessionFile: children.find((child) => child.sessionFile)?.sessionFile,
+		...(input.nestedChildren?.length ? { nestedChildren: input.nestedChildren } : {}),
 	});
 	while (state.foregroundRuns.size > 50) {
 		const oldest = [...state.foregroundRuns.values()].sort((left, right) => left.updatedAt - right.updatedAt)[0];
@@ -1626,7 +1644,15 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 
 	const chainDetails = chainResult.details ? compactForegroundDetails({ ...chainResult.details, runId }) : undefined;
 	if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
-	if (chainDetails) rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: chainDetails.results });
+	if (chainDetails) rememberForegroundRun(deps.state, {
+		runId,
+		mode: "chain",
+		cwd: effectiveCwd,
+		sessionId: deps.state.currentSessionId,
+		startedAt: foregroundControl?.startedAt,
+		results: chainDetails.results,
+		...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
+	});
 	const intercomReceipt = chainDetails && !chainDetails.results.some((result) => result.interrupted || result.detached)
 		? await maybeBuildForegroundIntercomReceipt({
 			pi: deps.pi,
@@ -1804,6 +1830,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			input.foregroundControl.currentAgent = task.agent;
 			input.foregroundControl.currentIndex = index;
 			input.foregroundControl.currentActivityState = undefined;
+			input.foregroundControl.currentModel = input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
 			input.foregroundControl.updatedAt = Date.now();
 			input.foregroundControl.sessionFile = input.sessionFileForIndex(index);
 			input.foregroundControl.interrupt = () => {
@@ -1855,6 +1882,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 						input.foregroundControl.currentAgent = task.agent;
 						input.foregroundControl.currentIndex = index;
 						input.foregroundControl.currentActivityState = current?.activityState;
+						input.foregroundControl.currentModel = stepResults[0]?.model ?? input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
 						input.foregroundControl.lastActivityAt = current?.lastActivityAt;
 						input.foregroundControl.currentTool = current?.currentTool;
 						input.foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
@@ -2171,7 +2199,15 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			progress: params.includeProgress ? allProgress : undefined,
 			artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		});
-		rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: details.results });
+		rememberForegroundRun(deps.state, {
+			runId,
+			mode: "parallel",
+			cwd: effectiveCwd,
+			sessionId: deps.state.currentSessionId,
+			startedAt: foregroundControl?.startedAt,
+			results: details.results,
+			...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
+		});
 		if (interrupted) {
 			return {
 				content: [{ type: "text", text: `Parallel run paused after interrupt (${interrupted.agent}). Waiting for explicit next action.` }],
@@ -2379,6 +2415,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.currentAgent = params.agent;
 		foregroundControl.currentIndex = 0;
 		foregroundControl.currentActivityState = undefined;
+		foregroundControl.currentModel = modelOverride ?? agentConfig.model;
 		foregroundControl.updatedAt = Date.now();
 		foregroundControl.sessionFile = sessionFileForIndex(0);
 		foregroundControl.interrupt = () => {
@@ -2397,6 +2434,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				foregroundControl.currentAgent = params.agent;
 				foregroundControl.currentIndex = firstProgress?.index ?? 0;
 				foregroundControl.currentActivityState = firstProgress?.activityState;
+				foregroundControl.currentModel = update.details?.results?.[0]?.model ?? modelOverride ?? agentConfig.model;
 				foregroundControl.lastActivityAt = firstProgress?.lastActivityAt;
 				foregroundControl.currentTool = firstProgress?.currentTool;
 				foregroundControl.currentToolStartedAt = firstProgress?.currentToolStartedAt;
@@ -2451,6 +2489,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	if (foregroundControl?.currentIndex === 0) {
 		foregroundControl.interrupt = undefined;
 		foregroundControl.currentActivityState = r.progress?.activityState;
+		foregroundControl.currentModel = r.model ?? modelOverride ?? agentConfig.model;
 		foregroundControl.lastActivityAt = r.progress?.lastActivityAt;
 		foregroundControl.currentTool = r.progress?.currentTool;
 		foregroundControl.currentToolStartedAt = r.progress?.currentToolStartedAt;
@@ -2484,7 +2523,15 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		truncation: r.truncation,
 	});
-	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: details.results });
+	rememberForegroundRun(deps.state, {
+		runId,
+		mode: "single",
+		cwd: effectiveCwd,
+		sessionId: deps.state.currentSessionId,
+		startedAt: foregroundControl?.startedAt,
+		results: details.results,
+		...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
+	});
 
 	if (!r.detached && !r.interrupted) {
 		if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
@@ -2815,8 +2862,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const childSessionFileForIndex = (idx?: number) =>
 			sessionFileForIndex(idx) ?? path.join(sessionDirForIndex(idx), "session.jsonl");
 
-		const onUpdateWithContext = onUpdate
-			? (r: AgentToolResult<Details>) => onUpdate(withForkContext(r, effectiveParams.context))
+		const onUpdateWithContext = (onUpdate || (inheritedNestedRoute && nestedParentAddress))
+			? (r: AgentToolResult<Details>) => {
+				if (!effectiveAsync) {
+					writeNestedForegroundEvent("subagent.nested.updated", r);
+				}
+				onUpdate?.(withForkContext(r, effectiveParams.context));
+			}
 			: undefined;
 
 		const execData: ExecutionContextData = {
@@ -2870,27 +2922,105 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			});
 		}
 
-		const writeNestedForegroundEvent = (type: "subagent.nested.started" | "subagent.nested.completed", result?: AgentToolResult<Details>): void => {
+		const writeNestedForegroundEvent = (type: "subagent.nested.started" | "subagent.nested.updated" | "subagent.nested.completed", result?: AgentToolResult<Details>): void => {
 			if (!inheritedNestedRoute || !nestedParentAddress) return;
 			const now = Date.now();
+			const tokenUsageFromResult = (child: Details["results"][number]) => child.usage
+				? { input: child.usage.input ?? 0, output: child.usage.output ?? 0, total: (child.usage.input ?? 0) + (child.usage.output ?? 0) }
+				: undefined;
 			const details = result?.details;
-			const state = type === "subagent.nested.started"
-				? "running"
-				: result?.isError || details?.results.some((child) => child.exitCode !== 0)
+			const state = type === "subagent.nested.completed"
+				? result?.isError || details?.results.some((child) => child.exitCode !== 0)
 					? "failed"
 					: details?.results.some((child) => child.interrupted)
 						? "paused"
-						: "complete";
+						: "complete"
+				: "running";
 			const resultText = result?.content.find((item) => item.type === "text")?.text;
 			const errorText = result?.isError ? resultText : undefined;
 			const agentsForSummary = hasTasks && effectiveParams.tasks
 				? effectiveParams.tasks.map((task) => task.agent)
 				: hasChain && effectiveParams.chain
-					? effectiveParams.chain.flatMap((step) => isParallelStep(step) ? step.parallel.map((task) => task.agent) : [(step as SequentialStep).agent])
+					? effectiveParams.chain.flatMap((step) => isParallelStep(step)
+						? step.parallel.map((task) => task.agent)
+						: isDynamicParallelStep(step)
+							? [step.parallel.agent]
+							: [(step as SequentialStep).agent])
 					: effectiveParams.agent ? [effectiveParams.agent] : [];
+			let availableModels: ModelInfo[] = [];
+			try {
+				availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
+			} catch {
+				availableModels = [];
+			}
+			const currentProvider = ctx.model?.provider;
+			const resolveConfiguredModel = (agentName: string | undefined, explicitModel: string | undefined): string | undefined => {
+				const fallback = explicitModel ?? agents.find((agent) => agent.name === agentName)?.model;
+				if (!fallback) return undefined;
+				try {
+					return resolveModelCandidate(fallback, availableModels, currentProvider) ?? fallback;
+				} catch {
+					return fallback;
+				}
+			};
+			const configuredModels = hasTasks && effectiveParams.tasks
+				? effectiveParams.tasks.map((task) => resolveConfiguredModel(task.agent, task.model))
+				: hasChain && effectiveParams.chain
+					? effectiveParams.chain.flatMap((step) => isParallelStep(step)
+						? step.parallel.map((task) => resolveConfiguredModel(task.agent, task.model))
+						: isDynamicParallelStep(step)
+							? [resolveConfiguredModel(step.parallel.agent, step.parallel.model)]
+							: [resolveConfiguredModel((step as SequentialStep).agent, (step as SequentialStep).model)])
+					: effectiveParams.agent
+						? [resolveConfiguredModel(effectiveParams.agent, effectiveParams.model as string | undefined)]
+						: [];
 			const leafIntercomTarget = intercomBridge.active && agentsForSummary[0]
 				? resolveSubagentIntercomTarget(runId, agentsForSummary[0], 0)
 				: undefined;
+			const totalTokensFromResults = details?.results.reduce((acc, child) => {
+				const usage = tokenUsageFromResult(child);
+				if (!usage) return acc;
+				return { input: acc.input + usage.input, output: acc.output + usage.output, total: acc.total + usage.total };
+			}, { input: 0, output: 0, total: 0 });
+			const totalProgressTokens = details?.progress?.reduce((acc, progress) => acc + (progress.tokens ?? 0), 0);
+			const totalTokens = totalTokensFromResults && totalTokensFromResults.total > 0
+				? totalTokensFromResults
+				: approximateTokenUsage(totalProgressTokens);
+			const progressByIndex = new Map((details?.progress ?? []).map((progress) => [progress.index, progress] as const));
+			const stepCount = Math.max(agentsForSummary.length, configuredModels.length, details?.progress?.length ?? 0, details?.results.length ?? 0);
+			const steps = Array.from({ length: stepCount }, (_, index) => {
+				const progress = progressByIndex.get(index) ?? details?.progress?.[index];
+				const child = details?.results[index];
+				const agent = progress?.agent ?? child?.agent ?? agentsForSummary[index];
+				if (!agent) return undefined;
+				const stepStatus = type === "subagent.nested.completed"
+					? child
+						? child.interrupted ? "paused" : child.exitCode === 0 ? "complete" : "failed"
+						: progress?.status === "failed" ? "failed" : progress?.status === "completed" ? "complete" : progress?.status === "pending" ? "pending" : "running"
+					: progress?.status === "failed" ? "failed" : progress?.status === "completed" ? "complete" : progress?.status === "pending" ? "pending" : "running";
+				const stepTokens = child ? tokenUsageFromResult(child) : approximateTokenUsage(progress?.tokens);
+				const stepModel = child?.model ?? configuredModels[index];
+				return {
+					agent,
+					status: stepStatus,
+					...(child?.sessionFile ? { sessionFile: child.sessionFile } : childSessionFileForIndex(index) ? { sessionFile: childSessionFileForIndex(index) } : {}),
+					...(progress?.activityState ? { activityState: progress.activityState } : {}),
+					...(progress?.lastActivityAt !== undefined ? { lastActivityAt: progress.lastActivityAt } : {}),
+					...(progress?.currentTool ? { currentTool: progress.currentTool } : {}),
+					...(progress?.currentToolStartedAt !== undefined ? { currentToolStartedAt: progress.currentToolStartedAt } : {}),
+					...(progress?.currentPath ? { currentPath: progress.currentPath } : {}),
+					...(progress?.turnCount !== undefined ? { turnCount: progress.turnCount } : {}),
+					...(progress?.toolCount !== undefined ? { toolCount: progress.toolCount } : {}),
+					...(stepModel ? { model: stepModel } : {}),
+					...(stepTokens ? { totalTokens: stepTokens } : {}),
+					...(foregroundControl?.startedAt ? { startedAt: foregroundControl.startedAt } : {}),
+					...(child?.error ?? progress?.error ? { error: child?.error ?? progress?.error } : {}),
+				};
+			}).filter((step): step is NonNullable<NestedRunSummary["steps"]>[number] => Boolean(step));
+			const currentIndex = foregroundControl?.currentIndex ?? 0;
+			const modelFromParams = type === "subagent.nested.completed"
+				? details?.results[currentIndex]?.model ?? details?.results.find((child) => child.model)?.model ?? configuredModels[currentIndex] ?? configuredModels.find(Boolean)
+				: configuredModels[currentIndex] ?? configuredModels.find(Boolean);
 			try {
 				writeNestedEvent(inheritedNestedRoute, {
 					type,
@@ -2914,14 +3044,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						startedAt: foregroundControl?.startedAt ?? now,
 						...(state !== "running" ? { endedAt: now } : {}),
 						lastUpdate: now,
+						...(foregroundControl?.currentActivityState ? { activityState: foregroundControl.currentActivityState } : {}),
+						...(foregroundControl?.lastActivityAt !== undefined ? { lastActivityAt: foregroundControl.lastActivityAt } : {}),
+						...(foregroundControl?.currentTool ? { currentTool: foregroundControl.currentTool } : {}),
+						...(foregroundControl?.currentToolStartedAt !== undefined ? { currentToolStartedAt: foregroundControl.currentToolStartedAt } : {}),
+						...(foregroundControl?.currentPath ? { currentPath: foregroundControl.currentPath } : {}),
+						...(foregroundControl?.turnCount !== undefined ? { turnCount: foregroundControl.turnCount } : {}),
+						...(foregroundControl?.toolCount !== undefined ? { toolCount: foregroundControl.toolCount } : {}),
+						...(modelFromParams ? { model: modelFromParams } : {}),
+						...(totalTokens ? { totalTokens } : {}),
 						...(errorText ? { error: errorText } : {}),
 						...(resultText ? { summary: resultText } : {}),
-						...(details?.results.length ? { steps: details.results.map((child) => ({
-							agent: child.agent,
-							status: child.interrupted ? "paused" : child.exitCode === 0 ? "complete" : "failed",
-							...(child.sessionFile ? { sessionFile: child.sessionFile } : {}),
-							...(child.error ? { error: child.error } : {}),
-						})) } : {}),
+						...(steps.length ? { steps } : {}),
 					},
 				});
 			} catch (error) {

@@ -61,12 +61,15 @@ describe("subagents overlay rendering", () => {
 		const runs: OverlayRun[] = [
 			{
 				id: "run-1",
-				label: "single: worker",
+				label: "chain: worker",
 				state: "running",
-				mode: "single",
+				mode: "chain",
 				source: "async",
 				agents: ["worker"],
 				elapsed: "5.2s",
+				startedAt: Date.UTC(2026, 0, 2, 3, 4, 5),
+				model: "test-model",
+				tokens: { input: 1000, output: 200, total: 1200 },
 				sessionFile: "/s",
 				logPath: "/l",
 				artifactPath: "/a",
@@ -81,18 +84,21 @@ describe("subagents overlay rendering", () => {
 				],
 			},
 		];
-		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const lines = renderOverlay(runs, theme as never, 120);
 		const text = lines.join("\n");
 
 		assert.ok(text.includes("worker"), "should show agent name");
 		assert.ok(text.includes("running"), "should show run state");
 		assert.ok(text.includes("bg"), "should show async source badge");
 		assert.ok(text.includes("run-1"), "should show run id");
-		assert.ok(text.includes("/s"), "should show session path when available");
-		assert.ok(text.includes("/l"), "should show log path when available");
-		assert.ok(text.includes("/a"), "should show artifact path when available");
+		assert.ok(!text.includes("/s"), "overview should not show session path");
+		assert.ok(!text.includes("/l"), "overview should not show log path");
+		assert.ok(!text.includes("/a"), "overview should not show artifact path");
 		assert.ok(text.includes("read"), "should show current tool");
-		assert.ok(text.includes("5.2s"), "should show elapsed");
+		assert.ok(text.includes("ran 5.2s"), "should show elapsed runtime");
+		assert.ok(text.includes("started 2026-01-02 03:04:05"), "should show start time");
+		assert.ok(text.includes("model test-model"), "should show model");
+		assert.ok(text.includes("1.2k tokens"), "should show token total");
 		assert.ok(text.includes("Esc"), "should show escape hint");
 		// Verify indentation for step (should be indented)
 		const stepLine = lines.find((l) => l.includes("worker") && l.includes("running") && !l.includes("Subagents"));
@@ -457,10 +463,10 @@ describe("subagents overlay detail pane (issue #21)", () => {
 				steps: [],
 			};
 			const pane = new SubagentDetailPane(run, theme as never, () => {});
-			// height 9 gives viewport = 4 lines (5 non-content lines); 6 lines total => 2 below
+			// height 9 with a file path header gives viewport = 3 lines (6 non-content lines); 6 lines total => 3 below
 			const lines = pane.render(80, 9);
 			const text = lines.join("\n");
-			assert.ok(text.includes("↓ 2 more"), "scroll hint should reflect height-based viewport");
+			assert.ok(text.includes("↓ 3 more"), "scroll hint should reflect height-based viewport");
 		} finally {
 			cleanup(p);
 		}
@@ -1624,7 +1630,7 @@ describe("subagents overlay chain/nested hierarchy (issue #29)", () => {
 		];
 		const lines = renderOverlay(runs, theme as never, WIDTH);
 		const text = lines.join("\n");
-		assert.ok(text.includes("chain:"), "should show chain mode prefix");
+		assert.ok(text.includes("chain(researcher, worker)"), "should show chain grouping header");
 	});
 
 	it("renders parallel mode prefix in run header", () => {
@@ -1641,7 +1647,7 @@ describe("subagents overlay chain/nested hierarchy (issue #29)", () => {
 		];
 		const lines = renderOverlay(runs, theme as never, WIDTH);
 		const text = lines.join("\n");
-		assert.ok(text.includes("parallel:"), "should show parallel mode prefix");
+		assert.ok(text.includes("parallel(reviewer, reviewer)"), "should show parallel grouping header");
 	});
 
 	it("does not render mode prefix for single runs", () => {
@@ -1758,7 +1764,7 @@ describe("subagents overlay chain/nested hierarchy (issue #29)", () => {
 		const lines = renderOverlay(runs, theme as never, WIDTH);
 		const text = lines.join("\n");
 		assert.ok(text.includes("reviewer"), "should show nested run");
-		assert.ok(text.includes("1. leaf"), "should show nested run step with step number");
+		assert.ok(text.includes("* leaf"), "should show non-chain nested run step with bullet marker");
 	});
 });
 
@@ -2353,6 +2359,56 @@ describe("subagents overlay flattened selectable rows (issue #30)", () => {
 		assert.strictEqual(rows[3]!.target.id, "nested-1");
 	});
 
+	it("flattenRows collapses redundant solo async run headers to expose the real child row", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "async-solo",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: "/tmp/worker.jsonl",
+				steps: [{ agent: "worker", state: "running", sessionFile: "/tmp/worker.jsonl", children: [] }],
+			},
+		];
+		const rows = flattenRows(runs);
+		assert.strictEqual(rows.length, 1, "solo async should expose only the child step row");
+		assert.strictEqual(rows[0]!.type, "step");
+		assert.strictEqual(rows[0]!.target.sessionFile, "/tmp/worker.jsonl");
+
+		const text = renderOverlay(runs, theme as never, WIDTH).join("\n");
+		assert.ok(text.includes("* worker"), "child step should be visible with non-chain marker");
+		assert.ok(!text.includes("async-solo"), "redundant async run header should be hidden");
+	});
+
+	it("collapses solo async parent rows even when the parent has distinct targets", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "async-parent-session",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				sessionFile: "/tmp/parent.jsonl",
+				logPath: "/tmp/parent.log",
+				artifactPath: "/tmp/parent.md",
+				steps: [{ agent: "worker", state: "running", sessionFile: "/tmp/worker.jsonl", logPath: "/tmp/worker.log", children: [] }],
+			},
+		];
+
+		const rows = flattenRows(runs);
+		assert.strictEqual(rows.length, 1, "solo async wrapper rows should not remain selectable");
+		assert.strictEqual(rows[0]!.type, "step");
+		assert.strictEqual(rows[0]!.target.sessionFile, "/tmp/worker.jsonl");
+		assert.strictEqual(rows[0]!.target.logPath, "/tmp/worker.log");
+
+		const text = renderOverlay(runs, theme as never, WIDTH).join("\n");
+		assert.ok(text.includes("* worker"), "real child step should remain visible with non-chain marker");
+		assert.ok(!text.includes("async-parent-session"), "solo async wrapper header should be hidden");
+	});
+
 	it("flattenRows skips redundant step for single foreground run but keeps nested children", () => {
 		const runs: OverlayRun[] = [
 			{
@@ -2385,6 +2441,75 @@ describe("subagents overlay flattened selectable rows (issue #30)", () => {
 		assert.strictEqual(rows[1]!.target.id, "nested-1");
 	});
 
+	it("preserves grouping headers for chain and parallel runs", () => {
+		const chain: OverlayRun = {
+			id: "chain-1",
+			label: "chain: agent a, agent b",
+			state: "running",
+			mode: "chain",
+			source: "async",
+			agents: ["agent a", "agent b"],
+			steps: [],
+		};
+		const parallel: OverlayRun = {
+			id: "parallel-1",
+			label: "parallel: agent x, agent y",
+			state: "running",
+			mode: "parallel",
+			source: "async",
+			agents: ["agent x", "agent y"],
+			steps: [],
+		};
+		const text = renderOverlay([chain, parallel], theme as never, WIDTH).join("\n");
+		assert.ok(text.includes("chain(agent a, agent b)"), "chain header should be preserved as a grouping row");
+		assert.ok(text.includes("parallel(agent x, agent y)"), "parallel header should be preserved as a grouping row");
+	});
+
+	it("collapses solo nested run headers and targets the real child step session", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "parent",
+				label: "single: parent",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["parent"],
+				steps: [
+					{
+						agent: "parent",
+						state: "running",
+						children: [
+							{
+								id: "nested-solo",
+								agent: "reviewer",
+								state: "running",
+								elapsed: "4.2s",
+								startedAt: Date.UTC(2026, 0, 2, 3, 4, 5),
+								model: "review-model",
+								tokens: { input: 10, output: 5, total: 15 },
+								steps: [{ agent: "reviewer", state: "running", sessionFile: "/tmp/reviewer.jsonl", children: [] }],
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		const rows = flattenRows(runs);
+		const nestedHeader = rows.find((row) => row.type === "nested" && row.target.id === "nested-solo");
+		assert.strictEqual(nestedHeader, undefined, "redundant solo nested run header should be hidden");
+		const nestedStep = rows.find((row) => row.type === "step" && row.target.id === "nested-solo:step:0");
+		assert.strictEqual(nestedStep?.target.sessionFile, "/tmp/reviewer.jsonl");
+
+		const text = renderOverlay(runs, theme as never, 160).join("\n");
+		assert.ok(text.includes("* reviewer"), "real nested child step should be visible with bullet marker");
+		assert.ok(text.includes("ran 4.2s"), "collapsed nested child should keep runtime metadata");
+		assert.ok(text.includes("started 2026-01-02 03:04:05"), "collapsed nested child should keep start time");
+		assert.ok(text.includes("model review-model"), "collapsed nested child should keep model metadata");
+		assert.ok(text.includes("15 tokens"), "collapsed nested child should keep token metadata");
+		assert.ok(!text.includes("nested-solo"), "redundant nested run id header should be hidden");
+	});
+
 	it("renderOverlay shows selection indicator on child rows", () => {
 		const runs: OverlayRun[] = [
 			{
@@ -2407,7 +2532,7 @@ describe("subagents overlay flattened selectable rows (issue #30)", () => {
 		assert.ok(stepLine, "step line should exist");
 		assert.ok(stepLine!.includes("> "), "selected step should have selector");
 		// The run header should not have selector
-		const runLine = lines.find((l) => l.includes("chain:"));
+		const runLine = lines.find((l) => l.includes("chain(a, b)"));
 		assert.ok(runLine, "run line should exist");
 		assert.ok(!runLine!.includes("> "), "non-selected run should not have selector");
 	});
@@ -2581,6 +2706,7 @@ describe("subagents overlay flattened selectable rows (issue #30)", () => {
 					asyncId: "run-1",
 					asyncDir: "/tmp/run-1",
 					status: "running",
+					mode: "chain",
 					agents: ["worker"],
 					steps: [
 						{ agent: "researcher", status: "running" },

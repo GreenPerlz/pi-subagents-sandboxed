@@ -1,6 +1,7 @@
 import type { ResolvedSandboxConfig } from "./types.ts";
 
 export interface SandboxWriteInferenceInput {
+	agentName?: string;
 	tools?: string[];
 	sandbox?: Pick<ResolvedSandboxConfig, "bashWrite">;
 }
@@ -9,12 +10,19 @@ function isBuiltinTool(tool: string, name: string): boolean {
 	return tool.trim() === name;
 }
 
+function isRalphOrchestratorAgent(agentName: string | undefined): boolean {
+	return agentName?.trim() === "ralph-orchestrator";
+}
+
 /**
  * Infers whether a sandboxed child needs its cwd/worktree mounted writable.
  * Explicit edit/write tools are writer-capable. Bash is writer-capable only
- * when the resolved sandbox config opts into bash writes.
+ * when the resolved sandbox config opts into bash writes. Ralph orchestrators
+ * also need a writable cwd because their nested workers must be able to edit
+ * the assigned worktree through the parent sandbox.
  */
 export function inferSandboxCwdWritable(input: SandboxWriteInferenceInput): boolean {
+	if (isRalphOrchestratorAgent(input.agentName)) return true;
 	if (input.tools === undefined) return true;
 	const tools = input.tools;
 	if (tools.some((tool) => isBuiltinTool(tool, "edit") || isBuiltinTool(tool, "write"))) return true;
@@ -27,7 +35,7 @@ export function hasSandboxWritableAgent(input: { agents: Array<SandboxWriteInfer
 	if (!hasSandbox) return false;
 	return input.agents.some((agent) => {
 		const sandbox = agent.sandbox ?? input.sandbox;
-		return Boolean(sandbox) && inferSandboxCwdWritable({ tools: agent.tools, sandbox });
+		return Boolean(sandbox) && inferSandboxCwdWritable({ agentName: agent.agentName, tools: agent.tools, sandbox });
 	});
 }
 

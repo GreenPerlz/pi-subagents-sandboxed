@@ -624,7 +624,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
 			const stepSandboxes = stepAgentConfigs.map((agent) => resolveStepSandbox(agent));
-			if (!step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
+			if (!step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
 				return buildChainExecutionErrorResult(
 					sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`),
 					makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
@@ -795,7 +795,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		} else if (isDynamicParallelStep(step)) {
 			const dynamicAgentConfig = agents.find((agent) => agent.name === step.parallel.agent);
 			const dynamicSandbox = dynamicAgentConfig ? resolveStepSandbox(dynamicAgentConfig) : undefined;
-			if (dynamicAgentConfig && hasSandboxWritableAgent({ agents: [{ tools: dynamicAgentConfig.tools, sandbox: dynamicSandbox }] })) {
+			if (dynamicAgentConfig && hasSandboxWritableAgent({ agents: [{ agentName: dynamicAgentConfig.name, tools: dynamicAgentConfig.tools, sandbox: dynamicSandbox }] })) {
 				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
 				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));

@@ -277,7 +277,7 @@ async function runSingleAttempt(
 		if (options.sandbox) {
 			result.sandbox = sandboxResultDetails(options.sandbox);
 			const provider = createSandboxProvider(options.sandbox);
-			const cwdMode = inferSandboxCwdWritable({ tools: agent.tools, sandbox: options.sandbox }) ? "rw" : "ro";
+			const cwdMode = inferSandboxCwdWritable({ agentName: agent.name, tools: agent.tools, sandbox: options.sandbox }) ? "rw" : "ro";
 			const sandboxInvocation: SpawnableInvocation = {
 				command: piSpawnSpec.command,
 				args: piSpawnSpec.args,

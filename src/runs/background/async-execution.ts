@@ -311,14 +311,14 @@ export function executeAsyncChain(
 			const stepAgentConfigs = s.parallel
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
-			const sandboxWriteInputs = stepAgentConfigs.map((agent) => ({ tools: agent.tools, sandbox: resolveStepSandbox(agent) }));
+			const sandboxWriteInputs = stepAgentConfigs.map((agent) => ({ agentName: agent.name, tools: agent.tools, sandbox: resolveStepSandbox(agent) }));
 			if (hasSandboxWritableAgent({ agents: sandboxWriteInputs })) {
 				return formatAsyncStartError(resultMode, sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`));
 			}
 		}
 		if (isDynamicParallelStep(s)) {
 			const agent = agents.find((candidate) => candidate.name === s.parallel.agent);
-			if (agent && hasSandboxWritableAgent({ agents: [{ tools: agent.tools, sandbox: resolveStepSandbox(agent) }] })) {
+			if (agent && hasSandboxWritableAgent({ agents: [{ agentName: agent.name, tools: agent.tools, sandbox: resolveStepSandbox(agent) }] })) {
 				return formatAsyncStartError(resultMode, sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`));
 			}
 		}

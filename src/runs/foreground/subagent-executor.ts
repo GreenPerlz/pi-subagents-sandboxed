@@ -1947,7 +1947,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	});
 	const sandboxIntercomBridge = resolveSandboxIntercomBridge(data.intercomBridge);
 	const taskSandboxes = agentConfigs.map((agent) => resolveChildSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox }));
-	if (!params.worktree && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
+	if (!params.worktree && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
 		return buildParallelModeError(sandboxParallelWorktreeRequiredMessage());
 	}
 

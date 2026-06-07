@@ -768,7 +768,7 @@ async function runSingleStep(
 		return {
 			config: sandbox,
 			cwd: stepCwd,
-			cwdMode: inferSandboxCwdWritable({ tools: step.tools, sandbox }) ? "rw" : "ro",
+			cwdMode: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }) ? "rw" : "ro",
 			tempDir: input.tempDir,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
@@ -1720,7 +1720,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		if (isDynamicRunnerGroup(step)) {
 			const groupStartFlatIndex = flatIndex;
 			const dynamicSandbox = step.parallel.sandbox ?? config.sandbox;
-			if (dynamicSandbox && inferSandboxCwdWritable({ tools: step.parallel.tools, sandbox: dynamicSandbox })) {
+			if (dynamicSandbox && inferSandboxCwdWritable({ agentName: step.parallel.agent, tools: step.parallel.tools, sandbox: dynamicSandbox })) {
 				const now = Date.now();
 				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
 				statusPayload.state = "failed";
@@ -2009,7 +2009,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const groupStartFlatIndex = flatIndex;
 			let aborted = false;
 			let worktreeSetup: WorktreeSetup | undefined;
-			if (!group.worktree && hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, sandbox: task.sandbox ?? config.sandbox })) })) {
+			if (!group.worktree && hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, agentName: task.agent, sandbox: task.sandbox ?? config.sandbox })) })) {
 				const failedAt = Date.now();
 				markParallelGroupSetupFailure({
 					statusPayload,

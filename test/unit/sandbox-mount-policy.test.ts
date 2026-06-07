@@ -29,6 +29,13 @@ function mountMode(mounts: ReturnType<typeof buildSubagentSandboxMounts>, source
 	return mounts.find((mount) => mount.source === path.resolve(source))?.mode;
 }
 
+function bundledAgentTools(agentName: string): string[] {
+	const content = fs.readFileSync(path.join(process.cwd(), "agents", `${agentName}.md`), "utf-8");
+	const match = /^tools:\s*(.+)$/m.exec(content);
+	assert.ok(match, `${agentName} should declare default tools`);
+	return match[1].split(",").map((tool) => tool.trim()).filter(Boolean);
+}
+
 afterEach(() => {
 	for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -44,6 +51,50 @@ describe("sandbox write capability inference", () => {
 	it("treats omitted tools as writer-capable because child pi receives its default tools", () => {
 		assert.equal(inferSandboxCwdWritable({ tools: undefined, sandbox: { bashWrite: false } }), true);
 		assert.equal(inferSandboxCwdWritable({ tools: [], sandbox: { bashWrite: true } }), false);
+	});
+
+	it("defaults ralph-orchestrator cwd writable for nested worker workflows without bash write opt-in", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const cwdWritable = inferSandboxCwdWritable({
+			agentName: "ralph-orchestrator",
+			tools: ["read", "grep", "find", "ls", "bash", "subagent"],
+			sandbox: { bashWrite: false },
+		});
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: cwdWritable ? "rw" : "ro" });
+
+		assert.equal(cwdWritable, true);
+		assert.equal(mountMode(mounts, cwd), "rw");
+	});
+
+	it("keeps ordinary read-only sandboxed agents read-only by default", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const cwdWritable = inferSandboxCwdWritable({
+			agentName: "reviewer",
+			tools: ["read", "grep", "find", "ls", "bash"],
+			sandbox: { bashWrite: false },
+		});
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: cwdWritable ? "rw" : "ro" });
+
+		assert.equal(cwdWritable, false);
+		assert.equal(mountMode(mounts, cwd), "ro");
+	});
+
+	it("keeps bundled reviewer and researcher sandbox defaults read-only while worker remains writable", () => {
+		for (const agentName of ["reviewer", "researcher"]) {
+			const tools = bundledAgentTools(agentName);
+			assert.equal(tools.includes("edit"), false, `${agentName} should not expose edit by default`);
+			assert.equal(tools.includes("write"), false, `${agentName} should not expose write by default`);
+			assert.equal(inferSandboxCwdWritable({ agentName, tools, sandbox: { bashWrite: false } }), false);
+		}
+
+		const workerTools = bundledAgentTools("worker");
+		assert.equal(workerTools.includes("edit"), true, "worker should retain edit ability");
+		assert.equal(workerTools.includes("write"), true, "worker should retain write ability");
+		assert.equal(inferSandboxCwdWritable({ agentName: "worker", tools: workerTools, sandbox: { bashWrite: false } }), true);
 	});
 });
 

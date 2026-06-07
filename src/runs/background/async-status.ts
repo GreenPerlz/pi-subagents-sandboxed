@@ -4,7 +4,7 @@ import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
 import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode, type TokenUsage } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
-import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedRegistryForRoot } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedEvents, projectNestedRegistryForRoot } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
@@ -130,10 +130,12 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	const steps = status.steps ?? [];
 	const chainStepCount = status.chainStepCount ?? steps.length;
 	const parallelGroups = normalizeParallelGroups(status.parallelGroups, steps.length, chainStepCount);
-	let nestedChildren: NestedRunSummary[] = [];
-	if (nestedWarnings.length === 0) {
+	let nestedChildren: NestedRunSummary[] = status.nestedChildren ?? [];
+	if (nestedChildren.length === 0 && nestedWarnings.length === 0) {
 		try {
-			nestedChildren = projectNestedRegistryForRoot(status.runId || path.basename(asyncDir))?.children ?? [];
+			nestedChildren = status.nestedRoute
+				? projectNestedEvents(status.nestedRoute).children
+				: projectNestedRegistryForRoot(status.runId || path.basename(asyncDir))?.children ?? [];
 		} catch (error) {
 			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
 		}

@@ -763,6 +763,52 @@ describe("collectRunTree", () => {
 		}
 	});
 
+	it("hydrates completed persisted async nested children from nested route events", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		const state = baseState();
+		const route = createNestedRoute("persisted-nested-root");
+		try {
+			writeNestedEvent(route, {
+				type: "subagent.nested.completed",
+				ts: 4500,
+				parentRunId: "persisted-parent",
+				parentStepIndex: 0,
+				child: makeNestedChild({
+					id: "nested-reviewer",
+					parentRunId: "persisted-parent",
+					parentStepIndex: 0,
+					state: "complete",
+					agent: "reviewer",
+					sessionFile: "/tmp/nested-reviewer/session.jsonl",
+				}),
+			});
+			writePersistedAsyncStatus(asyncDirRoot, "persisted-parent", {
+				runId: "persisted-parent",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				endedAt: 5000,
+				lastUpdate: 5000,
+				nestedRoute: route,
+				steps: [{ agent: "ralph-orchestrator", status: "complete", durationMs: 4000 }],
+			});
+
+			const runs = collectRunTree(state, 6000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.id, "persisted-parent");
+			assert.strictEqual(runs[0]!.state, "complete");
+			assert.strictEqual(runs[0]!.steps[0]!.children.length, 1);
+			assert.strictEqual(runs[0]!.steps[0]!.children[0]!.id, "nested-reviewer");
+			assert.strictEqual(runs[0]!.steps[0]!.children[0]!.state, "complete");
+			assert.strictEqual(runs[0]!.steps[0]!.children[0]!.sessionFile, "/tmp/nested-reviewer/session.jsonl");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
 	it("hydrates queued async runs from disk after parent session resume", () => {
 		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
 		try {

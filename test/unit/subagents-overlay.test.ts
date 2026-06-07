@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { renderOverlay, SubagentDetailPane, SubagentsOverlay, registerSubagentsOverlayShortcut, flattenRows } from "../../src/tui/subagents-overlay.ts";
+import { renderOverlay, SubagentDetailPane, SubagentsOverlay, registerSubagentsOverlayShortcut, flattenRows, filterRunsForView } from "../../src/tui/subagents-overlay.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { OverlayRun } from "../../src/tui/run-tree-collector.ts";
 
@@ -1015,6 +1015,158 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		} finally {
 			overlay.dispose();
 		}
+	});
+
+	it("shows completed nested child in completed bucket while parent run is still running", () => {
+		let renderCount = 0;
+		const requestRender = () => { renderCount++; };
+
+		const state = {
+			baseCwd: "/tmp",
+			currentSessionId: null,
+			asyncJobs: new Map([
+				["parent-running", {
+					asyncId: "parent-running",
+					asyncDir: "/tmp/parent-running",
+					status: "running",
+					agents: ["parent-worker"],
+					steps: [
+						{
+							agent: "parent-worker",
+							status: "running",
+							children: [
+								{
+									id: "nested-complete",
+									agent: "nested-reviewer",
+									state: "complete",
+									sessionFile: "/tmp/nested-session.jsonl",
+									children: [],
+								},
+							],
+						},
+					],
+				}],
+			]),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+			pendingForegroundControlNotices: new Map(),
+			cleanupTimers: new Map(),
+			lastUiContext: null,
+			poller: null,
+			completionSeen: new Map(),
+			watcher: null,
+			watcherRestartTimer: null,
+			resultFileCoalescer: { schedule: () => false, clear: () => {} },
+		};
+
+		const keybindings = {
+			matches: (data: string, keyId: string) => {
+				if (keyId === "tui.select.up" && data === "\x1B[A") return true;
+				if (keyId === "tui.select.down" && data === "\x1B[B") return true;
+				if (keyId === "tui.select.cancel" && data === "\x1B") return true;
+				return false;
+			},
+		} as never;
+
+		const overlay = new SubagentsOverlay(theme as never, state as never, () => {}, requestRender, keybindings);
+		try {
+			const runningText = overlay.render(WIDTH).join("\n");
+			assert.ok(runningText.includes("running 1"), "running count should include the visible running parent");
+			assert.ok(runningText.includes("completed 1"), "completed count should include the completed nested child");
+			assert.ok(runningText.includes("parent-worker running"), "running view should show the running parent");
+
+			overlay.handleInput("c");
+			const completedText = overlay.render(WIDTH).join("\n");
+			assert.ok(completedText.includes("completed 1"), "completed count should align with the one visible completed entry");
+			assert.ok(completedText.includes("nested-reviewer complete"), "completed view should show completed nested child");
+			assert.ok(completedText.includes("nested-complete"), "completed view should expose nested child id for detail selection");
+			assert.ok(!completedText.includes("parent-worker running"), "completed view should not show the running parent as an entry");
+		} finally {
+			overlay.dispose();
+		}
+	});
+
+	it("filterRunsForView flattens completed nested children from running parents", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "parent-running",
+				label: "single: parent-worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["parent-worker"],
+				steps: [
+					{
+						agent: "parent-worker",
+						state: "running",
+						children: [
+							{ id: "nested-complete", agent: "nested-reviewer", state: "complete", children: [] },
+							{ id: "nested-running", agent: "nested-worker", state: "running", children: [] },
+						],
+					},
+				],
+			},
+		];
+
+		const completedRuns = filterRunsForView(runs, "completed");
+		assert.deepStrictEqual(completedRuns.map((run) => run.id), ["nested-complete"]);
+		assert.strictEqual(flattenRows(completedRuns).length, 1, "flattened completed rows should align with visible completed entries");
+		assert.strictEqual(completedRuns[0]!.state, "complete");
+		assert.deepStrictEqual(completedRuns[0]!.agents, ["nested-reviewer"]);
+	});
+
+	it("keeps counts aligned when a completed nested child has steps and descendants", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "parent-running",
+				label: "single: parent-worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["parent-worker"],
+				steps: [
+					{
+						agent: "parent-worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-complete",
+								agent: "nested-reviewer",
+								state: "complete",
+								steps: [
+									{
+										agent: "nested-step",
+										state: "complete",
+										children: [
+											{ id: "step-descendant", agent: "step-descendant-agent", state: "complete", children: [] },
+										],
+									},
+								],
+								children: [
+									{ id: "direct-descendant", agent: "direct-descendant-agent", state: "complete", children: [] },
+								],
+							},
+						],
+					},
+				],
+			},
+		];
+
+		const completedRuns = filterRunsForView(runs, "completed");
+		assert.deepStrictEqual(completedRuns.map((run) => run.id), ["nested-complete"]);
+		assert.deepStrictEqual(completedRuns[0]!.steps, [], "synthetic completed run should not preserve descendants as extra visible rows");
+		assert.strictEqual(flattenRows(completedRuns).length, completedRuns.length, "flattened rows should align with filtered completed count");
+
+		const completedText = renderOverlay(completedRuns, theme as never, WIDTH, 0, {
+			view: "completed",
+			runningCount: filterRunsForView(runs, "running").length,
+			completedCount: completedRuns.length,
+		}).join("\n");
+		assert.ok(completedText.includes("completed 1"), "completed count should match the one visible synthetic run");
+		assert.ok(completedText.includes("nested-reviewer complete"), "completed view should show the matching nested child");
+		assert.ok(!completedText.includes("nested-step"), "completed view should not render preserved child steps as extra rows");
+		assert.ok(!completedText.includes("direct-descendant"), "completed view should not render preserved child descendants as extra rows");
+		assert.ok(!completedText.includes("step-descendant"), "completed view should not render preserved step descendants as extra rows");
 	});
 
 	it("preserves list selection when going back from detail", () => {

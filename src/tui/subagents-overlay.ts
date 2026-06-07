@@ -36,18 +36,59 @@ function runMatchesView(run: OverlayRun, view: SubagentsOverlayView): boolean {
 	return view === "running" ? isRunning : !isRunning;
 }
 
+function nestedChildToRun(parent: OverlayRun, child: OverlayNestedChild): OverlayRun {
+	return {
+		id: child.id,
+		label: `${child.mode ?? "single"}: ${child.agent}`,
+		state: child.state,
+		mode: child.mode ?? "single",
+		source: parent.source,
+		agents: [child.agent],
+		elapsed: child.elapsed,
+		currentTool: child.currentTool,
+		sessionFile: child.sessionFile,
+		logPath: child.logPath,
+		artifactPath: child.artifactPath,
+		asyncDir: child.asyncDir,
+		steps: [],
+	};
+}
+
+function collectNestedRunsForView(run: OverlayRun, view: SubagentsOverlayView): OverlayRun[] {
+	const matches: OverlayRun[] = [];
+	const visit = (children: OverlayNestedChild[]): void => {
+		for (const child of children) {
+			if (runMatchesView({ ...run, state: child.state }, view)) {
+				matches.push(nestedChildToRun(run, child));
+				continue;
+			}
+			if (child.steps?.length) {
+				for (const step of child.steps) visit(step.children);
+			}
+			visit(child.children);
+		}
+	};
+	for (const step of run.steps) visit(step.children);
+	return matches;
+}
+
 function countRunsByView(runs: OverlayRun[]): { running: number; completed: number } {
-	let running = 0;
-	let completed = 0;
-	for (const run of runs) {
-		if (isRunningViewState(run.state)) running++;
-		else completed++;
-	}
-	return { running, completed };
+	return {
+		running: filterRunsForView(runs, "running").length,
+		completed: filterRunsForView(runs, "completed").length,
+	};
 }
 
 export function filterRunsForView(runs: OverlayRun[], view: SubagentsOverlayView): OverlayRun[] {
-	return runs.filter((run) => runMatchesView(run, view));
+	const filtered: OverlayRun[] = [];
+	for (const run of runs) {
+		if (runMatchesView(run, view)) {
+			filtered.push(run);
+			continue;
+		}
+		filtered.push(...collectNestedRunsForView(run, view));
+	}
+	return filtered;
 }
 
 interface RenderOverlayOptions {

@@ -57,7 +57,7 @@ import { buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime, readStructuredOutput } from "../shared/structured-output.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
-import { nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
+import { nestedSummaryFromAsyncStatus, projectNestedEvents, writeNestedEvent } from "../shared/nested-events.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
@@ -1325,6 +1325,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		artifactsDir,
 		sessionDir: config.sessionDir,
 		outputFile: path.join(asyncDir, "output-0.log"),
+		...(config.nestedRoute ? { nestedRoute: config.nestedRoute } : {}),
 	};
 
 	fs.mkdirSync(asyncDir, { recursive: true });
@@ -1383,6 +1384,13 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	};
 	const writeStatusPayload = (): void => {
 		refreshWorkflowGraph();
+		if (config.nestedRoute) {
+			try {
+				statusPayload.nestedChildren = projectNestedEvents(config.nestedRoute).children;
+			} catch (error) {
+				console.error("Failed to project nested subagent events for async status:", error);
+			}
+		}
 		writeAtomicJson(statusPath, statusPayload);
 		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" ? "subagent.nested.updated" : "subagent.nested.completed");
 	};

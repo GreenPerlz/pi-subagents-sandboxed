@@ -193,7 +193,11 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	}
 
 	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown) => unknown) => void;
+	let cleanedInitialContext = false;
 	onRuntimeEvent("context", (event: { messages: unknown[] }) => {
+		if (cleanedInitialContext) return undefined;
+		cleanedInitialContext = true;
+
 		const messages = stripParentOnlySubagentMessages(event.messages);
 		if (messages === event.messages) return undefined;
 		return { messages };

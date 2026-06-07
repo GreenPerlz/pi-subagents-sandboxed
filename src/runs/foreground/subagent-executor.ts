@@ -36,7 +36,6 @@ import {
 import { runSandboxPreflight } from "../../sandbox/preflight.ts";
 import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skills.ts";
 import { executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable } from "../background/async-execution.ts";
-import { checkAsyncDuplicateLaunch, computeAsyncFingerprint, type FingerprintItem } from "../background/async-duplicate-guard.ts";
 import { writePersistedForegroundStatus, type PersistedForegroundStep } from "./foreground-status.ts";
 import { createForkContextResolver } from "../../shared/fork-context.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
@@ -55,7 +54,7 @@ import {
 } from "../../intercom/result-intercom.ts";
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../background/async-resume.ts";
 import { createNestedRoute, projectNestedEvents, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateAsyncJobNestedProjection, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
-import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV, SUBAGENT_RUN_ID_ENV } from "../shared/pi-args.ts";
+import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV } from "../shared/pi-args.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { inspectSubagentStatus } from "../background/run-status.ts";
@@ -151,8 +150,6 @@ export interface SubagentParamsLike {
 	agentScope?: unknown;
 	chainDir?: string;
 	acceptance?: AcceptanceInput;
-	confirmationToken?: string;
-	confirmationReason?: string;
 }
 
 function resolveChildSandboxConfig(input: {
@@ -1325,7 +1322,6 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		controlConfig,
 		intercomBridge,
 		nestedRoute,
-		inheritedNestedRoute,
 	} = data;
 	const hasChain = (params.chain?.length ?? 0) > 0;
 	const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -1361,76 +1357,6 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			details: { mode: "single" as const, results: [] },
 		};
 	}
-
-	const modeLabel: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
-	let fingerprintItems: FingerprintItem[] = [];
-	if (hasSingle) {
-		fingerprintItems = [{
-			kind: "task",
-			agent: params.agent!,
-			task: params.task ?? "",
-			cwd: effectiveCwd,
-		}];
-	} else if (hasTasks && params.tasks) {
-		fingerprintItems = [{
-			kind: "parallel",
-			tasks: params.tasks.map((t) => ({
-				agent: t.agent,
-				task: t.task ?? "",
-				cwd: resolveChildCwd(effectiveCwd, t.cwd),
-			})),
-		}];
-	} else if (hasChain && params.chain) {
-		for (const step of params.chain) {
-			if (isParallelStep(step)) {
-				fingerprintItems.push({
-					kind: "parallel",
-					tasks: step.parallel.map((t) => ({
-						agent: t.agent,
-						task: t.task ?? "",
-						cwd: resolveChildCwd(effectiveCwd, t.cwd),
-					})),
-				});
-			} else if (isDynamicParallelStep(step)) {
-				fingerprintItems.push({
-					kind: "parallel",
-					tasks: [{
-						agent: step.parallel.agent,
-						task: step.parallel.task ?? "",
-						cwd: resolveChildCwd(effectiveCwd, step.parallel.cwd),
-					}],
-				});
-			} else {
-				const seq = step as SequentialStep;
-				fingerprintItems.push({
-					kind: "task",
-					agent: seq.agent,
-					task: seq.task ?? "",
-					cwd: resolveChildCwd(effectiveCwd, seq.cwd),
-				});
-			}
-		}
-	}
-	const duplicateFingerprint = computeAsyncFingerprint({
-		mode: modeLabel,
-		items: fingerprintItems,
-		cwd: effectiveCwd,
-		sessionId: deps.state.currentSessionId,
-		nestedRoute: inheritedNestedRoute,
-	});
-	const duplicateConfirmationReason = params.confirmationToken && params.confirmationReason?.trim()
-		? params.confirmationReason.trim()
-		: undefined;
-	const duplicateGuard = checkAsyncDuplicateLaunch(deps.state, {
-		mode: modeLabel,
-		items: fingerprintItems,
-		cwd: effectiveCwd,
-		sessionId: deps.state.currentSessionId,
-		nestedRoute: inheritedNestedRoute,
-		confirmationToken: params.confirmationToken,
-		confirmationReason: params.confirmationReason,
-	});
-	if (duplicateGuard) return duplicateGuard;
 
 	const id = randomUUID();
 	const asyncCtx = {
@@ -1498,8 +1424,6 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sandboxSettings,
 			sandboxRun: params.sandbox,
 			sandboxIntercomBridge,
-			duplicateFingerprint,
-			duplicateConfirmationReason,
 		});
 	}
 
@@ -1533,8 +1457,6 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sandboxSettings,
 			sandboxRun: params.sandbox,
 			sandboxIntercomBridge,
-			duplicateFingerprint,
-			duplicateConfirmationReason,
 		});
 	}
 
@@ -1586,8 +1508,6 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			acceptance: params.acceptance,
 			sandbox: singleSandbox,
 			sandboxIntercomBridge: resolveSandboxIntercomBridge(intercomBridge),
-			duplicateFingerprint,
-			duplicateConfirmationReason,
 		});
 	}
 

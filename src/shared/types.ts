@@ -585,8 +585,6 @@ export interface AsyncStartedEvent {
 	parallelGroups?: AsyncParallelGroupStatus[];
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
-	duplicateFingerprint?: string;
-	duplicateConfirmationReason?: string;
 }
 
 export interface AsyncStatus {
@@ -610,7 +608,6 @@ export interface AsyncStatus {
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	workflowGraph?: WorkflowGraphSnapshot;
-	duplicateConfirmationReason?: string;
 	steps?: Array<{
 		agent: string;
 		phase?: string;
@@ -691,8 +688,6 @@ export interface AsyncJobState {
 	controlEventCursor?: number;
 	nestedRoute?: NestedRouteInfo;
 	nestedChildren?: NestedRunSummary[];
-	duplicateFingerprint?: string;
-	duplicateConfirmationReason?: string;
 }
 
 export interface ForegroundResumeChild {
@@ -749,7 +744,6 @@ export interface SubagentState {
 		schedule(file: string, delayMs?: number): boolean;
 		clear(): void;
 	};
-	asyncDuplicateConfirmations?: Map<string, { fingerprint: string; existingRunId: string; createdAt: number; expiresAt: number }>;
 	ralphOrchestratorNestedWorkerActiveGuard?: Map<string, { runId: string; agent?: string; startedAt: number; lastSeenAt: number }>;
 }
 

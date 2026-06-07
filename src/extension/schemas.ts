@@ -312,10 +312,4 @@ export const SubagentParams = Type.Object({
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" })),
 	acceptance: Type.Optional(AcceptanceOverride),
-	confirmationToken: Type.Optional(Type.String({
-		description: "Explicit token to override duplicate async run blocking. Required when launching a materially equivalent async run while another is already active.",
-	})),
-	confirmationReason: Type.Optional(Type.String({
-		description: "Human-readable reason for overriding duplicate async run blocking. Required when confirmationToken is provided.",
-	})),
 });

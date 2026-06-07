@@ -214,7 +214,6 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				`Updated: ${updated}`,
 				`Dir: ${asyncDir}`,
 				outputPath ? `Output: ${outputPath}` : undefined,
-				status.duplicateConfirmationReason ? `Duplicate override reason: ${status.duplicateConfirmationReason}` : undefined,
 				reconciliation.message ? `Diagnosis: ${reconciliation.message}` : undefined,
 				reconciliation.resultPath && fs.existsSync(reconciliation.resultPath) ? `Result: ${reconciliation.resultPath}` : undefined,
 			].filter((line): line is string => Boolean(line));

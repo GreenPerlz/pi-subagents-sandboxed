@@ -52,7 +52,6 @@ function createChildSafeState(): SubagentState {
 			schedule: () => false,
 			clear: () => {},
 		},
-		asyncDuplicateConfirmations: new Map(),
 	};
 }
 

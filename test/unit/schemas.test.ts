@@ -206,20 +206,6 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.deepEqual(controlSchema.properties?.notifyChannels?.items?.enum, ["event", "async", "intercom"]);
 	});
 
-	it("exposes confirmation token and reason fields", () => {
-		const tokenSchema = SubagentParams?.properties?.confirmationToken;
-		assert.ok(tokenSchema, "confirmationToken schema should exist");
-		assert.equal(tokenSchema.type, "string");
-		assert.match(String(tokenSchema.description ?? ""), /duplicate/i);
-		assert.match(String(tokenSchema.description ?? ""), /async/i);
-
-		const reasonSchema = SubagentParams?.properties?.confirmationReason;
-		assert.ok(reasonSchema, "confirmationReason schema should exist");
-		assert.equal(reasonSchema.type, "string");
-		assert.match(String(reasonSchema.description ?? ""), /duplicate/i);
-		assert.match(String(reasonSchema.description ?? ""), /reason/i);
-	});
-
 	it("does not emit description-only schema nodes", () => {
 		const descriptionOnlyPaths: string[] = [];
 

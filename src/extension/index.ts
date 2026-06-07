@@ -256,7 +256,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			schedule: () => false,
 			clear: () => {},
 		},
-		asyncDuplicateConfirmations: new Map(),
 	};
 
 	const { startResultWatcher, primeExistingResults, stopResultWatcher } = createResultWatcher(

@@ -297,6 +297,84 @@ describe("subagent prompt runtime", () => {
 		});
 	});
 
+	it("preserves child's own nested subagent launch/result after one-shot initial context cleanup", () => {
+		let contextHandler: ((event: { messages: unknown[] }) => { messages: unknown[] } | undefined) | undefined;
+		registerSubagentPromptRuntime({
+			on(event: string, handler: (payload: { messages: unknown[] }) => { messages: unknown[] } | undefined) {
+				if (event === "context") contextHandler = handler;
+			},
+		} as { on(event: string, handler: (payload: { messages: unknown[] }) => { messages: unknown[] } | undefined): void });
+
+		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+
+		// Simulate initial context with inherited parent artifacts
+		const priorParentTurn = { role: "user", content: "Earlier planning." };
+		const parentSubagentResult = { role: "toolResult", toolName: "subagent", content: "parent subagent results" };
+		const task = { role: "user", content: "Launch exactly one async reviewer, then status-check it once." };
+
+		// First context event: strips inherited parent artifacts (one-shot)
+		const firstResult = contextHandler?.({ messages: [priorParentTurn, parentSubagentResult, task] });
+		assert.deepEqual(firstResult, { messages: [priorParentTurn, task] });
+
+		// Child launches its own async reviewer
+		const asyncLaunchCall = {
+			role: "assistant",
+			content: [{
+				type: "toolCall",
+				id: "call-reviewer-1",
+				name: "subagent",
+				arguments: { agent: "reviewer", async: true, task: "smoke test" },
+			}],
+		};
+		const asyncLaunchResult = {
+			role: "toolResult",
+			toolCallId: "call-reviewer-1",
+			toolName: "subagent",
+			content: [{ type: "text", text: "Async: reviewer [reviewer-run-1]" }],
+			details: { mode: "single", asyncId: "reviewer-run-1", asyncDir: "/tmp/reviewer-run-1", results: [] },
+		};
+
+		// Second context event: child's own subagent artifacts are preserved
+		const secondResult = contextHandler?.({ messages: [priorParentTurn, task, asyncLaunchCall, asyncLaunchResult] });
+		assert.equal(secondResult, undefined, "one-shot cleanup should not strip child's own subagent artifacts");
+	});
+
+	it("preserves child's mixed assistant messages with subagent call after one-shot initial context cleanup", () => {
+		let contextHandler: ((event: { messages: unknown[] }) => { messages: unknown[] } | undefined) | undefined;
+		registerSubagentPromptRuntime({
+			on(event: string, handler: (payload: { messages: unknown[] }) => { messages: unknown[] } | undefined) {
+				if (event === "context") contextHandler = handler;
+			},
+		} as { on(event: string, handler: (payload: { messages: unknown[] }) => { messages: unknown[] } | undefined): void });
+
+		// Simulate initial context with inherited parent artifacts to trigger one-shot cleanup
+		const priorParentTurn = { role: "user", content: "Earlier planning." };
+		const parentSubagentResult = { role: "toolResult", toolName: "subagent", content: "parent subagent results" };
+		const task = { role: "user", content: "Launch a reviewer." };
+
+		// First context event: strips inherited parent artifacts
+		contextHandler?.({ messages: [priorParentTurn, parentSubagentResult, task] });
+
+		// Child's own mixed assistant message with subagent call
+		const mixedLaunchCall = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "I will launch one reviewer." },
+				{ type: "toolCall", id: "call-reviewer-1", name: "subagent", arguments: { agent: "reviewer", async: true } },
+			],
+		};
+		const launchResult = {
+			role: "toolResult",
+			toolCallId: "call-reviewer-1",
+			toolName: "subagent",
+			content: [{ type: "text", text: "Async: reviewer [reviewer-run-1]" }],
+		};
+
+		// Second context event: child's own subagent artifacts are preserved
+		const result = contextHandler?.({ messages: [priorParentTurn, task, mixedLaunchCall, launchResult] });
+		assert.equal(result, undefined, "one-shot cleanup should not strip child's own subagent artifacts");
+	});
+
 	it("does not rewrite child context when no parent-only artifacts are present", () => {
 		let contextHandler: ((event: { messages: unknown[] }) => { messages: unknown[] } | undefined) | undefined;
 		registerSubagentPromptRuntime({

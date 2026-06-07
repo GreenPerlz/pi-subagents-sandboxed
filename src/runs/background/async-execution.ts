@@ -129,8 +129,6 @@ interface AsyncChainParams {
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
-	duplicateFingerprint?: string;
-	duplicateConfirmationReason?: string;
 }
 
 interface AsyncSingleParams {
@@ -162,8 +160,6 @@ interface AsyncSingleParams {
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
-	duplicateFingerprint?: string;
-	duplicateConfirmationReason?: string;
 }
 
 interface AsyncExecutionResult {
@@ -529,7 +525,6 @@ export function executeAsyncChain(
 				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
-				...(params.duplicateConfirmationReason ? { duplicateConfirmationReason: params.duplicateConfirmationReason } : {}),
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
 					parentStepIndex: nestedAddress.parentStepIndex,
@@ -629,8 +624,6 @@ export function executeAsyncChain(
 			cwd: runnerCwd,
 			asyncDir,
 			nestedRoute,
-			...(params.duplicateFingerprint !== undefined ? { duplicateFingerprint: params.duplicateFingerprint } : {}),
-			...(params.duplicateConfirmationReason ? { duplicateConfirmationReason: params.duplicateConfirmationReason } : {}),
 		});
 	}
 
@@ -775,7 +768,6 @@ export function executeAsyncSingle(
 				sandbox,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
-				...(params.duplicateConfirmationReason ? { duplicateConfirmationReason: params.duplicateConfirmationReason } : {}),
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
 					parentStepIndex: nestedAddress.parentStepIndex,
@@ -839,8 +831,6 @@ export function executeAsyncSingle(
 			cwd: runnerCwd,
 			asyncDir,
 			nestedRoute,
-			...(params.duplicateFingerprint !== undefined ? { duplicateFingerprint: params.duplicateFingerprint } : {}),
-			...(params.duplicateConfirmationReason ? { duplicateConfirmationReason: params.duplicateConfirmationReason } : {}),
 		});
 	}
 

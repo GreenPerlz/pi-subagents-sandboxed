@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { detectGitWorktreePointerGitdir } from "./preflight.ts";
 import type { SandboxMount, SandboxMountMode } from "./types.ts";
 
 export interface StructuredOutputMountInput {
@@ -204,10 +205,34 @@ function addExplicitMounts(mounts: SandboxMount[], seen: Map<string, SandboxMoun
 	}
 }
 
+function addGitWorktreePointerMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, cwd: string): void {
+	const detection = detectGitWorktreePointerGitdir(cwd);
+	if (!detection.ok) {
+		throw new Error(detection.error ?? `Invalid Git worktree .git pointer in ${path.resolve(cwd)}`);
+	}
+	if (!detection.pointerGitdir) return;
+	const resolvedCwd = path.resolve(cwd);
+	if (!isWithinAnyRoot(detection.pointerGitdir, [resolvedCwd])) {
+		addSandboxMount(mounts, seen, detection.pointerGitdir, "ro");
+	}
+	if (detection.commonGitdir && !isWithinAnyRoot(detection.commonGitdir, [resolvedCwd])) {
+		addSandboxMount(mounts, seen, detection.commonGitdir, "ro");
+	}
+}
+
+function isWithinAnyRoot(candidate: string, roots: string[]): boolean {
+	for (const root of roots) {
+		const relative = path.relative(root, candidate);
+		if (!relative.startsWith("..") && !path.isAbsolute(relative)) return true;
+	}
+	return false;
+}
+
 export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): SandboxMount[] {
 	const mounts: SandboxMount[] = [];
 	const seen = new Map<string, SandboxMount["mode"]>();
 	addSandboxMount(mounts, seen, input.cwd, input.cwdMode ?? "rw");
+	addGitWorktreePointerMount(mounts, seen, input.cwd);
 	addSandboxMount(mounts, seen, input.tempDir, "ro");
 	addSandboxMount(mounts, seen, input.sessionDir, "rw");
 	addSandboxSessionFileMount(mounts, seen, input.sessionFile);

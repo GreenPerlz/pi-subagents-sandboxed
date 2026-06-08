@@ -21,6 +21,16 @@ export interface GitWorktreePointerResult {
 	ok: boolean;
 	skipped?: boolean;
 	pointerGitdir?: string;
+	commonGitdir?: string;
+	autoMountGitdir?: string;
+	autoMountCommonGitdir?: string;
+	error?: string;
+}
+
+export interface GitWorktreePointerDetectionResult {
+	ok: boolean;
+	pointerGitdir?: string;
+	commonGitdir?: string;
 	error?: string;
 }
 
@@ -144,63 +154,154 @@ export function checkGitProbe(cwd: string, deps?: { execSync: () => ExecResult }
 }
 
 /**
- * Check whether git works in a sandboxed worktree when `.git` is a pointer file.
- * If the referenced gitdir is outside the sandbox root AND outside all extra mount
- * roots, the check fails with an actionable message about required mount exceptions.
+ * Detect and validate a Git linked-worktree `.git` pointer file.
+ * Returns the real gitdir path only for pointer-file worktrees; normal `.git`
+ * directories, non-git directories, and non-pointer files return ok with no path.
  */
-export function checkGitWorktreePointer(cwd: string, options: { sandboxRoot: string; extraMountRoots?: string[]; requireGitWorktree?: boolean }): GitWorktreePointerResult {
-	const gitPath = path.join(cwd, ".git");
+export function detectGitWorktreePointerGitdir(cwd: string, options: { requireGitWorktree?: boolean } = {}): GitWorktreePointerDetectionResult {
+	const resolvedCwd = path.resolve(cwd);
+	const gitPath = path.join(resolvedCwd, ".git");
 
 	let stat: fs.Stats;
 	try {
 		stat = fs.lstatSync(gitPath);
 	} catch {
 		if (options.requireGitWorktree) {
-			return { ok: false, error: `No .git found at ${cwd}; expected a git worktree.` };
+			return { ok: false, error: `No .git found at ${resolvedCwd}; expected a git worktree.` };
 		}
-		// No .git at all — nothing to check.
 		return { ok: true };
 	}
 
-	// If .git is a regular directory, git works directly.
 	if (stat.isDirectory() && !stat.isSymbolicLink()) {
 		return { ok: true };
 	}
 
-	// .git is a file (pointer) or symlink — read it.
 	let content: string;
 	try {
 		content = fs.readFileSync(gitPath, "utf-8").trim();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		return { ok: false, error: `Cannot read .git pointer file: ${message}` };
+		return { ok: false, error: `Cannot read .git pointer file at ${gitPath}: ${message}` };
 	}
 
-	// Git worktree pointer files start with "gitdir:"
 	if (!content.startsWith("gitdir:")) {
-		// Not a pointer file; treat as ok (could be a submodule or other format).
 		return { ok: true };
 	}
 
 	const gitdir = content.replace(/^gitdir:\s*/, "").trim();
-	const resolvedGitdir = path.resolve(cwd, gitdir);
+	if (!gitdir) {
+		return { ok: false, error: `Unsafe Git worktree .git pointer at ${gitPath}: gitdir is empty.` };
+	}
+	if (gitdir.includes("\0")) {
+		return { ok: false, error: `Unsafe Git worktree .git pointer at ${gitPath}: gitdir contains a NUL byte.` };
+	}
+
+	const resolvedGitdir = path.resolve(resolvedCwd, gitdir);
+	let realGitdir: string;
+	try {
+		realGitdir = fs.realpathSync.native(resolvedGitdir);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, pointerGitdir: resolvedGitdir, error: `Git worktree .git pointer references missing or inaccessible gitdir: ${resolvedGitdir} (${message})` };
+	}
+
+	let gitdirStat: fs.Stats;
+	try {
+		gitdirStat = fs.statSync(realGitdir);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, pointerGitdir: realGitdir, error: `Git worktree .git pointer references inaccessible gitdir: ${realGitdir} (${message})` };
+	}
+	if (!gitdirStat.isDirectory()) {
+		return { ok: false, pointerGitdir: realGitdir, error: `Git worktree .git pointer references non-directory gitdir: ${realGitdir}` };
+	}
+
+	const unsafeGitdirError = validateGitMountRoot(realGitdir, resolvedCwd, "Git worktree .git pointer", "gitdir");
+	if (unsafeGitdirError) return { ok: false, pointerGitdir: realGitdir, error: unsafeGitdirError };
+
+	const commonGitdirResult = detectGitdirCommondir(realGitdir, resolvedCwd);
+	if (!commonGitdirResult.ok) return { ok: false, pointerGitdir: realGitdir, commonGitdir: commonGitdirResult.commonGitdir, error: commonGitdirResult.error };
+
+	return { ok: true, pointerGitdir: realGitdir, commonGitdir: commonGitdirResult.commonGitdir };
+}
+
+function detectGitdirCommondir(gitdir: string, resolvedCwd: string): GitWorktreePointerDetectionResult {
+	const commondirPath = path.join(gitdir, "commondir");
+	if (!fs.existsSync(commondirPath)) return { ok: true };
+
+	let content: string;
+	try {
+		content = fs.readFileSync(commondirPath, "utf-8").trim();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, error: `Cannot read Git worktree commondir at ${commondirPath}: ${message}` };
+	}
+
+	if (!content) {
+		return { ok: false, error: `Unsafe Git worktree commondir at ${commondirPath}: commondir is empty.` };
+	}
+	if (content.includes("\0")) {
+		return { ok: false, error: `Unsafe Git worktree commondir at ${commondirPath}: commondir contains a NUL byte.` };
+	}
+
+	const resolvedCommondir = path.resolve(gitdir, content);
+	let realCommondir: string;
+	try {
+		realCommondir = fs.realpathSync.native(resolvedCommondir);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, commonGitdir: resolvedCommondir, error: `Git worktree commondir references missing or inaccessible common gitdir: ${resolvedCommondir} (${message})` };
+	}
+
+	let commonStat: fs.Stats;
+	try {
+		commonStat = fs.statSync(realCommondir);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, commonGitdir: realCommondir, error: `Git worktree commondir references inaccessible common gitdir: ${realCommondir} (${message})` };
+	}
+	if (!commonStat.isDirectory()) {
+		return { ok: false, commonGitdir: realCommondir, error: `Git worktree commondir references non-directory common gitdir: ${realCommondir}` };
+	}
+
+	const unsafeCommondirError = validateGitMountRoot(realCommondir, resolvedCwd, "Git worktree commondir", "common gitdir");
+	if (unsafeCommondirError) return { ok: false, commonGitdir: realCommondir, error: unsafeCommondirError };
+
+	return { ok: true, commonGitdir: realCommondir };
+}
+
+function validateGitMountRoot(candidate: string, resolvedCwd: string, subject: string, label: string): string | undefined {
+	const root = path.parse(candidate).root;
+	if (candidate === root || isWithinAnyRoot(resolvedCwd, [candidate])) {
+		return `Unsafe ${subject} references overly broad ${label} mount root: ${candidate}`;
+	}
+	return undefined;
+}
+
+/**
+ * Check whether git works in a sandboxed worktree when `.git` is a pointer file.
+ * External linked-worktree gitdirs are accepted because launch mounts the narrow
+ * referenced gitdir read-only by default.
+ */
+export function checkGitWorktreePointer(cwd: string, options: { sandboxRoot: string; extraMountRoots?: string[]; requireGitWorktree?: boolean }): GitWorktreePointerResult {
+	const detection = detectGitWorktreePointerGitdir(cwd, { requireGitWorktree: options.requireGitWorktree });
+	if (!detection.ok) return detection;
+	if (!detection.pointerGitdir) return { ok: true };
+
+	const resolvedGitdir = detection.pointerGitdir;
+	const resolvedCommonGitdir = detection.commonGitdir;
 	const resolvedSandboxRoot = path.resolve(options.sandboxRoot);
-
-	// Check if the gitdir is inside the sandbox root.
-	if (isWithinAnyRoot(resolvedGitdir, [resolvedSandboxRoot])) {
-		return { ok: true, pointerGitdir: resolvedGitdir };
-	}
-
-	// Check if the gitdir is inside any of the extra mount roots.
 	const extraRoots = (options.extraMountRoots ?? []).map((r) => path.resolve(r));
-	if (isWithinAnyRoot(resolvedGitdir, extraRoots)) {
-		return { ok: true, pointerGitdir: resolvedGitdir };
-	}
+	const mountRoots = [resolvedSandboxRoot, ...extraRoots];
+	const alreadyMounted = isWithinAnyRoot(resolvedGitdir, mountRoots);
+	const commonAlreadyMounted = resolvedCommonGitdir ? isWithinAnyRoot(resolvedCommonGitdir, mountRoots) : true;
 
 	return {
-		ok: false,
+		ok: true,
 		pointerGitdir: resolvedGitdir,
-		error: `Git worktree .git pointer references gitdir outside sandbox mount: ${resolvedGitdir} is outside ${resolvedSandboxRoot}. Either mount the gitdir read-only in the sandbox (sandbox.extraReadOnlyMounts) or move the worktree so its gitdir is inside the sandbox root.`,
+		...(resolvedCommonGitdir ? { commonGitdir: resolvedCommonGitdir } : {}),
+		...(alreadyMounted ? {} : { autoMountGitdir: resolvedGitdir }),
+		...(resolvedCommonGitdir && !commonAlreadyMounted ? { autoMountCommonGitdir: resolvedCommonGitdir } : {}),
 	};
 }
 
@@ -329,7 +430,10 @@ export function runSandboxPreflight(input: PreflightInput): PreflightCheckResult
 	} else {
 		worktree = checkGitWorktreePointer(input.cwd, { sandboxRoot: input.sandboxRoot, extraMountRoots: input.extraMountRoots, requireGitWorktree: input.requireGitWorktree });
 		if (worktree.ok) {
-			lines.push(`  git worktree pointer: ok${worktree.pointerGitdir ? ` (gitdir: ${worktree.pointerGitdir})` : ""}`);
+			const details = worktree.pointerGitdir
+				? ` (gitdir: ${worktree.pointerGitdir}${worktree.autoMountGitdir ? ", auto-mounted read-only" : ""}${worktree.commonGitdir ? `, commondir: ${worktree.commonGitdir}${worktree.autoMountCommonGitdir ? ", auto-mounted read-only" : ""}` : ""})`
+				: "";
+			lines.push(`  git worktree pointer: ok${details}`);
 		} else {
 			lines.push(`  git worktree pointer: ${worktree.error}`);
 			if (worktree.error) errors.push(worktree.error);

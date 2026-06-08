@@ -254,7 +254,7 @@ describe("sandbox preflight: git worktree pointer file", () => {
 		}
 	});
 
-	it("fails when .git is a pointer file and gitdir is outside the sandbox root", () => {
+	it("passes when .git is a pointer file and external gitdir will be auto-mounted read-only", () => {
 		const { repoDir, bareDir } = createBareRepo("pi-preflight-outside");
 		tempDirs.push(repoDir, bareDir);
 		const { worktreeDir, gitdirPath, cleanup } = createWorktreeWithPointerFile(bareDir, "pi-preflight-outside");
@@ -265,14 +265,45 @@ describe("sandbox preflight: git worktree pointer file", () => {
 			const result = checkGitWorktreePointer(worktreeDir, {
 				sandboxRoot: worktreeDir,
 			});
-			assert.equal(result.ok, false);
-			assert.ok(result.error);
-			assert.match(result.error, /gitdir.*outside.*sandbox|sandbox.*mount.*gitdir/i);
+			assert.equal(result.ok, true);
+			assert.equal(result.error, undefined);
 			assert.ok(result.pointerGitdir);
+			assert.ok(result.commonGitdir);
+			assert.ok(result.autoMountGitdir);
+			assert.ok(result.autoMountCommonGitdir);
 			assert.ok(!result.pointerGitdir.startsWith(worktreeDir));
 		} finally {
 			cleanup();
 		}
+	});
+
+	it("fails clearly when .git pointer commondir references a missing common gitdir", () => {
+		const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-missing-commondir-"));
+		tempDirs.push(worktreeDir);
+		const gitdir = path.join(path.dirname(worktreeDir), "repo.git", "worktrees", "worktree");
+		fs.mkdirSync(gitdir, { recursive: true });
+		fs.writeFileSync(path.join(gitdir, "commondir"), "../../missing-common\n", "utf-8");
+		fs.writeFileSync(path.join(worktreeDir, ".git"), `gitdir: ${gitdir}\n`, "utf-8");
+
+		const result = checkGitWorktreePointer(worktreeDir, { sandboxRoot: worktreeDir });
+
+		assert.equal(result.ok, false);
+		assert.match(result.error!, /missing or inaccessible common gitdir/i);
+	});
+
+	it("fails clearly when .git pointer commondir references an unsafe broad common gitdir", () => {
+		const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-unsafe-commondir-"));
+		tempDirs.push(worktreeDir);
+		const root = path.dirname(worktreeDir);
+		const gitdir = path.join(root, "repo.git", "worktrees", "worktree");
+		fs.mkdirSync(gitdir, { recursive: true });
+		fs.writeFileSync(path.join(gitdir, "commondir"), `${root}\n`, "utf-8");
+		fs.writeFileSync(path.join(worktreeDir, ".git"), `gitdir: ${gitdir}\n`, "utf-8");
+
+		const result = checkGitWorktreePointer(worktreeDir, { sandboxRoot: worktreeDir });
+
+		assert.equal(result.ok, false);
+		assert.match(result.error!, /unsafe.*overly broad common gitdir/i);
 	});
 
 	it("passes when no .git exists", () => {
@@ -284,6 +315,30 @@ describe("sandbox preflight: git worktree pointer file", () => {
 		assert.equal(result.ok, true);
 		assert.equal(result.pointerGitdir, undefined);
 		assert.equal(result.error, undefined);
+	});
+
+	it("fails clearly when .git pointer references a missing gitdir", () => {
+		const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-missing-gitdir-"));
+		tempDirs.push(worktreeDir);
+		const missingGitdir = path.join(path.dirname(worktreeDir), "missing-gitdir");
+		fs.writeFileSync(path.join(worktreeDir, ".git"), `gitdir: ${missingGitdir}\n`, "utf-8");
+
+		const result = checkGitWorktreePointer(worktreeDir, { sandboxRoot: worktreeDir });
+
+		assert.equal(result.ok, false);
+		assert.equal(result.pointerGitdir, missingGitdir);
+		assert.match(result.error!, /missing or inaccessible gitdir/i);
+	});
+
+	it("fails clearly when .git pointer references an unsafe broad gitdir", () => {
+		const worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-unsafe-gitdir-"));
+		tempDirs.push(worktreeDir);
+		fs.writeFileSync(path.join(worktreeDir, ".git"), `gitdir: ${path.dirname(worktreeDir)}\n`, "utf-8");
+
+		const result = checkGitWorktreePointer(worktreeDir, { sandboxRoot: worktreeDir });
+
+		assert.equal(result.ok, false);
+		assert.match(result.error!, /unsafe.*overly broad gitdir/i);
 	});
 
 	it("passes when gitdir is outside sandboxRoot but inside extraMountRoots", () => {
@@ -309,7 +364,7 @@ describe("sandbox preflight: git worktree pointer file", () => {
 		}
 	});
 
-	it("fails when gitdir is outside both sandboxRoot and extraMountRoots", () => {
+	it("passes and requests auto-mount when gitdir is outside both sandboxRoot and extraMountRoots", () => {
 		const { repoDir, bareDir } = createBareRepo("pi-preflight-extra-mount-fail");
 		tempDirs.push(repoDir, bareDir);
 		const { worktreeDir, cleanup } = createWorktreeWithPointerFile(bareDir, "pi-preflight-extra-mount-fail");
@@ -323,9 +378,8 @@ describe("sandbox preflight: git worktree pointer file", () => {
 				sandboxRoot: worktreeDir,
 				extraMountRoots: [unrelatedRoot],
 			});
-			assert.equal(result.ok, false);
-			assert.ok(result.error);
-			assert.match(result.error, /gitdir.*outside.*sandbox/i);
+			assert.equal(result.ok, true);
+			assert.ok(result.autoMountGitdir);
 		} finally {
 			cleanup();
 		}
@@ -359,7 +413,7 @@ describe("sandbox preflight: combined run", () => {
 		assert.equal(result.warnings.length, 0);
 	});
 
-	it("collects warnings from gh auth and errors from worktree", () => {
+	it("collects warnings from gh auth while external worktree gitdir is auto-mounted", () => {
 		const { repoDir, bareDir } = createBareRepo("pi-preflight-combined-fail");
 		tempDirs.push(repoDir, bareDir);
 		const { worktreeDir, cleanup } = createWorktreeWithPointerFile(bareDir, "pi-preflight-combined-fail");
@@ -374,11 +428,12 @@ describe("sandbox preflight: combined run", () => {
 				},
 			});
 
-			// gh auth failure is informational (warning), worktree is blocking (error)
-			assert.equal(result.passed, false);
+			// gh auth failure is informational (warning); worktree gitdir is mounted by default.
+			assert.equal(result.passed, true);
 			assert.equal(result.ghAuth.available, false);
-			assert.equal(result.worktree.ok, false);
-			assert.equal(result.errors.length, 1); // worktree only
+			assert.equal(result.worktree.ok, true);
+			assert.ok(result.worktree.autoMountGitdir);
+			assert.equal(result.errors.length, 0);
 			assert.equal(result.warnings.length, 1); // gh auth only
 		} finally {
 			cleanup();
@@ -669,7 +724,7 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 		}
 	});
 
-	it("blocks ralph-orchestrator worker when gitdir is outside sandbox mount", async () => {
+	it("allows ralph-orchestrator worker when external worktree gitdir is auto-mounted", async () => {
 		saveAndClearEnv();
 		const { repoDir, bareDir } = createBareRepo("pi-ralph-preflight-block");
 		const { worktreeDir, cleanup } = createWorktreeWithPointerFile(bareDir, "pi-ralph-preflight-block");
@@ -678,13 +733,18 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 			const route = createNestedRoute("root-preflight-block");
 			routeRoots.push(path.dirname(route.eventSink));
 			setRalphOrchestratorNestedEnv(route);
+			const throwingCtx = {
+				...testCtx(worktreeDir),
+				modelRegistry: { getAvailable() { throw new Error("worker reached execution"); } },
+			};
 			const executor = createTestExecutor();
 
-			const result = await executor.execute("run", { agent: "worker", task: "go" }, new AbortController().signal, undefined, testCtx(worktreeDir));
+			const result = await executor.execute("run", { agent: "worker", task: "go" }, new AbortController().signal, undefined, throwingCtx);
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /preflight failed/i);
-			assert.match(text(result), /gitdir.*outside.*sandbox/i);
+			const resultText = text(result);
+			assert.match(resultText, /auto-mounted read-only/i);
+			assert.match(resultText, /worker reached execution/);
 		} finally {
 			cleanup();
 			try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch {}

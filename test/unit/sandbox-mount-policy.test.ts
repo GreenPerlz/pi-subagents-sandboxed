@@ -108,6 +108,82 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, cwd), "ro");
 	});
 
+	it("does not add an extra gitdir mount for a normal repo with a .git directory", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const gitDir = mkdirp(path.join(cwd, ".git"));
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: "ro" });
+
+		assert.equal(mountMode(mounts, cwd), "ro");
+		assert.equal(mountMode(mounts, gitDir), undefined);
+	});
+
+	it("auto-mounts a linked worktree .git pointer gitdir read-only without changing cwd writability", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "worktree"));
+		const gitdir = mkdirp(path.join(root, "repo.git", "worktrees", "worktree"));
+		fs.writeFileSync(path.join(cwd, ".git"), `gitdir: ${path.relative(cwd, gitdir)}\n`, "utf-8");
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: "rw" });
+
+		assert.equal(mountMode(mounts, cwd), "rw");
+		assert.equal(mountMode(mounts, gitdir), "ro");
+	});
+
+	it("auto-mounts a linked worktree commondir read-only without changing cwd writability", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "worktree"));
+		const commonGitdir = mkdirp(path.join(root, "repo", ".git"));
+		const gitdir = mkdirp(path.join(commonGitdir, "worktrees", "worktree"));
+		fs.writeFileSync(path.join(gitdir, "commondir"), "../..\n", "utf-8");
+		fs.writeFileSync(path.join(cwd, ".git"), `gitdir: ${path.relative(cwd, gitdir)}\n`, "utf-8");
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: "rw" });
+
+		assert.equal(mountMode(mounts, cwd), "rw");
+		assert.equal(mountMode(mounts, gitdir), "ro");
+		assert.equal(mountMode(mounts, commonGitdir), "ro");
+	});
+
+	it("fails sandbox mount setup clearly for a missing linked worktree gitdir", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "worktree"));
+		const missingGitdir = path.join(root, "repo.git", "worktrees", "missing");
+		fs.writeFileSync(path.join(cwd, ".git"), `gitdir: ${missingGitdir}\n`, "utf-8");
+
+		assert.throws(
+			() => buildSubagentSandboxMounts({ cwd, cwdMode: "ro" }),
+			/missing or inaccessible gitdir/i,
+		);
+	});
+
+	it("fails sandbox mount setup clearly for a missing linked worktree commondir", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "worktree"));
+		const gitdir = mkdirp(path.join(root, "repo.git", "worktrees", "worktree"));
+		fs.writeFileSync(path.join(gitdir, "commondir"), "../../missing-common\n", "utf-8");
+		fs.writeFileSync(path.join(cwd, ".git"), `gitdir: ${gitdir}\n`, "utf-8");
+
+		assert.throws(
+			() => buildSubagentSandboxMounts({ cwd, cwdMode: "ro" }),
+			/missing or inaccessible common gitdir/i,
+		);
+	});
+
+	it("fails sandbox mount setup clearly for an unsafe linked worktree commondir", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "worktree"));
+		const gitdir = mkdirp(path.join(root, "repo.git", "worktrees", "worktree"));
+		fs.writeFileSync(path.join(gitdir, "commondir"), `${root}\n`, "utf-8");
+		fs.writeFileSync(path.join(cwd, ".git"), `gitdir: ${gitdir}\n`, "utf-8");
+
+		assert.throws(
+			() => buildSubagentSandboxMounts({ cwd, cwdMode: "ro" }),
+			/unsafe.*overly broad common gitdir/i,
+		);
+	});
+
 	it("mounts a fresh child session directory writable without mounting the broad session root", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));

@@ -258,6 +258,102 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.id, "nested-fg");
 	});
 
+	it("keeps a genuinely live foreground control with a live nested child running", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-live-nested", {
+			currentAgent: "worker",
+			mode: "single",
+			currentIndex: 0,
+			nestedChildren: [makeNestedChild({
+				id: "nested-live-running",
+				parentRunId: "fg-live-nested",
+				parentStepIndex: 0,
+				state: "running",
+				currentTool: "read",
+				startedAt: 1000,
+			})],
+		});
+
+		const runs = collectRunTree(state, 5000);
+
+		assert.strictEqual(runs[0]!.state, "running");
+		const nested = runs[0]!.steps[0]!.children[0]!;
+		assert.strictEqual(nested.state, "running");
+		assert.strictEqual(nested.currentTool, "read");
+		assert.match(nested.elapsed ?? "", /^\d/);
+	});
+
+	it("classifies a foreground control with remembered completed children as completed", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-finalizing", {
+			currentAgent: "ralph-orchestrator",
+			mode: "single",
+			currentIndex: 0,
+			currentTool: "subagent",
+			nestedChildren: [makeNestedChild({
+				id: "nested-reviewer",
+				parentRunId: "fg-finalizing",
+				parentStepIndex: 0,
+				agent: "reviewer",
+				state: "running",
+				currentTool: "bash",
+				startedAt: 1000,
+				lastUpdate: 2500,
+				steps: [{ agent: "reviewer", status: "running", currentTool: "bash", startedAt: 1000 }],
+			})],
+		});
+		addForegroundRun(state, "fg-finalizing", {
+			mode: "single",
+			children: [{ agent: "ralph-orchestrator", index: 0, status: "completed" }],
+		});
+
+		const runs = collectRunTree(state, 10000);
+
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.state, "complete");
+		assert.strictEqual(runs[0]!.currentTool, undefined);
+		assert.strictEqual(runs[0]!.steps[0]!.state, "complete");
+		const nested = runs[0]!.steps[0]!.children[0]!;
+		assert.strictEqual(nested.state, "complete");
+		assert.strictEqual(nested.currentTool, undefined);
+		assert.strictEqual(nested.elapsed, "1.5s");
+		assert.strictEqual(nested.steps![0]!.state, "complete");
+		assert.strictEqual(nested.steps![0]!.currentTool, undefined);
+		assert.strictEqual(nested.steps![0]!.elapsed, "1.5s");
+	});
+
+	it("freezes restarted foreground nested children without their own update timestamp", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-finalizing-no-update", {
+			currentAgent: "ralph-orchestrator",
+			mode: "single",
+			currentIndex: 0,
+			updatedAt: 3000,
+			nestedChildren: [makeNestedChild({
+				id: "nested-no-update",
+				parentRunId: "fg-finalizing-no-update",
+				parentStepIndex: 0,
+				state: "running",
+				currentTool: "bash",
+				startedAt: 1000,
+				steps: [{ agent: "reviewer", status: "running", currentTool: "bash", startedAt: 1000 }],
+			})],
+		});
+		addForegroundRun(state, "fg-finalizing-no-update", {
+			mode: "single",
+			updatedAt: 3500,
+			children: [{ agent: "ralph-orchestrator", index: 0, status: "completed" }],
+		});
+
+		const runs = collectRunTree(state, 10000);
+
+		const nested = runs[0]!.steps[0]!.children[0]!;
+		assert.strictEqual(nested.state, "complete");
+		assert.strictEqual(nested.currentTool, undefined);
+		assert.strictEqual(nested.elapsed, "2.5s");
+		assert.strictEqual(nested.steps![0]!.elapsed, "2.5s");
+	});
+
 	it("refreshes foreground nested children from the nested event route", () => {
 		const route = createNestedRoute("fg-route");
 		const child = makeNestedChild({ id: "nested-live", parentRunId: "fg-route", parentStepIndex: 0, agent: "reviewer" });
@@ -541,7 +637,7 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.elapsed, "4.5s");
 	});
 
-	it("deduplicates live foregroundControls against finished foregroundRuns", () => {
+	it("deduplicates live foregroundControls against remembered foregroundRuns", () => {
 		const state = baseState();
 		addForegroundControl(state, "fg-live", {
 			currentAgent: "worker",
@@ -556,7 +652,7 @@ describe("collectRunTree", () => {
 		const runs = collectRunTree(state);
 		assert.strictEqual(runs.length, 1);
 		assert.strictEqual(runs[0]!.id, "fg-live");
-		assert.strictEqual(runs[0]!.state, "running");
+		assert.strictEqual(runs[0]!.state, "complete");
 	});
 
 	it("hydrates interrupted persisted foreground runs after parent session resume", () => {
@@ -574,6 +670,15 @@ describe("collectRunTree", () => {
 				currentAgent: "file-reader-demo",
 				currentIndex: 0,
 				children: [{ agent: "file-reader-demo", index: 0, status: "running", sessionFile: "/tmp/fg/session.jsonl" }],
+				nestedChildren: [makeNestedChild({
+					id: "nested-interrupted-stale",
+					parentRunId: "fg-interrupted",
+					parentStepIndex: 0,
+					state: "running",
+					currentTool: "read",
+					startedAt: 1000,
+					lastUpdate: 2500,
+				})],
 			});
 
 			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
@@ -583,6 +688,10 @@ describe("collectRunTree", () => {
 			assert.strictEqual(runs[0]!.state, "paused");
 			assert.deepStrictEqual(runs[0]!.agents, ["file-reader-demo"]);
 			assert.strictEqual(runs[0]!.steps[0]!.state, "paused");
+			const nested = runs[0]!.steps[0]!.children[0]!;
+			assert.strictEqual(nested.state, "paused");
+			assert.strictEqual(nested.currentTool, undefined);
+			assert.strictEqual(nested.elapsed, "1.5s");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -601,6 +710,15 @@ describe("collectRunTree", () => {
 				startedAt: 1000,
 				updatedAt: 2000,
 				children: [{ agent: "worker", index: 0, status: "completed", sessionFile: "/tmp/fg-complete/session.jsonl" }],
+				nestedChildren: [makeNestedChild({
+					id: "nested-persisted-stale",
+					parentRunId: "fg-complete",
+					parentStepIndex: 0,
+					state: "running",
+					currentTool: "read",
+					startedAt: 1000,
+					lastUpdate: 2500,
+				})],
 			});
 
 			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
@@ -610,6 +728,46 @@ describe("collectRunTree", () => {
 			assert.strictEqual(runs[0]!.state, "complete");
 			assert.strictEqual(runs[0]!.steps[0]!.agent, "worker");
 			assert.strictEqual(runs[0]!.steps[0]!.state, "complete");
+			const nested = runs[0]!.steps[0]!.children[0]!;
+			assert.strictEqual(nested.state, "complete");
+			assert.strictEqual(nested.currentTool, undefined);
+			assert.strictEqual(nested.elapsed, "1.5s");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("freezes persisted foreground nested children without their own update timestamp", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-persisted-no-update", {
+				runId: "fg-persisted-no-update",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				startedAt: 1000,
+				updatedAt: 3000,
+				children: [{ agent: "worker", index: 0, status: "completed", sessionFile: "/tmp/fg-complete/session.jsonl" }],
+				nestedChildren: [makeNestedChild({
+					id: "nested-persisted-no-update",
+					parentRunId: "fg-persisted-no-update",
+					parentStepIndex: 0,
+					state: "running",
+					currentTool: "read",
+					startedAt: 1000,
+					steps: [{ agent: "reviewer", status: "running", currentTool: "read", startedAt: 1000 }],
+				})],
+			});
+
+			const runs = collectRunTree(state, 10000, { foregroundDirRoot, resultsDir });
+
+			const nested = runs[0]!.steps[0]!.children[0]!;
+			assert.strictEqual(nested.state, "complete");
+			assert.strictEqual(nested.currentTool, undefined);
+			assert.strictEqual(nested.elapsed, "2.0s");
+			assert.strictEqual(nested.steps![0]!.elapsed, "2.0s");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

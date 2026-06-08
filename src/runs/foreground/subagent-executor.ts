@@ -2199,6 +2199,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			progress: params.includeProgress ? allProgress : undefined,
 			artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		});
+		if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
 		rememberForegroundRun(deps.state, {
 			runId,
 			mode: "parallel",
@@ -2523,6 +2524,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		truncation: r.truncation,
 	});
+	if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
 	rememberForegroundRun(deps.state, {
 		runId,
 		mode: "single",

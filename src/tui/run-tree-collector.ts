@@ -177,11 +177,6 @@ function sumTokenUsage(values: Array<TokenUsage | undefined>): TokenUsage | unde
 	return seen ? { input, output, total } : undefined;
 }
 
-function mapNestedStepChildren(children: NestedRunSummary[] | undefined): OverlayNestedChild[] {
-	if (!children?.length) return [];
-	return children.map(mapNestedRun);
-}
-
 function inferSessionFileFromAsyncDir(asyncDir: string | undefined): string | undefined {
 	return fileIfExists(asyncDir ? path.join(asyncDir, "session.jsonl") : undefined);
 }
@@ -194,25 +189,40 @@ function inferNestedSessionFile(run: NestedRunSummary, steps: OverlayStep[], dir
 }
 
 function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
-	const steps: OverlayStep[] = (run.steps ?? []).map((step) => ({
-		agent: step.agent,
-		state: mapState(step.status),
-		currentTool: step.currentTool,
-		elapsed: elapsedFromRange(step.startedAt, step.endedAt),
-		startedAt: step.startedAt,
-		model: step.model,
-		tokens: step.totalTokens,
-		sessionFile: step.sessionFile,
-		children: mapNestedStepChildren(step.children),
-	}));
-	const directChildren: OverlayNestedChild[] = (run.children ?? []).map(mapNestedRun);
+	return mapNestedRunWithStaleState(run);
+}
+
+function staleNestedState(state: OverlayRunState, fallback: OverlayRunState | undefined): OverlayRunState {
+	if ((state === "running" || state === "queued") && fallback) return fallback;
+	return state;
+}
+
+function mapNestedRunWithStaleState(run: NestedRunSummary, fallbackState?: OverlayRunState, fallbackFreezeAt?: number): OverlayNestedChild {
+	const runMappedState = staleNestedState(mapState(run.state), fallbackState);
+	const freezeAt = fallbackState ? run.endedAt ?? run.lastUpdate ?? fallbackFreezeAt : run.endedAt;
+	const steps: OverlayStep[] = (run.steps ?? []).map((step) => {
+		const stepState = staleNestedState(mapState(step.status), fallbackState);
+		return {
+			agent: step.agent,
+			state: stepState,
+			currentTool: stepState === "running" ? step.currentTool : undefined,
+			elapsed: elapsedFromRange(step.startedAt, step.endedAt ?? freezeAt),
+			startedAt: step.startedAt,
+			model: step.model,
+			tokens: step.totalTokens,
+			sessionFile: step.sessionFile,
+			children: mapNestedStepChildrenWithStaleState(step.children, fallbackState, freezeAt),
+		};
+	});
+	const directChildren: OverlayNestedChild[] = (run.children ?? []).map((child) => mapNestedRunWithStaleState(child, fallbackState, freezeAt));
+	const derivedState = deriveRunState(runMappedState, steps, directChildren);
 	return {
 		id: run.id,
 		agent: run.agent ?? run.agents?.join(", ") ?? run.id,
-		state: deriveRunState(mapState(run.state), steps, directChildren),
+		state: derivedState,
 		mode: run.mode,
-		currentTool: run.currentTool,
-		elapsed: elapsedFromRange(run.startedAt, run.endedAt),
+		currentTool: derivedState === "running" ? run.currentTool : undefined,
+		elapsed: elapsedFromRange(run.startedAt, freezeAt),
 		startedAt: run.startedAt,
 		model: run.model,
 		tokens: run.totalTokens,
@@ -221,6 +231,11 @@ function mapNestedRun(run: NestedRunSummary): OverlayNestedChild {
 		children: directChildren,
 		steps: steps.length ? steps : undefined,
 	};
+}
+
+function mapNestedStepChildrenWithStaleState(children: NestedRunSummary[] | undefined, fallbackState?: OverlayRunState, fallbackFreezeAt?: number): OverlayNestedChild[] {
+	if (!children?.length) return [];
+	return children.map((child) => mapNestedRunWithStaleState(child, fallbackState, fallbackFreezeAt));
 }
 
 function modeLabel(mode: SubagentRunMode | undefined): string {
@@ -452,22 +467,26 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 		if (!agents.length && ctrl.currentAgent) agents.push(ctrl.currentAgent);
 
 		const elapsed = elapsedFromRange(ctrl.startedAt, ctrl.updatedAt, now);
+		const rememberedState = childInfo.length > 0 ? resolveForegroundRunState(childInfo) : undefined;
+		const finalizedNestedState = rememberedState === "complete" || rememberedState === "failed" || rememberedState === "paused" ? rememberedState : undefined;
+		const finalizedNestedFreezeAt = finalizedNestedState ? fgRuns?.updatedAt ?? ctrl.updatedAt : undefined;
 
 		const steps: OverlayStep[] = childInfo.map((child, index) => {
 			const stepElapsed = elapsedFromRange(ctrl.startedAt, ctrl.updatedAt, now);
 			const nestedChildren = ctrl.nestedChildren ?? [];
 			const stepNested = nestedChildren.filter((nc) => nc.parentStepIndex === index);
+			const stepState = mapState(child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" ? child.status : "running");
 			return {
 				agent: child.agent,
-				state: mapState(child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" ? child.status : "running"),
-				currentTool: ctrl.currentIndex === index ? ctrl.currentTool : undefined,
+				state: stepState,
+				currentTool: stepState === "running" && ctrl.currentIndex === index ? ctrl.currentTool : undefined,
 				elapsed: stepElapsed,
 				startedAt: ctrl.startedAt,
 				model: ctrl.currentIndex === index ? ctrl.currentModel ?? child.model : child.model,
 				tokens: ctrl.currentIndex === index ? approximateTokenUsage(ctrl.tokens) ?? child.totalTokens : child.totalTokens,
 				sessionFile: child.sessionFile,
 				artifactPath: child.artifactPath,
-				children: stepNested.map(mapNestedRun),
+				children: stepNested.map((nested) => mapNestedRunWithStaleState(nested, finalizedNestedState, finalizedNestedFreezeAt)),
 			};
 		});
 
@@ -492,17 +511,19 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 		const nestedSessionFile = ctrl.nestedChildren?.find((nc) => nc.sessionFile)?.sessionFile;
 		const nestedAsyncDir = ctrl.nestedChildren?.find((nc) => nc.asyncDir)?.asyncDir;
 
+		const runState = deriveRunState(rememberedState ?? "running", steps, (ctrl.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, finalizedNestedState, finalizedNestedFreezeAt)));
+
 		runs.push({
 			id,
 			label: `${modeLabel(ctrl.mode)}: ${agents.join(", ")}`,
-			state: "running",
+			state: runState,
 			mode: ctrl.mode,
 			source: "foreground",
 			agents,
 			elapsed,
 			startedAt: ctrl.startedAt,
 			updatedAt: ctrl.updatedAt,
-			currentTool: ctrl.currentTool,
+			currentTool: runState === "running" ? ctrl.currentTool : undefined,
 			model: ctrl.currentModel ?? childInfo.find((child) => child.model)?.model,
 			tokens: approximateTokenUsage(ctrl.tokens) ?? sumTokenUsage(childInfo.map((child) => child.totalTokens)),
 			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile ?? ctrl.sessionFile ?? nestedSessionFile,
@@ -537,8 +558,9 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 
 		const agents = run.children.map((c) => c.agent);
 		const elapsed = elapsedFromRange(run.startedAt, run.updatedAt, now);
+		const runState = resolveForegroundRunState(run.children);
 
-		const nestedChildren = (run.nestedChildren ?? []).map(mapNestedRun);
+		const nestedChildren = (run.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, runState, run.updatedAt));
 		const steps: OverlayStep[] = run.children.map((child, index) => ({
 			agent: child.agent,
 			state: mapState(child.status),
@@ -555,7 +577,7 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 		runs.push({
 			id,
 			label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
-			state: deriveRunState(resolveForegroundRunState(run.children), steps, nestedChildren),
+			state: deriveRunState(runState, steps, nestedChildren),
 			mode: run.mode,
 			source: "foreground",
 			agents,
@@ -583,7 +605,7 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		: status.currentAgent
 			? [{ agent: status.currentAgent, index: status.currentIndex ?? 0, status: status.state, sessionFile: status.sessionFile }]
 			: [];
-	const nestedChildren = (status.nestedChildren ?? []).map(mapNestedRun);
+	const nestedChildren = (status.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, staleState, status.updatedAt));
 	const steps: OverlayStep[] = children.map((child, index) => ({
 		agent: child.agent,
 		state: staleForegroundState(mapState(child.status)),

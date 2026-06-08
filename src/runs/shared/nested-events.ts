@@ -210,6 +210,7 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		...(clampNumber(raw.turnCount) !== undefined ? { turnCount: clampNumber(raw.turnCount) } : {}),
 		...(clampNumber(raw.toolCount) !== undefined ? { toolCount: clampNumber(raw.toolCount) } : {}),
 		...(stringValue(raw.model, 128) ? { model: stringValue(raw.model, 128) } : {}),
+		...(stringValue(raw.thinking, 128) ? { thinking: stringValue(raw.thinking, 128) } : {}),
 		...(sanitizeTokenUsage(raw.totalTokens) ? { totalTokens: sanitizeTokenUsage(raw.totalTokens) } : {}),
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
 		...(clampNumber(raw.endedAt) !== undefined ? { endedAt: clampNumber(raw.endedAt) } : {}),
@@ -258,6 +259,7 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.turnCount) !== undefined ? { turnCount: clampNumber(raw.turnCount) } : {}),
 		...(clampNumber(raw.toolCount) !== undefined ? { toolCount: clampNumber(raw.toolCount) } : {}),
 		...(stringValue(raw.model, 128) ? { model: stringValue(raw.model, 128) } : {}),
+		...(stringValue(raw.thinking, 128) ? { thinking: stringValue(raw.thinking, 128) } : {}),
 		...(totalTokens ? { totalTokens } : {}),
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
 		...(clampNumber(raw.endedAt) !== undefined ? { endedAt: clampNumber(raw.endedAt) } : {}),
@@ -762,7 +764,9 @@ export function hasLiveNestedDescendants(children: NestedRunSummary[] | undefine
 
 export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: string, fallback: { id: string; parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }>; mode?: SubagentRunMode; ts: number }): NestedRunSummary {
 	const activeStep = status.currentStep !== undefined ? status.steps?.[status.currentStep] : undefined;
-	const model = activeStep?.model ?? status.steps?.find((step) => step.model)?.model;
+	const modelStep = activeStep?.model ? activeStep : status.steps?.find((step) => step.model);
+	const model = modelStep?.model;
+	const thinking = modelStep?.thinking;
 	return {
 		id: status.runId || fallback.id,
 		parentRunId: fallback.parentRunId,
@@ -784,6 +788,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		...(status.turnCount !== undefined ? { turnCount: status.turnCount } : {}),
 		...(status.toolCount !== undefined ? { toolCount: status.toolCount } : {}),
 		...(model ? { model } : {}),
+		...(thinking ? { thinking } : {}),
 		...(status.totalTokens ? { totalTokens: status.totalTokens } : {}),
 		...(status.startedAt !== undefined ? { startedAt: status.startedAt } : { startedAt: fallback.ts }),
 		...(status.endedAt !== undefined ? { endedAt: status.endedAt } : {}),
@@ -801,6 +806,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 			...(step.turnCount !== undefined ? { turnCount: step.turnCount } : {}),
 			...(step.toolCount !== undefined ? { toolCount: step.toolCount } : {}),
 			...(step.model ? { model: step.model } : {}),
+			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.tokens ? { totalTokens: step.tokens } : {}),
 			...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
 			...(step.endedAt !== undefined ? { endedAt: step.endedAt } : {}),

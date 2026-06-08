@@ -14,6 +14,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type KeybindingsManager, type KeyId } from "@earendil-works/pi-tui";
 import { collectRunTree, type OverlayNestedChild, type OverlayRun, type OverlayStep } from "./run-tree-collector.ts";
+import { formatModelThinking } from "../shared/formatters.ts";
 import { readSessionFile, resolveSessionPath, type FormattedLine } from "./session-reader.ts";
 import type { SubagentState, ExtensionConfig } from "../shared/types.ts";
 import {
@@ -46,6 +47,9 @@ function nestedChildToRun(parent: OverlayRun, child: OverlayNestedChild): Overla
 		agents: [child.agent],
 		elapsed: child.elapsed,
 		currentTool: child.currentTool,
+		model: child.model,
+		thinking: child.thinking,
+		tokens: child.tokens,
 		sessionFile: nestedChildSessionFile(child),
 		logPath: child.logPath,
 		artifactPath: child.artifactPath,
@@ -183,13 +187,14 @@ function formatTokenTotal(tokens: { total?: number } | undefined): string | unde
 	return `${total} tokens`;
 }
 
-function overviewMeta(input: { currentTool?: string; elapsed?: string; startedAt?: number; model?: string; tokens?: { total?: number } }, theme: Theme): string {
+function overviewMeta(input: { currentTool?: string; elapsed?: string; startedAt?: number; model?: string; thinking?: string; tokens?: { total?: number } }, theme: Theme): string {
 	const parts: string[] = [];
 	if (input.currentTool) parts.push(input.currentTool);
 	if (input.elapsed) parts.push(`ran ${input.elapsed}`);
 	const start = formatStartTime(input.startedAt);
 	if (start) parts.push(`started ${start}`);
-	if (input.model) parts.push(`model ${input.model}`);
+	const modelThinking = formatModelThinking(input.model, input.thinking);
+	if (modelThinking) parts.push(modelThinking);
 	const tokenTotal = formatTokenTotal(input.tokens);
 	if (tokenTotal) parts.push(tokenTotal);
 	return parts.length ? theme.fg("dim", ` · ${parts.join(" · ")}`) : "";
@@ -212,12 +217,19 @@ function renderNestedChildren(
 		if (lines.length > 200) return; // line budget
 		if (isSoloNestedChildHeaderRedundant(child)) {
 			const onlyStep = child.steps![0]!;
+			const mergedModel = onlyStep.model ?? child.model;
+			const mergedThinking = mergedModel === undefined
+				? (onlyStep.thinking ?? child.thinking)
+				: (onlyStep.model !== undefined
+					? (onlyStep.thinking ?? (onlyStep.model === child.model ? child.thinking : undefined))
+					: child.thinking);
 			const mergedStep: OverlayStep = {
 				...onlyStep,
 				currentTool: onlyStep.currentTool ?? child.currentTool,
 				elapsed: onlyStep.elapsed ?? child.elapsed,
 				startedAt: onlyStep.startedAt ?? child.startedAt,
-				model: onlyStep.model ?? child.model,
+				model: mergedModel,
+				thinking: mergedThinking,
 				tokens: onlyStep.tokens ?? child.tokens,
 				sessionFile: onlyStep.sessionFile ?? nestedChildSessionFile(child),
 				logPath: onlyStep.logPath ?? child.logPath,

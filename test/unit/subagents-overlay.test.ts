@@ -97,7 +97,7 @@ describe("subagents overlay rendering", () => {
 		assert.ok(text.includes("read"), "should show current tool");
 		assert.ok(text.includes("ran 5.2s"), "should show elapsed runtime");
 		assert.ok(text.includes("started 2026-01-02 03:04:05"), "should show start time");
-		assert.ok(text.includes("model test-model"), "should show model");
+		assert.ok(text.includes("test-model"), "should show model");
 		assert.ok(text.includes("1.2k tokens"), "should show token total");
 		assert.ok(text.includes("Esc"), "should show escape hint");
 		// Verify indentation for step (should be indented)
@@ -350,6 +350,171 @@ describe("subagents overlay rendering", () => {
 			const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
 			assert.ok(stripped.length <= narrowWidth, `line exceeds width: "${stripped}"`);
 		}
+	});
+
+	it("renders explicit thinking level alongside model", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "run-think",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				model: "openai/gpt-4o",
+				thinking: "high",
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						model: "openai/gpt-4o",
+						thinking: "high",
+						children: [],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, 120);
+		const text = lines.join("\n");
+		assert.ok(text.includes("gpt-4o · thinking high"), "should show explicit thinking level alongside model");
+	});
+
+	it("renders thinking level parsed from model suffix when explicit thinking is absent", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "run-suffix",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				model: "openai/gpt-4o:high",
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						model: "openai/gpt-4o:high",
+						children: [],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, 120);
+		const text = lines.join("\n");
+		assert.ok(text.includes("gpt-4o · thinking high"), "should parse thinking suffix from model string");
+	});
+
+	it("renders nested child thinking level when known", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "parent",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-think",
+								agent: "reviewer",
+								state: "running",
+								model: "anthropic/claude-sonnet",
+								thinking: "medium",
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, 120);
+		const text = lines.join("\n");
+		assert.ok(text.includes("claude-sonnet · thinking medium"), "should show nested child thinking level");
+	});
+
+	it("does not pair nested step model with thinking from a different child header", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "parent",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-mismatch",
+								agent: "reviewer",
+								state: "running",
+								model: "openai/gpt-4o",
+								thinking: "high",
+								steps: [
+									{
+										agent: "reviewer",
+										state: "running",
+										model: "anthropic/claude-sonnet",
+										children: [],
+									},
+								],
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, 120);
+		const text = lines.join("\n");
+		assert.ok(text.includes("claude-sonnet"), "should show step model");
+		assert.ok(!text.includes("thinking high"), "should not show mismatched child header thinking");
+	});
+
+	it("keeps nested child thinking when step model matches child header", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "parent",
+				label: "single: worker",
+				state: "running",
+				mode: "single",
+				source: "async",
+				agents: ["worker"],
+				steps: [
+					{
+						agent: "worker",
+						state: "running",
+						children: [
+							{
+								id: "nested-match",
+								agent: "reviewer",
+								state: "running",
+								model: "openai/gpt-4o",
+								thinking: "high",
+								steps: [
+									{
+										agent: "reviewer",
+										state: "running",
+										model: "openai/gpt-4o",
+										children: [],
+									},
+								],
+								children: [],
+							},
+						],
+					},
+				],
+			},
+		];
+		const lines = renderOverlay(runs, theme as never, 120);
+		const text = lines.join("\n");
+		assert.ok(text.includes("gpt-4o · thinking high"), "should show aligned thinking when model matches");
 	});
 });
 
@@ -2505,7 +2670,7 @@ describe("subagents overlay flattened selectable rows (issue #30)", () => {
 		assert.ok(text.includes("* reviewer"), "real nested child step should be visible with bullet marker");
 		assert.ok(text.includes("ran 4.2s"), "collapsed nested child should keep runtime metadata");
 		assert.ok(text.includes("started 2026-01-02 03:04:05"), "collapsed nested child should keep start time");
-		assert.ok(text.includes("model review-model"), "collapsed nested child should keep model metadata");
+		assert.ok(text.includes("review-model"), "collapsed nested child should keep model metadata");
 		assert.ok(text.includes("15 tokens"), "collapsed nested child should keep token metadata");
 		assert.ok(!text.includes("nested-solo"), "redundant nested run id header should be hidden");
 	});

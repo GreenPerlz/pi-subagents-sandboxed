@@ -143,6 +143,7 @@ interface StepResult {
 	sessionFile?: string;
 	intercomTarget?: string;
 	model?: string;
+	thinking?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
@@ -710,6 +711,7 @@ async function runSingleStep(
 	exitCode: number | null;
 	error?: string;
 	model?: string;
+	thinking?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
@@ -1085,6 +1087,7 @@ async function runSingleStep(
 		sessionFile: step.sessionFile,
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
+		thinking: resolveEffectiveThinking(finalResult?.model, step.thinking),
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 		modelAttempts,
 		artifactPaths,
@@ -1585,7 +1588,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
 			appendRecentStepOutput(step, stripAcceptanceReport(extractTextFromContent(event.message.content)).split("\n").slice(-10));
-			if (event.message.model) step.model = event.message.model;
+			if (event.message.model) {
+				step.model = event.message.model;
+				step.thinking = resolveEffectiveThinking(event.message.model, step.thinking);
+			}
 			step.turnCount = (step.turnCount ?? 0) + 1;
 			const usage = event.message.usage;
 			if (usage) {
@@ -1949,6 +1955,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					sessionFile: pr.sessionFile,
 					intercomTarget: pr.intercomTarget,
 					model: pr.model,
+					thinking: pr.thinking,
 					attemptedModels: pr.attemptedModels,
 					modelAttempts: pr.modelAttempts,
 					artifactPaths: pr.artifactPaths,
@@ -2237,6 +2244,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						sessionFile: pr.sessionFile,
 						intercomTarget: pr.intercomTarget,
 						model: pr.model,
+						thinking: pr.thinking,
 						attemptedModels: pr.attemptedModels,
 						modelAttempts: pr.modelAttempts,
 						artifactPaths: pr.artifactPaths,
@@ -2343,6 +2351,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				sessionFile: singleResult.sessionFile,
 				intercomTarget: singleResult.intercomTarget,
 				model: singleResult.model,
+				thinking: singleResult.thinking,
 				attemptedModels: singleResult.attemptedModels,
 				modelAttempts: singleResult.modelAttempts,
 				artifactPaths: singleResult.artifactPaths,
@@ -2552,6 +2561,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				sessionFile: r.sessionFile,
 				intercomTarget: r.intercomTarget,
 				model: r.model,
+				thinking: r.thinking,
 				attemptedModels: r.attemptedModels,
 				modelAttempts: r.modelAttempts,
 				artifactPaths: r.artifactPaths,

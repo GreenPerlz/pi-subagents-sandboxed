@@ -201,6 +201,56 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.steps[0]!.model, "runtime/gpt-4o-mini");
 	});
 
+	it("propagates child thinking to live foreground run headers", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-live-thinking", {
+			mode: "parallel",
+			currentIndex: 0,
+			currentModel: "openai/gpt-4o",
+		});
+		addForegroundRun(state, "fg-live-thinking", {
+			mode: "parallel",
+			children: [{ agent: "worker", index: 0, status: "running", model: "openai/gpt-4o", thinking: "high" }],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.thinking, "high");
+	});
+
+	it("propagates currentThinking to synthesized live foreground step and run", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-synth-thinking", {
+			currentAgent: "worker",
+			mode: "single",
+			currentModel: "openai/gpt-4o",
+			currentThinking: "high",
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.thinking, "high");
+		assert.strictEqual(runs[0]!.steps.length, 1);
+		assert.strictEqual(runs[0]!.steps[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.steps[0]!.thinking, "high");
+	});
+
+	it("prefers currentThinking over missing child thinking for active step", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-active-thinking", {
+			mode: "parallel",
+			currentIndex: 0,
+			currentModel: "openai/gpt-4o",
+			currentThinking: "high",
+		});
+		addForegroundRun(state, "fg-active-thinking", {
+			mode: "parallel",
+			children: [{ agent: "worker", index: 0, status: "running", model: "openai/gpt-4o" }],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.thinking, "high");
+		assert.strictEqual(runs[0]!.steps[0]!.thinking, "high");
+	});
+
 	it("propagates nested child sessionFile and asyncDir to live foreground run", () => {
 		const state = baseState();
 		addForegroundControl(state, "fg-live", {
@@ -578,6 +628,56 @@ describe("collectRunTree", () => {
 		assert.deepStrictEqual(nestedRow.steps![0]!.tokens, { input: 1000, output: 500, total: 1500 });
 	});
 
+	it("propagates explicit thinking from async steps to overlay rows", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-think",
+			asyncDir: "/tmp/think",
+			status: "running",
+			mode: "single",
+			agents: ["worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			steps: [{ agent: "worker", status: "running", index: 0, model: "openai/gpt-4o", thinking: "high" }],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.steps[0]!.thinking, "high");
+	});
+
+	it("propagates explicit thinking from nested runs and steps to overlay rows", () => {
+		const nested = makeNestedChild({
+			id: "nested-think",
+			parentRunId: "async-1",
+			depth: 1,
+			path: [{ runId: "async-1" }],
+			state: "running",
+			agent: "reviewer",
+			model: "anthropic/claude-sonnet",
+			thinking: "medium",
+			steps: [
+				{ agent: "reviewer", status: "running", model: "anthropic/claude-sonnet", thinking: "medium" },
+			],
+		});
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-1",
+			asyncDir: "/tmp/a1",
+			status: "running",
+			mode: "single",
+			agents: ["worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			steps: [
+				{ agent: "worker", status: "complete", index: 0, durationMs: 500 },
+				{ agent: "worker", status: "running", index: 1, children: [nested] },
+			],
+		});
+		const runs = collectRunTree(state);
+		const nestedRow = runs[0]!.steps[1]!.children[0]!;
+		assert.strictEqual(nestedRow.thinking, "medium");
+		assert.strictEqual(nestedRow.steps![0]!.thinking, "medium");
+	});
+
 	it("maps async state strings to overlay states", () => {
 		const state = baseState();
 		addAsyncJob(state, {
@@ -624,6 +724,16 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.id, "nested-done");
 		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.model, "review-model");
 		assert.strictEqual(runs[0]!.sessionFile, "/tmp/worker.jsonl");
+	});
+
+	it("propagates child thinking to finished foreground run headers", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-done-thinking", {
+			children: [{ agent: "worker", index: 0, status: "completed", model: "openai/gpt-4o", thinking: "high" }],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.thinking, "high");
 	});
 
 	it("computes elapsed for finished foreground runs when startedAt is present", () => {
@@ -692,6 +802,27 @@ describe("collectRunTree", () => {
 			assert.strictEqual(nested.state, "paused");
 			assert.strictEqual(nested.currentTool, undefined);
 			assert.strictEqual(nested.elapsed, "1.5s");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("propagates child thinking to persisted foreground run headers", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-persisted-thinking", {
+				runId: "fg-persisted-thinking",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "complete",
+				updatedAt: 4000,
+				children: [{ agent: "worker", index: 0, status: "completed", model: "openai/gpt-4o", thinking: "high" }],
+			});
+			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
+			assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+			assert.strictEqual(runs[0]!.thinking, "high");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1411,5 +1542,231 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs.length, 1);
 		assert.strictEqual(runs[0]!.state, "running");
 		assert.strictEqual(runs[0]!.steps[0]!.children[0]!.state, "running");
+	});
+
+	it("does not pair live foreground run header model with thinking from a different child", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-mismatch", {
+			mode: "parallel",
+			currentIndex: 0,
+			currentModel: "openai/gpt-4o",
+		});
+		addForegroundRun(state, "fg-mismatch", {
+			mode: "parallel",
+			children: [
+				{ agent: "worker-a", index: 0, status: "running", model: "openai/gpt-4o" },
+				{ agent: "worker-b", index: 1, status: "running", model: "anthropic/claude-sonnet", thinking: "medium" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.thinking, undefined);
+	});
+
+	it("does not pair currentThinking with a fallback model from a different child when currentModel is missing", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-missing-model", {
+			mode: "chain",
+			currentIndex: 0,
+			currentThinking: "high",
+			// currentModel intentionally omitted
+		});
+		addForegroundRun(state, "fg-missing-model", {
+			mode: "chain",
+			children: [
+				{ agent: "worker", index: 0, status: "running" },
+				{ agent: "reviewer", index: 1, status: "completed", model: "review-model", thinking: "low" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		// The run header should not take currentThinking from the active step (index 0)
+		// because currentModel is missing and the fallback model comes from a different child (index 1).
+		assert.notStrictEqual(runs[0]!.thinking, "high");
+		// It should instead use the thinking of the child that provided the fallback model.
+		assert.strictEqual(runs[0]!.thinking, "low");
+		// The active step itself can still show currentThinking because it pairs with its own child.
+		assert.strictEqual(runs[0]!.steps[0]!.thinking, "high");
+	});
+
+	it("does not pair finished foreground run header model with thinking from a different child", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-done-mismatch", {
+			mode: "parallel",
+			children: [
+				{ agent: "worker-a", index: 0, status: "completed", model: "openai/gpt-4o" },
+				{ agent: "worker-b", index: 1, status: "completed", model: "anthropic/claude-sonnet", thinking: "medium" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.thinking, undefined);
+	});
+
+	it("does not pair persisted foreground run header model with thinking from a different child", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-persisted-mismatch", {
+				runId: "fg-persisted-mismatch",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "parallel",
+				state: "complete",
+				updatedAt: 4000,
+				children: [
+					{ agent: "worker-a", index: 0, status: "completed", model: "openai/gpt-4o" },
+					{ agent: "worker-b", index: 1, status: "completed", model: "anthropic/claude-sonnet", thinking: "medium" },
+				],
+			});
+			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
+			assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+			assert.strictEqual(runs[0]!.thinking, undefined);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not pair live foreground run header model with thinking from a same-model sibling", () => {
+		const state = baseState();
+		addForegroundControl(state, "fg-same-model-live", {
+			mode: "parallel",
+			currentIndex: 0,
+			currentModel: "openai/gpt-4o",
+		});
+		addForegroundRun(state, "fg-same-model-live", {
+			mode: "parallel",
+			children: [
+				{ agent: "worker-a", index: 0, status: "running", model: "openai/gpt-4o" },
+				{ agent: "worker-b", index: 1, status: "running", model: "openai/gpt-4o", thinking: "high" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.thinking, undefined);
+	});
+
+	it("does not pair finished foreground run header model with thinking from a same-model sibling", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-same-model-done", {
+			mode: "parallel",
+			children: [
+				{ agent: "worker-a", index: 0, status: "completed", model: "openai/gpt-4o" },
+				{ agent: "worker-b", index: 1, status: "completed", model: "openai/gpt-4o", thinking: "high" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+		assert.strictEqual(runs[0]!.thinking, undefined);
+	});
+
+	it("does not pair persisted foreground run header model with thinking from a same-model sibling", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-persisted-same-model", {
+				runId: "fg-persisted-same-model",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "parallel",
+				state: "complete",
+				updatedAt: 4000,
+				children: [
+					{ agent: "worker-a", index: 0, status: "completed", model: "openai/gpt-4o" },
+					{ agent: "worker-b", index: 1, status: "completed", model: "openai/gpt-4o", thinking: "high" },
+				],
+			});
+			const runs = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir });
+			assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
+			assert.strictEqual(runs[0]!.thinking, undefined);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("derives run-level model and thinking from async job steps", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-run-model",
+			asyncDir: "/tmp/async-run-model",
+			status: "running",
+			mode: "chain",
+			agents: ["researcher", "worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			steps: [
+				{ agent: "researcher", status: "complete", index: 0, model: "gpt-4", thinking: "low" },
+				{ agent: "worker", status: "running", index: 1, model: "claude-sonnet", thinking: "high" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		// Run-level should derive from the first step with a model
+		assert.strictEqual(runs[0]!.model, "gpt-4");
+		assert.strictEqual(runs[0]!.thinking, "low");
+		// Step-level should keep its own values
+		assert.strictEqual(runs[0]!.steps[0]!.model, "gpt-4");
+		assert.strictEqual(runs[0]!.steps[0]!.thinking, "low");
+		assert.strictEqual(runs[0]!.steps[1]!.model, "claude-sonnet");
+		assert.strictEqual(runs[0]!.steps[1]!.thinking, "high");
+	});
+
+	it("derives run-level model and thinking from persisted async status", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedAsyncStatus(asyncDirRoot, "persisted-async-model", {
+				runId: "persisted-async-model",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "chain",
+				state: "complete",
+				startedAt: 1000,
+				endedAt: 4000,
+				lastUpdate: 4000,
+				steps: [
+					{ agent: "researcher", status: "complete", index: 0, model: "gpt-4", thinking: "low" },
+					{ agent: "worker", status: "complete", index: 1, model: "claude-sonnet", thinking: "high" },
+				],
+			});
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.model, "gpt-4");
+			assert.strictEqual(runs[0]!.thinking, "low");
+			assert.strictEqual(runs[0]!.steps[0]!.model, "gpt-4");
+			assert.strictEqual(runs[0]!.steps[0]!.thinking, "low");
+			assert.strictEqual(runs[0]!.steps[1]!.model, "claude-sonnet");
+			assert.strictEqual(runs[0]!.steps[1]!.thinking, "high");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("derives run-level model and thinking from persisted async result file", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedResult(resultsDir, "persisted-result-model", {
+				id: "persisted-result-model",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "chain",
+				state: "complete",
+				results: [
+					{ agent: "researcher", success: true, model: "gpt-4", thinking: "low" },
+					{ agent: "worker", success: true, model: "claude-sonnet", thinking: "high" },
+				],
+			});
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.model, "gpt-4");
+			assert.strictEqual(runs[0]!.thinking, "low");
+			assert.strictEqual(runs[0]!.steps[0]!.model, "gpt-4");
+			assert.strictEqual(runs[0]!.steps[0]!.thinking, "low");
+			assert.strictEqual(runs[0]!.steps[1]!.model, "claude-sonnet");
+			assert.strictEqual(runs[0]!.steps[1]!.thinking, "high");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

@@ -281,7 +281,7 @@ function approximateTokenUsage(total: number | undefined): TokenUsage | undefine
 		: undefined;
 }
 
-function foregroundChildrenFromResults(results: SingleResult[]): PersistedForegroundStep[] {
+export function foregroundChildrenFromResults(results: SingleResult[]): PersistedForegroundStep[] {
 	return results.map((result, index) => ({
 		agent: result.agent,
 		index,
@@ -289,6 +289,7 @@ function foregroundChildrenFromResults(results: SingleResult[]): PersistedForegr
 		...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
 		...(result.artifactPaths?.outputPath ? { artifactPath: result.artifactPaths.outputPath } : {}),
 		...(result.model ? { model: result.model } : {}),
+		...(result.thinking ? { thinking: result.thinking } : {}),
 		...(tokenUsageFromSingleResult(result) ? { totalTokens: tokenUsageFromSingleResult(result) } : {}),
 	}));
 }
@@ -1831,6 +1832,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			input.foregroundControl.currentIndex = index;
 			input.foregroundControl.currentActivityState = undefined;
 			input.foregroundControl.currentModel = input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
+			input.foregroundControl.currentThinking = input.agents.find((agent) => agent.name === task.agent)?.thinking;
 			input.foregroundControl.updatedAt = Date.now();
 			input.foregroundControl.sessionFile = input.sessionFileForIndex(index);
 			input.foregroundControl.interrupt = () => {
@@ -1883,6 +1885,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 						input.foregroundControl.currentIndex = index;
 						input.foregroundControl.currentActivityState = current?.activityState;
 						input.foregroundControl.currentModel = stepResults[0]?.model ?? input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
+						input.foregroundControl.currentThinking = stepResults[0]?.thinking ?? input.agents.find((agent) => agent.name === task.agent)?.thinking;
 						input.foregroundControl.lastActivityAt = current?.lastActivityAt;
 						input.foregroundControl.currentTool = current?.currentTool;
 						input.foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
@@ -2417,6 +2420,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.currentIndex = 0;
 		foregroundControl.currentActivityState = undefined;
 		foregroundControl.currentModel = modelOverride ?? agentConfig.model;
+		foregroundControl.currentThinking = agentConfig.thinking;
 		foregroundControl.updatedAt = Date.now();
 		foregroundControl.sessionFile = sessionFileForIndex(0);
 		foregroundControl.interrupt = () => {
@@ -2436,6 +2440,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				foregroundControl.currentIndex = firstProgress?.index ?? 0;
 				foregroundControl.currentActivityState = firstProgress?.activityState;
 				foregroundControl.currentModel = update.details?.results?.[0]?.model ?? modelOverride ?? agentConfig.model;
+				foregroundControl.currentThinking = update.details?.results?.[0]?.thinking ?? agentConfig.thinking;
 				foregroundControl.lastActivityAt = firstProgress?.lastActivityAt;
 				foregroundControl.currentTool = firstProgress?.currentTool;
 				foregroundControl.currentToolStartedAt = firstProgress?.currentToolStartedAt;
@@ -2491,6 +2496,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.interrupt = undefined;
 		foregroundControl.currentActivityState = r.progress?.activityState;
 		foregroundControl.currentModel = r.model ?? modelOverride ?? agentConfig.model;
+		foregroundControl.currentThinking = r.thinking ?? agentConfig.thinking;
 		foregroundControl.lastActivityAt = r.progress?.lastActivityAt;
 		foregroundControl.currentTool = r.progress?.currentTool;
 		foregroundControl.currentToolStartedAt = r.progress?.currentToolStartedAt;
@@ -3002,6 +3008,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					: progress?.status === "failed" ? "failed" : progress?.status === "completed" ? "complete" : progress?.status === "pending" ? "pending" : "running";
 				const stepTokens = child ? tokenUsageFromResult(child) : approximateTokenUsage(progress?.tokens);
 				const stepModel = child?.model ?? configuredModels[index];
+				const stepThinking = child?.thinking ?? (index === (foregroundControl?.currentIndex ?? 0) ? foregroundControl?.currentThinking : undefined);
 				return {
 					agent,
 					status: stepStatus,
@@ -3014,6 +3021,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					...(progress?.turnCount !== undefined ? { turnCount: progress.turnCount } : {}),
 					...(progress?.toolCount !== undefined ? { toolCount: progress.toolCount } : {}),
 					...(stepModel ? { model: stepModel } : {}),
+					...(stepThinking ? { thinking: stepThinking } : {}),
 					...(stepTokens ? { totalTokens: stepTokens } : {}),
 					...(foregroundControl?.startedAt ? { startedAt: foregroundControl.startedAt } : {}),
 					...(child?.error ?? progress?.error ? { error: child?.error ?? progress?.error } : {}),
@@ -3023,6 +3031,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const modelFromParams = type === "subagent.nested.completed"
 				? details?.results[currentIndex]?.model ?? details?.results.find((child) => child.model)?.model ?? configuredModels[currentIndex] ?? configuredModels.find(Boolean)
 				: configuredModels[currentIndex] ?? configuredModels.find(Boolean);
+			const thinkingFromParams = type === "subagent.nested.completed"
+				? details?.results[currentIndex]?.thinking ?? details?.results.find((child) => child.model)?.thinking
+				: foregroundControl?.currentThinking;
 			try {
 				writeNestedEvent(inheritedNestedRoute, {
 					type,
@@ -3054,6 +3065,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						...(foregroundControl?.turnCount !== undefined ? { turnCount: foregroundControl.turnCount } : {}),
 						...(foregroundControl?.toolCount !== undefined ? { toolCount: foregroundControl.toolCount } : {}),
 						...(modelFromParams ? { model: modelFromParams } : {}),
+						...(thinkingFromParams ? { thinking: thinkingFromParams } : {}),
 						...(totalTokens ? { totalTokens } : {}),
 						...(errorText ? { error: errorText } : {}),
 						...(resultText ? { summary: resultText } : {}),

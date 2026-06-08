@@ -419,6 +419,7 @@ export interface SingleResult {
 	messages?: Message[];
 	usage: Usage;
 	model?: string;
+	thinking?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	controlEvents?: ControlEvent[];
@@ -525,6 +526,7 @@ export interface NestedStepSummary {
 	turnCount?: number;
 	toolCount?: number;
 	model?: string;
+	thinking?: string;
 	totalTokens?: TokenUsage;
 	startedAt?: number;
 	endedAt?: number;
@@ -548,6 +550,7 @@ export interface NestedRunSummary extends NestedRunAddress {
 	agent?: string;
 	agents?: string[];
 	model?: string;
+	thinking?: string;
 	currentStep?: number;
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
@@ -700,6 +703,7 @@ export interface ForegroundResumeChild {
 	artifactPath?: string;
 	status: SubagentResultStatus;
 	model?: string;
+	thinking?: string;
 	totalTokens?: TokenUsage;
 }
 
@@ -734,6 +738,7 @@ export interface SubagentState {
 		tokens?: number;
 		toolCount?: number;
 		currentModel?: string;
+		currentThinking?: string;
 		sessionFile?: string;
 		nestedRoute?: NestedRouteInfo;
 		nestedChildren?: NestedRunSummary[];

@@ -12,6 +12,7 @@ export interface PersistedForegroundStep {
 	sessionFile?: string;
 	artifactPath?: string;
 	model?: string;
+	thinking?: string;
 	totalTokens?: ForegroundResumeChild["totalTokens"];
 }
 

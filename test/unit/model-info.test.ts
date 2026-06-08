@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findModelInfo, getSupportedThinkingLevels, type ModelInfo } from "../../src/shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, resolveEffectiveThinking, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -58,5 +58,32 @@ describe("model info helpers", () => {
 			}),
 			["high"],
 		);
+	});
+
+	describe("resolveEffectiveThinking", () => {
+		it("returns undefined when there is no model and no config thinking", () => {
+			assert.equal(resolveEffectiveThinking(undefined, undefined), undefined);
+		});
+
+		it("preserves config-derived thinking even when no model is known yet", () => {
+			assert.equal(resolveEffectiveThinking(undefined, "high"), "high");
+			assert.equal(resolveEffectiveThinking(undefined, "medium"), "medium");
+		});
+
+		it("ignores unrecognized config thinking even when no model is known", () => {
+			assert.equal(resolveEffectiveThinking(undefined, "extreme"), undefined);
+		});
+
+		it("prefers the model suffix over the config thinking", () => {
+			assert.equal(resolveEffectiveThinking("openai/gpt-4o:high", "low"), "high");
+		});
+
+		it("falls back to config thinking when the model has no recognized suffix", () => {
+			assert.equal(resolveEffectiveThinking("openai/gpt-4o", "low"), "low");
+		});
+
+		it("returns undefined for an invalid config when the model has no recognized suffix", () => {
+			assert.equal(resolveEffectiveThinking("openai/gpt-4o", "extreme"), undefined);
+		});
 	});
 });

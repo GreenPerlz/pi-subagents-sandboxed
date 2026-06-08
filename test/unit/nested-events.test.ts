@@ -369,4 +369,71 @@ describe("nestedSummaryFromAsyncStatus", () => {
 		});
 		assert.equal(summary.model, undefined);
 	});
+
+	it("does not pair run header model with thinking from a different step", () => {
+		const status = {
+			runId: "run-1",
+			mode: "chain" as const,
+			state: "running" as const,
+			startedAt: 1000,
+			lastUpdate: 2000,
+			currentStep: 1,
+			steps: [
+				{ agent: "researcher", status: "complete" as const, model: "gpt-4", thinking: "high" },
+				{ agent: "worker", status: "running" as const, model: "claude-sonnet" },
+			],
+		};
+		const summary = nestedSummaryFromAsyncStatus(status, "/tmp/run-1", {
+			id: "run-1",
+			parentRunId: "parent-1",
+			depth: 1,
+			ts: 2000,
+		});
+		assert.equal(summary.model, "claude-sonnet");
+		assert.equal(summary.thinking, undefined);
+	});
+
+	it("falls back to first step with model and preserves its thinking, not another step's", () => {
+		const status = {
+			runId: "run-1",
+			mode: "single" as const,
+			state: "running" as const,
+			startedAt: 1000,
+			lastUpdate: 2000,
+			steps: [
+				{ agent: "worker", status: "running" as const, model: "gemini-pro" },
+				{ agent: "reviewer", status: "pending" as const, thinking: "medium" },
+			],
+		};
+		const summary = nestedSummaryFromAsyncStatus(status, "/tmp/run-1", {
+			id: "run-1",
+			parentRunId: "parent-1",
+			depth: 1,
+			ts: 2000,
+		});
+		assert.equal(summary.model, "gemini-pro");
+		assert.equal(summary.thinking, undefined);
+	});
+
+	it("preserves active step thinking when model text later changes", () => {
+		const status = {
+			runId: "run-1",
+			mode: "single" as const,
+			state: "running" as const,
+			startedAt: 1000,
+			lastUpdate: 2000,
+			currentStep: 0,
+			steps: [
+				{ agent: "worker", status: "running" as const, model: "claude-sonnet:high", thinking: "high" },
+			],
+		};
+		const summary = nestedSummaryFromAsyncStatus(status, "/tmp/run-1", {
+			id: "run-1",
+			parentRunId: "parent-1",
+			depth: 1,
+			ts: 2000,
+		});
+		assert.equal(summary.model, "claude-sonnet:high");
+		assert.equal(summary.thinking, "high");
+	});
 });

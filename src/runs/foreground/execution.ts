@@ -57,6 +57,7 @@ import { inferSandboxCwdWritable } from "../../sandbox/write-inference.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
+import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -1240,6 +1241,8 @@ export async function runSync(
 			result.progress.error = result.error;
 		}
 	}
+
+	result.thinking = resolveEffectiveThinking(result.model, agent.thinking);
 
 	return result;
 }

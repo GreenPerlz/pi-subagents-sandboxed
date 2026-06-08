@@ -29,6 +29,7 @@ import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { registerSlashCommands } from "../slash/slash-commands.ts";
 import { registerSubagentsOverlayCommand, registerSubagentsOverlayShortcut } from "../tui/subagents-overlay.ts";
+import { registerSubagentsSettingsCommand } from "../tui/subagents-settings-overlay.ts";
 import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template-bridge.ts";
 import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
@@ -471,6 +472,7 @@ DIAGNOSTICS:
 	pi.registerTool(tool);
 	registerSlashCommands(pi, state);
 	registerSubagentsOverlayCommand(pi, state, config.externalTerminal);
+	registerSubagentsSettingsCommand(pi);
 	registerSubagentsOverlayShortcut(pi, state, config);
 
 	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";

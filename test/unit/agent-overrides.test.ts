@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { buildBuiltinOverrideConfig, discoverAgents, discoverAgentsAll, removeBuiltinAgentOverride } from "../../src/agents/agents.ts";
+import { buildBuiltinOverrideConfig, discoverAgents, discoverAgentsAll, removeBuiltinAgentOverride, saveBuiltinAgentOverride } from "../../src/agents/agents.ts";
 
 let tempHome = "";
 let tempProject = "";
@@ -222,6 +222,22 @@ describe("builtin agent overrides", () => {
 				&& error.message.includes("reviewer")
 				&& error.message.includes("completionGuard"),
 		);
+	});
+
+	it("saves builtin model defaults as user-scope JSON settings", () => {
+		const settingsPath = saveBuiltinAgentOverride(tempProject, "reviewer", "user", {
+			model: "openai/gpt-5.4",
+			fallbackModels: ["openai/gpt-5-mini"],
+			thinking: "high",
+		});
+
+		assert.equal(settingsPath, path.join(tempHome, ".pi", "agent", "settings.json"));
+		const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+		assert.deepEqual(settings.subagents.agentOverrides.reviewer, {
+			model: "openai/gpt-5.4",
+			fallbackModels: ["openai/gpt-5-mini"],
+			thinking: "high",
+		});
 	});
 
 	it("builds false sentinels when an override clears builtin fields", () => {

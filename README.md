@@ -351,8 +351,11 @@ Skip this section until you want exact syntax.
 | `/parallel agent1 "task1" -> agent2 "task2"` | Run agents in parallel |
 | `/run-chain <chainName> -- <task>` | Launch a saved `.chain.md` or `.chain.json` workflow |
 | `/subagents-doctor` | Show read-only setup diagnostics |
+| `/subagents-settings` | Open a TUI overlay to configure user-scope agent default model, fallback models, and thinking level |
 
 Commands validate agent names locally, support tab completion, and send results back into the conversation.
+
+`/subagents-settings` is TUI-only. Use Tab or ←/→ to switch between user agents and builtin agents, ↑/↓ to move, and Enter to edit. Model choices are limited to the currently available model registry. Builtin changes are saved as user-scope overrides in the user's Pi settings JSON rather than modifying bundled agent files.
 
 ### Per-step tasks
 

@@ -5,6 +5,7 @@ import { serializeAgent } from "../../src/agents/agent-serializer.ts";
 import { buildBuiltinOverrideConfig } from "../../src/agents/agents.ts";
 import { THINKING_CHOICES, buildDefaultModelChoices, buildSettingsRows, getAgentThinkingChoices, registerSubagentsSettingsCommand, renderSubagentsSettingsOverlay } from "../../src/tui/subagents-settings-overlay.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
+import type { ModelInfo } from "../../src/shared/model-info.ts";
 
 const theme = {
 	fg: (_name: string, text: string) => text,
@@ -176,6 +177,175 @@ describe("subagents settings overlay", () => {
 
 		assert.match(serialized, /^thinking: off$/m);
 		assert.equal(frontmatter.thinking, "off");
+	});
+
+	const availableModels: ModelInfo[] = [
+		{ provider: "xiaomi-token-plan-ams", id: "mimo-v2.5-pro", fullId: "xiaomi-token-plan-ams/mimo-v2.5-pro", reasoning: true },
+		{ provider: "kimi-coding", id: "kimi-for-coding", fullId: "kimi-coding/kimi-for-coding", reasoning: true },
+		{ provider: "openai-codex", id: "gpt-5.4", fullId: "openai-codex/gpt-5.4", reasoning: true },
+		{ provider: "openai", id: "gpt-4o", fullId: "openai/gpt-4o", reasoning: false },
+		{ provider: "deepseek", id: "v4", fullId: "deepseek/v4", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" } },
+	];
+
+	describe("buildSettingsRows with effective display", () => {
+		it("shows effective thinking-suffixed model string for supported model", () => {
+			const rows = buildSettingsRows([
+				agent({ name: "worker", model: "xiaomi-token-plan-ams/mimo-v2.5-pro", thinking: "high" }),
+			], availableModels);
+			const modelRow = rows.find((r) => r.field === "model")!;
+			assert.equal(modelRow.value, "xiaomi-token-plan-ams/mimo-v2.5-pro:high");
+		});
+
+		it("shows effective thinking-suffixed fallback models", () => {
+			const rows = buildSettingsRows([
+				agent({
+					name: "worker",
+					model: "xiaomi-token-plan-ams/mimo-v2.5-pro",
+					fallbackModels: ["kimi-coding/kimi-for-coding", "openai-codex/gpt-5.4"],
+					thinking: "high",
+				}),
+			], availableModels);
+			const fallbackRow = rows.find((r) => r.field === "fallbackModels")!;
+			assert.equal(fallbackRow.value, "kimi-coding/kimi-for-coding:high, openai-codex/gpt-5.4:high");
+		});
+
+		it("shows bare model for unsupported thinking level", () => {
+			const rows = buildSettingsRows([
+				agent({ name: "worker", model: "deepseek/v4", thinking: "minimal" }),
+			], availableModels);
+			const modelRow = rows.find((r) => r.field === "model")!;
+			assert.equal(modelRow.value, "deepseek/v4");
+		});
+
+		it("shows bare model for non-reasoning model even with thinking set", () => {
+			const rows = buildSettingsRows([
+				agent({ name: "worker", model: "openai/gpt-4o", thinking: "high" }),
+			], availableModels);
+			const modelRow = rows.find((r) => r.field === "model")!;
+			assert.equal(modelRow.value, "openai/gpt-4o");
+		});
+
+		it("shows mixed suffixed and bare fallback models based on support", () => {
+			const rows = buildSettingsRows([
+				agent({
+					name: "worker",
+					model: "openai/gpt-4o",
+					fallbackModels: ["deepseek/v4", "openai-codex/gpt-5.4"],
+					thinking: "high",
+				}),
+			], availableModels);
+			const fallbackRow = rows.find((r) => r.field === "fallbackModels")!;
+			assert.equal(fallbackRow.value, "deepseek/v4:high, openai-codex/gpt-5.4:high");
+		});
+
+		it("shows bare values when no availableModels are passed (backward compatible)", () => {
+			const rows = buildSettingsRows([
+				agent({ name: "worker", model: "openai/gpt-5", fallbackModels: ["anthropic/claude"], thinking: "high" }),
+			]);
+			assert.deepEqual(rows.map((row) => [row.field, row.value]), [
+				["model", "openai/gpt-5"],
+				["fallbackModels", "anthropic/claude"],
+				["thinking", "high"],
+			]);
+		});
+
+		it("shows bare values when thinking is off", () => {
+			const rows = buildSettingsRows([
+				agent({ name: "worker", model: "xiaomi-token-plan-ams/mimo-v2.5-pro", thinking: "off" }),
+			], availableModels);
+			const modelRow = rows.find((r) => r.field === "model")!;
+			assert.equal(modelRow.value, "xiaomi-token-plan-ams/mimo-v2.5-pro");
+		});
+
+		it("preserves thinking row as separate editable field", () => {
+			const rows = buildSettingsRows([
+				agent({ name: "worker", model: "xiaomi-token-plan-ams/mimo-v2.5-pro", thinking: "high" }),
+			], availableModels);
+			const thinkingRow = rows.find((r) => r.field === "thinking")!;
+			assert.equal(thinkingRow.label, "Thinking level");
+			assert.equal(thinkingRow.value, "high");
+		});
+	});
+
+	describe("buildDefaultModelChoices with thinking suffix preview", () => {
+		it("shows effective suffixed labels in picker choices when thinking is set", () => {
+			const choices = buildDefaultModelChoices(
+				{ modelRegistry: { getAvailable: () => availableModels.map((m) => ({ provider: m.provider, id: m.id, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap })) } } as any,
+				agent({ model: "openai/gpt-4o" }),
+				"high",
+			);
+			const deepseekChoice = choices.find((c) => c.value === "deepseek/v4")!;
+			assert.equal(deepseekChoice.label, "deepseek/v4:high", "supporting model should have suffix");
+			const gpt4oChoice = choices.find((c) => c.value === "openai/gpt-4o")!;
+			assert.equal(gpt4oChoice.label, "openai/gpt-4o", "non-reasoning model should be bare");
+		});
+
+		it("shows bare labels when thinking is off", () => {
+			const choices = buildDefaultModelChoices(
+				{ modelRegistry: { getAvailable: () => availableModels.map((m) => ({ provider: m.provider, id: m.id, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap })) } } as any,
+				agent({ model: "openai/gpt-4o" }),
+				"off",
+			);
+			const deepseekChoice = choices.find((c) => c.value === "deepseek/v4")!;
+			assert.equal(deepseekChoice.label, "deepseek/v4");
+		});
+
+		it("shows bare labels when thinking is undefined", () => {
+			const choices = buildDefaultModelChoices(
+				{ modelRegistry: { getAvailable: () => availableModels.map((m) => ({ provider: m.provider, id: m.id, reasoning: m.reasoning, thinkingLevelMap: m.thinkingLevelMap })) } } as any,
+				agent({ model: "openai/gpt-4o" }),
+			);
+			const deepseekChoice = choices.find((c) => c.value === "deepseek/v4")!;
+			assert.equal(deepseekChoice.label, "deepseek/v4");
+		});
+	});
+
+	describe("picker rendering with effective suffixed values", () => {
+		it("renders fallback picker choices with effective suffixed labels", () => {
+			const lines = renderSubagentsSettingsOverlay({
+				view: "user",
+				rows: buildSettingsRows([agent({ name: "worker", source: "user", model: "openai/gpt-4o" })]),
+				selected: 0,
+				theme: theme as never,
+				width: 100,
+				picker: {
+					title: "Choose fallback models",
+					selected: 0,
+					multi: true,
+					choices: [
+						{ label: "kimi-coding/kimi-for-coding:high" },
+						{ label: "openai-codex/gpt-5.4:high" },
+						{ label: "openai/gpt-4o" },
+					],
+				},
+			});
+			const text = lines.join("\n");
+			assert.ok(text.includes("kimi-coding/kimi-for-coding:high"));
+			assert.ok(text.includes("openai-codex/gpt-5.4:high"));
+			assert.ok(text.includes("openai/gpt-4o"), "non-reasoning model should be bare in picker");
+		});
+
+		it("renders default model picker choices with effective suffixed labels", () => {
+			const lines = renderSubagentsSettingsOverlay({
+				view: "user",
+				rows: buildSettingsRows([agent({ name: "worker", source: "user", model: "openai/gpt-4o" })]),
+				selected: 0,
+				theme: theme as never,
+				width: 100,
+				picker: {
+					title: "Choose default model",
+					selected: 0,
+					multi: false,
+					choices: [
+						{ label: "xiaomi-token-plan-ams/mimo-v2.5-pro:high" },
+						{ label: "deepseek/v4" },
+					],
+				},
+			});
+			const text = lines.join("\n");
+			assert.ok(text.includes("xiaomi-token-plan-ams/mimo-v2.5-pro:high"));
+			assert.ok(text.includes("deepseek/v4"), "unsupported model should be bare");
+		});
 	});
 
 	it("registers the /subagents-settings command and rejects non-TUI mode", async () => {

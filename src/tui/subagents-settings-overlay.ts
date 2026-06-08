@@ -10,7 +10,7 @@ import {
 	type BuiltinAgentOverrideBase,
 } from "../agents/agents.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
-import { findModelInfo, getSupportedThinkingLevels, toModelInfo, THINKING_LEVELS as SUPPORTED_THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
+import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, toModelInfo, THINKING_LEVELS as SUPPORTED_THINKING_LEVELS, type ModelInfo, type ThinkingLevel } from "../shared/model-info.ts";
 
 const OVERLAY_OPTIONS = {
 	anchor: "center" as const,
@@ -53,26 +53,38 @@ function fallbackLabel(values: string[] | undefined): string {
 	return values?.length ? values.join(", ") : "(none)";
 }
 
-function registryModelChoices(ctx: ExtensionContext): ModelChoice[] {
+function registryModelChoices(ctx: ExtensionContext, thinking?: string): ModelChoice[] {
 	const available = ctx.modelRegistry?.getAvailable?.() ?? [];
 	const seen = new Set<string>();
 	const choices: ModelChoice[] = [];
-	for (const model of available as Array<{ provider?: string; id?: string; name?: string }>) {
+	for (const model of available as Array<{ provider?: string; id?: string; name?: string; reasoning?: boolean; thinkingLevelMap?: any }>) {
 		if (!model?.id) continue;
 		const value = model.provider ? `${model.provider}/${model.id}` : model.id;
 		if (seen.has(value)) continue;
 		seen.add(value);
-		choices.push({ value, label: model.provider ? `${model.provider}/${model.id}` : model.id });
+		let label = value;
+		if (thinking && thinking !== "off" && model.provider) {
+			const modelInfo = toModelInfo({ provider: model.provider, id: model.id, reasoning: model.reasoning, thinkingLevelMap: model.thinkingLevelMap });
+			const supported = getSupportedThinkingLevels(modelInfo);
+			if (supported.some((l) => l === thinking)) {
+				label = `${value}:${thinking}`;
+			}
+		}
+		choices.push({ value, label });
 	}
 	return choices.sort((a, b) => a.label.localeCompare(b.label));
 }
 
-export function buildDefaultModelChoices(ctx: ExtensionContext, agent: AgentConfig): ModelChoice[] {
+export function buildDefaultModelChoices(ctx: ExtensionContext, agent: AgentConfig, thinking?: string): ModelChoice[] {
 	const baseModel = agent.source === "builtin" ? builtinBase(agent).model : undefined;
+	const available = ctx.modelRegistry?.getAvailable?.() ?? [];
+	const registryModels = (available as Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>).filter((m) => m?.provider && m?.id);
+	const availableModels = registryModels.map((m) => toModelInfo(m));
+	const effectiveBase = effectiveModelDisplay(baseModel, thinking, availableModels);
 	const defaultChoice: ModelChoice = agent.source === "builtin"
-		? { value: baseModel, label: `Inherit builtin default (${valueLabel(baseModel)})` }
+		? { value: baseModel, label: `Inherit builtin default (${valueLabel(effectiveBase)})` }
 		: { value: undefined, label: "Clear default model (unset)" };
-	const choices = registryModelChoices(ctx).filter((choice) => choice.value !== defaultChoice.value);
+	const choices = registryModelChoices(ctx, thinking).filter((choice) => choice.value !== defaultChoice.value);
 	return [defaultChoice, ...choices];
 }
 
@@ -104,11 +116,15 @@ function builtinBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 	};
 }
 
-export function buildSettingsRows(agents: AgentConfig[]): Row[] {
+export function buildSettingsRows(agents: AgentConfig[], availableModels?: ModelInfo[]): Row[] {
 	const rows: Row[] = [];
 	for (const agent of agents) {
-		rows.push({ agent, field: "model", label: "Default model", value: valueLabel(agent.model) });
-		rows.push({ agent, field: "fallbackModels", label: "Fallback models", value: fallbackLabel(agent.fallbackModels) });
+		const effectiveModel = effectiveModelDisplay(agent.model, agent.thinking, availableModels);
+		const effectiveFallbacks = agent.fallbackModels?.map(
+			(m) => effectiveModelDisplay(m, agent.thinking, availableModels) ?? m,
+		);
+		rows.push({ agent, field: "model", label: "Default model", value: valueLabel(effectiveModel) });
+		rows.push({ agent, field: "fallbackModels", label: "Fallback models", value: fallbackLabel(effectiveFallbacks) });
 		rows.push({ agent, field: "thinking", label: "Thinking level", value: valueLabel(agent.thinking) });
 	}
 	return rows;
@@ -207,7 +223,10 @@ class SubagentsSettingsOverlay {
 	}
 
 	private rows(): Row[] {
-		return buildSettingsRows(this.agents());
+		const available = this.ctx.modelRegistry?.getAvailable?.() ?? [];
+		const registryModels = (available as Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>).filter((m) => m?.provider && m?.id);
+		const availableModels = registryModels.map((m) => toModelInfo(m));
+		return buildSettingsRows(this.agents(), availableModels);
 	}
 
 	private clamp(): void {
@@ -233,7 +252,8 @@ class SubagentsSettingsOverlay {
 	}
 
 	private openPicker(row: Row): void {
-		const choices = row.field === "model" ? buildDefaultModelChoices(this.ctx, row.agent) : registryModelChoices(this.ctx);
+		const thinking = row.agent.thinking;
+		const choices = row.field === "model" ? buildDefaultModelChoices(this.ctx, row.agent, thinking) : registryModelChoices(this.ctx, thinking);
 		if (choices.length === 0) {
 			this.message = "No models are available in the current model registry.";
 			this.invalidate();

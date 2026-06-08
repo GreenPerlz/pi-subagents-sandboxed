@@ -78,3 +78,26 @@ export function getSupportedThinkingLevels(model: ModelInfo | undefined): Thinki
 	});
 	return levels;
 }
+
+/** Returns the model string with thinking suffix appended when the model supports the thinking level.
+ * If thinking is off/unset, the model already has a known suffix, or availableModels is not provided,
+ * returns the bare model string. Returns undefined if model is undefined.
+ *
+ * Matches the runtime logic in buildModelCandidates so the overlay shows what will actually be sent. */
+export function effectiveModelDisplay(
+	model: string | undefined,
+	thinking: string | undefined,
+	availableModels: ModelInfo[] | undefined,
+): string | undefined {
+	if (!model) return undefined;
+	if (!thinking || thinking === "off") return model;
+	if (availableModels === undefined) return model;
+	const { thinkingSuffix } = splitKnownThinkingSuffix(model);
+	if (thinkingSuffix) return model;
+	const modelInfo = findModelInfo(model, availableModels);
+	const supported = getSupportedThinkingLevels(modelInfo);
+	if (supported.some((l) => l === thinking)) {
+		return `${model}:${thinking}`;
+	}
+	return model;
+}

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findModelInfo, getSupportedThinkingLevels, resolveEffectiveThinking, type ModelInfo } from "../../src/shared/model-info.ts";
+import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, resolveEffectiveThinking, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -58,6 +58,54 @@ describe("model info helpers", () => {
 			}),
 			["high"],
 		);
+	});
+
+	describe("effectiveModelDisplay", () => {
+		const availableModels: ModelInfo[] = [
+			{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini", reasoning: true },
+			{ provider: "deepseek", id: "v4", fullId: "deepseek/v4", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" } },
+			{ provider: "openai", id: "gpt-4o", fullId: "openai/gpt-4o", reasoning: false },
+		];
+
+		it("returns undefined for undefined model", () => {
+			assert.equal(effectiveModelDisplay(undefined, "high", availableModels), undefined);
+		});
+
+		it("returns bare model when thinking is off", () => {
+			assert.equal(effectiveModelDisplay("openai/gpt-5-mini", "off", availableModels), "openai/gpt-5-mini");
+		});
+
+		it("returns bare model when thinking is undefined", () => {
+			assert.equal(effectiveModelDisplay("openai/gpt-5-mini", undefined, availableModels), "openai/gpt-5-mini");
+		});
+
+		it("returns bare model when availableModels is not provided (undefined)", () => {
+			assert.equal(effectiveModelDisplay("openai/gpt-5-mini", "high", undefined), "openai/gpt-5-mini");
+		});
+
+		it("appends thinking suffix when model supports the level", () => {
+			assert.equal(effectiveModelDisplay("openai/gpt-5-mini", "high", availableModels), "openai/gpt-5-mini:high");
+		});
+
+		it("returns bare model when model does not support the thinking level", () => {
+			assert.equal(effectiveModelDisplay("deepseek/v4", "minimal", availableModels), "deepseek/v4");
+		});
+
+		it("appends suffix for model that supports the specific level", () => {
+			assert.equal(effectiveModelDisplay("deepseek/v4", "high", availableModels), "deepseek/v4:high");
+		});
+
+		it("preserves existing thinking suffix on model", () => {
+			assert.equal(effectiveModelDisplay("openai/gpt-5-mini:medium", "high", availableModels), "openai/gpt-5-mini:medium");
+		});
+
+		it("returns bare model for non-reasoning model", () => {
+			assert.equal(effectiveModelDisplay("openai/gpt-4o", "high", availableModels), "openai/gpt-4o");
+		});
+
+		it("appends suffix for model not in registry when availableModels is empty array", () => {
+			assert.equal(effectiveModelDisplay("unknown/model", "high", []), "unknown/model:high");
+		});
 	});
 
 	describe("resolveEffectiveThinking", () => {

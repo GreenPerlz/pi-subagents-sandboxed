@@ -144,7 +144,7 @@ function extractToolCalls(content: string | AssistantContent[]): ToolCallContent
 function wrapLines(text: string, prefix: string, width: number): string[] {
 	if (!text.trim()) return [];
 	const available = Math.max(1, width - localVisibleWidth(prefix));
-	const lines = text.split("\n");
+	const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 	const result: string[] = [];
 	for (const raw of lines) {
 		const line = raw.replace(/\t/g, "  ");
@@ -169,6 +169,12 @@ function wrapLines(text: string, prefix: string, width: number): string[] {
 	return result;
 }
 
+function pushWrappedLines(lines: FormattedLine[], text: string, prefix: string, width: number, flags: Pick<FormattedLine, "isThinking" | "isToolResult"> = { isThinking: false }): void {
+	for (const wrapped of wrapLines(text, prefix, width)) {
+		lines.push({ text: truncateToWidth(wrapped, width), ...flags });
+	}
+}
+
 function formatTimestamp(ts: number | string | undefined): string {
 	if (ts === undefined) return "";
 	const num = typeof ts === "string" ? Date.parse(ts) : ts;
@@ -187,9 +193,7 @@ function formatUserMessage(entry: MessageEntry, theme: Theme, width: number): Fo
 	const ts = formatTimestamp(msg.timestamp);
 	const header = `${theme.fg("accent", "User")}${ts ? theme.fg("dim", ` · ${ts}`) : ""}`;
 	const lines: FormattedLine[] = [{ text: header, isThinking: false }];
-	for (const wrapped of wrapLines(text, "  ", width)) {
-		lines.push({ text: truncateToWidth(wrapped, width), isThinking: false });
-	}
+	pushWrappedLines(lines, text, "  ", width);
 	return lines;
 }
 
@@ -212,9 +216,7 @@ function formatAssistantMessage(entry: MessageEntry, theme: Theme, width: number
 	}
 
 	// Main text
-	for (const wrapped of wrapLines(text, "  ", width)) {
-		lines.push({ text: truncateToWidth(wrapped, width), isThinking: false });
-	}
+	pushWrappedLines(lines, text, "  ", width);
 
 	// Thinking blocks
 	for (const tb of thinkingBlocks) {
@@ -225,9 +227,7 @@ function formatAssistantMessage(entry: MessageEntry, theme: Theme, width: number
 		}
 		const thinkingHeader = `  ${theme.fg("dim", "⎿ thinking:")}`;
 		lines.push({ text: truncateToWidth(thinkingHeader, width), isThinking: true });
-		for (const wrapped of wrapLines(tb.thinking, "    ", width)) {
-			lines.push({ text: truncateToWidth(wrapped, width), isThinking: true });
-		}
+		pushWrappedLines(lines, tb.thinking, "    ", width, { isThinking: true });
 	}
 
 	return lines;
@@ -244,9 +244,7 @@ function formatToolResultMessage(entry: MessageEntry, theme: Theme, width: numbe
 		return [{ text: truncateToWidth(hidden, width), isThinking: false, isToolResult: true }];
 	}
 	const lines: FormattedLine[] = [{ text: header, isThinking: false, isToolResult: true }];
-	for (const wrapped of wrapLines(text, "  ", width)) {
-		lines.push({ text: truncateToWidth(wrapped, width), isThinking: false, isToolResult: true });
-	}
+	pushWrappedLines(lines, text, "  ", width, { isThinking: false, isToolResult: true });
 	return lines;
 }
 
@@ -260,14 +258,16 @@ function formatMessageEntry(entry: MessageEntry, theme: Theme, width: number, sh
 }
 
 function formatCompactionEntry(entry: CompactionEntry, theme: Theme, width: number): FormattedLine[] {
-	const text = `${theme.fg("dim", "[compaction]")} ${entry.summary}`;
-	return [{ text: truncateToWidth(text, width), isThinking: false }];
+	const lines: FormattedLine[] = [];
+	pushWrappedLines(lines, entry.summary, `${theme.fg("dim", "[compaction]")} `, width);
+	return lines;
 }
 
 function formatCustomMessageEntry(entry: CustomMessageEntry, theme: Theme, width: number): FormattedLine[] {
 	const content = typeof entry.content === "string" ? entry.content : entry.content.map((c) => c.text).join("");
-	const text = `${theme.fg("dim", `[${entry.customType}]`)} ${content}`;
-	return [{ text: truncateToWidth(text, width), isThinking: false }];
+	const lines: FormattedLine[] = [];
+	pushWrappedLines(lines, content, `${theme.fg("dim", `[${entry.customType}]`)} `, width);
+	return lines;
 }
 
 function formatThinkingLevelChange(entry: ThinkingLevelChangeEntry, theme: Theme, width: number): FormattedLine[] {

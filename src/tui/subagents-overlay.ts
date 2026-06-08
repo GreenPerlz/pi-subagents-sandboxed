@@ -326,6 +326,14 @@ function renderViewSwitch(theme: Theme, options?: RenderOverlayOptions): string 
 	return `${theme.fg("dim", "·")} ${running} ${theme.fg("dim", "|")} ${completed}`;
 }
 
+function singleOverlayRowContent(content: string): string {
+	// Overlay compositors expect each returned string to be exactly one terminal
+	// row. Structured transcript blocks can contain embedded CR/LF sequences;
+	// replace them before truncation so they cannot create unbordered rows that
+	// bleed into adjacent panels.
+	return content.replace(/\r\n/g, " ↵ ").replace(/[\r\n]/g, " ↵ ");
+}
+
 function capOverlayLines(lines: string[], maxHeight?: number): string[] {
 	// Pi TUI slices overlay lines above overlayOptions.maxHeight. Keep our
 	// returned line count within that cap so the bottom border/footer is not
@@ -345,7 +353,7 @@ function renderEmptyState(theme: Theme, width: number, options?: RenderOverlayOp
 		return s + " ".repeat(Math.max(0, len - vis));
 	};
 	const row = (content: string) => {
-		const truncated = truncateToWidth(content, innerW);
+		const truncated = truncateToWidth(singleOverlayRowContent(content), innerW);
 		return theme.fg("border", "│") + pad(truncated, innerW) + theme.fg("border", "│");
 	};
 
@@ -390,7 +398,7 @@ export function renderOverlay(
 		return s + " ".repeat(Math.max(0, len - vis));
 	};
 	const row = (content: string) => {
-		const truncated = truncateToWidth(content, innerW);
+		const truncated = truncateToWidth(singleOverlayRowContent(content), innerW);
 		return theme.fg("border", "│") + pad(truncated, innerW) + theme.fg("border", "│");
 	};
 
@@ -856,7 +864,7 @@ export class SubagentDetailPane {
 			return s + " ".repeat(Math.max(0, len - vis));
 		};
 		const row = (content: string) => {
-			const truncated = truncateToWidth(content, innerW);
+			const truncated = truncateToWidth(singleOverlayRowContent(content), innerW);
 			return this.theme.fg("border", "│") + pad(truncated, innerW) + this.theme.fg("border", "│");
 		};
 

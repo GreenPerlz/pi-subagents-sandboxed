@@ -106,6 +106,29 @@ describe("session-reader", () => {
 			}
 		});
 
+		it("wraps multiline subagent result custom messages into independent display rows", () => {
+			const subagentResult = [
+				"subagent results",
+				"",
+				"Run: run-123",
+				"Summary: " + "nested child result ".repeat(20),
+				"Nested subagents:",
+				"↳ ralph-orchestrator — complete [nested-a]",
+			].join("\n");
+			const content = JSON.stringify({ type: "custom_message", id: "1", parentId: null, timestamp: new Date().toISOString(), customType: "subagent-slash-result", content: subagentResult, display: true });
+			const p = tmpFile(content);
+			try {
+				const result = readSessionFile(p, theme as never, 48, false);
+				assert.ok(!result.error);
+				assert.ok(result.lines.length > 3, "multiline structured result should be split/wrapped into rows");
+				assert.ok(result.lines.some((l) => l.text.includes("subagent results")), "should include result heading");
+				assert.ok(result.lines.some((l) => l.text.includes("Nested subagents")), "should include nested-result section");
+				assert.ok(result.lines.every((l) => !/[\r\n]/.test(l.text)), "formatted rows must not contain embedded line breaks");
+			} finally {
+				cleanup(p);
+			}
+		});
+
 		it("hides tool result output when showToolResults is false", () => {
 			const content = JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "tc1", toolName: "bash", content: [{ type: "text", text: "very noisy output" }], isError: false, timestamp: Date.now() } });
 			const p = tmpFile(content);

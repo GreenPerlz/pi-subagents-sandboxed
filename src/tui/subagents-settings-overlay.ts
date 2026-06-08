@@ -10,7 +10,7 @@ import {
 	type BuiltinAgentOverrideBase,
 } from "../agents/agents.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
-import { THINKING_LEVELS as SUPPORTED_THINKING_LEVELS } from "../shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, toModelInfo, THINKING_LEVELS as SUPPORTED_THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
 
 const OVERLAY_OPTIONS = {
 	anchor: "center" as const,
@@ -36,6 +36,14 @@ interface Row {
 }
 
 export const THINKING_CHOICES = [undefined, ...SUPPORTED_THINKING_LEVELS] as const;
+
+export function getAgentThinkingChoices(agent: AgentConfig, registryModels: Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>): (string | undefined)[] {
+	if (!agent.model) return [undefined, ...SUPPORTED_THINKING_LEVELS];
+	const modelInfos = registryModels.map((m) => toModelInfo(m));
+	const modelInfo = findModelInfo(agent.model, modelInfos);
+	const levels = getSupportedThinkingLevels(modelInfo);
+	return [undefined, ...levels];
+}
 
 function valueLabel(value: string | undefined): string {
 	return value && value.trim() ? value : "(unset)";
@@ -120,7 +128,7 @@ export function renderSubagentsSettingsOverlay(input: {
 	const tabUser = input.view === "user" ? input.theme.bold("User agents") : "User agents";
 	const tabBuiltin = input.view === "builtin" ? input.theme.bold("Builtin agents") : "Builtin agents";
 	lines.push(`Subagent settings  [${tabUser}] [${tabBuiltin}]`);
-	lines.push("Tab/←/→ switch views · ↑/↓ move · Enter edit · Esc close");
+	lines.push("Tab/←/→ switch views · ↑/↓ move · Enter edit · t cycle thinking · Esc close");
 	if (input.message) lines.push(input.theme.fg("dim", input.message));
 	if (input.picker) {
 		lines.push("");
@@ -238,8 +246,10 @@ class SubagentsSettingsOverlay {
 	}
 
 	private cycleThinking(row: Row): void {
-		const index = THINKING_CHOICES.findIndex((level) => level === row.agent.thinking);
-		row.agent.thinking = THINKING_CHOICES[(index + 1 + THINKING_CHOICES.length) % THINKING_CHOICES.length];
+		const available = this.ctx.modelRegistry?.getAvailable?.() ?? [];
+		const choices = getAgentThinkingChoices(row.agent, available as Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>);
+		const index = choices.findIndex((level) => level === row.agent.thinking);
+		row.agent.thinking = choices[(index + 1 + choices.length) % choices.length];
 		this.save(row.agent);
 	}
 
@@ -314,6 +324,10 @@ class SubagentsSettingsOverlay {
 		if (this.keybindings.matches(data, "tui.select.up")) this.selected = Math.max(0, this.selected - 1);
 		else if (this.keybindings.matches(data, "tui.select.down")) this.selected = Math.min(this.rows().length - 1, this.selected + 1);
 		else if (matchesKey(data, "return") || matchesKey(data, "enter") || matchesKey(data, "space")) this.editSelected();
+		else if (matchesKey(data, "t")) {
+			const row = this.selectedRow();
+			if (row) this.cycleThinking(row);
+		}
 		this.invalidate();
 	}
 

@@ -1,4 +1,5 @@
-import type { ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import { applyThinkingSuffix } from "./pi-args.ts";
 import type { Usage } from "../../shared/types.ts";
 
 export type { AvailableModelInfo };
@@ -44,15 +45,22 @@ export function buildModelCandidates(
 	fallbackModels: string[] | undefined,
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
+	thinking?: string,
 ): string[] {
 	const seen = new Set<string>();
 	const candidates: string[] = [];
 	for (const raw of [primaryModel, ...(fallbackModels ?? [])]) {
 		if (!raw) continue;
 		const normalized = resolveModelCandidate(raw.trim(), availableModels, preferredProvider);
-		if (!normalized || seen.has(normalized)) continue;
-		seen.add(normalized);
-		candidates.push(normalized);
+		let withThinking = normalized;
+		if (thinking) {
+			const modelInfo = findModelInfo(normalized, availableModels, preferredProvider);
+			const supported = getSupportedThinkingLevels(modelInfo);
+			withThinking = supported.some((l) => l === thinking) ? (applyThinkingSuffix(normalized, thinking) ?? normalized) : normalized;
+		}
+		if (!withThinking || seen.has(withThinking)) continue;
+		seen.add(withThinking);
+		candidates.push(withThinking);
 	}
 	return candidates;
 }

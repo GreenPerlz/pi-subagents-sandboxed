@@ -1019,7 +1019,7 @@ async function runSingleStep(
 					usage: finalizationRun.usage,
 				});
 				const finalizationOutput = finalizationRun.finalOutput;
-				if (finalizationRun.exitCode !== 0 || finalizationRun.error || finalizationRun.interrupted) {
+				if (finalizationRun.error || finalizationRun.interrupted || (finalizationRun.exitCode !== 0 && !finalizationOutput.trim())) {
 					const message = finalizationRun.error ?? "Acceptance finalization turn did not complete successfully.";
 					turns.push(createFinalizationProcessFailureTurn({ turn, prompt, rawOutput: finalizationOutput, message }));
 					acceptance = buildFinalizationProcessFailureLedger({ initialLedger: acceptance, turns, maxTurns, message });

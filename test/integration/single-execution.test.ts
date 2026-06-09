@@ -525,6 +525,57 @@ process.exit(${exitCode});
 		assert.deepEqual(result.acceptance?.finalization?.turns?.map((turn) => turn.status), ["rejected", "rejected"]);
 	});
 
+	it("preserves successful acceptance when finalization turn exits nonzero with valid output", async () => {
+		mockPi.onCall({ output: acceptanceReport() });
+		mockPi.onCall({ output: acceptanceReport(), exitCode: 1 });
+		const agents = [makeAgent("worker")];
+
+		const result = await runSync(tempDir, agents, "worker", "Create guard-acceptance.txt with verified content", {
+			runId: "guard-acceptance-nonzero-exit-valid-output",
+			acceptance: {
+				criteria: ["Create guard-acceptance.txt with verified content", "Verify the file content"],
+				maxFinalizationTurns: 3,
+			},
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.error, undefined);
+		assert.equal(result.acceptance?.status, "checked");
+		assert.equal(result.acceptance?.finalization?.status, "completed");
+		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("still fails acceptance when finalization turn has an explicit provider error", async () => {
+		mockPi.onCall({ output: acceptanceReport() });
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "" }],
+					model: "mock/test-model",
+					stopReason: "error",
+					errorMessage: "provider rate limit exceeded",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		const agents = [makeAgent("worker")];
+
+		const result = await runSync(tempDir, agents, "worker", "Create guard-acceptance.txt with verified content", {
+			runId: "guard-acceptance-explicit-error",
+			acceptance: {
+				criteria: ["Create guard-acceptance.txt with verified content", "Verify the file content"],
+				maxFinalizationTurns: 3,
+			},
+		});
+
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /provider rate limit exceeded/);
+		assert.equal(result.acceptance?.finalization?.status, "failed");
+	});
+
 	it("allows implementation runs when parsed messages include a real edit tool call", async () => {
 		mockPi.onCall({
 			jsonl: [

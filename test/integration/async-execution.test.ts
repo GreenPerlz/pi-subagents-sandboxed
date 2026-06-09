@@ -658,6 +658,99 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	it("async single preserves successful acceptance when finalization turn exits nonzero with valid output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const report = [
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [
+					{ id: "criterion-1", status: "satisfied", evidence: "file exists with exact content" },
+					{ id: "criterion-2", status: "satisfied", evidence: "verification command passed" },
+				],
+				changedFiles: ["async-guard-acceptance.txt"],
+				commandsRun: [{ command: "test file content", result: "passed", summary: "passed" }],
+				residualRisks: [],
+			}),
+			"```",
+		].join("\n");
+		mockPi.onCall({ output: report });
+		mockPi.onCall({ output: report, exitCode: 1 });
+		const id = `async-acceptance-nonzero-exit-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Create async-guard-acceptance.txt with accepted criteria",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-acceptance-nonzero" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sessionFile: path.join(tempDir, "async-acceptance-nonzero-exit-session.jsonl"),
+			acceptance: {
+				criteria: ["Create async-guard-acceptance.txt with accepted criteria", "Verify the file content"],
+				maxFinalizationTurns: 3,
+			},
+		});
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+
+		assert.equal(result.success, true);
+		assert.equal(result.results[0]?.error, undefined);
+		assert.equal(result.results[0]?.acceptance?.status, "checked");
+		assert.equal((result.results[0]?.acceptance as Record<string, unknown>)?.finalization?.status, "completed");
+		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("async single still fails acceptance when finalization turn has an explicit provider error", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const report = [
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [
+					{ id: "criterion-1", status: "satisfied", evidence: "file exists with exact content" },
+					{ id: "criterion-2", status: "satisfied", evidence: "verification command passed" },
+				],
+				changedFiles: ["async-guard-acceptance.txt"],
+				commandsRun: [{ command: "test file content", result: "passed", summary: "passed" }],
+				residualRisks: [],
+			}),
+			"```",
+		].join("\n");
+		mockPi.onCall({ output: report });
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "" }],
+					model: "mock/test-model",
+					stopReason: "error",
+					errorMessage: "provider rate limit exceeded",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		const id = `async-acceptance-explicit-error-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Create async-guard-acceptance.txt with accepted criteria",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-acceptance-explicit-error" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sessionFile: path.join(tempDir, "async-acceptance-explicit-error-session.jsonl"),
+			acceptance: {
+				criteria: ["Create async-guard-acceptance.txt with accepted criteria", "Verify the file content"],
+				maxFinalizationTurns: 3,
+			},
+		});
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+
+		assert.equal(result.success, false);
+		assert.ok(result.results[0]?.error);
+		assert.equal((result.results[0]?.acceptance as Record<string, unknown>)?.finalization?.status, "failed");
+	});
+
 	it("async single rejects explicit reviewed acceptance without a reviewer result", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			output: [

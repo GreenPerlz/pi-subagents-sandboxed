@@ -970,7 +970,7 @@ async function runAcceptanceFinalizationLoop(input: {
 			input.result.controlEvents = [...(input.result.controlEvents ?? []), ...finalizationResult.controlEvents];
 		}
 		const rawOutput = acceptanceOutputByResult.get(finalizationResult) ?? getFinalOutput(finalizationResult.messages) ?? finalizationResult.finalOutput ?? "";
-		if (finalizationResult.exitCode !== 0 || finalizationResult.error || finalizationResult.detached || finalizationResult.interrupted) {
+		if (finalizationResult.error || finalizationResult.interrupted || finalizationResult.detached || (finalizationResult.exitCode !== 0 && !rawOutput.trim())) {
 			const message = finalizationResult.error ?? "Acceptance finalization turn did not complete successfully.";
 			turns.push(createFinalizationProcessFailureTurn({ turn, prompt, rawOutput, message }));
 			return buildFinalizationProcessFailureLedger({ initialLedger: input.initialLedger, turns, maxTurns, message });

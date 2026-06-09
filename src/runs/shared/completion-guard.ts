@@ -121,10 +121,10 @@ export function expectsImplementationMutation(agent: string, task: string): bool
 	if (EXPLICIT_NO_EDIT_PATTERNS.some((pattern) => pattern.test(taskTextWithoutScopedConstraints))) return false;
 
 	if (RESEARCH_AGENT_PATTERNS.some((pattern) => pattern.test(agent))) return false;
-	if (/\breviewer\b/i.test(agent)) return REVIEWER_REQUIRED_EDIT_PATTERNS.some((pattern) => pattern.test(taskText));
+	if (/\b(review|reviewer)\b/i.test(agent)) return REVIEWER_REQUIRED_EDIT_PATTERNS.some((pattern) => pattern.test(taskText));
 
-	const workerIntent = agent === "worker" && WORKER_IMPLEMENTATION_PATTERNS.some((pattern) => pattern.test(taskText));
-	if (workerIntent) return true;
+	const workIntent = (agent === "work" || agent === "worker") && WORKER_IMPLEMENTATION_PATTERNS.some((pattern) => pattern.test(taskText));
+	if (workIntent) return true;
 
 	return GENERAL_IMPLEMENTATION_PATTERNS.some((pattern) => pattern.test(taskText));
 }

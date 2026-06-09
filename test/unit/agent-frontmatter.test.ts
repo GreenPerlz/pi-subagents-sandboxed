@@ -20,14 +20,14 @@ afterEach(() => {
 describe("agent frontmatter defaultContext", () => {
 	it("serializes defaultContext into agent frontmatter", () => {
 		const agent: AgentConfig = {
-			name: "worker",
-			description: "Worker",
+			name: "work",
+			description: "Work",
 			systemPrompt: "Do work",
 			systemPromptMode: "replace",
 			inheritProjectContext: true,
 			inheritSkills: false,
 			source: "project",
-			filePath: "/tmp/worker.md",
+			filePath: "/tmp/work.md",
 			defaultContext: "fork",
 		};
 
@@ -40,9 +40,9 @@ describe("agent frontmatter defaultContext", () => {
 		tempDirs.push(dir);
 		const agentsDir = path.join(dir, ".pi", "agents");
 		fs.mkdirSync(agentsDir, { recursive: true });
-		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---
-name: worker
-description: Worker
+		fs.writeFileSync(path.join(agentsDir, "work.md"), `---
+name: work
+description: Work
 defaultContext: fork
 ---
 
@@ -50,8 +50,8 @@ Do work
 `, "utf-8");
 
 		const result = discoverAgents(dir, "project");
-		const worker = result.agents.find((agent) => agent.name === "worker");
-		assert.equal(worker?.defaultContext, "fork");
+		const work = result.agents.find((agent) => agent.name === "work");
+		assert.equal(work?.defaultContext, "fork");
 	});
 
 	it("loads the packaged builtin agents", () => {
@@ -59,9 +59,9 @@ Do work
 		tempDirs.push(dir);
 		const agents = discoverAgentsAll(dir).builtin;
 
-		assert.deepEqual(agents.map((agent) => agent.name).sort(), ["explore", "orchestrator", "researcher", "reviewer", "worker"]);
-		const worker = agents.find((candidate) => candidate.name === "worker");
-		assert.equal(worker?.defaultContext, "fresh", "worker should default to fresh context");
+		assert.deepEqual(agents.map((agent) => agent.name).sort(), ["explore", "orchestrator", "research", "review", "work"]);
+		const work = agents.find((candidate) => candidate.name === "work");
+		assert.equal(work?.defaultContext, "fresh", "work should default to fresh context");
 	});
 
 	it("loads packaged agents with bubblewrap sandbox defaults", () => {
@@ -109,7 +109,7 @@ Run the markdown chain
 				},
 				{
 					expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
-					parallel: { agent: "reviewer", task: "Review {item.path}" },
+					parallel: { agent: "review", task: "Review {item.path}" },
 					collect: { as: "reviews" },
 				},
 			],
@@ -220,14 +220,14 @@ Inspect code
 describe("agent frontmatter fallbackModels", () => {
 	it("serializes fallbackModels into agent frontmatter", () => {
 		const agent: AgentConfig = {
-			name: "worker",
-			description: "Worker",
+			name: "work",
+			description: "Work",
 			systemPrompt: "Do work",
 			systemPromptMode: "replace",
 			inheritProjectContext: false,
 			inheritSkills: false,
 			source: "project",
-			filePath: "/tmp/worker.md",
+			filePath: "/tmp/work.md",
 			fallbackModels: ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"],
 		};
 
@@ -240,9 +240,9 @@ describe("agent frontmatter fallbackModels", () => {
 		tempDirs.push(dir);
 		const agentsDir = path.join(dir, ".pi", "agents");
 		fs.mkdirSync(agentsDir, { recursive: true });
-		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---
-name: worker
-description: Worker
+		fs.writeFileSync(path.join(agentsDir, "work.md"), `---
+name: work
+description: Work
 fallbackModels: openai/gpt-5-mini, anthropic/claude-sonnet-4
 ---
 
@@ -250,22 +250,22 @@ Do work
 `, "utf-8");
 
 		const result = discoverAgents(dir, "project");
-		const worker = result.agents.find((agent) => agent.name === "worker");
-		assert.deepEqual(worker?.fallbackModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		const work = result.agents.find((agent) => agent.name === "work");
+		assert.deepEqual(work?.fallbackModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
 	});
 });
 
 describe("agent frontmatter systemPromptMode", () => {
 	it("serializes systemPromptMode into agent frontmatter", () => {
 		const agent: AgentConfig = {
-			name: "worker",
-			description: "Worker",
+			name: "work",
+			description: "Work",
 			systemPrompt: "Do work",
 			systemPromptMode: "replace",
 			inheritProjectContext: false,
 			inheritSkills: false,
 			source: "project",
-			filePath: "/tmp/worker.md",
+			filePath: "/tmp/work.md",
 		};
 
 		const serialized = serializeAgent(agent);
@@ -277,9 +277,9 @@ describe("agent frontmatter systemPromptMode", () => {
 		tempDirs.push(dir);
 		const agentsDir = path.join(dir, ".pi", "agents");
 		fs.mkdirSync(agentsDir, { recursive: true });
-		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---
-name: worker
-description: Worker
+		fs.writeFileSync(path.join(agentsDir, "work.md"), `---
+name: work
+description: Work
 systemPromptMode: replace
 ---
 
@@ -287,22 +287,22 @@ Do work
 `, "utf-8");
 
 		const result = discoverAgents(dir, "project");
-		const worker = result.agents.find((agent) => agent.name === "worker");
-		assert.equal(worker?.systemPromptMode, "replace");
+		const work = result.agents.find((agent) => agent.name === "work");
+		assert.equal(work?.systemPromptMode, "replace");
 	});
 });
 
 describe("agent frontmatter prompt inheritance flags", () => {
 	it("serializes inheritProjectContext and inheritSkills into agent frontmatter", () => {
 		const agent: AgentConfig = {
-			name: "worker",
-			description: "Worker",
+			name: "work",
+			description: "Work",
 			systemPrompt: "Do work",
 			systemPromptMode: "replace",
 			inheritProjectContext: true,
 			inheritSkills: true,
 			source: "project",
-			filePath: "/tmp/worker.md",
+			filePath: "/tmp/work.md",
 		};
 
 		const serialized = serializeAgent(agent);
@@ -315,9 +315,9 @@ describe("agent frontmatter prompt inheritance flags", () => {
 		tempDirs.push(dir);
 		const agentsDir = path.join(dir, ".pi", "agents");
 		fs.mkdirSync(agentsDir, { recursive: true });
-		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---
-name: worker
-description: Worker
+		fs.writeFileSync(path.join(agentsDir, "work.md"), `---
+name: work
+description: Work
 inheritProjectContext: true
 inheritSkills: true
 ---
@@ -326,9 +326,9 @@ Do work
 `, "utf-8");
 
 		const result = discoverAgents(dir, "project");
-		const worker = result.agents.find((agent) => agent.name === "worker");
-		assert.equal(worker?.inheritProjectContext, true);
-		assert.equal(worker?.inheritSkills, true);
+		const work = result.agents.find((agent) => agent.name === "work");
+		assert.equal(work?.inheritProjectContext, true);
+		assert.equal(work?.inheritSkills, true);
 	});
 });
 
@@ -338,19 +338,19 @@ describe("agent frontmatter prompt assembly defaults", () => {
 		tempDirs.push(dir);
 		const agentsDir = path.join(dir, ".pi", "agents");
 		fs.mkdirSync(agentsDir, { recursive: true });
-		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---
-name: worker
-description: Worker
+		fs.writeFileSync(path.join(agentsDir, "work.md"), `---
+name: work
+description: Work
 ---
 
 Do work
 `, "utf-8");
 
 		const result = discoverAgents(dir, "project");
-		const worker = result.agents.find((agent) => agent.name === "worker");
-		assert.equal(worker?.systemPromptMode, "replace");
-		assert.equal(worker?.inheritProjectContext, false);
-		assert.equal(worker?.inheritSkills, false);
+		const work = result.agents.find((agent) => agent.name === "work");
+		assert.equal(work?.systemPromptMode, "replace");
+		assert.equal(work?.inheritProjectContext, false);
+		assert.equal(work?.inheritSkills, false);
 	});
 
 	it("builtin agents inherit project context by default", () => {
@@ -366,12 +366,12 @@ Do work
 			process.env.USERPROFILE = homeDir;
 
 			const result = discoverAgents(dir, "both");
-			const reviewer = result.agents.find((agent) => agent.name === "reviewer");
-			const researcher = result.agents.find((agent) => agent.name === "researcher");
-			const worker = result.agents.find((agent) => agent.name === "worker");
-			assert.equal(reviewer?.inheritProjectContext, true);
-			assert.equal(researcher?.inheritProjectContext, true);
-			assert.equal(worker?.inheritProjectContext, true);
+			const review = result.agents.find((agent) => agent.name === "review");
+			const research = result.agents.find((agent) => agent.name === "research");
+			const work = result.agents.find((agent) => agent.name === "work");
+			assert.equal(review?.inheritProjectContext, true);
+			assert.equal(research?.inheritProjectContext, true);
+			assert.equal(work?.inheritProjectContext, true);
 		} finally {
 			if (previousHome === undefined) delete process.env.HOME;
 			else process.env.HOME = previousHome;
@@ -404,7 +404,7 @@ Do work
 		}
 	});
 
-	it("worker includes the child-facing supervisor tool", () => {
+	it("work includes the child-facing supervisor tool", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-supervisor-tool-"));
 		const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-supervisor-tool-home-"));
 		tempDirs.push(dir);
@@ -416,8 +416,8 @@ Do work
 			process.env.HOME = homeDir;
 			process.env.USERPROFILE = homeDir;
 			const agents = discoverAgentsAll(dir).builtin;
-			const agent = agents.find((candidate) => candidate.name === "worker");
-			assert.ok(agent, "worker builtin should be discovered");
+			const agent = agents.find((candidate) => candidate.name === "work");
+			assert.ok(agent, "work builtin should be discovered");
 			assert.deepEqual(agent?.tools, ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"]);
 		} finally {
 			if (previousHome === undefined) delete process.env.HOME;
@@ -733,7 +733,7 @@ name: canonical-chain
 description: Canonical chain
 ---
 
-## worker
+## work
 
 Inspect canonical
 `, "utf-8");
@@ -771,7 +771,7 @@ name: shared-chain
 description: Project chain
 ---
 
-## worker
+## work
 
 Inspect project
 `, "utf-8");
@@ -784,7 +784,7 @@ Inspect project
 			assert.ok(shared);
 			assert.equal(shared.filePath, path.join(dir, ".pi", "chains", "shared.chain.md"));
 			assert.equal(shared.description, "Project chain");
-			assert.equal(shared.steps[0]?.agent, "worker");
+			assert.equal(shared.steps[0]?.agent, "work");
 			assert.equal(shared.steps[0]?.task, "Inspect project");
 		} finally {
 			if (oldHome === undefined) delete process.env.HOME;

@@ -33,10 +33,10 @@ function bundledAgentTools(agentName: string): string[] {
 	const fileName = ({
 		explore: "explore.md",
 		orchestrator: "orchestrator.md",
-		researcher: "research.md",
-		reviewer: "review.md",
-		worker: "work.md",
-	} as const)[agentName as "explore" | "orchestrator" | "researcher" | "reviewer" | "worker"];
+		research: "research.md",
+		review: "review.md",
+		work: "work.md",
+	} as const)[agentName as "explore" | "orchestrator" | "research" | "review" | "work"];
 	assert.ok(fileName, `${agentName} should map to a bundled agent file`);
 	const content = fs.readFileSync(path.join(process.cwd(), "agents", fileName), "utf-8");
 	const match = /^tools:\s*(.+)$/m.exec(content);
@@ -61,7 +61,7 @@ describe("sandbox write capability inference", () => {
 		assert.equal(inferSandboxCwdWritable({ tools: [], sandbox: { bashWrite: true } }), false);
 	});
 
-	it("defaults orchestrator cwd writable for nested worker workflows without bash write opt-in", () => {
+	it("defaults orchestrator cwd writable for nested work workflows without bash write opt-in", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));
 		const cwdWritable = inferSandboxCwdWritable({
@@ -80,7 +80,7 @@ describe("sandbox write capability inference", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));
 		const cwdWritable = inferSandboxCwdWritable({
-			agentName: "reviewer",
+			agentName: "review",
 			tools: ["read", "grep", "find", "ls", "bash"],
 			sandbox: { bashWrite: false },
 		});
@@ -91,18 +91,18 @@ describe("sandbox write capability inference", () => {
 		assert.equal(mountMode(mounts, cwd), "ro");
 	});
 
-	it("keeps bundled reviewer and researcher sandbox defaults read-only while worker remains writable", () => {
-		for (const agentName of ["reviewer", "researcher"]) {
+	it("keeps bundled review and research sandbox defaults read-only while work remains writable", () => {
+		for (const agentName of ["review", "research"]) {
 			const tools = bundledAgentTools(agentName);
 			assert.equal(tools.includes("edit"), false, `${agentName} should not expose edit by default`);
 			assert.equal(tools.includes("write"), false, `${agentName} should not expose write by default`);
 			assert.equal(inferSandboxCwdWritable({ agentName, tools, sandbox: { bashWrite: false } }), false);
 		}
 
-		const workerTools = bundledAgentTools("worker");
-		assert.equal(workerTools.includes("edit"), true, "worker should retain edit ability");
-		assert.equal(workerTools.includes("write"), true, "worker should retain write ability");
-		assert.equal(inferSandboxCwdWritable({ agentName: "worker", tools: workerTools, sandbox: { bashWrite: false } }), true);
+		const workTools = bundledAgentTools("work");
+		assert.equal(workTools.includes("edit"), true, "work should retain edit ability");
+		assert.equal(workTools.includes("write"), true, "work should retain write ability");
+		assert.equal(inferSandboxCwdWritable({ agentName: "work", tools: workTools, sandbox: { bashWrite: false } }), true);
 	});
 });
 

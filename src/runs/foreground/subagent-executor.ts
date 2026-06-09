@@ -996,7 +996,12 @@ function validationErrorResult(mode: Details["mode"], text: string): AgentToolRe
 }
 
 function isRalphNestedWorkerAgentName(agent: unknown): boolean {
-	return typeof agent === "string" && (agent === "worker" || agent.endsWith("-worker"));
+	return typeof agent === "string" && (
+		agent === "work"
+		|| agent === "worker"
+		|| agent.endsWith("-work")
+		|| agent.endsWith("-worker")
+	);
 }
 
 function collectRalphNestedLaunchAgentTargets(params: SubagentParamsLike): string[] {

@@ -9,15 +9,15 @@ description: |
 
 # Pi Subagents
 
-This skill is for the main parent orchestrator only. Do not inject or follow it inside spawned child subagents. The parent session owns delegation, review fanout, final fix-worker launches, and all decisions about what to do with child results.
+This skill is for the main parent orchestrator only. Do not inject or follow it inside spawned child subagents. The parent session owns delegation, review fanout, final follow-up `work` launches, and all decisions about what to do with child results.
 
 Packaged builtin agents in this fork:
 
 | Agent | Role |
 |---|---|
-| `researcher` | Web/docs research with source-backed findings. |
-| `reviewer` | Evidence-backed review of diffs, plans, PRs, issues, and code health. |
-| `worker` | Single-writer implementation with validation and decision escalation. |
+| `research` | Web/docs research with source-backed findings. |
+| `review` | Evidence-backed review of diffs, plans, PRs, issues, and code health. |
+| `work` | Single-writer implementation with validation and decision escalation. |
 
 Custom user/project agents and chains may still exist. Use `subagent({ action: "list" })` before relying on any non-packaged agent name.
 
@@ -25,8 +25,8 @@ Custom user/project agents and chains may still exist. Use `subagent({ action: "
 
 - Keep one parent decision-maker. Children inspect, research, implement, or review; the parent synthesizes and decides next actions.
 - Use one writer at a time against the active checkout. Parallel writers require `worktree: true`.
-- Prefer fresh context for reviewers/researchers unless inherited conversation state is explicitly needed.
-- Use `worker` for edits, `reviewer` for adversarial checks, and `researcher` for external facts.
+- Prefer fresh context for `review` and `research` runs unless inherited conversation state is explicitly needed.
+- Use `work` for edits, `review` for adversarial checks, and `research` for external facts.
 - Do not let ordinary children run nested subagents. A child can call `subagent` only when its resolved builtin tools explicitly include `subagent`; default packaged agents do not.
 - Prefer `async: true` for subagent runs by default. Use foreground/synchronous runs mainly when you need the child result immediately in the current turn.
 
@@ -38,27 +38,27 @@ Use when external APIs, libraries, docs, standards, ecosystem behavior, or curre
 
 ```typescript
 subagent({
-  agent: "researcher",
+  agent: "research",
   task: "Research the current official docs and summarize constraints with sources.",
   async: true
 })
 ```
 
-For broad questions, run 2-3 researchers in parallel with distinct angles: official docs, recent changes, and practical tradeoffs.
+For broad questions, run 2-3 `research` agents in parallel with distinct angles: official docs, recent changes, and practical tradeoffs.
 
 ### Implement then review
 
-Use one `worker` to implement the accepted scope, then fresh `reviewer` agents to inspect the actual diff. Prefer launching the workflow async unless you explicitly need the result inline.
+Use one `work` to implement the accepted scope, then fresh `review` agents to inspect the actual diff. Prefer launching the workflow async unless you explicitly need the result inline.
 
 ```typescript
 subagent({
   chain: [
-    { agent: "worker", task: "Implement the approved change and validate it." },
+    { agent: "work", task: "Implement the approved change and validate it." },
     {
       parallel: [
-        { agent: "reviewer", task: "Review the resulting diff for correctness and regressions." },
-        { agent: "reviewer", task: "Review tests, validation, and edge cases." },
-        { agent: "reviewer", task: "Review simplicity, maintainability, and unnecessary complexity." }
+        { agent: "review", task: "Review the resulting diff for correctness and regressions." },
+        { agent: "review", task: "Review tests, validation, and edge cases." },
+        { agent: "review", task: "Review simplicity, maintainability, and unnecessary complexity." }
       ]
     }
   ],
@@ -66,17 +66,17 @@ subagent({
 })
 ```
 
-After reviewers return, synthesize fixes worth doing now. If fixes are accepted, launch exactly one `worker` to apply them.
+After reviews return, synthesize fixes worth doing now. If fixes are accepted, launch exactly one `work` agent to apply them.
 
 ### Review-only
 
-Use fresh reviewers for current diffs, plans, issues, PRs, or proposed solutions. Ask for file/line evidence and concise findings. Do not ask reviewers to edit unless the user explicitly wants a writer pass. Prefer async review runs unless the current turn depends on the answer immediately.
+Use fresh `review` runs for current diffs, plans, issues, PRs, or proposed solutions. Ask for file/line evidence and concise findings. Do not ask them to edit unless the user explicitly wants a writer pass. Prefer async review runs unless the current turn depends on the answer immediately.
 
 ```typescript
 subagent({
   tasks: [
-    { agent: "reviewer", task: "Review the current diff for correctness." },
-    { agent: "reviewer", task: "Review the current diff for tests and validation." }
+    { agent: "review", task: "Review the current diff for correctness." },
+    { agent: "review", task: "Review the current diff for tests and validation." }
   ],
   async: true
 })
@@ -103,15 +103,15 @@ Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider:
 
 Parallel sandboxed tasks with write-capable tools require `worktree: true`; otherwise use read-only review/research tasks in parallel.
 
-## Ralph-style per-issue orchestrators
+## Per-issue orchestrators
 
-For parallel AFK issue work, prefer one parent session plus per-issue `orchestrator` children:
+For parallel issue work, prefer one parent session plus per-issue `orchestrator` children. For a reusable parent workflow, use the `work-on-issues` skill.
 
 ```typescript
 subagent({
   tasks: [
-    { agent: "orchestrator", label: "Issue #123", task: "Orchestrate exactly this issue: ...", output: "ralph/issue-123.md", outputMode: "file-only" },
-    { agent: "orchestrator", label: "Issue #124", task: "Orchestrate exactly this issue: ...", output: "ralph/issue-124.md", outputMode: "file-only" }
+    { agent: "orchestrator", label: "Issue #123", task: "Orchestrate exactly this issue: ...", output: "tmp/issues/issue-123.md", outputMode: "file-only" },
+    { agent: "orchestrator", label: "Issue #124", task: "Orchestrate exactly this issue: ...", output: "tmp/issues/issue-124.md", outputMode: "file-only" }
   ],
   concurrency: 2,
   worktree: true,
@@ -121,7 +121,7 @@ subagent({
 })
 ```
 
-Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `worker`, and `researcher`/`reviewer` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, parallel batch planning, serial integration of successful worktree commits/PRs, and final close decisions.
+Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `work`, and `research`/`review` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, parallel batch planning, serial integration of successful worktree commits/PRs, and final close decisions.
 
 ## Status and control
 
@@ -155,8 +155,8 @@ Current convention:
 - saved reports go under the current worktree or cwd `tmp/` directory
 - each run creates a fresh markdown file like `tmp/<agent>-<runId>.md`
 - parallel/chain siblings may add an index or numeric collision suffix
-- saved files include run identity metadata so later worker/reviewer loops are traceable
+- saved files include run identity metadata so later work/review loops are traceable
 - session logs, async status files, and runner `.log`/`.jsonl` artifacts remain in the runtime session/temp areas, not repo `tmp/`
 
-This keeps reviewer/explore/research outputs out of tracked repo files while
+This keeps review/explore/research outputs out of tracked repo files while
 preserving per-run history for debugging and follow-up passes.

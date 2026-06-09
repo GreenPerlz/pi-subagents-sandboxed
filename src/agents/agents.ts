@@ -108,6 +108,22 @@ interface SubagentSettings {
 	sandbox?: SandboxSettingsDefaults;
 }
 
+const LEGACY_BUILTIN_AGENT_NAME_MAP: Record<string, string> = {
+	researcher: "research",
+	reviewer: "review",
+	worker: "work",
+};
+
+function canonicalBuiltinAgentName(name: string): string {
+	return LEGACY_BUILTIN_AGENT_NAME_MAP[name] ?? name;
+}
+
+function legacyBuiltinAgentNames(name: string): string[] {
+	return Object.entries(LEGACY_BUILTIN_AGENT_NAME_MAP)
+		.filter(([, canonical]) => canonical === name)
+		.map(([legacy]) => legacy);
+}
+
 const EMPTY_SUBAGENT_SETTINGS: SubagentSettings = { overrides: {} };
 
 export interface ChainStepConfig {
@@ -522,9 +538,15 @@ function readSubagentSettings(filePath: string | null): SubagentSettings {
 	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) {
 		return { overrides: parsed, disableBuiltins, sandbox };
 	}
+	const rawParsed: Record<string, BuiltinAgentOverrideConfig> = {};
 	for (const [name, value] of Object.entries(agentOverrides)) {
 		const override = parseBuiltinOverrideEntry(name, value, filePath);
-		if (override) parsed[name] = override;
+		if (override) rawParsed[name] = override;
+	}
+	for (const [name, override] of Object.entries(rawParsed)) {
+		const canonicalName = canonicalBuiltinAgentName(name);
+		if (canonicalName !== name && rawParsed[canonicalName]) continue;
+		parsed[canonicalName] = override;
 	}
 	return { overrides: parsed, disableBuiltins, sandbox };
 }
@@ -657,7 +679,9 @@ export function saveBuiltinAgentOverride(
 		? { ...(subagents.agentOverrides as Record<string, unknown>) }
 		: {};
 
-	agentOverrides[name] = cloneOverrideValue(override);
+	const canonicalName = canonicalBuiltinAgentName(name);
+	agentOverrides[canonicalName] = cloneOverrideValue(override);
+	for (const legacyName of legacyBuiltinAgentNames(canonicalName)) delete agentOverrides[legacyName];
 	subagents.agentOverrides = agentOverrides;
 	settings.subagents = subagents;
 	writeSettingsFile(filePath, settings);
@@ -677,7 +701,9 @@ export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "us
 	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) return filePath;
 
 	const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
-	delete nextOverrides[name];
+	const canonicalName = canonicalBuiltinAgentName(name);
+	delete nextOverrides[canonicalName];
+	for (const legacyName of legacyBuiltinAgentNames(canonicalName)) delete nextOverrides[legacyName];
 	if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
 	else delete nextSubagents.agentOverrides;
 

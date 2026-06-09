@@ -1,5 +1,5 @@
 ---
-name: researcher
+name: research
 description: Autonomous web researcher — searches, evaluates, and synthesizes a focused research brief
 tools: read, web_search, fetch_content, get_search_content, intercom
 systemPromptMode: replace

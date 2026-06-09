@@ -45,18 +45,18 @@ describe("builtin agent disabling", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
 				agentOverrides: {
-					reviewer: { disabled: true },
+					review: { disabled: true },
 				},
 			},
 		});
 
-		const runtimeReviewer = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "reviewer");
-		assert.equal(runtimeReviewer, undefined);
+		const runtimeReview = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "review");
+		assert.equal(runtimeReview, undefined);
 
-		const allReviewer = discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "reviewer");
-		assert.ok(allReviewer);
-		assert.equal(allReviewer.disabled, true);
-		assert.equal(allReviewer.override?.scope, "user");
+		const allReview = discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "review");
+		assert.ok(allReview);
+		assert.equal(allReview.disabled, true);
+		assert.equal(allReview.override?.scope, "user");
 	});
 
 	it("surfaces malformed disabled overrides instead of silently ignoring them", () => {
@@ -64,7 +64,7 @@ describe("builtin agent disabling", () => {
 		writeJson(settingsPath, {
 			subagents: {
 				agentOverrides: {
-					reviewer: { disabled: "true" },
+					review: { disabled: "true" },
 				},
 			},
 		});
@@ -73,7 +73,7 @@ describe("builtin agent disabling", () => {
 			() => discoverAgents(tempProject, "both"),
 			(error: unknown) => error instanceof Error
 				&& error.message.includes(settingsPath)
-				&& error.message.includes("reviewer")
+				&& error.message.includes("review")
 				&& error.message.includes("disabled"),
 		);
 	});
@@ -97,16 +97,16 @@ describe("builtin agent disabling", () => {
 			subagents: {
 				disableBuiltins: true,
 				agentOverrides: {
-					reviewer: { model: "openai/gpt-5.4" },
+					review: { model: "openai/gpt-5.4" },
 				},
 			},
 		});
 
-		const reviewer = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "reviewer");
-		assert.ok(reviewer);
-		assert.equal(reviewer.disabled, undefined);
-		assert.equal(reviewer.model, "openai/gpt-5.4");
-		assert.equal(reviewer.override?.scope, "user");
+		const review = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "review");
+		assert.ok(review);
+		assert.equal(review.disabled, undefined);
+		assert.equal(review.model, "openai/gpt-5.4");
+		assert.equal(review.override?.scope, "user");
 	});
 
 	it("project disableBuiltins false re-enables builtins hidden by user bulk disable", () => {
@@ -127,7 +127,7 @@ describe("builtin agent disabling", () => {
 			subagents: {
 				disableBuiltins: true,
 				agentOverrides: {
-					reviewer: { disabled: false, model: "openai/gpt-5.4" },
+					review: { disabled: false, model: "openai/gpt-5.4" },
 				},
 			},
 		});
@@ -135,13 +135,13 @@ describe("builtin agent disabling", () => {
 			subagents: { disableBuiltins: true },
 		});
 
-		const reviewer = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "reviewer");
-		assert.equal(reviewer, undefined);
+		const review = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "review");
+		assert.equal(review, undefined);
 
-		const allReviewer = discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "reviewer");
-		assert.ok(allReviewer);
-		assert.equal(allReviewer.disabled, true);
-		assert.equal(allReviewer.override?.scope, "project");
+		const allReview = discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "review");
+		assert.ok(allReview);
+		assert.equal(allReview.disabled, true);
+		assert.equal(allReview.override?.scope, "project");
 	});
 
 	it("surfaces malformed disableBuiltins values instead of silently ignoring them", () => {

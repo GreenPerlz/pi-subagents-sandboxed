@@ -296,7 +296,7 @@ process.exit(child.status ?? 0);
 		assert.equal(liveModels.at(-1), "runtime/gpt-4o-mini");
 	});
 
-	it("top-level parallel output saves use per-task output paths", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("top-level parallel relative outputs keep the explicit file and report tmp history paths", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Saved report" });
 		const executor = makeExecutor();
 
@@ -311,7 +311,30 @@ process.exit(child.status ?? 0);
 		const outputPath = path.join(tempDir, "parallel-output.md");
 		assert.equal(result.isError, undefined);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "Saved report");
-		assert.equal(result.details?.results?.[0]?.savedOutputPath, outputPath);
+		assert.ok(result.details?.results?.[0]?.savedOutputPath);
+		assert.notEqual(result.details?.results?.[0]?.savedOutputPath, outputPath);
+		assert.match(result.details?.results?.[0]?.savedOutputPath ?? "", /\/tmp\//);
+	});
+
+	it("top-level parallel read-only agents keep the explicit output file and also save per-run history in tmp", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "Parallel review report" });
+		const executor = makeExecutor([makeAgent("reviewer", { tools: ["read", "bash"] })]);
+
+		const result = await executor.execute(
+			"parallel-output-history",
+			{ tasks: [{ agent: "reviewer", task: "Review", output: "parallel-output.md" }] },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		const outputPath = path.join(tempDir, "parallel-output.md");
+		assert.equal(result.isError, undefined);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), "Parallel review report");
+		assert.ok(result.details?.results?.[0]?.savedOutputPath);
+		assert.notEqual(result.details?.results?.[0]?.savedOutputPath, outputPath);
+		assert.match(result.details?.results?.[0]?.savedOutputPath ?? "", /\/tmp\//);
+		assert.match(fs.readFileSync(result.details?.results?.[0]?.savedOutputPath!, "utf-8"), /# Saved subagent output/);
 	});
 
 	it("top-level parallel file-only output aggregates concise file references", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -330,11 +353,12 @@ process.exit(child.status ?? 0);
 		const text = result.content[0]?.text ?? "";
 		assert.equal(result.isError, undefined);
 		assert.match(text, /Output saved to:/);
-		assert.match(text, /2 lines/);
+		assert.match(text, /\/tmp\//);
 		assert.doesNotMatch(text, /Parallel full report/);
 		assert.match(result.details?.results?.[0]?.finalOutput ?? "", /Output saved to:/);
 		assert.doesNotMatch(result.details?.results?.[0]?.finalOutput ?? "", /Parallel full report/);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "Parallel full report\nwith details");
+		assert.match(fs.readFileSync(result.details?.results?.[0]?.savedOutputPath!, "utf-8"), /# Saved subagent output/);
 	});
 
 	it("rejects top-level parallel file-only output without an output path", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

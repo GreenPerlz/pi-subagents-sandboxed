@@ -288,11 +288,49 @@ process.exit(child.status ?? 0);
 
 		assert.ok(!result.isError, `chain should succeed: ${JSON.stringify(result.content)}`);
 		assert.match(result.details.results[0]?.finalOutput ?? "", /Output saved to:/);
+		assert.match(result.details.results[0]?.finalOutput ?? "", /\/tmp\//);
 		assert.doesNotMatch(result.details.results[0]?.finalOutput ?? "", /full chain output/);
 		const secondTaskArg = readCallArgs(1).at(-1) ?? "";
 		assert.match(secondTaskArg, /Output saved to:/);
-		assert.match(secondTaskArg, /2 lines/);
+		assert.match(secondTaskArg, /\/tmp\//);
 		assert.doesNotMatch(secondTaskArg, /full chain output/);
+	});
+
+	it("auto-saves read-only file-only chain steps without explicit output paths", async () => {
+		mockPi.onCall({ output: "review output\nwith evidence" });
+		const agents = [makeAgent("reviewer", { tools: ["read", "bash"] })];
+
+		const result = await executeChain(
+			makeChainParams(
+				[{ agent: "reviewer", task: "Review", outputMode: "file-only" }],
+				agents,
+				{ chainDir: tempDir },
+			),
+		);
+
+		assert.ok(!result.isError, `chain should succeed: ${JSON.stringify(result.content)}`);
+		assert.match(result.details.results[0]?.finalOutput ?? "", /Output saved to:/);
+		assert.match(result.details.results[0]?.savedOutputPath ?? "", /\/tmp\//);
+		assert.match(fs.readFileSync(result.details.results[0]!.savedOutputPath!, "utf-8"), /# Saved subagent output/);
+	});
+
+	it("keeps explicit chain output files while also saving per-run history in tmp", async () => {
+		mockPi.onCall({ output: "# Analysis\n\nSaved body" });
+		const agents = [makeAgent("analyst", { tools: ["read"], output: "analysis.md" })];
+
+		const params = makeChainParams(
+			[{ agent: "analyst", task: "Analyze", output: "analysis.md" }],
+			agents,
+			{ chainDir: tempDir },
+		);
+		const result = await executeChain(params);
+
+		assert.ok(!result.isError, `chain should succeed: ${JSON.stringify(result.content)}`);
+		const explicitOutputPath = path.join(tempDir, String(params.runId), "analysis.md");
+		assert.equal(fs.readFileSync(explicitOutputPath, "utf-8"), "# Analysis\n\nSaved body");
+		assert.ok(result.details.results[0]?.savedOutputPath);
+		assert.notEqual(result.details.results[0]?.savedOutputPath, explicitOutputPath);
+		assert.match(result.details.results[0]?.savedOutputPath ?? "", /\/tmp\//);
 	});
 
 	it("persists explicit checked acceptance and rejects missing evidence", async () => {
@@ -1322,7 +1360,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 		assert.doesNotMatch(result.details.results[1]?.finalOutput ?? "", /full parallel chain output/);
 		const synthTaskArg = readCallArgs(2).at(-1) ?? "";
 		assert.match(synthTaskArg, /Output saved to:/);
-		assert.match(synthTaskArg, /2 lines/);
+		assert.match(synthTaskArg, /\/tmp\//);
 		assert.doesNotMatch(synthTaskArg, /full parallel chain output/);
 	});
 

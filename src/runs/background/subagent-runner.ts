@@ -12,6 +12,7 @@ import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diag
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import type { ResolvedSandboxConfig, SandboxResultDetails, SpawnableInvocation } from "../../sandbox/types.ts";
+import { writeSavedOutput } from "../../shared/output-paths.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	type AcceptanceFinalizationTurn,
@@ -148,6 +149,10 @@ interface StepResult {
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
 	truncated?: boolean;
+	outputMode?: "inline" | "file-only";
+	savedOutputPath?: string;
+	outputReference?: { path: string; bytes: number; lines: number; message: string };
+	outputSaveError?: string;
 	structuredOutput?: unknown;
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
@@ -718,6 +723,10 @@ async function runSingleStep(
 	interrupted?: boolean;
 	sessionFile?: string;
 	intercomTarget?: string;
+	outputMode?: "inline" | "file-only";
+	savedOutputPath?: string;
+	outputReference?: { path: string; bytes: number; lines: number; message: string };
+	outputSaveError?: string;
 	completionGuardTriggered?: boolean;
 	structuredOutput?: unknown;
 	structuredOutputPath?: string;
@@ -920,7 +929,25 @@ async function runSingleStep(
 		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot)
 		: { fullOutput: outputForPersistence };
 	const output = resolvedOutput.fullOutput;
-	const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, output) : undefined;
+	let savedOutputPath = resolvedOutput.savedPath;
+	let savedOutputContent = output;
+	let outputSaveError = resolvedOutput.saveError;
+	if (step.savedOutputPath && (finalResult?.exitCode ?? 1) === 0) {
+		try {
+			const saved = writeSavedOutput({
+				targetPath: step.savedOutputPath,
+				agent: step.agent,
+				runId: ctx.id,
+				index: ctx.flatIndex,
+				content: output,
+			});
+			savedOutputPath = saved.savedPath;
+			savedOutputContent = saved.savedContent;
+		} catch (error) {
+			outputSaveError = `Failed to save output history: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+	const outputReference = savedOutputPath ? formatSavedOutputReference(savedOutputPath, savedOutputContent) : undefined;
 	let outputForSummary = output;
 	if (attemptNotes.length > 0) {
 		outputForSummary = `${attemptNotes.join("\n")}\n\n${outputForSummary}`.trim();
@@ -931,9 +958,9 @@ async function runSingleStep(
 		outputPath: step.outputPath,
 		outputMode: step.outputMode,
 		exitCode: finalResult?.exitCode ?? 1,
-		savedPath: resolvedOutput.savedPath,
+		savedPath: savedOutputPath,
 		outputReference,
-		saveError: resolvedOutput.saveError,
+		saveError: outputSaveError,
 	});
 	outputForSummary = finalizedOutput.displayOutput;
 	const acceptanceForInitialReport = step.effectiveAcceptance && shouldRunAcceptanceFinalization(step.effectiveAcceptance)
@@ -1092,6 +1119,10 @@ async function runSingleStep(
 		modelAttempts,
 		artifactPaths,
 		interrupted: finalResult?.interrupted,
+		outputMode: step.outputMode,
+		savedOutputPath,
+		outputReference,
+		outputSaveError,
 		completionGuardTriggered: completionGuardTriggeredFinal,
 		structuredOutput: (finalResult as (RunPiStreamingResult & { structuredOutput?: unknown }) | undefined)?.structuredOutput,
 		structuredOutputPath: effectiveStructuredOutput?.outputPath,
@@ -1985,6 +2016,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					attemptedModels: pr.attemptedModels,
 					modelAttempts: pr.modelAttempts,
 					artifactPaths: pr.artifactPaths,
+					outputMode: pr.outputMode,
+					savedOutputPath: pr.savedOutputPath,
+					outputReference: pr.outputReference,
+					outputSaveError: pr.outputSaveError,
 					structuredOutput: pr.structuredOutput,
 					structuredOutputPath: pr.structuredOutputPath,
 					structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
@@ -2381,6 +2416,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				attemptedModels: singleResult.attemptedModels,
 				modelAttempts: singleResult.modelAttempts,
 				artifactPaths: singleResult.artifactPaths,
+				outputMode: singleResult.outputMode,
+				savedOutputPath: singleResult.savedOutputPath,
+				outputReference: singleResult.outputReference,
+				outputSaveError: singleResult.outputSaveError,
 				structuredOutput: singleResult.structuredOutput,
 				structuredOutputPath: singleResult.structuredOutputPath,
 				structuredOutputSchemaPath: singleResult.structuredOutputSchemaPath,
@@ -2592,6 +2631,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				modelAttempts: r.modelAttempts,
 				artifactPaths: r.artifactPaths,
 				truncated: r.truncated,
+				outputMode: r.outputMode,
+				savedOutputPath: r.savedOutputPath,
+				outputReference: r.outputReference,
+				outputSaveError: r.outputSaveError,
 				structuredOutput: r.structuredOutput,
 				structuredOutputPath: r.structuredOutputPath,
 				structuredOutputSchemaPath: r.structuredOutputSchemaPath,

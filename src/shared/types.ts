@@ -821,6 +821,7 @@ export interface RunSyncOptions {
 	sessionFile?: string;
 	share?: boolean;
 	outputPath?: string;
+	savedOutputPath?: string;
 	outputMode?: OutputMode;
 	maxSubagentDepth?: number;
 	nestedRoute?: NestedRouteInfo;

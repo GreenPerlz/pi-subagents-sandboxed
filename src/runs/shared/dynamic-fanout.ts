@@ -47,7 +47,7 @@ const DYNAMIC_EXPAND_FROM_KEYS = new Set(["output", "path"]);
 const DYNAMIC_PARALLEL_KEYS = new Set(["agent", "task", "phase", "label", "outputSchema", "cwd", "output", "outputMode", "reads", "progress", "skill", "model", "acceptance"]);
 const RUNNER_DYNAMIC_PARALLEL_KEYS = new Set([
 	...DYNAMIC_PARALLEL_KEYS,
-	"outputName", "structured", "inheritProjectContext", "inheritSkills", "skills", "outputPath", "maxSubagentDepth",
+	"outputName", "structured", "inheritProjectContext", "inheritSkills", "skills", "outputPath", "savedOutputPath", "maxSubagentDepth",
 	"structuredOutput", "structuredOutputSchema", "tools", "extensions", "mcpDirectTools", "completionGuard", "systemPrompt", "sandbox",
 	"systemPromptMode", "thinking", "modelCandidates", "sessionFile", "effectiveAcceptance",
 ]);

@@ -4,4 +4,6 @@ AGENTS.md
 node_modules/
 .fallow/
 
+tmp/
+
 package-lock.json

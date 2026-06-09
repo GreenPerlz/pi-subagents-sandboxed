@@ -61,6 +61,7 @@ import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { writeSavedOutput } from "../../shared/output-paths.ts";
 import { hasLiveNestedDescendantsForParent, projectNestedEvents } from "../shared/nested-events.ts";
 import {
 	buildModelCandidates,
@@ -894,13 +895,33 @@ async function runSingleAttempt(
 			reason: "completion_guard",
 		}));
 	}
-	if (options.outputPath && result.exitCode === 0) {
-		const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot);
+	if ((options.outputPath || options.savedOutputPath) && result.exitCode === 0) {
+		const resolvedOutput = options.outputPath
+			? resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot)
+			: { fullOutput };
 		fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
-		result.savedOutputPath = resolvedOutput.savedPath;
-		result.outputSaveError = resolvedOutput.saveError;
-		if (resolvedOutput.savedPath) {
-			result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, fullOutput);
+		let savedOutputPath = resolvedOutput.savedPath;
+		let savedOutputContent = fullOutput;
+		let outputSaveError = resolvedOutput.saveError;
+		if (options.savedOutputPath) {
+			try {
+				const saved = writeSavedOutput({
+					targetPath: options.savedOutputPath,
+					agent: agent.name,
+					runId: options.runId,
+					index: options.index,
+					content: fullOutput,
+				});
+				savedOutputPath = saved.savedPath;
+				savedOutputContent = saved.savedContent;
+			} catch (error) {
+				outputSaveError = `Failed to save output history: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		}
+		result.savedOutputPath = savedOutputPath;
+		result.outputSaveError = outputSaveError;
+		if (savedOutputPath) {
+			result.outputReference = formatSavedOutputReference(savedOutputPath, savedOutputContent);
 		}
 	}
 	artifactOutputByResult.set(result, fullOutput);
@@ -1041,7 +1062,7 @@ export async function runSync(
 			error: `Unknown agent: ${agentName}`,
 		};
 	}
-	const outputModeValidationError = validateFileOnlyOutputMode(options.outputMode, options.outputPath, `Single run (${agentName})`);
+	const outputModeValidationError = validateFileOnlyOutputMode(options.outputMode, options.outputPath ?? options.savedOutputPath, `Single run (${agentName})`);
 	if (outputModeValidationError) {
 		return {
 			agent: agentName,

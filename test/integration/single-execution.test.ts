@@ -1922,6 +1922,55 @@ process.exit(${exitCode});
 		assert.equal(fs.readFileSync(result.artifactPaths.outputPath, "utf-8"), "full saved output\nwith details");
 	});
 
+	it("executor auto-saves file-only output for read-only agents without an explicit output path", async () => {
+		mockPi.onCall({ output: "review findings\nwith evidence" });
+		const executor = makeExecutor([makeAgent("reviewer", { tools: ["read", "bash"] })]);
+
+		const response = await executor.execute(
+			"review-file-only-auto",
+			{ agent: "reviewer", task: "Review", outputMode: "file-only" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const result = response.details.results[0]!;
+
+		assert.equal(response.isError, undefined);
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.outputMode, "file-only");
+		assert.ok(result.savedOutputPath);
+		assert.match(result.savedOutputPath ?? "", new RegExp(`${tempDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/tmp/`));
+		assert.match(result.finalOutput ?? "", /^Output saved to:/);
+		assert.doesNotMatch(result.finalOutput ?? "", /review findings/);
+		const saved = fs.readFileSync(result.savedOutputPath!, "utf-8");
+		assert.match(saved, /# Saved subagent output/);
+		assert.match(saved, /review findings/);
+	});
+
+	it("executor keeps the working output file and also writes a per-run saved-output artifact for relative outputs", async () => {
+		mockPi.onCall({ output: "# Research\n\nSaved body" });
+		const executor = makeExecutor([makeAgent("researcher", { tools: ["read"], output: "research.md" })]);
+
+		const response = await executor.execute(
+			"relative-output-history",
+			{ agent: "researcher", task: "Research" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const result = response.details.results[0]!;
+
+		assert.equal(response.isError, undefined);
+		assert.equal(result.exitCode, 0);
+		assert.equal(fs.readFileSync(path.join(tempDir, "research.md"), "utf-8"), "# Research\n\nSaved body");
+		assert.ok(result.savedOutputPath);
+		assert.notEqual(result.savedOutputPath, path.join(tempDir, "research.md"));
+		assert.match(result.savedOutputPath ?? "", /\/tmp\//);
+		const saved = fs.readFileSync(result.savedOutputPath!, "utf-8");
+		assert.match(saved, /# Saved subagent output/);
+		assert.match(saved, /# Research/);
+	});
+
 	it("passes maxSubagentDepth through to child execution env", async () => {
 		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"] });
 		const agents = makeAgentConfigs(["echo"]);

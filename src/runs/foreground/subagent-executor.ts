@@ -42,6 +42,7 @@ import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
+import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { compactForegroundDetails, getAgentDir, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd } from "../../shared/utils.ts";
 import {
 	attachNestedChildrenToResultChildren,
@@ -1822,6 +1823,14 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			? buildChainInstructions({ ...behavior, output: false, reads: false }, input.paramsCwd, index === input.firstProgressIndex)
 			: { prefix: "", suffix: "" };
 		const outputPath = resolveSingleOutputPath(behavior?.output, input.ctx.cwd, taskCwd);
+		const agentConfig = input.agents.find((agent) => agent.name === task.agent);
+		const savedOutputPath = shouldPersistSavedOutput({
+			output: behavior?.output,
+			outputMode: behavior?.outputMode,
+			tools: agentConfig?.tools,
+		})
+			? resolveSavedOutputPath({ runtimeCwd: input.ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId: input.runId, index })
+			: undefined;
 		const taskText = injectSingleOutputInstruction(
 			`${readInstructions.prefix}${input.taskTexts[index]!}${progressInstructions.suffix}`,
 			outputPath,
@@ -1843,7 +1852,6 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 				return true;
 			};
 		}
-		const agentConfig = input.agents.find((agent) => agent.name === task.agent);
 		return runSync(input.ctx.cwd, input.agents, task.agent, taskText, {
 			cwd: taskCwd,
 			signal: input.signal,
@@ -1859,6 +1867,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			artifactConfig: input.artifactConfig,
 			maxOutput: input.maxOutput,
 			outputPath,
+			savedOutputPath,
 			outputMode: behavior?.outputMode,
 			maxSubagentDepth: input.maxSubagentDepths[index],
 			controlConfig: input.controlConfig,
@@ -2135,7 +2144,14 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		for (let index = 0; index < tasks.length; index++) {
 			const taskCwd = resolveParallelTaskCwd(tasks[index]!, effectiveCwd, worktreeSetup, index);
 			const outputPath = resolveSingleOutputPath(behaviors[index]?.output, ctx.cwd, taskCwd);
-			const validationError = validateFileOnlyOutputMode(behaviors[index]?.outputMode, outputPath, `Parallel task ${index + 1} (${tasks[index]!.agent})`);
+			const savedOutputPath = shouldPersistSavedOutput({
+				output: behaviors[index]?.output,
+				outputMode: behaviors[index]?.outputMode,
+				tools: agents.find((agent) => agent.name === tasks[index]!.agent)?.tools,
+			})
+				? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: tasks[index]!.agent, runId, index })
+				: undefined;
+			const validationError = validateFileOnlyOutputMode(behaviors[index]?.outputMode, outputPath ?? savedOutputPath, `Parallel task ${index + 1} (${tasks[index]!.agent})`);
 			if (validationError) return buildParallelModeError(validationError);
 		}
 
@@ -2401,7 +2417,14 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	}
 	const cleanTask = task;
 	const outputPath = resolveSingleOutputPath(effectiveOutput, ctx.cwd, effectiveCwd);
-	const validationError = validateFileOnlyOutputMode(effectiveOutputMode, outputPath, `Single run (${params.agent})`);
+	const savedOutputPath = shouldPersistSavedOutput({
+		output: effectiveOutput,
+		outputMode: effectiveOutputMode,
+		tools: agentConfig.tools,
+	})
+		? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: effectiveCwd, agent: params.agent!, runId, index: 0 })
+		: undefined;
+	const validationError = validateFileOnlyOutputMode(effectiveOutputMode, outputPath ?? savedOutputPath, `Single run (${params.agent})`);
 	if (validationError) {
 		return { content: [{ type: "text", text: validationError }], isError: true, details: { mode: "single", results: [] } };
 	}
@@ -2474,6 +2497,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		artifactConfig,
 		maxOutput: params.maxOutput,
 		outputPath,
+		savedOutputPath,
 		outputMode: effectiveOutputMode,
 		maxSubagentDepth,
 		onUpdate: forwardSingleUpdate,

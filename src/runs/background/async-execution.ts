@@ -15,6 +15,7 @@ import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults }
 import { hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { applyThinkingSuffix } from "../shared/pi-args.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
+import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
 import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
@@ -352,7 +353,14 @@ export function executeAsyncChain(
 			...(s.model ? { model: s.model } : {}),
 		};
 	};
-	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior) => {
+	const buildSeqStep = (
+		s: SequentialStep,
+		sessionFile?: string,
+		behaviorCwd?: string,
+		progressPrecreated = false,
+		resolvedBehavior?: ResolvedStepBehavior,
+		outputIndex?: number,
+	) => {
 		const a = agents.find((x) => x.name === s.agent)!;
 		const stepSandbox = resolveStepSandbox(a);
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
@@ -373,7 +381,14 @@ export function executeAsyncChain(
 		if (behavior.progress) progressInstructionCreated = true;
 		const progressInstructions = buildChainInstructions({ ...behavior, output: false, reads: false }, runnerCwd, isFirstProgressAgent);
 		const outputPath = resolveSingleOutputPath(behavior.output, ctx.cwd, instructionCwd);
-		const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath, `Async step (${s.agent})`);
+		const savedOutputPath = shouldPersistSavedOutput({
+			output: behavior.output,
+			outputMode: behavior.outputMode,
+			tools: a.tools,
+		})
+			? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: instructionCwd, agent: s.agent, runId: id, index: outputIndex })
+			: undefined;
+		const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath ?? savedOutputPath, `Async step (${s.agent})`);
 		if (validationError) throw new AsyncStartValidationError(validationError);
 		let taskTemplate = s.task ?? "{previous}";
 		taskTemplate = taskTemplate.replace(/\{task\}/g, originalTask ?? "");
@@ -403,6 +418,7 @@ export function executeAsyncChain(
 			inheritSkills: a.inheritSkills,
 			skills: resolvedSkills.map((r) => r.name),
 			outputPath,
+			savedOutputPath,
 			outputMode: behavior.outputMode,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
@@ -450,7 +466,7 @@ export function executeAsyncChain(
 								behaviorCwd = undefined;
 							}
 						}
-						return buildSeqStep(t, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex]);
+						return buildSeqStep(t, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], stepIndex * 1000 + taskIndex);
 					}),
 					concurrency: s.concurrency,
 					failFast: s.failFast,
@@ -467,7 +483,7 @@ export function executeAsyncChain(
 				}
 				return {
 					expand: s.expand,
-					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior),
+					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior, stepIndex),
 					collect: s.collect,
 					concurrency: s.concurrency,
 					failFast: s.failFast,
@@ -475,7 +491,7 @@ export function executeAsyncChain(
 					label: s.label,
 				};
 			}
-			return buildSeqStep(s as SequentialStep, nextSessionFile());
+			return buildSeqStep(s as SequentialStep, nextSessionFile(), undefined, false, undefined, stepIndex);
 		});
 	} catch (error) {
 		if (error instanceof UnavailableSubagentSkillError || error instanceof AsyncStartValidationError) return formatAsyncStartError(resultMode, error.message);
@@ -700,7 +716,14 @@ export function executeAsyncSingle(
 	const effectiveOutput = normalizeSingleOutputOverride(params.output, agentConfig.output);
 	const outputPath = resolveSingleOutputPath(effectiveOutput, ctx.cwd, runnerCwd);
 	const outputMode = params.outputMode ?? "inline";
-	const validationError = validateFileOnlyOutputMode(outputMode, outputPath, `Async single run (${agent})`);
+	const savedOutputPath = shouldPersistSavedOutput({
+		output: effectiveOutput,
+		outputMode,
+		tools: agentConfig.tools,
+	})
+		? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: runnerCwd, agent, runId: id, index: 0 })
+		: undefined;
+	const validationError = validateFileOnlyOutputMode(outputMode, outputPath ?? savedOutputPath, `Async single run (${agent})`);
 	if (validationError) return formatAsyncStartError("single", validationError);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
 	const model = applyThinkingSuffix(
@@ -730,6 +753,7 @@ export function executeAsyncSingle(
 						inheritSkills: agentConfig.inheritSkills,
 						skills: resolvedSkills.map((r) => r.name),
 						outputPath,
+						savedOutputPath,
 						outputMode,
 						sessionFile,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),

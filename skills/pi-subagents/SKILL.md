@@ -141,4 +141,20 @@ Ask children to report:
 - validation evidence
 - blockers, risks, and decisions needing parent approval
 
-For large outputs, use `outputMode: "file-only"` with an explicit `output` path so the parent receives a concise file reference instead of a huge transcript.
+For large outputs, use `outputMode: "file-only"` so the parent receives a concise file reference instead of a huge transcript. Read-only flows can auto-save to repo-local `tmp/` even without an explicit `output` path; explicit `output` is still fine when you want a stable working file too.
+
+## Saved output paths
+
+When subagent output is being preserved for later inspection, prefer the runtime's
+repo-local `tmp/` area and keep `tmp/` in `.gitignore`.
+
+Current convention:
+
+- saved reports go under the current worktree or cwd `tmp/` directory
+- each run creates a fresh markdown file like `tmp/<agent>-<runId>.md`
+- parallel/chain siblings may add an index or numeric collision suffix
+- saved files include run identity metadata so later worker/reviewer loops are traceable
+- session logs, async status files, and runner `.log`/`.jsonl` artifacts remain in the runtime session/temp areas, not repo `tmp/`
+
+This keeps reviewer/explore/research outputs out of tracked repo files while
+preserving per-run history for debugging and follow-up passes.

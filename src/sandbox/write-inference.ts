@@ -11,7 +11,7 @@ function isBuiltinTool(tool: string, name: string): boolean {
 }
 
 function isRalphOrchestratorAgent(agentName: string | undefined): boolean {
-	return agentName?.trim() === "ralph-orchestrator";
+	return agentName?.trim() === "orchestrator";
 }
 
 /**

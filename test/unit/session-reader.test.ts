@@ -113,7 +113,7 @@ describe("session-reader", () => {
 				"Run: run-123",
 				"Summary: " + "nested child result ".repeat(20),
 				"Nested subagents:",
-				"↳ ralph-orchestrator — complete [nested-a]",
+				"↳ orchestrator — complete [nested-a]",
 			].join("\n");
 			const content = JSON.stringify({ type: "custom_message", id: "1", parentId: null, timestamp: new Date().toISOString(), customType: "subagent-slash-result", content: subagentResult, display: true });
 			const p = tmpFile(content);

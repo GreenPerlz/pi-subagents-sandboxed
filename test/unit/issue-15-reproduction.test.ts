@@ -9,7 +9,7 @@ function runReproduction(): string {
 	});
 }
 
-describe("issue #15 ralph-orchestrator runaway reproduction", () => {
+describe("issue #15 orchestrator runaway reproduction", () => {
 	it("demonstrates repeated nested calls after validation failure and duplicate async starts", () => {
 		const output = runReproduction();
 

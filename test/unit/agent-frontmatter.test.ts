@@ -54,12 +54,12 @@ Do work
 		assert.equal(worker?.defaultContext, "fork");
 	});
 
-	it("loads only the packaged reviewer, worker, and researcher agents", () => {
+	it("loads the packaged builtin agents", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-default-context-"));
 		tempDirs.push(dir);
 		const agents = discoverAgentsAll(dir).builtin;
 
-		assert.deepEqual(agents.map((agent) => agent.name).sort(), ["researcher", "reviewer", "worker"]);
+		assert.deepEqual(agents.map((agent) => agent.name).sort(), ["explore", "orchestrator", "researcher", "reviewer", "worker"]);
 		const worker = agents.find((candidate) => candidate.name === "worker");
 		assert.equal(worker?.defaultContext, "fresh", "worker should default to fresh context");
 	});

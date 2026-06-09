@@ -1028,7 +1028,7 @@ function isRalphOrchestratorNestedWorkerLaunch(input: {
 	inheritedNestedRoute?: NestedRouteInfo;
 	nestedParentAddress?: NestedRunAddress;
 }): boolean {
-	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "ralph-orchestrator") return false;
+	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "orchestrator") return false;
 	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return false;
 	return collectRalphNestedLaunchAgentTargets(input.params).some(isRalphNestedWorkerAgentName);
 }

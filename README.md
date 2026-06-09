@@ -43,7 +43,7 @@ That installs the extension and the packaged agents. Because those packaged agen
 
 ## Sandboxed subagents
 
-The packaged builtin agents (`researcher`, `reviewer`, and `worker`) request `bubblewrap` with the `host-toolchain` profile, host networking, `pi-json` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. To opt a specific run out, pass `sandbox: { provider: "none" }`.
+The packaged builtin agents (`explore`, `orchestrator`, `researcher`, `reviewer`, and `worker`) request `bubblewrap` with the `host-toolchain` profile, host networking, `pi-json` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. To opt a specific run out, pass `sandbox: { provider: "none" }`.
 
 ### Bubblewrap requirements
 
@@ -219,11 +219,13 @@ The extension ships with builtin agents you can use immediately. In this fork, e
 
 | Agent | Use it when you want... |
 |-------|--------------------------|
+| `explore` | Read-only codebase discovery: find the minimal relevant files, tests, call paths, and likely edit points. |
+| `orchestrator` | Per-issue nested orchestrator: runs explore/worker/researcher loops in one sandboxed worktree until green or blocked. |
 | `researcher` | Web/docs research with sources: official docs, specs, benchmarks, recent changes, and a concise research brief. |
 | `worker` | Implementation work. It edits files, validates, and escalates unapproved decisions instead of guessing. |
 | `reviewer` | Code review and small fixes. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |
 
-A simple rule of thumb: use `researcher` before you trust external facts, `worker` to implement, and `reviewer` to check.
+A simple rule of thumb: use `explore` to map the codebase, `researcher` before you trust external facts, `worker` to implement, `reviewer` to check, and `orchestrator` for one-issue nested loops.
 
 ## Changing a builtin agent's model
 
@@ -469,7 +471,7 @@ Agent locations, lowest to highest priority:
 
 Project discovery also reads legacy `.agents/**/*.md` files. Nested subdirectories are discovered recursively. `.chain.md` files do not define agents. If both `.agents/` and `.pi/agents/` define the same parsed runtime agent name, `.pi/agents/` wins. Use `agentScope: "user" | "project" | "both"` to control discovery; `both` is the default and project definitions win runtime-name collisions.
 
-Builtin agents load at the lowest priority, so a user or project agent with the same name overrides them. They do not pin a provider model; they inherit your current Pi default model unless you set `subagents.agentOverrides.<name>.model`. This package currently ships `researcher`, `reviewer`, and `worker`.
+Builtin agents load at the lowest priority, so a user or project agent with the same name overrides them. They do not pin a provider model; they inherit your current Pi default model unless you set `subagents.agentOverrides.<name>.model`. This package currently ships `explore`, `orchestrator`, `researcher`, `reviewer`, and `worker`.
 
 The `researcher` builtin uses `web_search`, `fetch_content`, and `get_search_content`; those require [pi-web-access](https://github.com/nicobailon/pi-web-access):
 

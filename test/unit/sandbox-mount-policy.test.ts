@@ -30,7 +30,15 @@ function mountMode(mounts: ReturnType<typeof buildSubagentSandboxMounts>, source
 }
 
 function bundledAgentTools(agentName: string): string[] {
-	const content = fs.readFileSync(path.join(process.cwd(), "agents", `${agentName}.md`), "utf-8");
+	const fileName = ({
+		explore: "explore.md",
+		orchestrator: "orchestrator.md",
+		researcher: "research.md",
+		reviewer: "review.md",
+		worker: "work.md",
+	} as const)[agentName as "explore" | "orchestrator" | "researcher" | "reviewer" | "worker"];
+	assert.ok(fileName, `${agentName} should map to a bundled agent file`);
+	const content = fs.readFileSync(path.join(process.cwd(), "agents", fileName), "utf-8");
 	const match = /^tools:\s*(.+)$/m.exec(content);
 	assert.ok(match, `${agentName} should declare default tools`);
 	return match[1].split(",").map((tool) => tool.trim()).filter(Boolean);
@@ -53,11 +61,11 @@ describe("sandbox write capability inference", () => {
 		assert.equal(inferSandboxCwdWritable({ tools: [], sandbox: { bashWrite: true } }), false);
 	});
 
-	it("defaults ralph-orchestrator cwd writable for nested worker workflows without bash write opt-in", () => {
+	it("defaults orchestrator cwd writable for nested worker workflows without bash write opt-in", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));
 		const cwdWritable = inferSandboxCwdWritable({
-			agentName: "ralph-orchestrator",
+			agentName: "orchestrator",
 			tools: ["read", "grep", "find", "ls", "bash", "subagent"],
 			sandbox: { bashWrite: false },
 		});

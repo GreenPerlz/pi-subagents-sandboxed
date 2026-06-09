@@ -570,7 +570,7 @@ describe("sandbox preflight: combined run", () => {
 	});
 });
 
-describe("sandbox preflight: ralph-orchestrator integration", () => {
+describe("sandbox preflight: orchestrator integration", () => {
 	const routeRoots: string[] = [];
 	const envKeys = [
 		SUBAGENT_CHILD_ENV,
@@ -652,7 +652,7 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 		process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = route.capabilityToken;
 		process.env[SUBAGENT_PARENT_RUN_ID_ENV] = "parent-run";
 		process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "0";
-		process.env[SUBAGENT_CHILD_AGENT_ENV] = "ralph-orchestrator";
+		process.env[SUBAGENT_CHILD_AGENT_ENV] = "orchestrator";
 		process.env[SUBAGENT_RUN_ID_ENV] = runId;
 	}
 
@@ -724,7 +724,7 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 		}
 	});
 
-	it("allows ralph-orchestrator worker when external worktree gitdir is auto-mounted", async () => {
+	it("allows orchestrator worker when external worktree gitdir is auto-mounted", async () => {
 		saveAndClearEnv();
 		const { repoDir, bareDir } = createBareRepo("pi-ralph-preflight-block");
 		const { worktreeDir, cleanup } = createWorktreeWithPointerFile(bareDir, "pi-ralph-preflight-block");
@@ -752,7 +752,7 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 		}
 	});
 
-	it("blocks ralph-orchestrator worker when git probe fails", async () => {
+	it("blocks orchestrator worker when git probe fails", async () => {
 		saveAndClearEnv();
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-nogit-"));
 		// Create a broken .git pointer to a nonexistent gitdir so git probe fails
@@ -774,7 +774,7 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 		}
 	});
 
-	it("does not run preflight for non-ralph-orchestrator nested workers", async () => {
+	it("does not run preflight for non-orchestrator nested workers", async () => {
 		saveAndClearEnv();
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-non-ralph-preflight-"));
 		try {
@@ -786,7 +786,7 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 			process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = route.capabilityToken;
 			process.env[SUBAGENT_PARENT_RUN_ID_ENV] = "parent-run";
 			process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "0";
-			process.env[SUBAGENT_CHILD_AGENT_ENV] = "worker"; // not ralph-orchestrator
+			process.env[SUBAGENT_CHILD_AGENT_ENV] = "worker"; // not orchestrator
 			process.env[SUBAGENT_RUN_ID_ENV] = "worker-run";
 			const throwingCtx = {
 				...testCtx(root),
@@ -804,7 +804,7 @@ describe("sandbox preflight: ralph-orchestrator integration", () => {
 		}
 	});
 
-	it("blocks ralph-orchestrator worker when cwd is not a git repo (no .git)", async () => {
+	it("blocks orchestrator worker when cwd is not a git repo (no .git)", async () => {
 		saveAndClearEnv();
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-nogitrepo-"));
 		tempDirs.push(root);

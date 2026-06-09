@@ -132,7 +132,7 @@ function setNestedRouteEnv(route: ReturnType<typeof createNestedRoute>, parentRu
 
 function setRalphOrchestratorNestedEnv(route: ReturnType<typeof createNestedRoute>, runId = "ralph-run") {
 	setNestedRouteEnv(route, "parent-run");
-	process.env[SUBAGENT_CHILD_AGENT_ENV] = "ralph-orchestrator";
+	process.env[SUBAGENT_CHILD_AGENT_ENV] = "orchestrator";
 	process.env[SUBAGENT_RUN_ID_ENV] = runId;
 }
 
@@ -361,7 +361,7 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("keeps ralph-orchestrator nested worker launches synchronous when async is only configured by default", async () => {
+	it("keeps orchestrator nested worker launches synchronous when async is only configured by default", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-default-sync-worker-"));
 		try {
 			git(root, ["init"]);
@@ -412,7 +412,7 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("allows ralph-orchestrator to launch one nested worker then a nested ralph-reviewer", async () => {
+	it("allows orchestrator to launch one nested worker then a nested ralph-reviewer", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-worker-reviewer-guard-"));
 		try {
 			git(root, ["init"]);
@@ -447,7 +447,7 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("allows sequential ralph-orchestrator nested worker launches after the previous worker returns", async () => {
+	it("allows sequential orchestrator nested worker launches after the previous worker returns", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-sequential-worker-guard-"));
 		const mockPi = createMockPi();
 		try {
@@ -480,7 +480,7 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("does not mark malformed ralph-orchestrator nested acceptance attempts as active workers", async () => {
+	it("does not mark malformed orchestrator nested acceptance attempts as active workers", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-malformed-guard-"));
 		try {
 			git(root, ["init"]);
@@ -507,7 +507,7 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("does not treat malformed ralph-orchestrator nested attempts with no visible target as active workers", async () => {
+	it("does not treat malformed orchestrator nested attempts with no visible target as active workers", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-unknown-target-guard-"));
 		try {
 			const route = createNestedRoute("root-ralph-unknown-target");
@@ -528,7 +528,7 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("does not apply the ralph-orchestrator nested guard to non-orchestrator parent subagent usage", async () => {
+	it("does not apply the orchestrator nested guard to non-orchestrator parent subagent usage", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-non-ralph-guard-"));
 		try {
 			const route = createNestedRoute("root-non-ralph");

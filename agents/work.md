@@ -1,10 +1,10 @@
 ---
 name: worker
 description: Implementation agent for normal tasks and approved oracle handoffs
-thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
+skills: tdd
 tools: read, grep, find, ls, bash, edit, write, contact_supervisor
 sandboxProvider: bubblewrap
 sandboxProfile: host-toolchain

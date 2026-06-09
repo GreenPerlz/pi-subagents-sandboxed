@@ -336,7 +336,7 @@ describe("collectRunTree", () => {
 	it("classifies a foreground control with remembered completed children as completed", () => {
 		const state = baseState();
 		addForegroundControl(state, "fg-finalizing", {
-			currentAgent: "ralph-orchestrator",
+			currentAgent: "orchestrator",
 			mode: "single",
 			currentIndex: 0,
 			currentTool: "subagent",
@@ -354,7 +354,7 @@ describe("collectRunTree", () => {
 		});
 		addForegroundRun(state, "fg-finalizing", {
 			mode: "single",
-			children: [{ agent: "ralph-orchestrator", index: 0, status: "completed" }],
+			children: [{ agent: "orchestrator", index: 0, status: "completed" }],
 		});
 
 		const runs = collectRunTree(state, 10000);
@@ -375,7 +375,7 @@ describe("collectRunTree", () => {
 	it("freezes restarted foreground nested children without their own update timestamp", () => {
 		const state = baseState();
 		addForegroundControl(state, "fg-finalizing-no-update", {
-			currentAgent: "ralph-orchestrator",
+			currentAgent: "orchestrator",
 			mode: "single",
 			currentIndex: 0,
 			updatedAt: 3000,
@@ -392,7 +392,7 @@ describe("collectRunTree", () => {
 		addForegroundRun(state, "fg-finalizing-no-update", {
 			mode: "single",
 			updatedAt: 3500,
-			children: [{ agent: "ralph-orchestrator", index: 0, status: "completed" }],
+			children: [{ agent: "orchestrator", index: 0, status: "completed" }],
 		});
 
 		const runs = collectRunTree(state, 10000);
@@ -1204,7 +1204,7 @@ describe("collectRunTree", () => {
 				endedAt: 5000,
 				lastUpdate: 5000,
 				nestedRoute: route,
-				steps: [{ agent: "ralph-orchestrator", status: "complete", durationMs: 4000 }],
+				steps: [{ agent: "orchestrator", status: "complete", durationMs: 4000 }],
 			});
 
 			const runs = collectRunTree(state, 6000, { asyncDirRoot, resultsDir });

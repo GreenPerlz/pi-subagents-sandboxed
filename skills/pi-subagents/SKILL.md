@@ -28,7 +28,7 @@ Custom user/project agents and chains may still exist. Use `subagent({ action: "
 - Prefer fresh context for reviewers/researchers unless inherited conversation state is explicitly needed.
 - Use `worker` for edits, `reviewer` for adversarial checks, and `researcher` for external facts.
 - Do not let ordinary children run nested subagents. A child can call `subagent` only when its resolved builtin tools explicitly include `subagent`; default packaged agents do not.
-- For long work, prefer `async: true` so the parent session can continue.
+- Prefer `async: true` for subagent runs by default. Use foreground/synchronous runs mainly when you need the child result immediately in the current turn.
 
 ## Common workflows
 
@@ -48,7 +48,7 @@ For broad questions, run 2-3 researchers in parallel with distinct angles: offic
 
 ### Implement then review
 
-Use one `worker` to implement the accepted scope, then fresh `reviewer` agents to inspect the actual diff.
+Use one `worker` to implement the accepted scope, then fresh `reviewer` agents to inspect the actual diff. Prefer launching the workflow async unless you explicitly need the result inline.
 
 ```typescript
 subagent({
@@ -70,7 +70,7 @@ After reviewers return, synthesize fixes worth doing now. If fixes are accepted,
 
 ### Review-only
 
-Use fresh reviewers for current diffs, plans, issues, PRs, or proposed solutions. Ask for file/line evidence and concise findings. Do not ask reviewers to edit unless the user explicitly wants a writer pass.
+Use fresh reviewers for current diffs, plans, issues, PRs, or proposed solutions. Ask for file/line evidence and concise findings. Do not ask reviewers to edit unless the user explicitly wants a writer pass. Prefer async review runs unless the current turn depends on the answer immediately.
 
 ```typescript
 subagent({
@@ -83,6 +83,8 @@ subagent({
 ```
 
 ## Sandboxed defaults
+
+If you need to explain, tune, or modify sandboxing, read [sandboxing.md](sandboxing.md) before changing anything. It covers config precedence, mounts, auth modes, package discovery, writable-vs-read-only behavior, and how implemented Bubblewrap profiles are created/edited in this codebase.
 
 Packaged builtin agents request a closed Bubblewrap `host-toolchain` sandbox by default:
 
@@ -97,19 +99,19 @@ sandbox: {
 }
 ```
 
-Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider: "none" }` only when the user explicitly approves an unsandboxed exception. Use `extraReadOnlyMounts` for narrow toolchain/input access and `extraWritableMounts` only for caches, outputs, or work directories.
+Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider: "none" }` only when the user explicitly approves an unsandboxed exception. Use `extraReadOnlyMounts` for narrow toolchain/input access and `extraWritableMounts` only for caches, outputs, or work directories. Do not invent new profile names in prompts or config; only implemented profiles work.
 
 Parallel sandboxed tasks with write-capable tools require `worktree: true`; otherwise use read-only review/research tasks in parallel.
 
 ## Ralph-style per-issue orchestrators
 
-For parallel AFK issue work, prefer one parent session plus per-issue `ralph-orchestrator` children:
+For parallel AFK issue work, prefer one parent session plus per-issue `orchestrator` children:
 
 ```typescript
 subagent({
   tasks: [
-    { agent: "ralph-orchestrator", label: "Issue #123", task: "Orchestrate exactly this issue: ...", output: "ralph/issue-123.md", outputMode: "file-only" },
-    { agent: "ralph-orchestrator", label: "Issue #124", task: "Orchestrate exactly this issue: ...", output: "ralph/issue-124.md", outputMode: "file-only" }
+    { agent: "orchestrator", label: "Issue #123", task: "Orchestrate exactly this issue: ...", output: "ralph/issue-123.md", outputMode: "file-only" },
+    { agent: "orchestrator", label: "Issue #124", task: "Orchestrate exactly this issue: ...", output: "ralph/issue-124.md", outputMode: "file-only" }
   ],
   concurrency: 2,
   worktree: true,
@@ -119,7 +121,7 @@ subagent({
 })
 ```
 
-Only agents whose tools include `subagent` should run nested subagents. `ralph-orchestrator` is the intended exception: it may use nested `worker` and `ralph-reviewer`/`reviewer` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, parallel batch planning, serial integration of successful worktree commits/PRs, and final close decisions.
+Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `worker`, and `researcher`/`reviewer` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, parallel batch planning, serial integration of successful worktree commits/PRs, and final close decisions.
 
 ## Status and control
 

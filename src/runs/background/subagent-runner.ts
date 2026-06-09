@@ -57,7 +57,7 @@ import { buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime, readStructuredOutput } from "../shared/structured-output.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
-import { nestedSummaryFromAsyncStatus, projectNestedEvents, writeNestedEvent } from "../shared/nested-events.ts";
+import { hasLiveNestedDescendantsForParent, nestedSummaryFromAsyncStatus, projectNestedEvents, writeNestedEvent } from "../shared/nested-events.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
@@ -1616,7 +1616,24 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		if (activityStateChanged) syncTopLevelActivityState();
 		writeStatusPayload();
 	};
+	let cachedNestedChildren: typeof statusPayload.nestedChildren | undefined;
+	let cachedNestedChildrenProjected = false;
+	const hasCachedNestedActivity = (index: number): boolean => {
+		if (!config.nestedRoute) return false;
+		if (!cachedNestedChildrenProjected) {
+			cachedNestedChildrenProjected = true;
+			try {
+				cachedNestedChildren = projectNestedEvents(config.nestedRoute).children;
+				statusPayload.nestedChildren = cachedNestedChildren;
+			} catch {
+				cachedNestedChildren = [];
+			}
+		}
+		return hasLiveNestedDescendantsForParent(cachedNestedChildren, id, index);
+	};
 	const updateRunnerActivityState = (now: number): boolean => {
+		cachedNestedChildren = undefined;
+		cachedNestedChildrenProjected = false;
 		if (!controlConfig.enabled) return false;
 		let changed = false;
 		let runLastActivityAt = statusPayload.lastActivityAt ?? overallStartTime;
@@ -1636,19 +1653,28 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				now,
 			});
 			if (idleState === "needs_attention") {
-				const previous = step.activityState;
-				step.activityState = "needs_attention";
-				if (previous !== "needs_attention") {
-					appendControlEvent(buildControlEvent({
-						from: previous,
-						to: "needs_attention",
-						runId: id,
-						agent: step.agent,
-						index,
-						ts: now,
-						lastActivityAt,
-					}));
-					changed = true;
+				// When a background runner has a live nested child for this step,
+				// treat it as active rather than idle (issue #47).
+				if (hasCachedNestedActivity(index)) {
+					if (step.activityState === "needs_attention" && !mutatingFailureAttentionSteps[index]) {
+						step.activityState = undefined;
+						changed = true;
+					}
+				} else {
+					const previous = step.activityState;
+					step.activityState = "needs_attention";
+					if (previous !== "needs_attention") {
+						appendControlEvent(buildControlEvent({
+							from: previous,
+							to: "needs_attention",
+							runId: id,
+							agent: step.agent,
+							index,
+							ts: now,
+							lastActivityAt,
+						}));
+						changed = true;
+					}
 				}
 			} else {
 				if (step.activityState === "needs_attention" && !mutatingFailureAttentionSteps[index]) {

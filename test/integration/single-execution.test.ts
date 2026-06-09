@@ -27,6 +27,7 @@ import {
 	tryImport,
 } from "../support/helpers.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT } from "../../src/shared/types.ts";
+import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
@@ -635,6 +636,65 @@ process.exit(${exitCode});
 		assert.equal(controlEvents[0]?.turns, 2);
 		assert.equal(result.controlEvents?.[0]?.type, "active_long_running");
 		assert.equal(result.progress.activityState, "active_long_running");
+	});
+
+	it("does not emit idle needs_attention while a sync nested child is running", async () => {
+		mockPi.onCall({
+			steps: [
+				{ delay: 600, jsonl: [events.assistantMessage("Done after nested child") ] },
+			],
+		});
+		const route = createNestedRoute("run-nested-active");
+		const agents = [makeAgent("worker")];
+		const controlEvents: NonNullable<RunSyncResult["controlEvents"]> = [];
+		const nestedStartedAt = Date.now();
+		const nestedTimer = setTimeout(() => {
+			writeNestedEvent(route, {
+				type: "subagent.nested.started",
+				ts: Date.now(),
+				parentRunId: "run-nested-active",
+				parentStepIndex: 0,
+				child: {
+					id: "nested-reviewer",
+					parentRunId: "run-nested-active",
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: "run-nested-active", stepIndex: 0 }],
+					mode: "single",
+					state: "running",
+					agent: "reviewer",
+					agents: ["reviewer"],
+					startedAt: nestedStartedAt,
+					lastUpdate: Date.now(),
+				},
+			});
+		}, 100);
+
+		try {
+			const result = await runSync(tempDir, agents, "worker", "Wait for nested reviewer", {
+				runId: "run-nested-active",
+				index: 0,
+				nestedRoute: route,
+				controlConfig: {
+					enabled: true,
+					needsAttentionAfterMs: 200,
+					activeNoticeAfterTurns: 999_999,
+					activeNoticeAfterMs: 999_999,
+					activeNoticeAfterTokens: 999_999,
+					failedToolAttemptsBeforeAttention: 999_999,
+					notifyOn: ["active_long_running", "needs_attention"],
+				},
+				onControlEvent: (event: NonNullable<RunSyncResult["controlEvents"]>[number]) => controlEvents.push(event),
+			});
+
+			assert.equal(result.exitCode, 0);
+			assert.equal(controlEvents.find((event) => event.reason === "idle" || event.reason === undefined), undefined);
+			assert.equal(result.controlEvents?.find((event) => event.reason === "idle" || event.reason === undefined), undefined);
+			assert.notEqual(result.progress.activityState, "needs_attention");
+		} finally {
+			clearTimeout(nestedTimer);
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
 	});
 
 	it("escalates repeated mutating tool failures to needs attention", async () => {

@@ -61,6 +61,7 @@ import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { hasLiveNestedDescendantsForParent, projectNestedEvents } from "../shared/nested-events.ts";
 import {
 	buildModelCandidates,
 	formatModelAttemptNote,
@@ -451,8 +452,18 @@ async function runSingleAttempt(
 		let activeLongRunningNotified = false;
 		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
 		const mutatingFailures = createMutatingFailureState();
+		let mutatingFailureAttentionActive = false;
 		const mutatingFailureWindowMs = 5 * 60_000;
 		const currentToolDurationMs = (now: number) => progress.currentToolStartedAt ? Math.max(0, now - progress.currentToolStartedAt) : undefined;
+		const hasLiveNestedActivity = (): boolean => {
+			if (!options.nestedRoute) return false;
+			try {
+				const registry = projectNestedEvents(options.nestedRoute);
+				return hasLiveNestedDescendantsForParent(registry.children, options.runId, options.index ?? 0);
+			} catch {
+				return false;
+			}
+		};
 		const emitNeedsAttention = (now: number, input: { message?: string; reason?: ControlEvent["reason"]; recentFailureSummary?: string; currentTool?: string; currentPath?: string; currentToolDurationMs?: number } = {}): boolean => {
 			if (!controlConfig.enabled) return false;
 			const previous = progress.activityState;
@@ -513,6 +524,15 @@ async function runSingleAttempt(
 				now,
 			});
 			if (idleState === "needs_attention") {
+				// When a foreground parent is waiting on a sync nested subagent,
+				// treat it as active rather than idle (issue #47).
+				if (hasLiveNestedActivity()) {
+					if (progress.activityState === "needs_attention" && !mutatingFailureAttentionActive) {
+						progress.activityState = undefined;
+						return true;
+					}
+					return false;
+				}
 				return progress.activityState === "needs_attention" ? false : emitNeedsAttention(now);
 			}
 			const activeReason = nextLongRunningTrigger(controlConfig, {
@@ -642,6 +662,7 @@ async function runSingleAttempt(
 						ts: now,
 					}, mutatingFailureWindowMs);
 					if (shouldEscalateMutatingFailures(mutatingFailures, controlConfig.failedToolAttemptsBeforeAttention)) {
+						mutatingFailureAttentionActive = true;
 						emitNeedsAttention(now, {
 							message: `${agent.name} needs attention after repeated mutating tool failures`,
 							reason: "tool_failures",
@@ -653,6 +674,7 @@ async function runSingleAttempt(
 					}
 				} else if (toolSnapshot?.mutates) {
 					resetMutatingFailureState(mutatingFailures);
+					mutatingFailureAttentionActive = false;
 				}
 				fireUpdate();
 			}

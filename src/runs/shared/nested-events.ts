@@ -762,6 +762,34 @@ export function hasLiveNestedDescendants(children: NestedRunSummary[] | undefine
 	return false;
 }
 
+export function selectNestedChildrenForParent(
+	children: NestedRunSummary[] | undefined,
+	parentRunId: string,
+	parentStepIndex?: number,
+): NestedRunSummary[] {
+	if (!children?.length) return [];
+	const matches: NestedRunSummary[] = [];
+	const walk = (items: NestedRunSummary[] | undefined): void => {
+		for (const child of items ?? []) {
+			if (child.parentRunId === parentRunId && child.parentStepIndex === parentStepIndex) {
+				matches.push(child);
+			}
+			walk(child.children);
+			walk(child.steps?.flatMap((step) => step.children ?? []));
+		}
+	};
+	walk(children);
+	return matches;
+}
+
+export function hasLiveNestedDescendantsForParent(
+	children: NestedRunSummary[] | undefined,
+	parentRunId: string,
+	parentStepIndex?: number,
+): boolean {
+	return hasLiveNestedDescendants(selectNestedChildrenForParent(children, parentRunId, parentStepIndex));
+}
+
 export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: string, fallback: { id: string; parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }>; mode?: SubagentRunMode; ts: number }): NestedRunSummary {
 	const activeStep = status.currentStep !== undefined ? status.steps?.[status.currentStep] : undefined;
 	const modelStep = activeStep?.model ? activeStep : status.steps?.find((step) => step.model);

@@ -6,7 +6,9 @@ import type { AsyncJobState, SubagentState } from "../../src/shared/types.ts";
 import {
 	createNestedRoute,
 	hasLiveNestedDescendants,
+	hasLiveNestedDescendantsForParent,
 	nestedSummaryFromAsyncStatus,
+	selectNestedChildrenForParent,
 	parseNestedEventRecords,
 	projectNestedEvents,
 	resolveNestedParentAddressFromEnv,
@@ -435,5 +437,118 @@ describe("nestedSummaryFromAsyncStatus", () => {
 		});
 		assert.equal(summary.model, "claude-sonnet:high");
 		assert.equal(summary.thinking, "high");
+	});
+});
+
+describe("sync-nested-child activity detection (issue #47)", () => {
+	it("reports live descendants when a child is running", () => {
+		const route = trackRoute();
+		writeNestedEvent(route, {
+			type: "subagent.nested.started",
+			ts: 100,
+			parentRunId: "root-run",
+			parentStepIndex: 0,
+			child: child("worker-nested", "running", 100),
+		});
+		const registry = projectNestedEvents(route);
+		assert.equal(hasLiveNestedDescendants(registry.children), true);
+	});
+
+	it("reports no live descendants when all children are terminal", () => {
+		const route = trackRoute();
+		writeNestedEvent(route, {
+			type: "subagent.nested.started",
+			ts: 100,
+			parentRunId: "root-run",
+			parentStepIndex: 0,
+			child: child("worker-done", "running", 100),
+		});
+		writeNestedEvent(route, {
+			type: "subagent.nested.completed",
+			ts: 200,
+			parentRunId: "root-run",
+			parentStepIndex: 0,
+			child: child("worker-done", "complete", 200),
+		});
+		const registry = projectNestedEvents(route);
+		assert.equal(hasLiveNestedDescendants(registry.children), false);
+	});
+
+	it("reports live descendants through nested step children", () => {
+		const route = trackRoute();
+		writeNestedEvent(route, {
+			type: "subagent.nested.started",
+			ts: 100,
+			parentRunId: "root-run",
+			parentStepIndex: 0,
+			child: {
+				...child("parent-step", "complete", 200),
+				steps: [{
+					agent: "step-agent",
+					status: "complete",
+					children: [{
+						...child("step-child", "running", 300, "parent-step"),
+						parentStepIndex: 0,
+						path: [{ runId: "parent-step", stepIndex: 0 }],
+					}],
+				}],
+			},
+		});
+		const registry = projectNestedEvents(route);
+		assert.equal(hasLiveNestedDescendants(registry.children), true);
+	});
+
+	it("transitions from live to no-live when nested child completes", () => {
+		const route = trackRoute();
+		writeNestedEvent(route, {
+			type: "subagent.nested.started",
+			ts: 100,
+			parentRunId: "root-run",
+			parentStepIndex: 0,
+			child: child("transient-child", "running", 100),
+		});
+		let registry = projectNestedEvents(route);
+		assert.equal(hasLiveNestedDescendants(registry.children), true);
+
+		writeNestedEvent(route, {
+			type: "subagent.nested.completed",
+			ts: 200,
+			parentRunId: "root-run",
+			parentStepIndex: 0,
+			child: child("transient-child", "complete", 200),
+		});
+		registry = projectNestedEvents(route);
+		assert.equal(hasLiveNestedDescendants(registry.children), false);
+	});
+
+	it("reports no live descendants for an empty registry", () => {
+		const route = trackRoute();
+		const registry = projectNestedEvents(route);
+		assert.equal(hasLiveNestedDescendants(registry.children), false);
+	});
+
+	it("scopes nested children and live-descendant checks by parent step", () => {
+		const runningStep0 = { ...child("nested-step-0", "running", 100, "root-run"), parentStepIndex: 0, path: [{ runId: "root-run", stepIndex: 0 }] };
+		const runningStep1 = { ...child("nested-step-1", "running", 110, "root-run"), parentStepIndex: 1, path: [{ runId: "root-run", stepIndex: 1 }] };
+		const completeStep0 = { ...child("nested-step-0-complete", "complete", 120, "root-run"), parentStepIndex: 0, path: [{ runId: "root-run", stepIndex: 0 }] };
+		const nestedParent = {
+			...child("nested-parent", "running", 130, "root-run"),
+			parentStepIndex: 0,
+			path: [{ runId: "root-run", stepIndex: 0 }],
+			children: [{
+				...child("grandchild-step-0", "running", 140, "nested-parent"),
+				parentStepIndex: 0,
+				path: [{ runId: "root-run", stepIndex: 0 }, { runId: "nested-parent", stepIndex: 0 }],
+			}],
+		};
+		const children = [runningStep0, runningStep1, completeStep0, nestedParent];
+
+		assert.deepEqual(selectNestedChildrenForParent(children, "root-run", 0).map((item) => item.id), ["nested-step-0", "nested-step-0-complete", "nested-parent"]);
+		assert.deepEqual(selectNestedChildrenForParent(children, "root-run", 1).map((item) => item.id), ["nested-step-1"]);
+		assert.deepEqual(selectNestedChildrenForParent(children, "nested-parent", 0).map((item) => item.id), ["grandchild-step-0"]);
+		assert.equal(hasLiveNestedDescendantsForParent(children, "root-run", 0), true);
+		assert.equal(hasLiveNestedDescendantsForParent(children, "root-run", 1), true);
+		assert.equal(hasLiveNestedDescendantsForParent(children, "nested-parent", 0), true);
+		assert.equal(hasLiveNestedDescendantsForParent(children, "root-run", 2), false);
 	});
 });

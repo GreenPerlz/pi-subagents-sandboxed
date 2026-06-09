@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
+import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import type { MockPi } from "../support/helpers.ts";
 
 interface AsyncExecutionResult {
@@ -2598,6 +2599,88 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		while (!fs.existsSync(resultPath)) {
 			if (Date.now() > resultDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
 			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
+	it("background runs do not emit idle needs_attention while a nested child is running", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ delay: 1_200, jsonl: [events.assistantMessage("Done after nested child")] },
+			],
+		});
+
+		const id = `async-nested-active-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		const route = createNestedRoute(id);
+		const nestedStartedAt = Date.now();
+		const nestedTimer = setTimeout(() => {
+			writeNestedEvent(route, {
+				type: "subagent.nested.started",
+				ts: Date.now(),
+				parentRunId: id,
+				parentStepIndex: 0,
+				child: {
+					id: "nested-reviewer",
+					parentRunId: id,
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: id, stepIndex: 0 }],
+					mode: "single",
+					state: "running",
+					agent: "reviewer",
+					agents: ["reviewer"],
+					startedAt: nestedStartedAt,
+					lastUpdate: Date.now(),
+				},
+			});
+		}, 100);
+
+		try {
+			executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Wait for nested reviewer",
+				agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+				nestedRoute: route,
+				controlConfig: {
+					enabled: true,
+					needsAttentionAfterMs: 300,
+					activeNoticeAfterTurns: 999_999,
+					activeNoticeAfterMs: 999_999,
+					activeNoticeAfterTokens: 999_999,
+					failedToolAttemptsBeforeAttention: 999_999,
+					notifyOn: ["active_long_running", "needs_attention"],
+					notifyChannels: ["event", "async", "intercom"],
+				},
+			});
+
+			const statusPath = path.join(asyncDir, "status.json");
+			const eventsPath = path.join(asyncDir, "events.jsonl");
+			const deadline = Date.now() + 12_000;
+			let observedRunningWithoutIdle = false;
+
+			while (Date.now() < deadline) {
+				if (fs.existsSync(statusPath)) {
+					const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+					if (status.state === "running" && !fs.existsSync(resultPath) && status.activityState !== "needs_attention" && status.steps?.[0]?.activityState !== "needs_attention") {
+						observedRunningWithoutIdle = true;
+					}
+				}
+				if (fs.existsSync(resultPath)) break;
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+
+			assert.ok(observedRunningWithoutIdle, "expected running async status without idle needs_attention while nested child was live");
+			const eventText = fs.existsSync(eventsPath) ? fs.readFileSync(eventsPath, "utf-8") : "";
+			assert.doesNotMatch(eventText, /"type":"needs_attention"/);
+		} finally {
+			clearTimeout(nestedTimer);
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 		}
 	});
 

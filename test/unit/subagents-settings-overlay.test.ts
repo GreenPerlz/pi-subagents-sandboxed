@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import { parseFrontmatter } from "../../src/agents/frontmatter.ts";
 import { serializeAgent } from "../../src/agents/agent-serializer.ts";
 import { buildBuiltinOverrideConfig } from "../../src/agents/agents.ts";
-import { THINKING_CHOICES, buildDefaultModelChoices, buildSettingsRows, getAgentThinkingChoices, registerSubagentsSettingsCommand, renderSubagentsSettingsOverlay } from "../../src/tui/subagents-settings-overlay.ts";
+import { THINKING_CHOICES, buildDefaultModelChoices, buildSettingsRows, cycleFallbackThinking, getAgentThinkingChoices, getBuiltinShadowingWarning, getFallbackThinkingChoices, getShadowingBuiltinWarning, registerSubagentsSettingsCommand, renderSubagentsSettingsOverlay } from "../../src/tui/subagents-settings-overlay.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
 import type { ModelInfo } from "../../src/shared/model-info.ts";
 
@@ -90,11 +93,45 @@ describe("subagents settings overlay", () => {
 		});
 		const text = lines.join("\n");
 
-		assert.ok(text.includes("User agents"));
+		assert.ok(text.includes("User/local agents"));
 		assert.ok(text.includes("Builtin agents"));
 		assert.ok(text.includes("Choose default model"));
 		assert.ok(text.includes("openai/gpt-5"));
 		assert.ok(text.includes("anthropic/claude-sonnet"));
+	});
+
+	it("shows subtle builtin shadowing warning with the shadowing path", () => {
+		const builtin = agent({ name: "worker", source: "builtin", model: "openai/gpt-5" });
+		const lines = renderSubagentsSettingsOverlay({
+			view: "builtin",
+			rows: buildSettingsRows([builtin]),
+			selected: 0,
+			theme: theme as never,
+			width: 120,
+			shadowingAgents: new Map([["worker", { source: "project", filePath: "/tmp/.pi/agents/worker.md" }]]),
+			builtinAgentNames: new Set(["worker"]),
+		});
+		const text = lines.join("\n");
+
+		assert.deepEqual(getBuiltinShadowingWarning(builtin, { source: "project", filePath: "/tmp/.pi/agents/worker.md" }), ["builtin model won't be used; overshadowed by user/local agent: /tmp/.pi/agents/worker.md"]);
+		assert.ok(text.includes("builtin model won't be used; overshadowed by user/local agent: /tmp/.pi/agents/worker.md"));
+	});
+
+	it("shows subtle note when a user/local agent shadows a builtin agent", () => {
+		const shadowingAgent = agent({ name: "worker", source: "project", model: "openai/gpt-5", filePath: "/tmp/.pi/agents/worker.md" });
+		const lines = renderSubagentsSettingsOverlay({
+			view: "user",
+			rows: buildSettingsRows([shadowingAgent]),
+			selected: 0,
+			theme: theme as never,
+			width: 120,
+			builtinAgentNames: new Set(["worker"]),
+		});
+		const text = lines.join("\n");
+
+		assert.deepEqual(getShadowingBuiltinWarning(shadowingAgent, new Set(["worker"])), ["shadows builtin agent"]);
+		assert.ok(text.includes("worker · local"));
+		assert.ok(text.includes("shadows builtin agent"));
 	});
 
 	it("shows t cycle thinking shortcut in help text", () => {
@@ -108,6 +145,18 @@ describe("subagents settings overlay", () => {
 		const text = lines.join("\n");
 
 		assert.ok(text.includes("t cycle thinking"));
+	});
+
+	it("uses the available overlay width instead of hard-capping to a narrow box", () => {
+		const lines = renderSubagentsSettingsOverlay({
+			view: "user",
+			rows: buildSettingsRows([agent({ name: "worker", source: "user", model: "openai/gpt-5" })]),
+			selected: 0,
+			theme: theme as never,
+			width: 160,
+		});
+
+		assert.equal(lines[0]?.length, 160);
 	});
 
 	it("uses shared thinking choices including minimal and xhigh", () => {
@@ -171,6 +220,32 @@ describe("subagents settings overlay", () => {
 		assert.ok(!cycleResults.includes("medium"));
 	});
 
+	it("fallback thinking choices are per fallback model and filter unsupported levels", () => {
+		const registry = [{
+			provider: "deepseek",
+			id: "deepseek-v4-pro",
+			reasoning: true,
+			thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" },
+		}];
+
+		assert.deepEqual(getFallbackThinkingChoices("deepseek/deepseek-v4-pro", registry), [undefined, "off", "high", "xhigh"]);
+		assert.equal(cycleFallbackThinking("deepseek/deepseek-v4-pro", undefined, registry), "off");
+		assert.equal(cycleFallbackThinking("deepseek/deepseek-v4-pro", "off", registry), "high");
+		assert.equal(cycleFallbackThinking("deepseek/deepseek-v4-pro", "high", registry), "xhigh");
+		assert.equal(cycleFallbackThinking("deepseek/deepseek-v4-pro", "xhigh", registry), undefined);
+	});
+
+	it("serializes suffixed fallback thinking while preserving unsuffixed inherited fallbacks", () => {
+		const serialized = serializeAgent(agent({
+			fallbackModels: ["kimi-coding/kimi-for-coding", "openai-codex/gpt-5.4:high"],
+			thinking: "medium",
+		}));
+		const { frontmatter } = parseFrontmatter(serialized);
+
+		assert.match(serialized, /^fallbackModels: kimi-coding\/kimi-for-coding, openai-codex\/gpt-5\.4:high$/m);
+		assert.equal(frontmatter.fallbackModels, "kimi-coding/kimi-for-coding, openai-codex/gpt-5.4:high");
+	});
+
 	it("persists explicit user-agent thinking off through frontmatter serialization", () => {
 		const serialized = serializeAgent(agent({ thinking: "off" }));
 		const { frontmatter } = parseFrontmatter(serialized);
@@ -186,6 +261,129 @@ describe("subagents settings overlay", () => {
 		{ provider: "openai", id: "gpt-4o", fullId: "openai/gpt-4o", reasoning: false },
 		{ provider: "deepseek", id: "v4", fullId: "deepseek/v4", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" } },
 	];
+
+	async function withUserAgentFile(fallbackModels: string[], run: (agentPath: string) => Promise<void>): Promise<void> {
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-settings-overlay-"));
+		try {
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+			const agentDir = path.join(tempHome, ".agents");
+			fs.mkdirSync(agentDir, { recursive: true });
+			const agentPath = path.join(agentDir, "worker.md");
+			fs.writeFileSync(agentPath, `---
+name: worker
+description: Worker
+model: openai/gpt-4o
+fallbackModels: ${fallbackModels.join(", ")}
+---
+
+Work
+`, "utf-8");
+			await run(agentPath);
+		} finally {
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	}
+
+	async function openSettingsOverlay(cwd: string): Promise<any> {
+		let registered: { handler: (args: string, ctx: any) => Promise<void> } | undefined;
+		let overlay: any;
+		registerSubagentsSettingsCommand({
+			registerCommand(name: string, command: any) {
+				assert.equal(name, "subagents-settings");
+				registered = command;
+			},
+		} as any);
+		await registered!.handler("", {
+			mode: "tui",
+			cwd,
+			modelRegistry: {
+				getAvailable: () => availableModels.map((model) => ({
+					provider: model.provider,
+					id: model.id,
+					reasoning: model.reasoning,
+					thinkingLevelMap: model.thinkingLevelMap,
+				})),
+			},
+			ui: {
+				theme,
+				notify() {},
+				custom(callback: any) {
+					overlay = callback({ requestRender() {} }, theme, {
+						matches(data: string, action: string) {
+							if (action === "tui.select.down") return data === "\x1B[B";
+							if (action === "tui.select.up") return data === "\x1B[A";
+							if (action === "tui.select.cancel") return data === "\x1B";
+							return false;
+						},
+					}, () => {});
+				},
+			},
+		});
+		assert.ok(overlay, "overlay should open in TUI mode");
+		return overlay;
+	}
+
+	it("cycling t for a highlighted fallback then saving persists a suffixed fallback", async () => {
+		await withUserAgentFile(["kimi-coding/kimi-for-coding"], async (agentPath) => {
+			const overlay = await openSettingsOverlay(path.dirname(agentPath));
+
+			overlay.handleInput("\x1B[B"); // fallbackModels row
+			overlay.handleInput("\r"); // open fallback picker with existing fallback highlighted
+			overlay.handleInput("t");
+			overlay.handleInput("\r"); // save picker
+
+			const saved = fs.readFileSync(agentPath, "utf-8");
+			assert.match(saved, /^fallbackModels: kimi-coding\/kimi-for-coding:off$/m);
+		});
+	});
+
+	it("cycling t for a highlighted fallback then escaping also persists the suffixed fallback", async () => {
+		await withUserAgentFile(["kimi-coding/kimi-for-coding"], async (agentPath) => {
+			const overlay = await openSettingsOverlay(path.dirname(agentPath));
+
+			overlay.handleInput("\x1B[B"); // fallbackModels row
+			overlay.handleInput("\r"); // open fallback picker with existing fallback highlighted
+			overlay.handleInput("t");
+			overlay.handleInput("\x1B"); // back out of picker
+
+			const saved = fs.readFileSync(agentPath, "utf-8");
+			assert.match(saved, /^fallbackModels: kimi-coding\/kimi-for-coding:off$/m);
+		});
+	});
+
+	it("opening and saving an existing unsuffixed fallback keeps it unsuffixed", async () => {
+		await withUserAgentFile(["kimi-coding/kimi-for-coding"], async (agentPath) => {
+			const overlay = await openSettingsOverlay(path.dirname(agentPath));
+
+			overlay.handleInput("\x1B[B"); // fallbackModels row
+			overlay.handleInput("\r"); // open fallback picker
+			overlay.handleInput("\r"); // save without cycling thinking
+
+			const saved = fs.readFileSync(agentPath, "utf-8");
+			assert.match(saved, /^fallbackModels: kimi-coding\/kimi-for-coding$/m);
+			assert.doesNotMatch(saved, /^fallbackModels: kimi-coding\/kimi-for-coding:/m);
+		});
+	});
+
+	it("escaping the default model picker still cancels without changing the saved model", async () => {
+		await withUserAgentFile(["kimi-coding/kimi-for-coding"], async (agentPath) => {
+			const overlay = await openSettingsOverlay(path.dirname(agentPath));
+
+			overlay.handleInput("\r"); // open default model picker
+			overlay.handleInput("\x1B[B"); // move to another model choice
+			overlay.handleInput("\x1B"); // cancel picker
+
+			const saved = fs.readFileSync(agentPath, "utf-8");
+			assert.match(saved, /^model: openai\/gpt-4o$/m);
+		});
+	});
 
 	describe("buildSettingsRows with effective display", () => {
 		it("shows effective thinking-suffixed model string for supported model", () => {

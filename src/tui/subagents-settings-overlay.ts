@@ -10,11 +10,11 @@ import {
 	type BuiltinAgentOverrideBase,
 } from "../agents/agents.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
-import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, toModelInfo, THINKING_LEVELS as SUPPORTED_THINKING_LEVELS, type ModelInfo, type ThinkingLevel } from "../shared/model-info.ts";
+import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, THINKING_LEVELS as SUPPORTED_THINKING_LEVELS, type ModelInfo } from "../shared/model-info.ts";
 
 const OVERLAY_OPTIONS = {
 	anchor: "center" as const,
-	width: "90%" as const,
+	width: "84%" as const,
 	minWidth: 84,
 	maxHeight: "80%" as const,
 };
@@ -35,6 +35,11 @@ interface Row {
 	value: string;
 }
 
+interface ShadowingAgentInfo {
+	source: "user" | "project";
+	filePath: string;
+}
+
 export const THINKING_CHOICES = [undefined, ...SUPPORTED_THINKING_LEVELS] as const;
 
 export function getAgentThinkingChoices(agent: AgentConfig, registryModels: Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>): (string | undefined)[] {
@@ -43,6 +48,25 @@ export function getAgentThinkingChoices(agent: AgentConfig, registryModels: Arra
 	const modelInfo = findModelInfo(agent.model, modelInfos);
 	const levels = getSupportedThinkingLevels(modelInfo);
 	return [undefined, ...levels];
+}
+
+function modelInfosFromRegistry(registryModels: Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>): ModelInfo[] {
+	return registryModels.filter((m) => m?.provider && m?.id).map((m) => toModelInfo(m));
+}
+
+export function getFallbackThinkingChoices(model: string, registryModels: Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>): (string | undefined)[] {
+	const modelInfo = findModelInfo(model, modelInfosFromRegistry(registryModels));
+	return [undefined, ...getSupportedThinkingLevels(modelInfo)];
+}
+
+export function cycleFallbackThinking(model: string, current: string | undefined, registryModels: Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>): string | undefined {
+	const choices = getFallbackThinkingChoices(model, registryModels);
+	const index = choices.findIndex((level) => level === current);
+	return choices[(index + 1 + choices.length) % choices.length];
+}
+
+function fallbackModelWithThinking(model: string, thinking: string | undefined): string {
+	return thinking ? `${model}:${thinking}` : model;
 }
 
 function valueLabel(value: string | undefined): string {
@@ -130,6 +154,16 @@ export function buildSettingsRows(agents: AgentConfig[], availableModels?: Model
 	return rows;
 }
 
+export function getBuiltinShadowingWarning(agent: AgentConfig, shadowedBy: ShadowingAgentInfo | undefined): string[] {
+	if (agent.source !== "builtin" || !shadowedBy) return [];
+	return [`builtin model won't be used; overshadowed by user/local agent: ${shadowedBy.filePath}`];
+}
+
+export function getShadowingBuiltinWarning(agent: AgentConfig, builtinAgentNames: Set<string>): string[] {
+	if (agent.source === "builtin" || !builtinAgentNames.has(agent.name)) return [];
+	return ["shadows builtin agent"];
+}
+
 export function renderSubagentsSettingsOverlay(input: {
 	view: SettingsView;
 	rows: Row[];
@@ -137,11 +171,13 @@ export function renderSubagentsSettingsOverlay(input: {
 	theme: Theme;
 	width: number;
 	message?: string;
+	shadowingAgents?: Map<string, ShadowingAgentInfo>;
+	builtinAgentNames?: Set<string>;
 	picker?: { title: string; choices: Array<{ label: string; selected?: boolean }>; selected: number; multi: boolean };
 }): string[] {
-	const innerWidth = Math.max(40, Math.min(input.width - 4, 120));
+	const innerWidth = Math.max(40, input.width - 4);
 	const lines: string[] = [];
-	const tabUser = input.view === "user" ? input.theme.bold("User agents") : "User agents";
+	const tabUser = input.view === "user" ? input.theme.bold("User/local agents") : "User/local agents";
 	const tabBuiltin = input.view === "builtin" ? input.theme.bold("Builtin agents") : "Builtin agents";
 	lines.push(`Subagent settings  [${tabUser}] [${tabBuiltin}]`);
 	lines.push("Tab/←/→ switch views · ↑/↓ move · Enter edit · t cycle thinking · Esc close");
@@ -149,7 +185,7 @@ export function renderSubagentsSettingsOverlay(input: {
 	if (input.picker) {
 		lines.push("");
 		lines.push(input.theme.bold(input.picker.title));
-		lines.push(input.picker.multi ? "Space toggles · Enter saves · Esc cancels" : "Enter selects · Esc cancels");
+		lines.push(input.picker.multi ? "Space toggles · t cycles highlighted thinking · Enter saves · Esc saves & backs" : "Enter selects · Esc cancels");
 		for (let i = 0; i < input.picker.choices.length; i++) {
 			const choice = input.picker.choices[i]!;
 			const cursor = i === input.picker.selected ? "›" : " ";
@@ -158,16 +194,29 @@ export function renderSubagentsSettingsOverlay(input: {
 		}
 	} else if (input.rows.length === 0) {
 		lines.push("");
-		lines.push(input.view === "user" ? "No user-scope agents found." : "No builtin agents found.");
+		lines.push(input.view === "user" ? "No user/local agents found." : "No builtin agents found.");
 	} else {
-		let lastAgent = "";
+		let lastAgentKey = "";
 		for (let i = 0; i < input.rows.length; i++) {
 			const row = input.rows[i]!;
-			if (row.agent.name !== lastAgent) {
-				lastAgent = row.agent.name;
+			const agentKey = `${row.agent.source}:${row.agent.name}:${row.agent.filePath}`;
+			if (agentKey !== lastAgentKey) {
+				lastAgentKey = agentKey;
 				lines.push("");
-				const source = row.agent.override?.scope ? ` · ${row.agent.override.scope} override` : "";
+				const source = row.agent.source === "project"
+					? " · local"
+					: row.agent.source === "user"
+						? " · user"
+						: row.agent.override?.scope
+							? ` · ${row.agent.override.scope} override`
+							: "";
 				lines.push(input.theme.bold(`${row.agent.name}${source}`));
+				for (const warning of getBuiltinShadowingWarning(row.agent, input.shadowingAgents?.get(row.agent.name))) {
+					lines.push(input.theme.fg("warning", warning));
+				}
+				for (const warning of getShadowingBuiltinWarning(row.agent, input.builtinAgentNames ?? new Set<string>())) {
+					lines.push(input.theme.fg("warning", warning));
+				}
 			}
 			const cursor = i === input.selected ? "›" : " ";
 			lines.push(`${cursor} ${row.label.padEnd(16)} ${row.value}`);
@@ -189,7 +238,9 @@ class SubagentsSettingsOverlay {
 	private selected = 0;
 	private drafts = new Map<string, AgentConfig>();
 	private message = "Edits are saved to user scope only.";
-	private picker: { field: FieldKey; selected: number; choices: ModelChoice[]; chosen: Set<string> } | undefined;
+	private shadowingAgents = new Map<string, ShadowingAgentInfo>();
+	private builtinAgentNames = new Set<string>();
+	private picker: { field: FieldKey; selected: number; choices: ModelChoice[]; chosen: Set<string | undefined>; fallbackThinking?: Map<string, string | undefined> } | undefined;
 
 	constructor(
 		ctx: ExtensionContext,
@@ -208,18 +259,27 @@ class SubagentsSettingsOverlay {
 
 	private reload(): void {
 		this.drafts.clear();
+		this.shadowingAgents.clear();
+		this.builtinAgentNames.clear();
 		const discovered = discoverAgentsAll(this.ctx.cwd);
-		for (const agent of [...discovered.user, ...discovered.builtin]) {
-			if (agent.source !== "user" && agent.source !== "builtin") continue;
-			this.drafts.set(`${agent.source}:${agent.name}`, cloneAgent(agent));
+		for (const agent of [...discovered.user, ...discovered.project, ...discovered.builtin]) {
+			if (agent.source !== "user" && agent.source !== "project" && agent.source !== "builtin") continue;
+			this.drafts.set(`${agent.source}:${agent.name}:${agent.filePath}`, cloneAgent(agent));
+		}
+		for (const agent of discovered.builtin) this.builtinAgentNames.add(agent.name);
+		for (const agent of discovered.user) {
+			this.shadowingAgents.set(agent.name, { source: "user", filePath: agent.filePath });
+		}
+		for (const agent of discovered.project) {
+			this.shadowingAgents.set(agent.name, { source: "project", filePath: agent.filePath });
 		}
 		this.clamp();
 	}
 
 	private agents(): AgentConfig[] {
 		return [...this.drafts.values()]
-			.filter((agent) => agent.source === this.view)
-			.sort((a, b) => a.name.localeCompare(b.name));
+			.filter((agent) => this.view === "user" ? agent.source === "user" || agent.source === "project" : agent.source === "builtin")
+			.sort((a, b) => a.name.localeCompare(b.name) || a.source.localeCompare(b.source) || a.filePath.localeCompare(b.filePath));
 	}
 
 	private rows(): Row[] {
@@ -259,9 +319,19 @@ class SubagentsSettingsOverlay {
 			this.invalidate();
 			return;
 		}
-		const chosen = new Set(row.field === "fallbackModels" ? (row.agent.fallbackModels ?? []) : [row.agent.model]);
+		const fallbackThinking = row.field === "fallbackModels" ? new Map<string, string | undefined>() : undefined;
+		const chosen = new Set<string | undefined>();
+		if (row.field === "fallbackModels") {
+			for (const fallback of row.agent.fallbackModels ?? []) {
+				const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(fallback);
+				chosen.add(baseModel);
+				fallbackThinking?.set(baseModel, thinkingSuffix ? thinkingSuffix.slice(1) : undefined);
+			}
+		} else {
+			chosen.add(row.agent.model);
+		}
 		const currentIndex = choices.findIndex((choice) => chosen.has(choice.value));
-		this.picker = { field: row.field, choices, chosen, selected: Math.max(0, currentIndex) };
+		this.picker = { field: row.field, choices, chosen, fallbackThinking, selected: Math.max(0, currentIndex) };
 		this.invalidate();
 	}
 
@@ -273,6 +343,26 @@ class SubagentsSettingsOverlay {
 		this.save(row.agent);
 	}
 
+	private cycleSelectedFallbackThinking(): void {
+		if (!this.picker || this.picker.field !== "fallbackModels") return;
+		const value = this.picker.choices[this.picker.selected]?.value;
+		if (!value) return;
+		const current = this.picker.fallbackThinking?.get(value);
+		const available = this.ctx.modelRegistry?.getAvailable?.() ?? [];
+		const next = cycleFallbackThinking(value, current, available as Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>);
+		this.picker.chosen.add(value);
+		if (next) this.picker.fallbackThinking?.set(value, next);
+		else this.picker.fallbackThinking?.delete(value);
+	}
+
+	private pickerChoiceLabel(choice: ModelChoice): string {
+		if (this.picker?.field !== "fallbackModels" || !choice.value || !this.picker.chosen.has(choice.value)) {
+			return choice.label;
+		}
+		const thinking = this.picker.fallbackThinking?.get(choice.value);
+		return thinking ? fallbackModelWithThinking(choice.value, thinking) : choice.label;
+	}
+
 	private editSelected(): void {
 		const row = this.selectedRow();
 		if (!row) return;
@@ -282,7 +372,7 @@ class SubagentsSettingsOverlay {
 
 	private save(agent: AgentConfig): void {
 		try {
-			if (agent.source === "user") {
+			if (agent.source === "user" || agent.source === "project") {
 				fs.writeFileSync(agent.filePath, serializeAgent(agent), "utf-8");
 				this.message = `Saved ${agent.name} to ${agent.filePath}`;
 			} else if (agent.source === "builtin") {
@@ -302,9 +392,23 @@ class SubagentsSettingsOverlay {
 		this.invalidate();
 	}
 
+	private applyPickerSelection(row: Row): void {
+		if (this.picker?.field === "fallbackModels") {
+			row.agent.fallbackModels = this.picker.choices
+				.map((c) => c.value)
+				.filter((v): v is string => typeof v === "string" && this.picker!.chosen.has(v))
+				.map((v) => fallbackModelWithThinking(v, this.picker!.fallbackThinking?.get(v)));
+		} else {
+			row.agent.model = this.picker?.choices[this.picker.selected]?.value;
+		}
+		this.save(row.agent);
+	}
+
 	private handlePickerInput(data: string): void {
 		if (!this.picker) return;
 		if (matchesKey(data, "escape")) {
+			const row = this.selectedRow();
+			if (row && this.picker.field === "fallbackModels") this.applyPickerSelection(row);
 			this.picker = undefined;
 			this.invalidate();
 			return;
@@ -316,13 +420,11 @@ class SubagentsSettingsOverlay {
 		} else if (matchesKey(data, "space") && this.picker.field === "fallbackModels") {
 			const value = this.picker.choices[this.picker.selected]?.value;
 			if (value) this.picker.chosen.has(value) ? this.picker.chosen.delete(value) : this.picker.chosen.add(value);
+		} else if (matchesKey(data, "t") && this.picker.field === "fallbackModels") {
+			this.cycleSelectedFallbackThinking();
 		} else if (matchesKey(data, "return") || matchesKey(data, "enter")) {
 			const row = this.selectedRow();
-			if (row) {
-				if (this.picker.field === "fallbackModels") row.agent.fallbackModels = this.picker.choices.map((c) => c.value).filter((v): v is string => typeof v === "string" && this.picker!.chosen.has(v));
-				else row.agent.model = this.picker.choices[this.picker.selected]?.value;
-				this.save(row.agent);
-			}
+			if (row) this.applyPickerSelection(row);
 			this.picker = undefined;
 		}
 		this.invalidate();
@@ -359,9 +461,11 @@ class SubagentsSettingsOverlay {
 			theme: this.theme,
 			width,
 			message: this.message,
+			shadowingAgents: this.shadowingAgents,
+			builtinAgentNames: this.builtinAgentNames,
 			picker: this.picker ? {
 				title: this.picker.field === "fallbackModels" ? "Choose fallback models" : "Choose default model",
-				choices: this.picker.choices.map((choice) => ({ label: choice.label, selected: this.picker!.chosen.has(choice.value) })),
+				choices: this.picker.choices.map((choice) => ({ label: this.pickerChoiceLabel(choice), selected: this.picker!.chosen.has(choice.value) })),
 				selected: this.picker.selected,
 				multi: this.picker.field === "fallbackModels",
 			} : undefined,

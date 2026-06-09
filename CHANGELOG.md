@@ -6,6 +6,9 @@
 - Packaged builtin agents now request a closed Bubblewrap `host-toolchain` sandbox by default, with fail-closed fallback and explicit per-run opt-out via `sandbox: { provider: "none" }`.
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 
+### Fixed
+- Foreground/non-async child runs no longer expose `contact_supervisor`; only async/background children receive the injected supervisor bridge tooling, while clarify-to-background launches keep that bridge behavior.
+
 ## [0.27.0] - 2026-05-30
 
 ### Changed

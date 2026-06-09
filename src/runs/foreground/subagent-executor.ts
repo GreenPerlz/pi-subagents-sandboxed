@@ -39,7 +39,7 @@ import { executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsy
 import { writePersistedForegroundStatus, type PersistedForegroundStep } from "./foreground-status.ts";
 import { createForkContextResolver } from "../../shared/fork-context.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
-import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
+import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, stripContactSupervisorFromAgent, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
@@ -181,6 +181,7 @@ interface ExecutionContextData {
 	signal: AbortSignal;
 	onUpdate?: (r: AgentToolResult<Details>) => void;
 	agents: AgentConfig[];
+	asyncAgents: AgentConfig[];
 	runId: string;
 	shareEnabled: boolean;
 	sessionRoot: string;
@@ -1618,7 +1619,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		return executeAsyncChain(id, {
 			chain: asyncChain,
 			task: params.task,
-			agents,
+			agents: data.asyncAgents,
 			ctx: asyncCtx,
 			availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
 			cwd: effectiveCwd,
@@ -2092,7 +2093,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			return executeAsyncChain(id, {
 				chain: [{ parallel: parallelTasks, concurrency: parallelConcurrency, worktree: params.worktree }],
 				resultMode: "parallel",
-				agents,
+				agents: data.asyncAgents,
 				ctx: asyncCtx,
 				availableModels,
 				cwd: effectiveCwd,
@@ -2378,15 +2379,23 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				currentSessionId: deps.state.currentSessionId!,
 				currentModelProvider: ctx.model?.provider,
 			};
+			const asyncAgentConfig = data.asyncAgents.find((a) => a.name === params.agent);
+			if (!asyncAgentConfig) {
+				return {
+					content: [{ type: "text", text: `Unknown agent: ${params.agent}` }],
+					isError: true,
+					details: { mode: "single" as const, results: [] },
+				};
+			}
 			const sandbox = resolveSandboxConfig({
 				settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
-				agent: agentConfig,
+				agent: asyncAgentConfig,
 				run: params.sandbox,
 			});
 			return executeAsyncSingle(id, {
 				agent: params.agent!,
 				task: params.context === "fork" ? wrapForkTask(task) : task,
-				agentConfig,
+				agentConfig: asyncAgentConfig,
 				ctx: asyncCtx,
 				availableModels,
 				cwd: effectiveCwd,
@@ -2790,9 +2799,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			cwd: effectiveCwd,
 			extensionDir: process.env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV],
 		});
-		const agents = intercomBridge.active
-			? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))
-			: discoveredAgents;
 		const runId = randomUUID().slice(0, 8);
 		const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
 		const nestedParentAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
@@ -2812,13 +2818,24 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			nestedParentAddress,
 		});
 
+		const requestedAsync = ralphNestedWorkerLaunch && effectiveParams.async === undefined
+			? false
+			: effectiveParams.async ?? deps.asyncByDefault;
+		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
+		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
+		const asyncAgents = intercomBridge.active
+			? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))
+			: discoveredAgents;
+		const foregroundAgents = discoveredAgents.map((agent) => stripContactSupervisorFromAgent(agent));
+		const agents = effectiveAsync ? asyncAgents : foregroundAgents;
+
 		// Ralph orchestrator sandbox preflight: check gh auth, git probe, and worktree pointer
 		// before launching nested workers, so environmental failures are detected early.
 		let preflightSummaryForResult: string | undefined;
 		if (ralphNestedWorkerLaunch) {
 			const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(effectiveParams.agentScope));
 			const ralphWorkerTargetAgentName = collectRalphNestedLaunchAgentTargets(effectiveParams).find(isRalphNestedWorkerAgentName);
-			const ralphWorkerTargetAgent = ralphWorkerTargetAgentName ? agents.find((a) => a.name === ralphWorkerTargetAgentName) : undefined;
+			const ralphWorkerTargetAgent = ralphWorkerTargetAgentName ? discoveredAgents.find((a) => a.name === ralphWorkerTargetAgentName) : undefined;
 			const sandboxConfig = resolveSandboxConfig({ settings: sandboxSettings, agent: ralphWorkerTargetAgent, run: effectiveParams.sandbox });
 			const sandboxRoot = effectiveCwd;
 			const extraMountRoots = [
@@ -2858,11 +2875,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		} catch (error) {
 			return toExecutionErrorResult(effectiveParams, error);
 		}
-		const requestedAsync = ralphNestedWorkerLaunch && effectiveParams.async === undefined
-			? false
-			: effectiveParams.async ?? deps.asyncByDefault;
-		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
-		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
 		const controlConfig = resolveControlConfig(deps.config.control, effectiveParams.control);
 
 		const artifactConfig: ArtifactConfig = {
@@ -2910,6 +2922,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			signal,
 			onUpdate: onUpdateWithContext,
 			agents,
+			asyncAgents,
 			runId,
 			shareEnabled,
 			sessionRoot,

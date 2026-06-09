@@ -26,6 +26,8 @@ function defaultSubagentConfigDir(agentDir = defaultAgentDir()): string {
 }
 
 const DEFAULT_INTERCOM_TARGET_PREFIX = "subagent-chat";
+const CONTACT_SUPERVISOR_TOOL = "contact_supervisor";
+const INTERCOM_BRIDGE_TOOLS = ["intercom", CONTACT_SUPERVISOR_TOOL];
 export const INTERCOM_BRIDGE_MARKER = "Intercom orchestration channel:";
 const DEFAULT_INTERCOM_BRIDGE_TEMPLATE = `The inherited thread is reference-only. Do not continue that conversation or send questions, status updates, or completion handoffs to the supervisor in normal assistant text.
 
@@ -358,9 +360,8 @@ export function applyIntercomBridgeToAgent(agent: AgentConfig, bridge: IntercomB
 	if (!bridge.active || !bridge.orchestratorTarget) return agent;
 	if (!extensionSandboxAllowsIntercom(agent.extensions, bridge.extensionDir)) return agent;
 
-	const bridgeTools = ["intercom", "contact_supervisor"];
 	const tools = agent.tools
-		? [...agent.tools, ...bridgeTools.filter((tool) => !agent.tools?.includes(tool))]
+		? [...agent.tools, ...INTERCOM_BRIDGE_TOOLS.filter((tool) => !agent.tools?.includes(tool))]
 		: agent.tools;
 	const instruction = bridge.instruction;
 	const trimmedPrompt = agent.systemPrompt?.trim() || "";
@@ -375,5 +376,13 @@ export function applyIntercomBridgeToAgent(agent: AgentConfig, bridge: IntercomB
 		...agent,
 		tools,
 		systemPrompt,
+	};
+}
+
+export function stripContactSupervisorFromAgent(agent: AgentConfig): AgentConfig {
+	if (!agent.tools?.includes(CONTACT_SUPERVISOR_TOOL)) return agent;
+	return {
+		...agent,
+		tools: agent.tools.filter((tool) => tool !== CONTACT_SUPERVISOR_TOOL),
 	};
 }

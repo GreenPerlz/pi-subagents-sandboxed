@@ -314,7 +314,7 @@ Add `autofix` to `/parallel-review` or `/parallel-cleanup` to apply only the syn
 pi install npm:pi-intercom
 ```
 
-Most users do not call `intercom` directly. After `pi-intercom` is installed, `pi-subagents` can automatically give child agents a private coordination channel back to the parent session. The bridge recognizes the normal `pi install npm:pi-intercom` package install as well as legacy local extension checkouts.
+Most users do not call `intercom` directly. After `pi-intercom` is installed, `pi-subagents` can automatically give async/background child agents a private coordination channel back to the parent session. Ordinary foreground/non-async children do not get `contact_supervisor`; if they are blocked, they should return a normal result/error instead of detaching into supervisor coordination. The bridge recognizes the normal `pi install npm:pi-intercom` package install as well as legacy local extension checkouts.
 
 Use it for work where the child might need a decision instead of guessing:
 
@@ -1028,7 +1028,7 @@ Controls nested delegation when no inherited `PI_SUBAGENT_MAX_DEPTH` is already 
 }
 ```
 
-Controls whether subagents receive runtime intercom coordination instructions and whether `intercom` and `contact_supervisor` are auto-added to their tool allowlist when needed.
+Controls whether subagents receive runtime intercom coordination instructions and whether `intercom` and `contact_supervisor` are auto-added to async/background child tool allowlists when needed.
 
 Fields:
 

@@ -7,6 +7,7 @@ import type { AgentConfig } from "../../src/agents/agents.ts";
 import {
 	applyIntercomBridgeToAgent,
 	diagnoseIntercomBridge,
+	stripContactSupervisorFromAgent,
 	resolveIntercomBridge,
 	resolveIntercomSessionTarget,
 	resolveSubagentIntercomTarget,
@@ -388,5 +389,17 @@ describe("applyIntercomBridgeToAgent", () => {
 		const agent = makeAgent({ tools: ["read"], extensions: ["/tmp/not-pi-intercom/index.ts"] });
 		const updated = applyIntercomBridgeToAgent(agent, activeBridge);
 		assert.equal(updated, agent);
+	});
+});
+
+describe("stripContactSupervisorFromAgent", () => {
+	it("removes contact_supervisor from a foreground child tool list", () => {
+		const updated = stripContactSupervisorFromAgent(makeAgent({ tools: ["read", "contact_supervisor", "bash"] }));
+		assert.deepEqual(updated.tools, ["read", "bash"]);
+	});
+
+	it("leaves agents without contact_supervisor unchanged", () => {
+		const agent = makeAgent({ tools: ["read", "intercom"] });
+		assert.equal(stripContactSupervisorFromAgent(agent), agent);
 	});
 });

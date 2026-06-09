@@ -201,6 +201,18 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		return payload.args;
 	}
 
+	async function waitForCallArgs(timeoutMs = 5_000): Promise<string[]> {
+		const deadline = Date.now() + timeoutMs;
+		while (true) {
+			try {
+				return readCallArgs();
+			} catch (error) {
+				if (Date.now() > deadline) throw error;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+		}
+	}
+
 	function installFakeBwrap(): { recordDir: string; restore: () => void } {
 		const rootDir = fs.mkdtempSync(path.join(tempDir, "fake-bwrap-"));
 		const binDir = path.join(rootDir, "bin");
@@ -1527,7 +1539,7 @@ process.exit(${exitCode});
 		}
 	});
 
-	it("auto-loads pi-intercom for active intercom bridge in closed sandbox without manual extensions", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("does not expose intercom tools for non-async foreground sandbox runs even with active bridge", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-active-agent-"));
 		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
 		const intercomStateDir = path.join(agentDir, "intercom");
@@ -1539,41 +1551,31 @@ process.exit(${exitCode});
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const fakeBwrap = installFakeBwrapWithJsonl([
-			events.toolStart("contact_supervisor", { reason: "progress_update", message: "UPDATE: sandboxed child started" }),
-			events.toolEnd("contact_supervisor"),
-			events.toolStart("contact_supervisor", { reason: "need_decision", message: "Approve continuing?" }),
-			events.toolEnd("contact_supervisor"),
-			events.assistantMessage("continued after supervisor reply"),
+			events.assistantMessage("foreground sandbox child done"),
 		]);
-		const seenSupervisorReasons: string[] = [];
 		try {
-			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false })]);
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read", "contact_supervisor"], completionGuard: false })]);
 			const result = await executor.execute(
 				"single-active-bridge-sandbox",
-				{ agent: "bridge", task: "Use supervisor bridge", sandbox: { provider: "bubblewrap" } },
+				{ agent: "bridge", task: "Do work", sandbox: { provider: "bubblewrap" } },
 				new AbortController().signal,
-				(update) => {
-					const argPreview = update.details?.progress?.[0]?.currentToolArgs ?? "";
-					const reason = argPreview.match(/reason[=:]\s*['\"]?([a-z_]+)/)?.[1];
-					if (reason) seenSupervisorReasons.push(reason);
-				},
+				undefined,
 				makeMinimalCtx(tempDir),
 			);
 
 			assert.equal(result.isError, undefined);
-			assert.match(result.content[0]?.text ?? "", /continued after supervisor reply/);
-			assert.ok(seenSupervisorReasons.includes("progress_update"), "progress_update contact_supervisor call should flow through child progress events");
-			assert.ok(seenSupervisorReasons.includes("need_decision"), "need_decision contact_supervisor call should flow through child progress events before child continues");
+			assert.match(result.content[0]?.text ?? "", /foreground sandbox child done/);
+			assert.equal(result.details?.results?.[0]?.detached, undefined, "non-async foreground run should not detach");
 			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
 			const separatorIndex = bwrapArgs.indexOf("--");
 			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
 			const piArgs = bwrapArgs.slice(separatorIndex + 3);
 			assert.ok(piArgs.includes("--no-extensions"), "closed sandbox should keep ambient extension discovery disabled");
-			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,intercom,contact_supervisor"]);
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read"], "non-async foreground run should strip contact_supervisor and avoid bridge tool injection");
 			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
-			assert.ok(extensionArgs.includes(intercomExtensionDir), "active bridge should pass pi-intercom as an explicit extension");
-			assertMountMode(bwrapArgs, intercomExtensionDir, "ro");
-			assertMountMode(bwrapArgs, intercomStateDir, "rw");
+			assert.equal(extensionArgs.includes(intercomExtensionDir), false, "non-async foreground run should not pass pi-intercom as an explicit extension");
+			assertNotMounted(bwrapArgs, intercomExtensionDir);
+			assertNotMounted(bwrapArgs, intercomStateDir);
 			assertNotMounted(bwrapArgs, settingsPath);
 			assertNotMounted(bwrapArgs, agentDir);
 		} finally {
@@ -1624,7 +1626,89 @@ process.exit(${exitCode});
 		}
 	});
 
-	it("auto-loads pi-intercom for agent-level sandboxed chain steps", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("keeps intercom bridge tools when clarify sends a single run to background", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-clarify-single-agent-"));
+		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		fs.mkdirSync(intercomExtensionDir, { recursive: true });
+		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
+		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		mockPi.onCall({ output: "clarify background single ok" });
+		try {
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false })]);
+			const result = await executor.execute(
+				"single-clarify-background-bridge",
+				{ agent: "bridge", task: "Use supervisor bridge", clarify: true },
+				new AbortController().signal,
+				undefined,
+				{
+					...makeMinimalCtx(tempDir),
+					hasUI: true,
+					ui: {
+						custom: async () => ({
+							confirmed: true,
+							templates: ["Use supervisor bridge"],
+							behaviorOverrides: [undefined],
+							runInBackground: true,
+						}),
+					},
+				},
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.ok(result.details?.asyncId, "clarify background single run should start async execution");
+			const piArgs = await waitForCallArgs();
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,intercom,contact_supervisor"]);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps intercom bridge tools when clarify sends a chain run to background", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-clarify-chain-agent-"));
+		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		fs.mkdirSync(intercomExtensionDir, { recursive: true });
+		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
+		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		mockPi.onCall({ output: "clarify background chain ok" });
+		try {
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false })]);
+			const result = await executor.execute(
+				"chain-clarify-background-bridge",
+				{ chain: [{ agent: "bridge", task: "Use supervisor bridge" }], clarify: true },
+				new AbortController().signal,
+				undefined,
+				{
+					...makeMinimalCtx(tempDir),
+					hasUI: true,
+					ui: {
+						custom: async () => ({
+							confirmed: true,
+							templates: ["Use supervisor bridge"],
+							behaviorOverrides: [undefined],
+							runInBackground: true,
+						}),
+					},
+				},
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.ok(result.details?.asyncId, "clarify background chain run should start async execution");
+			const piArgs = await waitForCallArgs();
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,intercom,contact_supervisor"]);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not expose intercom tools for non-async agent-level sandboxed chain steps", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-agent-sandbox-chain-"));
 		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");
 		const intercomStateDir = path.join(agentDir, "intercom");
@@ -1635,25 +1719,26 @@ process.exit(${exitCode});
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const fakeBwrap = installFakeBwrapWithJsonl([events.assistantMessage("agent sandbox chain ok")]);
 		try {
-			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false, sandbox: { provider: "bubblewrap" } })]);
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read", "contact_supervisor"], completionGuard: false, sandbox: { provider: "bubblewrap" } })]);
 			const result = await executor.execute(
 				"chain-agent-level-bridge-sandbox",
-				{ chain: [{ agent: "bridge", task: "Use supervisor bridge" }], clarify: false },
+				{ chain: [{ agent: "bridge", task: "Do chain work" }], clarify: false },
 				new AbortController().signal,
 				undefined,
 				makeMinimalCtx(tempDir),
 			);
 
 			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /Chain completed/);
 			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
 			const separatorIndex = bwrapArgs.indexOf("--");
 			assert.notEqual(separatorIndex, -1, "bubblewrap invocation should contain command separator");
 			const piArgs = bwrapArgs.slice(separatorIndex + 3);
 			const extensionArgs = piArgs.filter((arg, index) => piArgs[index - 1] === "--extension");
-			assert.ok(extensionArgs.includes(intercomExtensionDir), "agent-level sandboxed chain step should pass pi-intercom as an explicit extension");
-			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read,intercom,contact_supervisor"]);
-			assertMountMode(bwrapArgs, intercomExtensionDir, "ro");
-			assertMountMode(bwrapArgs, intercomStateDir, "rw");
+			assert.equal(extensionArgs.includes(intercomExtensionDir), false, "non-async foreground chain should not pass pi-intercom as an explicit extension");
+			assert.deepEqual(piArgs.slice(piArgs.indexOf("--tools"), piArgs.indexOf("--tools") + 2), ["--tools", "read"], "non-async foreground chain should strip contact_supervisor and avoid bridge tool injection");
+			assertNotMounted(bwrapArgs, intercomExtensionDir);
+			assertNotMounted(bwrapArgs, intercomStateDir);
 		} finally {
 			fakeBwrap.restore();
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

@@ -218,7 +218,7 @@ The extension ships with builtin agents you can use immediately. In this fork, e
 | Agent | Use it when you want... |
 |-------|--------------------------|
 | `explore` | Read-only codebase discovery: find the minimal relevant files, tests, call paths, and likely edit points. |
-| `orchestrator` | Per-issue nested orchestrator: runs explore/work/research loops in one sandboxed worktree until green or blocked. |
+| `orchestrator` | Per-issue nested orchestrator: runs explore/work/review loops in one sandboxed worktree until green or blocked. |
 | `research` | Web/docs research with sources: official docs, specs, benchmarks, recent changes, and a concise research brief. |
 | `work` | Implementation work. It edits files, validates, and escalates unapproved decisions instead of guessing. |
 | `review` | Code review and small fixes. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |

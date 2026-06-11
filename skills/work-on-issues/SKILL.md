@@ -67,9 +67,9 @@ If a source is weakly structured, create the best faithful normalized summary yo
 ## Core model
 
 - **Parent session**: gathers issues, orders them, decides which ones are parallel-safe, launches one per-issue `orchestrator` child in an isolated worktree, answers blocker questions, checks status when children look stuck, integrates successful work serially, and decides what to do next.
-- **`orchestrator` child**: owns exactly one issue in exactly one worktree. It may use nested `explore`, `work`, and `research`/`review` subagents for that issue only.
+- **`orchestrator` child**: owns exactly one issue in exactly one worktree. It may use nested `explore`, `work`, and `review` subagents for that issue only.
 - **Nested `work`**: the only writer inside the orchestrator worktree.
-- **Nested `review`/`research` agents**: read-only validation and critique.
+- **Nested `review` agents**: read-only validation, critique, and investigation.
 
 The parent owns the queue and integration. Children own only their assigned issue.
 
@@ -106,7 +106,7 @@ The parent owns the queue and integration. Children own only their assigned issu
    Expected agents:
    - `orchestrator`
    - `work`
-   - `review` and/or `research`
+   - `review`
 
 3. Confirm sandbox/intercom/runtime health:
 

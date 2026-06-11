@@ -101,7 +101,7 @@ sandbox: {
 
 Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider: "none" }` only when the user explicitly approves an unsandboxed exception. Use `extraReadOnlyMounts` for narrow toolchain/input access and `extraWritableMounts` only for caches, outputs, or work directories. Do not invent new profile names in prompts or config; only implemented profiles work.
 
-Parallel sandboxed tasks with write-capable tools require `worktree: true`; otherwise use read-only review/research tasks in parallel.
+Parallel sandboxed tasks with write-capable tools require `worktree: true`; otherwise use read-only review tasks in parallel.
 
 ## Per-issue orchestrators
 
@@ -121,7 +121,7 @@ subagent({
 })
 ```
 
-Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `work`, and `research`/`review` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, parallel batch planning, serial integration of successful worktree commits/PRs, and final close decisions.
+Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `work`, and `review` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, parallel batch planning, serial integration of successful worktree commits/PRs, and final close decisions.
 
 ## Status and control
 
@@ -158,5 +158,5 @@ Current convention:
 - saved files include run identity metadata so later work/review loops are traceable
 - session logs, async status files, and runner `.log`/`.jsonl` artifacts remain in the runtime session/temp areas, not repo `tmp/`
 
-This keeps review/explore/research outputs out of tracked repo files while
+This keeps review/explore outputs out of tracked repo files while
 preserving per-run history for debugging and follow-up passes.

@@ -376,7 +376,10 @@ class SubagentsSettingsOverlay {
 				fs.writeFileSync(agent.filePath, serializeAgent(agent), "utf-8");
 				this.message = `Saved ${agent.name} to ${agent.filePath}`;
 			} else if (agent.source === "builtin") {
-				const base = builtinBase(agent);
+				const discoveredBuiltin = discoverAgentsAll(this.ctx.cwd).builtin.find(
+					(candidate) => candidate.name === agent.name && candidate.filePath === agent.filePath,
+				);
+				const base = builtinBase(discoveredBuiltin ?? agent);
 				const override = buildBuiltinOverrideConfig(base, agent);
 				if (override) {
 					const filePath = saveBuiltinAgentOverride(this.ctx.cwd, agent.name, "user", override);

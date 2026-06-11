@@ -546,6 +546,32 @@ Work
 		});
 	});
 
+	it("saves builtin overrides from the overlay into user subagents.json", async () => {
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-settings-builtin-"));
+		try {
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+			const overlay = await openSettingsOverlay(process.cwd());
+
+			overlay.handleInput("\t"); // switch to builtin view
+			overlay.handleInput("\r"); // open default model picker for first builtin/model row
+			overlay.handleInput("\x1B[B"); // choose first concrete model instead of inherit/unset
+			overlay.handleInput("\r"); // save
+
+			const subagentsPath = path.join(tempHome, ".pi", "agent", "subagents.json");
+			const saved = JSON.parse(fs.readFileSync(subagentsPath, "utf-8"));
+			assert.equal(typeof saved.agentOverrides?.explore?.model, "string");
+		} finally {
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
 	it("registers the /subagents-settings command and rejects non-TUI mode", async () => {
 		let registered: { description: string; handler: (args: string, ctx: any) => Promise<void> } | undefined;
 		registerSubagentsSettingsCommand({

@@ -355,7 +355,7 @@ Skip this section until you want exact syntax.
 
 Commands validate agent names locally, support tab completion, and send results back into the conversation.
 
-`/subagents-settings` is TUI-only. Use Tab or ←/→ to switch between user agents and builtin agents, ↑/↓ to move, and Enter to edit. Model choices are limited to the currently available model registry. Builtin changes are saved as user-scope overrides in `~/.pi/agent/subagents.json` for new configs, or in existing legacy settings JSON, rather than modifying bundled agent files.
+`/subagents-settings` is TUI-only. Use Tab or ←/→ to switch between user agents and builtin agents, ↑/↓ to move, and Enter to edit. Model choices are limited to the currently available model registry. Builtin changes are saved as user-scope overrides in `~/.pi/agent/subagents.json`, and matching legacy builtin overrides are removed from `~/.pi/agent/settings.json`, rather than modifying bundled agent files.
 
 ### Per-step tasks
 

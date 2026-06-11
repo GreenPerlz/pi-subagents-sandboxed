@@ -349,19 +349,32 @@ function writeSettingsFile(filePath: string, settings: Record<string, unknown>):
 	fs.writeFileSync(filePath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
 
-function legacySettingsHasSubagents(filePath: string): boolean {
-	if (!fs.existsSync(filePath)) return false;
-	const settings = readSettingsFileStrict(filePath);
-	return !!settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents);
-}
-
-function pickWritableSubagentSettingsPath(cwd: string, scope: "user" | "project"): { filePath: string; dedicated: boolean } {
+function getSubagentSettingsPaths(cwd: string, scope: "user" | "project"): { legacyPath: string; dedicatedPath: string } {
 	const legacyPath = scope === "project" ? getProjectAgentSettingsPath(cwd) : getUserAgentSettingsPath();
 	const dedicatedPath = scope === "project" ? getProjectSubagentSettingsPath(cwd) : getUserSubagentSettingsPath();
 	if (!legacyPath || !dedicatedPath) throw new Error("Project override is not available here. No project config root was found.");
-	if (fs.existsSync(dedicatedPath)) return { filePath: dedicatedPath, dedicated: true };
-	if (legacySettingsHasSubagents(legacyPath)) return { filePath: legacyPath, dedicated: false };
-	return { filePath: dedicatedPath, dedicated: true };
+	return { legacyPath, dedicatedPath };
+}
+
+function deleteBuiltinOverrideFromLegacySettings(filePath: string, name: string): void {
+	if (!fs.existsSync(filePath)) return;
+	const settings = readSettingsFileStrict(filePath);
+	const subagents = settings.subagents;
+	if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return;
+	const nextSubagents = { ...(subagents as Record<string, unknown>) };
+	const agentOverrides = nextSubagents.agentOverrides;
+	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) return;
+
+	const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
+	const canonicalName = canonicalBuiltinAgentName(name);
+	delete nextOverrides[canonicalName];
+	for (const legacyName of legacyBuiltinAgentNames(canonicalName)) delete nextOverrides[legacyName];
+	if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
+	else delete nextSubagents.agentOverrides;
+
+	if (Object.keys(nextSubagents).length > 0) settings.subagents = nextSubagents;
+	else delete settings.subagents;
+	writeSettingsFile(filePath, settings);
 }
 
 function parseOverrideStringArrayOrFalse(
@@ -723,14 +736,10 @@ export function saveBuiltinAgentOverride(
 	scope: "user" | "project",
 	override: BuiltinAgentOverrideConfig,
 ): string {
-	const { filePath, dedicated } = pickWritableSubagentSettingsPath(cwd, scope);
+	const { legacyPath, dedicatedPath } = getSubagentSettingsPaths(cwd, scope);
 
-	const settings = readSettingsFileStrict(filePath);
-	const subagents = dedicated
-		? { ...settings }
-		: settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
-			? { ...(settings.subagents as Record<string, unknown>) }
-			: {};
+	const settings = readSettingsFileStrict(dedicatedPath);
+	const subagents = { ...settings };
 	const agentOverrides = subagents.agentOverrides && typeof subagents.agentOverrides === "object" && !Array.isArray(subagents.agentOverrides)
 		? { ...(subagents.agentOverrides as Record<string, unknown>) }
 		: {};
@@ -739,40 +748,29 @@ export function saveBuiltinAgentOverride(
 	agentOverrides[canonicalName] = cloneOverrideValue(override);
 	for (const legacyName of legacyBuiltinAgentNames(canonicalName)) delete agentOverrides[legacyName];
 	subagents.agentOverrides = agentOverrides;
-	if (dedicated) writeSettingsFile(filePath, subagents);
-	else {
-		settings.subagents = subagents;
-		writeSettingsFile(filePath, settings);
-	}
-	return filePath;
+	writeSettingsFile(dedicatedPath, subagents);
+	deleteBuiltinOverrideFromLegacySettings(legacyPath, name);
+	return dedicatedPath;
 }
 
 export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "user" | "project"): string {
-	const { filePath, dedicated } = pickWritableSubagentSettingsPath(cwd, scope);
-	if (!fs.existsSync(filePath)) return filePath;
-
-	const settings = readSettingsFileStrict(filePath);
-	const source = dedicated ? settings : settings.subagents;
-	if (!source || typeof source !== "object" || Array.isArray(source)) return filePath;
-	const nextSubagents = { ...(source as Record<string, unknown>) };
-	const agentOverrides = nextSubagents.agentOverrides;
-	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) return filePath;
-
-	const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
-	const canonicalName = canonicalBuiltinAgentName(name);
-	delete nextOverrides[canonicalName];
-	for (const legacyName of legacyBuiltinAgentNames(canonicalName)) delete nextOverrides[legacyName];
-	if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
-	else delete nextSubagents.agentOverrides;
-
-	if (dedicated) {
-		writeSettingsFile(filePath, nextSubagents);
-	} else {
-		if (Object.keys(nextSubagents).length > 0) settings.subagents = nextSubagents;
-		else delete settings.subagents;
-		writeSettingsFile(filePath, settings);
+	const { legacyPath, dedicatedPath } = getSubagentSettingsPaths(cwd, scope);
+	if (fs.existsSync(dedicatedPath)) {
+		const settings = readSettingsFileStrict(dedicatedPath);
+		const nextSubagents = { ...settings };
+		const agentOverrides = nextSubagents.agentOverrides;
+		if (agentOverrides && typeof agentOverrides === "object" && !Array.isArray(agentOverrides)) {
+			const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
+			const canonicalName = canonicalBuiltinAgentName(name);
+			delete nextOverrides[canonicalName];
+			for (const legacyName of legacyBuiltinAgentNames(canonicalName)) delete nextOverrides[legacyName];
+			if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
+			else delete nextSubagents.agentOverrides;
+			writeSettingsFile(dedicatedPath, nextSubagents);
+		}
 	}
-	return filePath;
+	deleteBuiltinOverrideFromLegacySettings(legacyPath, name);
+	return dedicatedPath;
 }
 
 function listFilesRecursive(dir: string, predicate: (fileName: string) => boolean): string[] {

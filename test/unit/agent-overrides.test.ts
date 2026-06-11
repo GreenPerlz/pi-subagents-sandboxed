@@ -306,8 +306,9 @@ describe("builtin agent overrides", () => {
 		);
 	});
 
-	it("saving a renamed builtin override removes its legacy key", () => {
+	it("saving a builtin override migrates it out of legacy settings into subagents.json", () => {
 		const legacySettingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
+		const subagentsPath = path.join(tempHome, ".pi", "agent", "subagents.json");
 		writeJson(legacySettingsPath, {
 			subagents: {
 				agentOverrides: {
@@ -316,13 +317,41 @@ describe("builtin agent overrides", () => {
 			},
 		});
 
-		saveBuiltinAgentOverride(tempProject, "review", "user", {
+		const savedPath = saveBuiltinAgentOverride(tempProject, "review", "user", {
 			model: "openai/gpt-5.4",
 		});
 
-		const settings = JSON.parse(fs.readFileSync(legacySettingsPath, "utf-8"));
-		assert.deepEqual(settings.subagents.agentOverrides.review, { model: "openai/gpt-5.4" });
-		assert.equal("reviewer" in settings.subagents.agentOverrides, false);
+		assert.equal(savedPath, subagentsPath);
+		const legacySettings = JSON.parse(fs.readFileSync(legacySettingsPath, "utf-8"));
+		assert.equal("subagents" in legacySettings, false);
+		const dedicatedSettings = JSON.parse(fs.readFileSync(subagentsPath, "utf-8"));
+		assert.deepEqual(dedicatedSettings.agentOverrides.review, { model: "openai/gpt-5.4" });
+		assert.equal("reviewer" in dedicatedSettings.agentOverrides, false);
+	});
+
+	it("removing a builtin override deletes it from both dedicated and legacy settings", () => {
+		const legacySettingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
+		const subagentsPath = path.join(tempHome, ".pi", "agent", "subagents.json");
+		writeJson(legacySettingsPath, {
+			subagents: {
+				agentOverrides: {
+					review: { model: "openai/legacy" },
+				},
+			},
+		});
+		writeJson(subagentsPath, {
+			agentOverrides: {
+				review: { model: "openai/dedicated" },
+			},
+		});
+
+		const removedPath = removeBuiltinAgentOverride(tempProject, "review", "user");
+
+		assert.equal(removedPath, subagentsPath);
+		const legacySettings = JSON.parse(fs.readFileSync(legacySettingsPath, "utf-8"));
+		assert.equal("subagents" in legacySettings, false);
+		const dedicatedSettings = JSON.parse(fs.readFileSync(subagentsPath, "utf-8"));
+		assert.equal("agentOverrides" in dedicatedSettings, false);
 	});
 
 	it("saves builtin model defaults as user-scope subagents JSON settings", () => {

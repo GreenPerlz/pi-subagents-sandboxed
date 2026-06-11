@@ -78,6 +78,71 @@ describe("builtin agent overrides", () => {
 		assert.equal(review.override?.path, path.join(tempHome, ".pi", "agent", "settings.json"));
 	});
 
+	it("applies user subagents.json overrides to builtin agents", () => {
+		const subagentsPath = path.join(tempHome, ".pi", "agent", "subagents.json");
+		writeJson(subagentsPath, {
+			agentOverrides: {
+				review: {
+					model: "openai/gpt-5.4",
+					thinking: "xhigh",
+				},
+			},
+		});
+
+		const review = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "review");
+		assert.ok(review);
+		assert.equal(review.model, "openai/gpt-5.4");
+		assert.equal(review.thinking, "xhigh");
+		assert.equal(review.override?.scope, "user");
+		assert.equal(review.override?.path, subagentsPath);
+	});
+
+	it("prefers dedicated subagent config over same-scope legacy settings", () => {
+		const legacyPath = path.join(tempHome, ".pi", "agent", "settings.json");
+		const subagentsPath = path.join(tempHome, ".pi", "agent", "subagents.json");
+		writeJson(legacyPath, {
+			subagents: { agentOverrides: { review: { model: "openai/legacy" } } },
+		});
+		writeJson(subagentsPath, {
+			agentOverrides: { review: { model: "openai/dedicated" } },
+		});
+
+		const review = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "review");
+		assert.ok(review);
+		assert.equal(review.model, "openai/dedicated");
+		assert.equal(review.override?.path, subagentsPath);
+	});
+
+	it("prefers project subagents.json overrides over user subagents.json overrides", () => {
+		fs.mkdirSync(path.join(tempProject, ".pi"), { recursive: true });
+		writeJson(path.join(tempHome, ".pi", "agent", "subagents.json"), {
+			agentOverrides: { review: { model: "openai/user" } },
+		});
+		writeJson(path.join(tempProject, ".pi", "subagents.json"), {
+			agentOverrides: { review: { model: "openai/project", thinking: "high" } },
+		});
+
+		const review = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "review");
+		assert.ok(review);
+		assert.equal(review.model, "openai/project");
+		assert.equal(review.thinking, "high");
+		assert.equal(review.override?.scope, "project");
+		assert.equal(review.override?.path, path.join(tempProject, ".pi", "subagents.json"));
+	});
+
+	it("surfaces malformed dedicated subagent config with its path", () => {
+		const subagentsPath = path.join(tempHome, ".pi", "agent", "subagents.json");
+		fs.mkdirSync(path.dirname(subagentsPath), { recursive: true });
+		fs.writeFileSync(subagentsPath, '{"agentOverrides":', "utf-8");
+
+		assert.throws(
+			() => discoverAgents(tempProject, "both"),
+			(error: unknown) => error instanceof Error
+				&& error.message.includes(subagentsPath)
+				&& error.message.includes("Failed to parse settings file"),
+		);
+	});
+
 	it("maps legacy builtin override keys onto renamed builtins", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
@@ -260,16 +325,16 @@ describe("builtin agent overrides", () => {
 		assert.equal("reviewer" in settings.subagents.agentOverrides, false);
 	});
 
-	it("saves builtin model defaults as user-scope JSON settings", () => {
+	it("saves builtin model defaults as user-scope subagents JSON settings", () => {
 		const settingsPath = saveBuiltinAgentOverride(tempProject, "review", "user", {
 			model: "openai/gpt-5.4",
 			fallbackModels: ["openai/gpt-5-mini"],
 			thinking: "high",
 		});
 
-		assert.equal(settingsPath, path.join(tempHome, ".pi", "agent", "settings.json"));
+		assert.equal(settingsPath, path.join(tempHome, ".pi", "agent", "subagents.json"));
 		const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-		assert.deepEqual(settings.subagents.agentOverrides.review, {
+		assert.deepEqual(settings.agentOverrides.review, {
 			model: "openai/gpt-5.4",
 			fallbackModels: ["openai/gpt-5-mini"],
 			thinking: "high",

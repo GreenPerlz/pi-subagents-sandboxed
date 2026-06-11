@@ -87,21 +87,19 @@ sandboxExtraWritableMounts: .cache/subagent-build
 sandboxPackageDiscovery: project-local
 ```
 
-Settings (`~/.pi/agent/settings.json` or `.pi/settings.json`):
+Dedicated subagent settings (`~/.pi/agent/subagents.json` or `.pi/subagents.json`; legacy `settings.json -> subagents` is still read):
 
 ```json
 {
-  "subagents": {
-    "sandbox": {
-      "defaultProvider": "bubblewrap",
-      "defaultProfile": "host-toolchain",
-      "network": "host",
-      "auth": "pi-json",
-      "fallback": "fail",
-      "extraReadOnlyMounts": ["/opt/project-toolchain"],
-      "extraWritableMounts": [".cache/subagent-build"],
-      "packageDiscovery": "closed"
-    }
+  "sandbox": {
+    "defaultProvider": "bubblewrap",
+    "defaultProfile": "host-toolchain",
+    "network": "host",
+    "auth": "pi-json",
+    "fallback": "fail",
+    "extraReadOnlyMounts": ["/opt/project-toolchain"],
+    "extraWritableMounts": [".cache/subagent-build"],
+    "packageDiscovery": "closed"
   }
 }
 ```
@@ -113,7 +111,7 @@ Run-level sandbox options override agent frontmatter, which overrides settings d
 - Provider: `bubblewrap` wraps child Pi invocations with `bwrap`; provider `none` or an omitted provider means no sandbox.
 - Profile: `host-toolchain` is for local developer machines that already have the repo toolchain installed on the host.
 - Network: `host` is the default so child Pi processes can reach model/API providers; `none` passes Bubblewrap `--unshare-net` for offline tasks.
-- Auth: `pi-json` is the default mode and mounts Pi's `auth.json` read-only without mounting `settings.json`; use `env` only when you explicitly want the child process to rely on provider credentials from its environment.
+- Auth: `pi-json` is the default mode and mounts Pi's `auth.json` and `subagents.json` read-only without mounting full `settings.json`; use `env` only when you explicitly want the child process to rely on provider credentials from its environment.
 - Fallback: `fail` is the default and refuses to run when Bubblewrap cannot be applied. Explicit `fallback: "none"` runs the original unsandboxed invocation and records a warning/result marker.
 - Package discovery: `closed` is the default for sandboxed children and starts child Pi with `--no-extensions`, `--no-prompt-templates`, and `--no-themes`, loading only runtime/explicit extension flags. `project-local` keeps those closed-runtime flags, but the parent resolves project-local Pi package declarations before Bubblewrap, passes their `package.json -> pi.extensions` as explicit `--extension` flags, and mounts those package roots read-only. It reads project `.pi/settings.json` package declarations and the nearest cwd package; it intentionally does not load user/global packages or mount user settings/global npm roots. `ambient` is unsafe/legacy and must be requested explicitly; it can re-enable Pi's normal discovery inside the sandbox and may require broader mounts, so it is not recommended for untrusted work.
 - Write inference: agents with `edit` or `write` tools get writable cwd/worktree mounts. `bash` alone stays read-only unless `bashWrite: true` is set. Parallel sandboxed writers require `worktree: true` so each writer gets an isolated writable worktree.
@@ -253,7 +251,7 @@ For a persistent override, edit settings. This example pins the review everywher
 }
 ```
 
-Use `~/.pi/agent/settings.json` for a user override or `.pi/settings.json` for a project override. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable a builtin. If you want a totally different agent, create a user or project agent with the same name; for normal tweaks, prefer overrides.
+Use `~/.pi/agent/subagents.json` for a user override or `.pi/subagents.json` for a project override. Legacy `~/.pi/agent/settings.json -> subagents` and `.pi/settings.json -> subagents` blocks are still read, but same-scope `subagents.json` wins when both exist. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable a builtin. If you want a totally different agent, create a user or project agent with the same name; for normal tweaks, prefer overrides.
 
 ## Where running subagents show up
 
@@ -357,7 +355,7 @@ Skip this section until you want exact syntax.
 
 Commands validate agent names locally, support tab completion, and send results back into the conversation.
 
-`/subagents-settings` is TUI-only. Use Tab or ←/→ to switch between user agents and builtin agents, ↑/↓ to move, and Enter to edit. Model choices are limited to the currently available model registry. Builtin changes are saved as user-scope overrides in the user's Pi settings JSON rather than modifying bundled agent files.
+`/subagents-settings` is TUI-only. Use Tab or ←/→ to switch between user agents and builtin agents, ↑/↓ to move, and Enter to edit. Model choices are limited to the currently available model registry. Builtin changes are saved as user-scope overrides in `~/.pi/agent/subagents.json` for new configs, or in existing legacy settings JSON, rather than modifying bundled agent files.
 
 ### Per-step tasks
 
@@ -483,8 +481,8 @@ pi install npm:pi-web-access
 
 You can override selected builtin fields without copying the whole agent. Overrides live in settings:
 
-- User: `~/.pi/agent/settings.json`
-- Project: `.pi/settings.json`
+- User: `~/.pi/agent/subagents.json` (legacy: `~/.pi/agent/settings.json -> subagents`)
+- Project: `.pi/subagents.json` (legacy: `.pi/settings.json -> subagents`)
 
 Example:
 
@@ -500,9 +498,9 @@ Example:
 }
 ```
 
-Supported override fields are `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `disabled`, `skills`, `tools`, and `systemPrompt`. Use `defaultContext: false` in builtin overrides to clear an inherited context default. Project overrides beat user overrides.
+Supported override fields are `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `disabled`, `skills`, `tools`, and `systemPrompt`. Use `defaultContext: false` in builtin overrides to clear an inherited context default. Project overrides beat user overrides, and a dedicated `subagents.json` beats same-scope legacy settings.
 
-Set `disabled: true` to hide a builtin from runtime discovery and agent-facing `subagent({ action: "list" })` output. For bulk control, set `subagents.disableBuiltins: true` in settings.
+Set `disabled: true` to hide a builtin from runtime discovery and agent-facing `subagent({ action: "list" })` output. For bulk control, set `disableBuiltins: true` in dedicated `subagents.json` (or legacy `subagents.disableBuiltins: true` in `settings.json`).
 
 ### Prompt assembly
 

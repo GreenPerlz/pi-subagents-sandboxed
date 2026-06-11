@@ -191,6 +191,7 @@ function addSandboxAuthMounts(mounts: SandboxMount[], seen: Map<string, SandboxM
 	if (!authModeUsesPiJson(authMode)) return;
 	const dir = path.resolve(expandTilde(agentDir || defaultAgentDir()));
 	addSandboxMount(mounts, seen, path.join(dir, "auth.json"), "ro");
+	addSandboxMount(mounts, seen, path.join(dir, "subagents.json"), "ro");
 	// Intentionally do NOT mount settings.json for sandboxed children.
 	// Parent/user settings.json may contain npm packages that trigger
 	// ambient package discovery (npm root -g) inside the sandbox, which

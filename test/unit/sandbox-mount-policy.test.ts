@@ -323,16 +323,18 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(fs.existsSync(writableCache), true, "writable explicit mounts should be created before bwrap binds them");
 	});
 
-	it("mounts Pi auth JSON read-only but NOT settings JSON when pi-json auth mode is requested", () => {
+	it("mounts Pi auth and subagent JSON read-only but NOT settings JSON when pi-json auth mode is requested", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));
 		const agentDir = mkdirp(path.join(root, "agent"));
 		const authPath = writeFile(path.join(agentDir, "auth.json"), "{}");
+		const subagentsPath = writeFile(path.join(agentDir, "subagents.json"), JSON.stringify({ agentOverrides: { review: { model: "openai/gpt-5.4" } } }));
 		const settingsPath = writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:ambient-package-that-would-need-npm-root"] }));
 
 		const mounts = buildSubagentSandboxMounts({ cwd, authMode: "pi-json", agentDir });
 
 		assert.equal(mountMode(mounts, authPath), "ro");
+		assert.equal(mountMode(mounts, subagentsPath), "ro");
 		assert.equal(mountMode(mounts, settingsPath), undefined);
 	});
 

@@ -115,6 +115,7 @@ There are effectively **two auth behaviors** today.
 
 `pi-json` is the safe default. In `src/sandbox/mount-policy.ts` it mounts:
 - `~/.pi/agent/auth.json` read-only
+- `~/.pi/agent/subagents.json` read-only, when present, so nested sandboxed children can honor builtin agent overrides without broader settings access
 
 It intentionally does **not** mount:
 - `~/.pi/agent/settings.json`
@@ -197,7 +198,7 @@ Currently only `host` and `none` are accepted.
 ### Change auth-file mounting behavior
 
 Edit `authModeUsesPiJson()` and `addSandboxAuthMounts()` in `src/sandbox/mount-policy.ts`.
-That is where `pi-json` gets translated into a read-only `auth.json` mount.
+That is where `pi-json` gets translated into read-only `auth.json` and `subagents.json` mounts.
 
 ### Change runtime-mounted paths
 
@@ -251,5 +252,5 @@ Prefer adding one narrow mount and re-testing over broadening the whole sandbox.
 
 - `host-toolchain` is the only implemented profile today
 - `trustProject` is accepted by schema/config but is not currently a meaningful Bubblewrap behavior switch in this fork; do not rely on it for access control
-- `pi-json` only covers Pi auth material; other tools may still need their own narrowly scoped mounts if they depend on external config files
+- `pi-json` covers Pi auth plus dedicated subagent override config (`subagents.json`); other tools may still need their own narrowly scoped mounts if they depend on external config files
 - do not mount all of `$HOME` just to make a failing tool work

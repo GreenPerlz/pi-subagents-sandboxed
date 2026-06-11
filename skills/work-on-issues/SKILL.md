@@ -1,6 +1,6 @@
 ---
 name: work-on-issues
-description: Run a general issue-work loop with Pi subagents: gather issues from an issue tracker or local files, order dependencies, batch independent issues into parallel per-issue orchestrator runs, supervise them through intercom/status, integrate successful work serially, and continue until the requested issues are done or blocked.
+description: "Run a general issue-work loop with Pi subagents: gather issues from an issue tracker or local files, order dependencies, batch independent issues into parallel per-issue orchestrator runs, supervise them through intercom/status, integrate successful work serially, and continue until the requested issues are done or blocked."
 ---
 
 # Work on Issues

@@ -1837,9 +1837,10 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 		})
 			? resolveSavedOutputPath({ runtimeCwd: input.ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId: input.runId, index })
 			: undefined;
+		const instructionOutputPath = outputPath ?? (behavior?.outputMode === "file-only" ? savedOutputPath : undefined);
 		const taskText = injectSingleOutputInstruction(
 			`${readInstructions.prefix}${input.taskTexts[index]!}${progressInstructions.suffix}`,
-			outputPath,
+			instructionOutputPath,
 		);
 		const interruptController = new AbortController();
 		if (input.foregroundControl) {
@@ -2442,7 +2443,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	if (validationError) {
 		return { content: [{ type: "text", text: validationError }], isError: true, details: { mode: "single", results: [] } };
 	}
-	task = injectSingleOutputInstruction(task, outputPath);
+	const instructionOutputPath = outputPath ?? (effectiveOutputMode === "file-only" ? savedOutputPath : undefined);
+	task = injectSingleOutputInstruction(task, instructionOutputPath);
 
 	let effectiveSkills: string[] | undefined;
 	if (skillOverride === false) {
@@ -2559,6 +2561,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		savedPath: r.savedOutputPath,
 		outputReference: r.outputReference,
 		saveError: r.outputSaveError,
+		announceSavedPath: r.savedOutputAnnounced,
 	});
 	const details = compactForegroundDetails({
 		mode: "single",

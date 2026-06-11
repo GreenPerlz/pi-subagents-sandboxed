@@ -1969,7 +1969,8 @@ process.exit(${exitCode});
 		}
 	});
 
-	it("rejects file-only mode without an output path before spawning", async () => {
+	it("auto-saves file-only mode without an explicit output path before spawning", async () => {
+		mockPi.onCall({ output: "implicit saved output" });
 		const agents = makeAgentConfigs(["echo"]);
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {
@@ -1977,9 +1978,10 @@ process.exit(${exitCode});
 			outputMode: "file-only",
 		});
 
-		assert.equal(result.exitCode, 1);
-		assert.match(result.error ?? "", /outputMode: "file-only"/);
-		assert.equal(mockPi.callCount(), 0);
+		assert.equal(result.exitCode, 0);
+		assert.match(result.finalOutput ?? "", /^Output saved to:/);
+		assert.match(result.savedOutputPath ?? "", /\/tmp\//);
+		assert.equal(fs.readFileSync(result.savedOutputPath!, "utf-8").includes("implicit saved output"), true);
 	});
 
 	it("returns only a saved-output reference in file-only mode", async () => {
@@ -2030,6 +2032,20 @@ process.exit(${exitCode});
 		const saved = fs.readFileSync(result.savedOutputPath!, "utf-8");
 		assert.match(saved, /# Saved subagent output/);
 		assert.match(saved, /review findings/);
+	});
+
+	it("auto-saves inline output to repo-local tmp without changing inline display output", async () => {
+		mockPi.onCall({ output: "inline review output" });
+		const agents = makeAgentConfigs(["echo"]);
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "inline-auto-save",
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.finalOutput, "inline review output");
+		assert.match(result.savedOutputPath ?? "", /\/tmp\//);
+		assert.equal(fs.readFileSync(result.savedOutputPath!, "utf-8").includes("inline review output"), true);
 	});
 
 	it("executor keeps the working output file and also writes a per-run saved-output artifact for relative outputs", async () => {

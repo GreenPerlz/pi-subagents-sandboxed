@@ -143,19 +143,23 @@ Ask children to report:
 - validation evidence
 - blockers, risks, and decisions needing parent approval
 
-For large outputs, use `outputMode: "file-only"` so the parent receives a concise file reference instead of a huge transcript. Read-only flows can auto-save to repo-local `tmp/` even without an explicit `output` path; explicit `output` is still fine when you want a stable working file too.
+For large outputs, use `outputMode: "file-only"` so the parent receives a concise file reference instead of a huge transcript. Subagent runs now auto-save a repo-local `tmp/` report by default unless output is explicitly disabled; explicit `output` is still fine when you want a stable working file too. In `file-only` mode, the returned pointer targets the explicit `output` path when one is set; otherwise it points at the auto-saved repo-local `tmp/...md` file.
 
 ## Saved output paths
 
-When subagent output is being preserved for later inspection, prefer the runtime's
-repo-local `tmp/` area and keep `tmp/` in `.gitignore`.
+Preserved subagent output should live in the runtime's repo-local `tmp/` area, and `tmp/` should stay in `.gitignore`.
 
 Current convention:
 
 - saved reports go under the current worktree or cwd `tmp/` directory
+- every run auto-persists a markdown report there unless output is explicitly disabled
 - each run creates a fresh markdown file like `tmp/<agent>-<runId>.md`
 - parallel/chain siblings may add an index or numeric collision suffix
 - saved files include run identity metadata so later work/review loops are traceable
+- child agents do not need to write these report files themselves; the runtime persists them after completion
+- saved-output/tmp awareness is injected as child runtime context/system-prompt guidance, not as extra task-body instructions
+- keep child task text focused on the actual job; do not pad it with report-writing directions just to get persistence
+- later subagents may inspect repo-local `tmp/` for prior reports when that context is useful
 - session logs, async status files, and runner `.log`/`.jsonl` artifacts remain in the runtime session/temp areas, not repo `tmp/`
 
 This keeps review/explore outputs out of tracked repo files while

@@ -94,8 +94,8 @@ interface CompletionMutationGuardResult {
 function stripFrameworkInstructions(task: string): string {
 	return task
 		.split("\n")
-		.filter((line) => !/^\s*\[(?:Write to|Read from):/i.test(line))
-		.filter((line) => !/^\s*(?:Create and maintain progress at:|Update progress at:|Write your findings to:)/i.test(line))
+		.filter((line) => !/^\s*\[(?:Saved output|Subagent outputs dir|Read from):/i.test(line))
+		.filter((line) => !/^\s*(?:Create and maintain progress at:|Update progress at:|Write your findings to:|Return your result in normal assistant text\.|The runtime saves it automatically\.|Subagent output runtime:|- final subagent outputs are persisted automatically|- repo-local saved reports live under:|- consult prior reports there only when another instruction explicitly tells you to)/i.test(line))
 		.join("\n");
 }
 

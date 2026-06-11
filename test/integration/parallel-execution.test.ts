@@ -358,10 +358,12 @@ process.exit(child.status ?? 0);
 		assert.match(result.details?.results?.[0]?.finalOutput ?? "", /Output saved to:/);
 		assert.doesNotMatch(result.details?.results?.[0]?.finalOutput ?? "", /Parallel full report/);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "Parallel full report\nwith details");
-		assert.match(fs.readFileSync(result.details?.results?.[0]?.savedOutputPath!, "utf-8"), /# Saved subagent output/);
+		assert.equal(result.details?.results?.[0]?.savedOutputPath, outputPath);
+		assert.equal(fs.readFileSync(result.details?.results?.[0]?.savedOutputPath!, "utf-8"), "Parallel full report\nwith details");
 	});
 
-	it("rejects top-level parallel file-only output without an output path", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("auto-saves top-level parallel file-only output without an explicit output path", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "Parallel auto-saved output" });
 		const executor = makeExecutor();
 
 		const result = await executor.execute(
@@ -372,9 +374,10 @@ process.exit(child.status ?? 0);
 			makeMinimalCtx(tempDir),
 		);
 
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /outputMode: "file-only"/);
-		assert.equal(mockPi.callCount(), 0);
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /Output saved to:/);
+		assert.match(result.details?.results?.[0]?.savedOutputPath ?? "", /\/tmp\//);
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("rejects duplicate top-level parallel output paths", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

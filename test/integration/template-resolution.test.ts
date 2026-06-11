@@ -218,13 +218,12 @@ describe("buildChainInstructions", { skip: !available ? "pi packages not availab
 		}
 	});
 
-	it("adds [Write to:] prefix for output", () => {
+	it("does not add child write instructions for output persistence", () => {
 		const behavior = { reads: undefined, output: "output.md", outputMode: "inline", progress: false, skills: undefined };
 		const dir = createTempDir("chain-test-");
 		try {
 			const { prefix } = buildChainInstructions(behavior, dir, false);
-			assert.ok(prefix.includes("[Write to:"), `should have Write instruction: ${prefix}`);
-			assert.ok(prefix.includes("output.md"), "should reference the file");
+			assert.equal(prefix, "");
 		} finally {
 			removeTempDir(dir);
 		}

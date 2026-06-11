@@ -176,7 +176,7 @@ Do not substitute another writer.
 
 You control nested child output locations by setting `output` on each nested `subagent(...)` call.
 
-Use explicit relative output paths under repo-local `tmp/` so everything stays in the assigned worktree and can be reread in later loop steps.
+Use explicit relative output paths under repo-local `tmp/` so everything stays in the assigned worktree and can be reread in later loop steps. The runtime persists those report files after the child finishes; the child does not need to write them itself.
 
 Recommended pattern:
 - `explore`: `output: "tmp/issue-123-explore.md"`

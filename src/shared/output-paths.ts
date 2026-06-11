@@ -40,8 +40,7 @@ export function shouldPersistSavedOutput(params: {
 	outputMode?: "inline" | "file-only";
 	tools?: string[];
 }): boolean {
-	return isRelativeOutputTarget(params.output)
-		|| (!params.output && params.outputMode === "file-only" && Array.isArray(params.tools) && hasReadOnlyToolset(params.tools));
+	return params.output !== false && params.output !== "false";
 }
 
 export function resolveSavedOutputDir(runtimeCwd: string, requestedCwd?: string): string {

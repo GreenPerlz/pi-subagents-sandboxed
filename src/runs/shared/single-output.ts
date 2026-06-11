@@ -31,9 +31,27 @@ export function resolveSingleOutputPath(
 	return path.resolve(baseCwd, output);
 }
 
-export function injectSingleOutputInstruction(task: string, outputPath: string | undefined): string {
-	if (!outputPath) return task;
-	return `${task}\n\n---\n**Output:** Write your findings to: ${outputPath}`;
+export function injectSingleOutputInstruction(task: string, _savedOutputPath: string | undefined): string {
+	return task;
+}
+
+export function appendSavedOutputSystemPrompt(
+	systemPrompt: string,
+	options: { outputPath?: string; savedOutputPath?: string } | undefined,
+): string {
+	const primaryPath = options?.outputPath ? path.resolve(options.outputPath) : undefined;
+	const savedPath = options?.savedOutputPath ? path.resolve(options.savedOutputPath) : undefined;
+	if (!primaryPath && !savedPath) return systemPrompt;
+	const savedDir = path.dirname(savedPath ?? primaryPath!);
+	const note = [
+		"Subagent output runtime:",
+		"- final subagent outputs are persisted automatically by the runtime",
+		...(primaryPath ? [`- this run's saved output path is: ${primaryPath}`] : []),
+		"- do not write or manage report files yourself unless the task explicitly asks you to edit a real working file",
+		`- repo-local saved reports live under: ${savedDir}`,
+		"- consult prior reports there only when another instruction explicitly tells you to",
+	].join("\n");
+	return systemPrompt ? `${systemPrompt}\n\n${note}` : note;
 }
 
 function countLines(text: string): number {
@@ -146,6 +164,7 @@ export function finalizeSingleOutput(params: {
 	savedPath?: string;
 	outputReference?: SavedOutputReference;
 	saveError?: string;
+	announceSavedPath?: boolean;
 }): { displayOutput: string; savedPath?: string; outputReference?: SavedOutputReference; saveError?: string } {
 	let displayOutput = params.truncatedOutput || params.fullOutput;
 	if (params.exitCode === 0 && params.savedPath) {
@@ -153,7 +172,9 @@ export function finalizeSingleOutput(params: {
 		if (params.outputMode === "file-only") {
 			return { displayOutput: outputReference.message, savedPath: params.savedPath, outputReference };
 		}
-		displayOutput += `\n\n${outputReference.message}`;
+		if (params.announceSavedPath !== false) {
+			displayOutput += `\n\n${outputReference.message}`;
+		}
 		return { displayOutput, savedPath: params.savedPath, outputReference };
 	}
 	if (params.exitCode === 0 && params.saveError && params.outputPath) {

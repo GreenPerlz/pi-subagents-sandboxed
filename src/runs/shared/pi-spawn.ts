@@ -113,8 +113,11 @@ export function resolveWindowsPiCliScript(deps: PiSpawnDeps = {}): string | unde
 
 export function getPiSpawnCommand(args: string[], deps: PiSpawnDeps = {}): PiSpawnCommand {
 	const platform = deps.platform ?? process.platform;
+	const existsSync = deps.existsSync ?? fs.existsSync;
+	const argv1 = deps.argv1 ?? process.argv[1];
+	const preferMockEntrypoint = deps.preferNodeCli && process.env.MOCK_PI_QUEUE_DIR && argv1 && isRunnableNodeScript(normalizePath(argv1), existsSync);
 	const piCliPath = deps.preferNodeCli
-		? resolvePiPackageBin(deps)
+		? (preferMockEntrypoint ? normalizePath(argv1!) : resolvePiPackageBin(deps))
 		: platform === "win32"
 			? resolveWindowsPiCliScript(deps)
 			: undefined;

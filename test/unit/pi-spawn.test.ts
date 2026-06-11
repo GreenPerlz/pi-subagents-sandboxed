@@ -108,6 +108,32 @@ describe("getPiSpawnCommand", () => {
 		assert.deepEqual(result.args, [cliPath, ...args]);
 	});
 
+	it("prefers the current mock entrypoint in sandboxed test runs", () => {
+		const packageJsonPath = "/opt/pi/package.json";
+		const cliPath = path.resolve(path.dirname(packageJsonPath), "dist/cli/index.js");
+		const argv1 = "/tmp/mock-pi-script.mjs";
+		const previousMockQueueDir = process.env.MOCK_PI_QUEUE_DIR;
+		process.env.MOCK_PI_QUEUE_DIR = "/tmp/mock-queue";
+		try {
+			const deps = makeDeps({
+				platform: "linux",
+				execPath: "/usr/local/bin/node",
+				argv1,
+				packageJsonPath,
+				packageJsonContent: JSON.stringify({ bin: { pi: "dist/cli/index.js" } }),
+				existing: [argv1, packageJsonPath, cliPath],
+				preferNodeCli: true,
+			});
+			const args = ["-p", "Task: hello"];
+			const result = getPiSpawnCommand(args, deps);
+			assert.equal(result.command, "/usr/local/bin/node");
+			assert.deepEqual(result.args, [argv1, ...args]);
+		} finally {
+			if (previousMockQueueDir === undefined) delete process.env.MOCK_PI_QUEUE_DIR;
+			else process.env.MOCK_PI_QUEUE_DIR = previousMockQueueDir;
+		}
+	});
+
 	it("uses node + argv1 script on Windows when argv1 is runnable JS", () => {
 		const argv1 = "/tmp/pi-entry.mjs";
 		const deps = makeDeps({

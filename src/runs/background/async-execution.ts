@@ -393,7 +393,8 @@ export function executeAsyncChain(
 		let taskTemplate = s.task ?? "{previous}";
 		taskTemplate = taskTemplate.replace(/\{task\}/g, originalTask ?? "");
 		taskTemplate = taskTemplate.replace(/\{chain_dir\}/g, runnerCwd);
-		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`, outputPath);
+		const instructionOutputPath = outputPath ?? (behavior.outputMode === "file-only" ? savedOutputPath : undefined);
+		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`, instructionOutputPath);
 
 		const primaryModel = resolveModelCandidate(behavior.model ?? a.model, availableModels, ctx.currentModelProvider);
 		const model = applyThinkingSuffix(primaryModel, a.thinking);
@@ -725,7 +726,8 @@ export function executeAsyncSingle(
 		: undefined;
 	const validationError = validateFileOnlyOutputMode(outputMode, outputPath ?? savedOutputPath, `Async single run (${agent})`);
 	if (validationError) return formatAsyncStartError("single", validationError);
-	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
+	const instructionOutputPath = outputPath ?? (outputMode === "file-only" ? savedOutputPath : undefined);
+	const taskWithOutputInstruction = injectSingleOutputInstruction(task, instructionOutputPath);
 	const model = applyThinkingSuffix(
 		resolveModelCandidate(params.modelOverride ?? agentConfig.model, availableModels, ctx.currentModelProvider),
 		agentConfig.thinking,

@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	appendSavedOutputSystemPrompt,
 	captureSingleOutputSnapshot,
 	finalizeSingleOutput,
 	formatSavedOutputReference,
@@ -74,9 +75,22 @@ describe("resolveSingleOutputPath", () => {
 });
 
 describe("injectSingleOutputInstruction", () => {
-	it("appends output instruction with resolved path", () => {
+	it("leaves the task unchanged because saved-output guidance now lives in system prompt context", () => {
 		const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md");
-		assert.match(output, /Write your findings to: \/tmp\/report.md/);
+		assert.equal(output, "Analyze this");
+	});
+});
+
+describe("appendSavedOutputSystemPrompt", () => {
+	it("adds saved-output path and tmp-awareness to the system prompt", () => {
+		const output = appendSavedOutputSystemPrompt("Base prompt", {
+			outputPath: "/repo/report.md",
+			savedOutputPath: "/repo/tmp/echo-run.md",
+		});
+		assert.match(output, /Base prompt/);
+		assert.match(output, /this run's saved output path is: \/repo\/report\.md/);
+		assert.match(output, /repo-local saved reports live under: \/repo\/tmp/);
+		assert.match(output, /do not write or manage report files yourself/i);
 	});
 });
 
@@ -175,6 +189,17 @@ describe("finalizeSingleOutput", () => {
 		assert.doesNotMatch(result.displayOutput, /line 1/);
 		assert.match(result.displayOutput, /^Output saved to:/);
 		assert.match(result.displayOutput, /3 lines/);
+	});
+
+	it("can keep implicit auto-saves out of inline display output", () => {
+		const result = finalizeSingleOutput({
+			fullOutput: "full output",
+			savedPath: "/tmp/review.md",
+			exitCode: 0,
+			announceSavedPath: false,
+		});
+
+		assert.equal(result.displayOutput, "full output");
 	});
 
 	it("does not add save messaging on failed runs", () => {

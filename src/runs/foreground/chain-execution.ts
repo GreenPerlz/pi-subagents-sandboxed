@@ -64,7 +64,7 @@ import {
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { resolveModelCandidate } from "../shared/model-fallback.ts";
-import { validateFileOnlyOutputMode } from "../shared/single-output.ts";
+import { injectSingleOutputInstruction, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, outputEntryFromResult, resolveOutputReferences, validateChainOutputBindings } from "../shared/chain-outputs.ts";
@@ -261,6 +261,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			})
 				? resolveSavedOutputPath({ runtimeCwd: input.ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId: input.runId, index: input.globalTaskIndex + taskIndex })
 				: undefined;
+			const instructionOutputPath = outputPath ?? (behavior.outputMode === "file-only" ? savedOutputPath : undefined);
+			taskStr = injectSingleOutputInstruction(taskStr, instructionOutputPath);
 			const interruptController = new AbortController();
 			if (input.foregroundControl) {
 				input.foregroundControl.currentAgent = task.agent;
@@ -1084,6 +1086,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			})
 				? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: stepCwd, agent: seqStep.agent, runId, index: globalTaskIndex })
 				: undefined;
+			const instructionOutputPath = outputPath ?? (behavior.outputMode === "file-only" ? savedOutputPath : undefined);
+			stepTask = injectSingleOutputInstruction(stepTask, instructionOutputPath);
 			const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath ?? savedOutputPath, `Chain step ${stepIndex + 1} (${seqStep.agent})`);
 			if (validationError) {
 				return buildChainExecutionErrorResult(validationError, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));

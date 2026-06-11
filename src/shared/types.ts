@@ -435,6 +435,7 @@ export interface SingleResult {
 	finalOutput?: string;
 	outputMode?: OutputMode;
 	savedOutputPath?: string;
+	savedOutputAnnounced?: boolean;
 	outputReference?: SavedOutputReference;
 	outputSaveError?: string;
 	structuredOutput?: unknown;

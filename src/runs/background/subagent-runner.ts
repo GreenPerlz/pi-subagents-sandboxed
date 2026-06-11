@@ -13,7 +13,7 @@ import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../.
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import type { ResolvedSandboxConfig, SandboxResultDetails, SpawnableInvocation } from "../../sandbox/types.ts";
 import { writeSavedOutput } from "../../shared/output-paths.ts";
-import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { appendSavedOutputSystemPrompt, captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	type AcceptanceFinalizationTurn,
 	type AcceptanceLedger,
@@ -772,7 +772,11 @@ async function runSingleStep(
 		? resolveProjectLocalPiPackageResources(stepCwd)
 		: undefined;
 	const closedSandboxRuntime = Boolean(effectiveSandbox && effectiveSandbox.packageDiscovery !== "ambient");
-	const sandboxIntercomBridgeApplies = step.systemPrompt.includes(INTERCOM_BRIDGE_MARKER);
+	const effectiveSystemPrompt = appendSavedOutputSystemPrompt(step.systemPrompt, {
+		outputPath: step.outputPath,
+		savedOutputPath: step.savedOutputPath,
+	});
+	const sandboxIntercomBridgeApplies = effectiveSystemPrompt.includes(INTERCOM_BRIDGE_MARKER);
 	const buildSandboxInput = (input: { args: string[]; tempDir?: string; sessionDir?: string; sessionFile?: string; outputFile: string; structuredOutput?: { schemaPath?: string; outputPath?: string } }): RunPiStreamingSandboxInput | undefined => {
 		const sandbox = effectiveSandbox;
 		if (!sandbox) return undefined;
@@ -823,7 +827,7 @@ async function runSingleStep(
 			tools: step.tools,
 			extensions: step.extensions,
 			packageExtensions: projectLocalPackageResources?.extensions,
-			systemPrompt: step.systemPrompt,
+			systemPrompt: effectiveSystemPrompt,
 			systemPromptMode: step.systemPromptMode,
 			mcpDirectTools: step.mcpDirectTools,
 			cwd: stepCwd,
@@ -929,7 +933,7 @@ async function runSingleStep(
 		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot)
 		: { fullOutput: outputForPersistence };
 	const output = resolvedOutput.fullOutput;
-	let savedOutputPath = resolvedOutput.savedPath;
+	let savedOutputPath = step.outputMode === "file-only" ? resolvedOutput.savedPath : undefined;
 	let savedOutputContent = output;
 	let outputSaveError = resolvedOutput.saveError;
 	if (step.savedOutputPath && (finalResult?.exitCode ?? 1) === 0) {
@@ -941,12 +945,19 @@ async function runSingleStep(
 				index: ctx.flatIndex,
 				content: output,
 			});
-			savedOutputPath = saved.savedPath;
-			savedOutputContent = saved.savedContent;
+			if (!savedOutputPath) {
+				savedOutputPath = saved.savedPath;
+				savedOutputContent = saved.savedContent;
+			}
 		} catch (error) {
 			outputSaveError = `Failed to save output history: ${error instanceof Error ? error.message : String(error)}`;
 		}
 	}
+	if (!savedOutputPath && resolvedOutput.savedPath) {
+		savedOutputPath = resolvedOutput.savedPath;
+		savedOutputContent = output;
+	}
+	const announceSavedOutput = Boolean(step.outputPath) || step.outputMode === "file-only";
 	const outputReference = savedOutputPath ? formatSavedOutputReference(savedOutputPath, savedOutputContent) : undefined;
 	let outputForSummary = output;
 	if (attemptNotes.length > 0) {
@@ -961,6 +972,7 @@ async function runSingleStep(
 		savedPath: savedOutputPath,
 		outputReference,
 		saveError: outputSaveError,
+		announceSavedPath: announceSavedOutput,
 	});
 	outputForSummary = finalizedOutput.displayOutput;
 	const acceptanceForInitialReport = step.effectiveAcceptance && shouldRunAcceptanceFinalization(step.effectiveAcceptance)
@@ -1006,7 +1018,7 @@ async function runSingleStep(
 					tools: step.tools,
 					extensions: step.extensions,
 					packageExtensions: projectLocalPackageResources?.extensions,
-					systemPrompt: step.systemPrompt,
+					systemPrompt: effectiveSystemPrompt,
 					systemPromptMode: step.systemPromptMode,
 					mcpDirectTools: step.mcpDirectTools,
 					cwd: stepCwd,
@@ -1121,6 +1133,7 @@ async function runSingleStep(
 		interrupted: finalResult?.interrupted,
 		outputMode: step.outputMode,
 		savedOutputPath,
+		savedOutputAnnounced: announceSavedOutput,
 		outputReference,
 		outputSaveError,
 		completionGuardTriggered: completionGuardTriggeredFinal,

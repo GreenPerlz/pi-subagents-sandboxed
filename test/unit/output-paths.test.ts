@@ -49,13 +49,15 @@ describe("hasReadOnlyToolset", () => {
 });
 
 describe("shouldPersistSavedOutput", () => {
-	it("persists relative outputs", () => {
+	it("persists outputs by default", () => {
 		assert.equal(shouldPersistSavedOutput({ output: "context.md", tools: ["read"] }), true);
+		assert.equal(shouldPersistSavedOutput({ output: undefined, outputMode: "inline", tools: ["read", "bash"] }), true);
+		assert.equal(shouldPersistSavedOutput({ output: undefined, outputMode: "file-only", tools: ["read", "edit"] }), true);
 	});
 
-	it("allows read-only file-only runs without an explicit output path", () => {
-		assert.equal(shouldPersistSavedOutput({ output: undefined, outputMode: "file-only", tools: ["read", "bash"] }), true);
-		assert.equal(shouldPersistSavedOutput({ output: undefined, outputMode: "file-only", tools: ["read", "edit"] }), false);
+	it("lets callers opt out with false", () => {
+		assert.equal(shouldPersistSavedOutput({ output: false, tools: ["read"] }), false);
+		assert.equal(shouldPersistSavedOutput({ output: "false", tools: ["read"] }), false);
 	});
 });
 

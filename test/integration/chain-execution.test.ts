@@ -759,8 +759,9 @@ process.exit(child.status ?? 0);
 		assert.match(result.details.workflowGraph?.nodes[1]?.error ?? "", /exceeding maxItems 1/);
 	});
 
-	it("marks dynamic file-only validation failures as failed graph groups before spawning children", async () => {
+	it("auto-saves dynamic file-only fanout results without explicit output paths", async () => {
 		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }] } });
+		mockPi.onCall({ output: "reviewed src/a.ts" });
 		const agents = [makeAgent("scout"), makeAgent("reviewer")];
 
 		const result = await executeChain(
@@ -778,11 +779,10 @@ process.exit(child.status ?? 0);
 			),
 		);
 
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /outputMode: "file-only"/);
-		assert.equal(mockPi.callCount(), 1);
-		assert.equal(result.details.workflowGraph?.nodes[1]?.status, "failed");
-		assert.match(result.details.workflowGraph?.nodes[1]?.error ?? "", /outputMode: "file-only"/);
+		assert.ok(!result.isError, `chain should succeed: ${JSON.stringify(result.content)}`);
+		assert.equal(mockPi.callCount(), 2);
+		assert.equal(result.details.workflowGraph?.nodes[1]?.status, "completed");
+		assert.match(result.details.results[1]?.savedOutputPath ?? "", /\/tmp\//);
 	});
 
 	it("marks empty dynamic fanout skip as a completed graph group", async () => {
@@ -1364,7 +1364,9 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 		assert.doesNotMatch(synthTaskArg, /full parallel chain output/);
 	});
 
-	it("rejects chain parallel file-only output without spawning siblings", async () => {
+	it("auto-saves chain parallel file-only output without spawning validation errors", async () => {
+		mockPi.onCall({ output: "Review A output" });
+		mockPi.onCall({ output: "Review B output" });
 		const agents = [makeAgent("reviewer-a"), makeAgent("reviewer-b")];
 
 		const result = await executeChain(
@@ -1380,9 +1382,9 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 			),
 		);
 
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /outputMode: "file-only"/);
-		assert.equal(mockPi.callCount(), 0);
+		assert.ok(!result.isError, `chain should succeed: ${JSON.stringify(result.content)}`);
+		assert.equal(mockPi.callCount(), 2);
+		assert.match(result.details.results[0]?.savedOutputPath ?? "", /\/tmp\//);
 	});
 
 	it("detaches parallel chain children cleanly on intercom handoff", async () => {

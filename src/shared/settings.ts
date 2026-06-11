@@ -15,7 +15,7 @@ const INITIAL_PROGRESS_CONTENT = "# Progress\n\n## Status\nIn Progress\n\n## Tas
 // =============================================================================
 
 export interface ResolvedStepBehavior {
-	output: string | false;
+	output?: string | false;
 	outputMode: OutputMode;
 	reads: string[] | false;
 	progress: boolean;
@@ -230,12 +230,12 @@ export function resolveStepBehavior(
 	stepOverrides: StepOverrides,
 	chainSkills?: string[],
 ): ResolvedStepBehavior {
-	// Output: step override > frontmatter > false (no output)
+	// Output: step override > frontmatter > implicit auto-save only (no explicit output file)
 	const stepOutput = normalizeOutputOverride(stepOverrides.output);
 	const output =
 		stepOutput !== undefined
 			? stepOutput
-			: normalizeOutputOverride(agentConfig.output) ?? false;
+			: normalizeOutputOverride(agentConfig.output);
 
 	// Reads: step override > frontmatter defaultReads > false (no reads)
 	const reads =
@@ -322,11 +322,8 @@ export function buildChainInstructions(
 		prefixParts.push(`[Read from: ${files.join(", ")}]`);
 	}
 
-	// OUTPUT - prepend so agent knows where to write
-	if (behavior.output) {
-		const outputPath = resolveChainPath(behavior.output, chainDir);
-		prefixParts.push(`[Write to: ${outputPath}]`);
-	}
+	// OUTPUT - parent/runtime persistence is automatic; child tasks do not need
+	// file-write instructions for report saving.
 
 	// Progress instructions in suffix (less critical)
 	if (behavior.progress) {
@@ -377,9 +374,9 @@ export function resolveParallelBehaviors(
 		// Build subdirectory path for this parallel task
 		const subdir = path.join(`parallel-${stepIndex}`, `${taskIndex}-${task.agent}`);
 
-		// Output: task override > agent default (namespaced) > false
+		// Output: task override > agent default (namespaced) > implicit auto-save only
 		// Absolute paths pass through unchanged; relative paths get namespaced under subdir
-		let output: string | false = false;
+		let output: string | false | undefined;
 		const taskOutput = normalizeOutputOverride(task.output);
 		const configOutput = normalizeOutputOverride(config.output);
 		if (taskOutput !== undefined) {

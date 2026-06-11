@@ -327,7 +327,10 @@ function formatRunHeader(run: AsyncRunSummary): string {
 	const stepLabel = formatAsyncRunProgressLabel(run);
 	const cwd = run.cwd ? shortenPath(run.cwd) : shortenPath(run.asyncDir);
 	const activity = formatActivityFacts(run);
-	return `${run.id} | ${run.state}${activity ? ` | ${activity}` : ""} | ${run.mode} | ${stepLabel} | ${cwd}`;
+	const activeStep = run.currentStep !== undefined ? run.steps[run.currentStep] : undefined;
+	const modelStep = activeStep?.model ? activeStep : run.steps.find((step) => step.model);
+	const modelThinking = formatModelThinking(modelStep?.model, modelStep?.thinking);
+	return `${run.id} | ${run.state}${activity ? ` | ${activity}` : ""} | ${run.mode} | ${stepLabel}${modelThinking ? ` | ${modelThinking}` : ""} | ${cwd}`;
 }
 
 export function formatAsyncRunList(runs: AsyncRunSummary[], heading = "Active async runs"): string {

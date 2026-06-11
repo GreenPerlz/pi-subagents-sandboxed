@@ -388,11 +388,12 @@ function sessionFileFromSoloStep(steps: OverlayStep[]): string | undefined {
 	return steps.length === 1 ? steps[0]?.sessionFile : undefined;
 }
 
-function deriveRunModelThinking(steps: Array<{ model?: string; thinking?: string }>): { model?: string; thinking?: string } {
-	const activeStep = steps.find((step) => step.model);
+function deriveRunModelThinking(steps: Array<{ model?: string; thinking?: string }>, currentStep?: number): { model?: string; thinking?: string } {
+	const active = currentStep !== undefined ? steps[currentStep] : undefined;
+	const modelStep = active?.model ? active : steps.find((step) => step.model);
 	return {
-		model: activeStep?.model,
-		thinking: activeStep?.thinking,
+		model: modelStep?.model,
+		thinking: modelStep?.thinking,
 	};
 }
 
@@ -425,7 +426,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 	const attachedIds = new Set(run.steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
 	const unattached = mappedNestedChildren.filter((child) => !attachedIds.has(child.id));
 	if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached);
-	const { model: runModel, thinking: runThinking } = deriveRunModelThinking(steps);
+	const { model: runModel, thinking: runThinking } = deriveRunModelThinking(steps, run.currentStep);
 	return {
 		id: run.id,
 		label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
@@ -741,7 +742,7 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 			lastStep.children.push(...unattached);
 		}
 
-		const { model: runModel, thinking: runThinking } = deriveRunModelThinking(steps);
+		const { model: runModel, thinking: runThinking } = deriveRunModelThinking(steps, job.currentStep);
 		runs.push({
 			id: job.asyncId,
 			label: `${modeLabel(job.mode)}: ${agents.join(", ")}`,

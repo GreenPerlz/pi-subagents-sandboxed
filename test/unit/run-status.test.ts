@@ -608,3 +608,299 @@ describe("async run status inspection", () => {
 		}
 	});
 });
+
+describe("async run header model/thinking display (issue #53)", () => {
+	function asyncHeaderLine(text: string): string {
+		return text.split("\n").find((line) => line.startsWith("- ")) ?? "";
+	}
+
+	it("shows model and thinking in run header when steps have them", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-model-header-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-model-header");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-model-header",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				currentStep: 0,
+				steps: [{ agent: "worker", status: "running", startedAt: 100, model: "openai/gpt-4o", thinking: "high" }],
+			}, null, 2), "utf-8");
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => 200,
+			});
+
+			const header = asyncHeaderLine(textContent(result));
+			assert.match(header, /run-model-header \| running/);
+			assert.match(header, /gpt-4o · thinking high/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("prefers current step model over first step model in run header", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-model-current-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-model-current");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-model-current",
+				mode: "chain",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				currentStep: 1,
+				steps: [
+					{ agent: "researcher", status: "complete", model: "gpt-4" },
+					{ agent: "worker", status: "running", model: "claude-sonnet", thinking: "high" },
+				],
+			}, null, 2), "utf-8");
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => 200,
+			});
+
+			const header = asyncHeaderLine(textContent(result));
+			assert.match(header, /claude-sonnet · thinking high/);
+			assert.doesNotMatch(header, /gpt-4/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not smear current-step thinking onto a fallback model from another step", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-model-no-smear-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-model-no-smear");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-model-no-smear",
+				mode: "chain",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				currentStep: 1,
+				steps: [
+					{ agent: "researcher", status: "complete", model: "gpt-4" },
+					{ agent: "worker", status: "running", thinking: "high" },
+				],
+			}, null, 2), "utf-8");
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => 200,
+			});
+
+			const header = asyncHeaderLine(textContent(result));
+			assert.match(header, /gpt-4/);
+			assert.doesNotMatch(header, /thinking high/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back gracefully when no steps have model/thinking", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-no-model-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-no-model");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-no-model",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				steps: [{ agent: "worker", status: "running", startedAt: 100 }],
+			}, null, 2), "utf-8");
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => 200,
+			});
+
+			const header = asyncHeaderLine(textContent(result));
+			assert.match(header, /run-no-model \| running/);
+			assert.doesNotMatch(header, /undefined/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("nested text status model/thinking display (issue #53)", () => {
+	it("shows model and thinking in nested child rows", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-nested-model-"));
+		const route = createNestedRoute("run-nested-model-root");
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-nested-model-root");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-nested-model-root",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				steps: [{ agent: "orchestrator", status: "running", startedAt: 100 }],
+			}, null, 2), "utf-8");
+			writeNestedEvent(route, {
+				type: "subagent.nested.updated",
+				ts: 150,
+				parentRunId: "run-nested-model-root",
+				parentStepIndex: 0,
+				child: {
+					id: "nested-model-child",
+					parentRunId: "run-nested-model-root",
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: "run-nested-model-root", stepIndex: 0, agent: "orchestrator" }],
+					state: "running",
+					agent: "reviewer",
+					model: "claude-sonnet",
+					thinking: "high",
+					currentTool: "read",
+					lastUpdate: 150,
+				},
+			});
+
+			const result = inspectSubagentStatus({ id: "run-nested-model-root" }, {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => 200,
+			});
+
+			const text = textContent(result);
+			assert.match(text, /↳ reviewer \[nested-model-child\] running.*claude-sonnet · thinking high/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("shows model and thinking in nested step rows", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-nested-step-model-"));
+		const route = createNestedRoute("run-nested-step-model-root");
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-nested-step-model-root");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-nested-step-model-root",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				steps: [{ agent: "orchestrator", status: "running", startedAt: 100 }],
+			}, null, 2), "utf-8");
+			writeNestedEvent(route, {
+				type: "subagent.nested.updated",
+				ts: 150,
+				parentRunId: "run-nested-step-model-root",
+				parentStepIndex: 0,
+				child: {
+					id: "nested-step-model-child",
+					parentRunId: "run-nested-step-model-root",
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: "run-nested-step-model-root", stepIndex: 0 }],
+					state: "running",
+					mode: "single",
+					agent: "reviewer",
+					model: "anthropic/claude-sonnet",
+					thinking: "medium",
+					steps: [{ agent: "leaf", status: "running", model: "anthropic/claude-sonnet", thinking: "medium" }],
+					lastUpdate: 150,
+				},
+			});
+
+			const result = inspectSubagentStatus({ id: "run-nested-step-model-root" }, {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => 200,
+			});
+
+			const text = textContent(result);
+			// Nested step should show model/thinking
+			assert.match(text, /1\. leaf running.*claude-sonnet · thinking medium/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("backward compat: nested rows without model/thinking still render", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-nested-no-model-"));
+		const route = createNestedRoute("run-nested-no-model-root");
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-nested-no-model-root");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-nested-no-model-root",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 100,
+				steps: [{ agent: "orchestrator", status: "running", startedAt: 100 }],
+			}, null, 2), "utf-8");
+			writeNestedEvent(route, {
+				type: "subagent.nested.updated",
+				ts: 150,
+				parentRunId: "run-nested-no-model-root",
+				parentStepIndex: 0,
+				child: {
+					id: "nested-no-model-child",
+					parentRunId: "run-nested-no-model-root",
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: "run-nested-no-model-root", stepIndex: 0 }],
+					state: "running",
+					agent: "worker",
+					currentTool: "bash",
+					lastUpdate: 150,
+				},
+			});
+
+			const result = inspectSubagentStatus({ id: "run-nested-no-model-root" }, {
+				asyncDirRoot: asyncRoot,
+				resultsDir: path.join(root, "results"),
+				kill: () => true,
+				now: () => 200,
+			});
+
+			const text = textContent(result);
+			// Should render without undefined or model/thinking artifacts
+			assert.doesNotMatch(text, /undefined/);
+			assert.match(text, /↳ worker \[nested-no-model-child\] running \| tool bash/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+});

@@ -86,3 +86,32 @@ describe("nested widget rendering", () => {
 		assert.notEqual(widgetRenderKey(first), widgetRenderKey(second));
 	});
 });
+
+describe("nested widget model/thinking display (issue #53)", () => {
+	it("shows model and thinking on expanded nested child rows", () => {
+		const child = nested("nested-model", "root-run", "running", {
+			model: "claude-sonnet",
+			thinking: "high",
+			steps: [{ agent: "worker", status: "running", model: "claude-sonnet", thinking: "high" }],
+		});
+		const expanded = buildWidgetLines([job(child)], theme as any, 160, true).join("\n");
+		assert.match(expanded, /nested-model · running \(claude-sonnet · thinking high\)/);
+	});
+
+	it("shows model and thinking on expanded nested step rows", () => {
+		const child = nested("nested-step-model", "root-run", "running", {
+			model: "anthropic/claude-sonnet",
+			thinking: "medium",
+			steps: [{ agent: "leaf", status: "running", model: "anthropic/claude-sonnet", thinking: "medium" }],
+		});
+		const expanded = buildWidgetLines([job(child)], theme as any, 160, true).join("\n");
+		assert.match(expanded, /leaf · running \(claude-sonnet · thinking medium\)/);
+	});
+
+	it("does not show undefined model/thinking when nested child has none", () => {
+		const child = nested("nested-no-model", "root-run", "running");
+		const expanded = buildWidgetLines([job(child)], theme as any, 160, true).join("\n");
+		assert.doesNotMatch(expanded, /undefined/);
+		assert.match(expanded, /nested-no-model · running/);
+	});
+});

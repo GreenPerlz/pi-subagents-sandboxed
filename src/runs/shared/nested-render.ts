@@ -1,4 +1,4 @@
-import { formatDuration, formatTokens, shortenPath } from "../../shared/formatters.ts";
+import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
 import { formatActivityLabel } from "../../shared/status-format.ts";
 import type { ActivityState, NestedRunSummary, NestedStepSummary } from "../../shared/types.ts";
 
@@ -84,8 +84,9 @@ function formatNestedRunLines(children: NestedRunSummary[] | undefined, options:
 				return;
 			}
 			const activity = child.state === "running" ? formatNestedActivity(child) : undefined;
+			const modelThinking = formatModelThinking(child.model, child.thinking);
 			const error = child.error ? ` | error: ${child.error}` : "";
-			lines.push(`${indent}↳ ${nestedRunLabel(child)} [${child.id}] ${child.state}${activity ? ` | ${activity}` : ""}${error}`);
+			lines.push(`${indent}↳ ${nestedRunLabel(child)} [${child.id}] ${child.state}${activity ? ` | ${activity}` : ""}${modelThinking ? ` | ${modelThinking}` : ""}${error}`);
 			if (options.commandHints && lines.length < options.maxLines) lines.push(`${indent}  Status: subagent({ action: "status", id: "${child.id}" })`);
 			if (depth === options.maxDepth) {
 				const aggregate = formatNestedAggregate([...(child.steps?.flatMap((step) => step.children ?? []) ?? []), ...(child.children ?? [])]);
@@ -95,7 +96,8 @@ function formatNestedRunLines(children: NestedRunSummary[] | undefined, options:
 			for (const [stepIndex, step] of (child.steps ?? []).entries()) {
 				if (lines.length >= options.maxLines) return;
 				const stepActivity = step.status === "running" ? formatNestedActivity(step) : undefined;
-				lines.push(`${indent}  ${stepIndex + 1}. ${step.agent} ${step.status}${stepActivity ? ` | ${stepActivity}` : ""}${step.error ? ` | error: ${step.error}` : ""}`);
+				const stepModelThinking = formatModelThinking(step.model, step.thinking);
+				lines.push(`${indent}  ${stepIndex + 1}. ${step.agent} ${step.status}${stepActivity ? ` | ${stepActivity}` : ""}${stepModelThinking ? ` | ${stepModelThinking}` : ""}${step.error ? ` | error: ${step.error}` : ""}`);
 				append(step.children, depth + 1, `${indent}    `);
 			}
 			append(child.children, depth + 1, `${indent}  `);

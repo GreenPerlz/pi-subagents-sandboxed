@@ -1770,3 +1770,123 @@ describe("collectRunTree", () => {
 		}
 	});
 });
+
+describe("deriveRunModelThinking with currentStep (issue #53)", () => {
+	it("prefers current step model over first step in async run tree", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-current-step",
+			asyncDir: "/tmp/async-current-step",
+			status: "running",
+			mode: "chain",
+			agents: ["researcher", "worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			currentStep: 1,
+			steps: [
+				{ agent: "researcher", status: "complete", index: 0, model: "gpt-4", thinking: "low" },
+				{ agent: "worker", status: "running", index: 1, model: "claude-sonnet", thinking: "high" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs.length, 1);
+		// Should prefer current step (index 1) model
+		assert.strictEqual(runs[0]!.model, "claude-sonnet");
+		assert.strictEqual(runs[0]!.thinking, "high");
+	});
+
+	it("falls back to first step with model when current step has no model", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-fallback",
+			asyncDir: "/tmp/async-fallback",
+			status: "running",
+			mode: "chain",
+			agents: ["researcher", "worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			currentStep: 1,
+			steps: [
+				{ agent: "researcher", status: "complete", index: 0, model: "gpt-4" },
+				{ agent: "worker", status: "running", index: 1 },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "gpt-4");
+		assert.strictEqual(runs[0]!.thinking, undefined);
+	});
+
+	it("falls back to first step when currentStep is undefined", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "async-no-current",
+			asyncDir: "/tmp/async-no-current",
+			status: "running",
+			mode: "single",
+			agents: ["worker"],
+			startedAt: 1000,
+			updatedAt: 2000,
+			steps: [
+				{ agent: "worker", status: "running", index: 0, model: "gemini-pro", thinking: "low" },
+			],
+		});
+		const runs = collectRunTree(state);
+		assert.strictEqual(runs[0]!.model, "gemini-pro");
+		assert.strictEqual(runs[0]!.thinking, "low");
+	});
+
+	it("prefers current step model in persisted async run", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedAsyncStatus(asyncDirRoot, "persisted-current-step", {
+				runId: "persisted-current-step",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "chain",
+				state: "running",
+				startedAt: 1000,
+				lastUpdate: 2000,
+				currentStep: 1,
+				steps: [
+					{ agent: "researcher", status: "complete", model: "gpt-4", thinking: "low" },
+					{ agent: "worker", status: "running", model: "claude-sonnet", thinking: "high" },
+				],
+			});
+			const runs = collectRunTree(state, 3000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			assert.strictEqual(runs[0]!.model, "claude-sonnet");
+			assert.strictEqual(runs[0]!.thinking, "high");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("backward compat: derives model from first step when persisted status has no currentStep", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedAsyncStatus(asyncDirRoot, "persisted-no-current", {
+				runId: "persisted-no-current",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "chain",
+				state: "complete",
+				startedAt: 1000,
+				endedAt: 4000,
+				lastUpdate: 4000,
+				steps: [
+					{ agent: "researcher", status: "complete", model: "gpt-4", thinking: "low" },
+					{ agent: "worker", status: "complete", model: "claude-sonnet", thinking: "high" },
+				],
+			});
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.strictEqual(runs.length, 1);
+			// Falls back to first step with model when no currentStep
+			assert.strictEqual(runs[0]!.model, "gpt-4");
+			assert.strictEqual(runs[0]!.thinking, "low");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});

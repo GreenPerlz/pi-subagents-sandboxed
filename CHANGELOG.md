@@ -49,7 +49,6 @@
 - Include selected direct MCP tool names in explicit child `--tools` allowlists when metadata cache/config resolution is available.
 - Honor `PI_CODING_AGENT_DIR` for runtime config, agent/chain/settings discovery, skills, run history, artifact cleanup, and intercom defaults.
 - Hide nested child Pi process windows on Windows for both foreground and background subagent runs.
-- Avoid completion-guard false positives for declared read-only agents, and add `completionGuard: false` for bash-enabled non-implementation agents that should not be required to edit files.
 - Skip empty or whitespace-only assistant text parts when selecting subagent final output, so later meaningful text in the same or earlier assistant message is not masked.
 - Declare `@earendil-works/pi-tui` as a runtime dependency so packaged installs can load the extension without relying on dev dependencies or optional peers.
 - Treat recovered intermediate child tool/provider errors as successful when a later clean final assistant response is emitted, preventing false failed subagent results.
@@ -196,9 +195,6 @@
 - Prevent child subagents from receiving parent orchestration tooling/history, and inject boundary instructions that forbid sub-delegation and pseudo tool calls.
 - Added active-long-running and repeated mutating-tool failure notices so supervised/forked workers cannot burn turns silently while still appearing healthy.
 - Fixed task editor wrapping so wide characters cannot push text past the right border.
-- Mark implementation subagents as failed when they complete without any file mutation attempt.
-- Applied the same no-mutation completion guard to async/background runner paths.
-- Split terminal no-mutation guard notices from live idle notices so completed failures do not suggest status or interrupt commands.
 - Clarified worker/intercom bridge instructions so blocked decisions use `intercom ask` and stay alive for the reply instead of completing with a question.
 - Labeled the Agents widget as async/background work so running detached agents are easier to identify.
 - Reworked parallel progress wording so parallel runs show running/done agent counts (and chain parallel groups show `step X/Y · parallel group` with agent fractions) instead of serial `step X/Y` counters.

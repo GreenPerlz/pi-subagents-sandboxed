@@ -59,8 +59,7 @@ describe("builtin agent overrides", () => {
 						systemPromptMode: "replace",
 						inheritProjectContext: true,
 						inheritSkills: true,
-						completionGuard: false,
-					},
+						},
 				},
 			},
 		});
@@ -73,7 +72,6 @@ describe("builtin agent overrides", () => {
 		assert.equal(review.systemPromptMode, "replace");
 		assert.equal(review.inheritProjectContext, true);
 		assert.equal(review.inheritSkills, true);
-		assert.equal(review.completionGuard, false);
 		assert.equal(review.override?.scope, "user");
 		assert.equal(review.override?.path, path.join(tempHome, ".pi", "agent", "settings.json"));
 	});
@@ -285,27 +283,6 @@ describe("builtin agent overrides", () => {
 		);
 	});
 
-	it("surfaces malformed completion guard override values", () => {
-		const settingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
-		writeJson(settingsPath, {
-			subagents: {
-				agentOverrides: {
-					review: {
-						completionGuard: "false",
-					},
-				},
-			},
-		});
-
-		assert.throws(
-			() => discoverAgents(tempProject, "both"),
-			(error: unknown) => error instanceof Error
-				&& error.message.includes(settingsPath)
-				&& error.message.includes("review")
-				&& error.message.includes("completionGuard"),
-		);
-	});
-
 	it("saving a builtin override migrates it out of legacy settings into subagents.json", () => {
 		const legacySettingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
 		const subagentsPath = path.join(tempHome, ".pi", "agent", "subagents.json");
@@ -384,7 +361,6 @@ describe("builtin agent overrides", () => {
 				skills: ["safe-bash"],
 				tools: ["bash"],
 				mcpDirectTools: ["xcodebuild_list_sims"],
-				completionGuard: false,
 			},
 			{
 				model: undefined,
@@ -398,7 +374,6 @@ describe("builtin agent overrides", () => {
 				skills: undefined,
 				tools: undefined,
 				mcpDirectTools: undefined,
-				completionGuard: true,
 			},
 		);
 
@@ -411,7 +386,6 @@ describe("builtin agent overrides", () => {
 			defaultContext: false,
 			skills: false,
 			tools: false,
-			completionGuard: true,
 		});
 	});
 });

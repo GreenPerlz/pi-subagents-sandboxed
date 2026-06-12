@@ -47,7 +47,6 @@ import {
 	extractTextFromContent,
 } from "../../shared/utils.ts";
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
-import { evaluateCompletionMutationGuard, resolveCompletionPolicy, type CompletionPolicy } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
@@ -178,7 +177,6 @@ async function runSingleAttempt(
 		attemptNotes: string[];
 		outputSnapshot?: SingleOutputSnapshot;
 		originalTask?: string;
-		completionPolicy: CompletionPolicy;
 	},
 ): Promise<SingleResult> {
 	const modelArg = applyThinkingSuffix(model, agent.thinking);
@@ -879,32 +877,6 @@ async function runSingleAttempt(
 
 	const acceptanceOutput = getFinalOutput(result.messages);
 	let fullOutput = stripAcceptanceReport(acceptanceOutput);
-	const completionGuard = result.exitCode === 0 && !result.error && shared.completionPolicy === "mutation-guard"
-		? evaluateCompletionMutationGuard({
-			agent: agent.name,
-			task: shared.originalTask ?? task,
-			messages: result.messages,
-			tools: agent.tools,
-			mcpDirectTools: agent.mcpDirectTools,
-		})
-		: undefined;
-	const completionGuardTriggered = completionGuard?.triggered === true && !observedMutationAttempt;
-	if (completionGuardTriggered) {
-		result.exitCode = 1;
-		result.error = "Subagent completed without making edits for an implementation task.\nIt appears to have returned planning or scratchpad output instead of applying changes.";
-		progress.status = "failed";
-		progress.error = result.error;
-		emitControlEvent(buildControlEvent({
-			from: progress.activityState,
-			to: "needs_attention",
-			runId: options.runId ?? agent.name,
-			agent: agent.name,
-			index: options.index,
-			ts: Date.now(),
-			message: `${agent.name} completed without making edits for an implementation task`,
-			reason: "completion_guard",
-		}));
-	}
 	if ((options.outputPath || effectiveSavedOutputPath) && result.exitCode === 0) {
 		const announceSavedOutput = Boolean(options.outputPath) || options.outputMode === "file-only";
 		const resolvedOutput = options.outputPath
@@ -1018,7 +990,6 @@ async function runAcceptanceFinalizationLoop(input: {
 				skillsWarning: input.skillsWarning,
 				attemptNotes: [],
 				originalTask: prompt,
-				completionPolicy: "acceptance-contract",
 			},
 		);
 		sumUsage(input.result.usage, finalizationResult.usage);
@@ -1176,14 +1147,6 @@ export async function runSync(
 			attemptNotes,
 			outputSnapshot,
 			originalTask: task,
-			completionPolicy: resolveCompletionPolicy({
-				agent: agent.name,
-				task,
-				completionGuardEnabled: agent.completionGuard !== false,
-				usesAcceptanceContract: effectiveAcceptance.explicit,
-				tools: agent.tools,
-				mcpDirectTools: agent.mcpDirectTools,
-			}),
 		});
 		lastResult = result;
 		sumUsage(aggregateUsage, result.usage);

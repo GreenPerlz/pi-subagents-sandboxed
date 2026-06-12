@@ -21,7 +21,6 @@ export const KNOWN_FIELDS = new Set([
 	"defaultProgress",
 	"interactive",
 	"maxSubagentDepth",
-	"completionGuard",
 	"sandboxProvider",
 	"sandboxProfile",
 	"sandboxNetwork",
@@ -81,7 +80,6 @@ export function serializeAgent(config: AgentConfig): string {
 	if (typeof maxSubagentDepth === "number" && Number.isInteger(maxSubagentDepth) && maxSubagentDepth >= 0) {
 		lines.push(`maxSubagentDepth: ${maxSubagentDepth}`);
 	}
-	if (config.completionGuard === false) lines.push("completionGuard: false");
 	if (config.sandbox?.provider) lines.push(`sandboxProvider: ${config.sandbox.provider}`);
 	if (config.sandbox?.profile) lines.push(`sandboxProfile: ${config.sandbox.profile}`);
 	if (config.sandbox?.network) lines.push(`sandboxNetwork: ${config.sandbox.network}`);

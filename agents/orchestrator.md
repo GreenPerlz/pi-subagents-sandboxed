@@ -14,7 +14,6 @@ sandboxPackageDiscovery: closed
 defaultContext: fresh
 defaultProgress: true
 defaultReads: context.md, plan.md
-completionGuard: false
 maxSubagentDepth: 2
 ---
 

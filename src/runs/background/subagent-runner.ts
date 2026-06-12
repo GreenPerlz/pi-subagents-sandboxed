@@ -63,7 +63,6 @@ import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
-import { evaluateCompletionMutationGuard, resolveCompletionPolicy } from "../shared/completion-guard.ts";
 import {
 	createMutatingFailureState,
 	didMutatingToolFail,
@@ -728,7 +727,6 @@ async function runSingleStep(
 	savedOutputPath?: string;
 	outputReference?: { path: string; bytes: number; lines: number; message: string };
 	outputSaveError?: string;
-	completionGuardTriggered?: boolean;
 	structuredOutput?: unknown;
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
@@ -740,7 +738,6 @@ async function runSingleStep(
 	const placeholderRegex = new RegExp(ctx.placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
 	let task = step.task.replace(placeholderRegex, () => ctx.previousOutput);
 	task = resolveOutputReferences(task, ctx.outputs ?? {});
-	const taskForCompletionGuard = task;
 	if (step.effectiveAcceptance) {
 		const acceptancePrompt = formatAcceptancePrompt(step.effectiveAcceptance);
 		if (acceptancePrompt) task = `${task}\n${acceptancePrompt}`;
@@ -803,7 +800,6 @@ async function runSingleStep(
 	};
 	let finalResult: RunPiStreamingResult | undefined;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
-	let completionGuardTriggeredFinal = false;
 
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
@@ -874,38 +870,14 @@ async function runSingleStep(
 			if (structured.error) structuredError = structured.error;
 			else structuredOutput = structured.value;
 		}
-		const completionPolicy = resolveCompletionPolicy({
-			agent: step.agent,
-			task: taskForCompletionGuard,
-			completionGuardEnabled: step.completionGuard !== false,
-			usesAcceptanceContract: step.effectiveAcceptance?.explicit === true,
-			tools: step.tools,
-			mcpDirectTools: step.mcpDirectTools,
-		});
-		const completionGuard = run.exitCode === 0 && !run.error && !hiddenError?.hasError && completionPolicy === "mutation-guard"
-			? evaluateCompletionMutationGuard({
-				agent: step.agent,
-				task: taskForCompletionGuard,
-				messages: run.messages,
-				tools: step.tools,
-				mcpDirectTools: step.mcpDirectTools,
-			})
-			: undefined;
-		const completionGuardTriggered = completionGuard?.triggered === true && !run.observedMutationAttempt;
-		const completionGuardError = completionGuardTriggered
-			? "Subagent completed without making edits for an implementation task.\nIt appears to have returned planning or scratchpad output instead of applying changes."
-			: undefined;
-		const effectiveExitCode = completionGuardError
+		const effectiveExitCode = structuredError
 			? 1
-			: structuredError
+			: hiddenError?.hasError
+			? (hiddenError.exitCode ?? 1)
+			: run.error && run.exitCode === 0
 				? 1
-				: hiddenError?.hasError
-				? (hiddenError.exitCode ?? 1)
-				: run.error && run.exitCode === 0
-					? 1
-					: run.exitCode;
-		const error = completionGuardError
-			?? structuredError
+				: run.exitCode;
+		const error = structuredError
 			?? (hiddenError?.hasError
 				? hiddenError.details
 					? `${hiddenError.errorType} failed (exit ${effectiveExitCode}): ${hiddenError.details}`
@@ -920,10 +892,9 @@ async function runSingleStep(
 		};
 		modelAttempts.push(attempt);
 		if (candidate) attemptedModels.push(candidate);
-		completionGuardTriggeredFinal = completionGuardTriggered;
 		finalOutputSnapshot = outputSnapshot;
 		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error, structuredOutput } as RunPiStreamingResult & { structuredOutput?: unknown };
-		if (attempt.success || completionGuardError) break;
+		if (attempt.success) break;
 		if (!isRetryableModelFailure(error) || index === candidates.length - 1) break;
 		attemptNotes.push(formatModelAttemptNote(attempt, candidates[index + 1]));
 	}
@@ -1137,7 +1108,6 @@ async function runSingleStep(
 		savedOutputAnnounced: announceSavedOutput,
 		outputReference,
 		outputSaveError,
-		completionGuardTriggered: completionGuardTriggeredFinal,
 		structuredOutput: (finalResult as (RunPiStreamingResult & { structuredOutput?: unknown }) | undefined)?.structuredOutput,
 		structuredOutputPath: effectiveStructuredOutput?.outputPath,
 		structuredOutputSchemaPath: effectiveStructuredOutput?.schemaPath,
@@ -2292,19 +2262,6 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
 							exitCode: singleResult.exitCode, durationMs: taskDuration,
 						}));
-						if (singleResult.completionGuardTriggered) {
-							const event = buildControlEvent({
-								from: statusPayload.steps[fi].activityState,
-								to: "needs_attention",
-								runId: id,
-								agent: task.agent,
-								index: fi,
-								ts: taskEndTime,
-								message: `${task.agent} completed without making edits for an implementation task`,
-								reason: "completion_guard",
-							});
-							appendControlEvent(event);
-						}
 
 						if (singleResult.exitCode !== 0 && failFast) aborted = true;
 						return { ...singleResult, skipped: false };
@@ -2525,19 +2482,6 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				durationMs: stepEndTime - stepStartTime,
 				tokens: stepTokens,
 			}));
-			if (singleResult.completionGuardTriggered) {
-				const event = buildControlEvent({
-					from: statusPayload.steps[flatIndex].activityState,
-					to: "needs_attention",
-					runId: id,
-					agent: seqStep.agent,
-					index: flatIndex,
-					ts: stepEndTime,
-					message: `${seqStep.agent} completed without making edits for an implementation task`,
-					reason: "completion_guard",
-				});
-				appendControlEvent(event);
-			}
 
 			flatIndex++;
 			if (singleResult.exitCode !== 0) {

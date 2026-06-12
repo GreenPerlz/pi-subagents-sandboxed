@@ -423,7 +423,7 @@ process.exit(${exitCode});
 		assert.equal(output, "Hello from mock agent");
 	});
 
-	it("fails implementation runs that complete without mutation attempts", async () => {
+	it("allows implementation runs to return validation-only output without forced mutation", async () => {
 		mockPi.onCall({ output: "Validation:\nlet rawFilename = params.filename.trim();" });
 		const agents = [makeAgent("worker")];
 		const controlEvents: Array<{ message: string }> = [];
@@ -433,19 +433,15 @@ process.exit(${exitCode});
 			onControlEvent: (event: { message: string }) => controlEvents.push(event),
 		});
 
-		assert.equal(result.exitCode, 1);
-		assert.match(result.error ?? "", /completed without making edits/);
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.error, undefined);
 		assert.equal(result.finalOutput, "Validation:\nlet rawFilename = params.filename.trim();");
-		assert.equal(result.progress.status, "failed");
-		assert.deepEqual(controlEvents.map((event) => event.message), [
-			"worker completed without making edits for an implementation task",
-		]);
-		assert.deepEqual(result.controlEvents?.map((event) => event.message), [
-			"worker completed without making edits for an implementation task",
-		]);
+		assert.equal(result.progress.status, "completed");
+		assert.deepEqual(controlEvents, []);
+		assert.deepEqual(result.controlEvents ?? [], []);
 	});
 
-	it("fails future-tense implementation summaries when no mutation attempt occurred", async () => {
+	it("allows future-tense implementation summaries without forced mutation", async () => {
 		mockPi.onCall({ output: "I’ll do that now and report back after implementing." });
 		const agents = [makeAgent("worker")];
 
@@ -453,8 +449,8 @@ process.exit(${exitCode});
 			runId: "guard-future-tense",
 		});
 
-		assert.equal(result.exitCode, 1);
-		assert.match(result.error ?? "", /completed without making edits/);
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.error, undefined);
 	});
 
 	it("allows declared read-only agents to mention implementation words without edits", async () => {
@@ -470,19 +466,19 @@ process.exit(${exitCode});
 		assert.equal(result.finalOutput, "Validation report after the patch");
 	});
 
-	it("keeps bash-enabled agents conservative unless completion guard is disabled", async () => {
+	it("allows bash-enabled agents to complete without forced mutation", async () => {
 		mockPi.onCall({ output: "cold start test after patch" });
 		mockPi.onCall({ output: "cold start test after patch" });
 		const agents = [
 			makeAgent("test-runner", { tools: ["read", "grep", "bash", "ls"] }),
-			makeAgent("test-runner-optout", { tools: ["read", "grep", "bash", "ls"], completionGuard: false }),
+			makeAgent("test-runner-optout", { tools: ["read", "grep", "bash", "ls"] }),
 		];
 
 		const withoutOptOut = await runSync(tempDir, agents, "test-runner", "Run cold start test after patch", {
 			runId: "guard-bash-conservative",
 		});
-		assert.equal(withoutOptOut.exitCode, 1);
-		assert.match(withoutOptOut.error ?? "", /completed without making edits/);
+		assert.equal(withoutOptOut.exitCode, 0);
+		assert.equal(withoutOptOut.progress.status, "completed");
 
 		const withOptOut = await runSync(tempDir, agents, "test-runner-optout", "Run cold start test after patch", {
 			runId: "guard-bash-optout",
@@ -1554,7 +1550,7 @@ process.exit(${exitCode});
 			events.assistantMessage("foreground sandbox child done"),
 		]);
 		try {
-			const executor = makeExecutor([makeAgent("bridge", { tools: ["read", "contact_supervisor"], completionGuard: false })]);
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read", "contact_supervisor"] })]);
 			const result = await executor.execute(
 				"single-active-bridge-sandbox",
 				{ agent: "bridge", task: "Do work", sandbox: { provider: "bubblewrap" } },
@@ -1597,7 +1593,7 @@ process.exit(${exitCode});
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const fakeBwrap = installFakeBwrapWithJsonl([events.assistantMessage("inactive bridge ok")]);
 		try {
-			const executor = makeExecutor([makeAgent("quiet", { tools: ["read"], completionGuard: false })], { config: { intercomBridge: { mode: "off" } } });
+			const executor = makeExecutor([makeAgent("quiet", { tools: ["read"] })], { config: { intercomBridge: { mode: "off" } } });
 			const result = await executor.execute(
 				"single-inactive-bridge-sandbox",
 				{ agent: "quiet", task: "Do not use intercom", sandbox: { provider: "bubblewrap" } },
@@ -1636,7 +1632,7 @@ process.exit(${exitCode});
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		mockPi.onCall({ output: "clarify background single ok" });
 		try {
-			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false })]);
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"] })]);
 			const result = await executor.execute(
 				"single-clarify-background-bridge",
 				{ agent: "bridge", task: "Use supervisor bridge", clarify: true },
@@ -1677,7 +1673,7 @@ process.exit(${exitCode});
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		mockPi.onCall({ output: "clarify background chain ok" });
 		try {
-			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"], completionGuard: false })]);
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read"] })]);
 			const result = await executor.execute(
 				"chain-clarify-background-bridge",
 				{ chain: [{ agent: "bridge", task: "Use supervisor bridge" }], clarify: true },
@@ -1719,7 +1715,7 @@ process.exit(${exitCode});
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const fakeBwrap = installFakeBwrapWithJsonl([events.assistantMessage("agent sandbox chain ok")]);
 		try {
-			const executor = makeExecutor([makeAgent("bridge", { tools: ["read", "contact_supervisor"], completionGuard: false, sandbox: { provider: "bubblewrap" } })]);
+			const executor = makeExecutor([makeAgent("bridge", { tools: ["read", "contact_supervisor"], sandbox: { provider: "bubblewrap" } })]);
 			const result = await executor.execute(
 				"chain-agent-level-bridge-sandbox",
 				{ chain: [{ agent: "bridge", task: "Do chain work" }], clarify: false },
@@ -1760,7 +1756,7 @@ process.exit(${exitCode});
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const fakeBwrap = installFakeBwrapWithJsonl([events.assistantMessage("extension allowlist ok")]);
 		try {
-			const executor = makeExecutor([makeAgent("limited", { tools: ["read"], extensions: [otherExtension], completionGuard: false })]);
+			const executor = makeExecutor([makeAgent("limited", { tools: ["read"], extensions: [otherExtension] })]);
 			const result = await executor.execute(
 				"single-active-bridge-extension-allowlist",
 				{ agent: "limited", task: "Do not load bridge extension", sandbox: { provider: "bubblewrap" } },
@@ -1833,7 +1829,7 @@ process.exit(${exitCode});
 		mockPi.onCall({ output: "write ok" });
 		const fakeBwrap = installFakeBwrap();
 		try {
-			const executor = makeExecutor([makeAgent("writer", { tools: ["read", "edit"], completionGuard: false }), makeAgent("shell", { tools: ["bash"] })]);
+			const executor = makeExecutor([makeAgent("writer", { tools: ["read", "edit"] }), makeAgent("shell", { tools: ["bash"] })]);
 			const writerResult = await executor.execute(
 				"single-writable-sandbox",
 				{ agent: "writer", task: "Edit", sandbox: { provider: "bubblewrap" } },

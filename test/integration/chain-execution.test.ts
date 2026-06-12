@@ -351,7 +351,7 @@ process.exit(child.status ?? 0);
 				"```",
 			].join("\n"),
 		});
-		const agents = [makeAgent("worker", { completionGuard: false })];
+		const agents = [makeAgent("worker")];
 
 		const result = await executeChain(
 			makeChainParams(
@@ -416,7 +416,7 @@ process.exit(child.status ?? 0);
 		const verifyCommand = `node -e 'require("node:fs").appendFileSync(${JSON.stringify(verifyLog)}, "x")'`;
 		mockPi.onCall({ output: acceptanceReport });
 		mockPi.onCall({ output: acceptanceReport });
-		const agents = [makeAgent("worker", { completionGuard: false })];
+		const agents = [makeAgent("worker")];
 
 		const result = await executeChain(
 			makeChainParams(
@@ -654,7 +654,7 @@ process.exit(child.status ?? 0);
 		mockPi.onCall({ output: acceptanceReport({ changedFiles: ["src/a.ts"] }) });
 		mockPi.onCall({ output: acceptanceReport({ changedFiles: ["src/b.ts"] }), structuredOutput: { ok: "b" } });
 		mockPi.onCall({ output: acceptanceReport({ changedFiles: ["src/b.ts"] }) });
-		const agents = [makeAgent("scout"), makeAgent("reviewer", { completionGuard: false })];
+		const agents = [makeAgent("scout"), makeAgent("reviewer")];
 
 		const result = await executeChain(
 			makeChainParams(
@@ -682,7 +682,7 @@ process.exit(child.status ?? 0);
 			output: "targets",
 			structuredOutput: { items: [{ path: "src/a.ts" }] },
 		});
-		const agents = [makeAgent("scout"), makeAgent("reviewer", { completionGuard: false })];
+		const agents = [makeAgent("scout"), makeAgent("reviewer")];
 
 		const result = await executeChain(
 			makeChainParams(

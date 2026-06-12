@@ -60,7 +60,6 @@ interface AgentConfig {
 	progress?: boolean;
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
-	completionGuard?: boolean;
 	sandbox?: Record<string, unknown>;
 }
 

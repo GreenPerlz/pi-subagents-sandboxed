@@ -539,6 +539,7 @@ export function executeAsyncChain(
 				sandbox: sharedSandbox,
 				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
+				ownerPid: process.pid,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
@@ -789,6 +790,7 @@ export function executeAsyncSingle(
 				resultMode: "single",
 				sandbox,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
+				ownerPid: process.pid,
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,

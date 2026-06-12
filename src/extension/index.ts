@@ -37,6 +37,7 @@ import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import registerSubagentNotify, { type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
 import registerFanoutChildSubagentExtension from "./fanout-child.ts";
+import { shutdownOwnedAsyncJobs } from "../runs/background/session-shutdown-cascade.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
 import { loadConfig } from "./config.ts";
 import {
@@ -546,6 +547,7 @@ DIAGNOSTICS:
 	});
 
 	pi.on("session_shutdown", () => {
+		shutdownOwnedAsyncJobs(state);
 		for (const unsubscribe of eventUnsubscribes) {
 			try {
 				unsubscribe();

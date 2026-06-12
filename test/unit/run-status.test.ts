@@ -904,3 +904,370 @@ describe("nested text status model/thinking display (issue #53)", () => {
 		}
 	});
 });
+
+describe("default status listing includes orphaned paused/failed runs (issue #37)", () => {
+	it("shows paused and failed runs alongside active runs in the default listing", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-orphaned-listing-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+
+			// Active running run
+			const activeDir = path.join(asyncRoot, "run-active");
+			fs.mkdirSync(activeDir, { recursive: true });
+			fs.writeFileSync(path.join(activeDir, "status.json"), JSON.stringify({
+				runId: "run-active",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{ agent: "worker", status: "running", startedAt: 100 }],
+			}), "utf-8");
+
+			// Paused orphaned run (post-shutdown)
+			const pausedDir = path.join(asyncRoot, "run-paused-orphan");
+			fs.mkdirSync(pausedDir, { recursive: true });
+			fs.writeFileSync(path.join(pausedDir, "status.json"), JSON.stringify({
+				runId: "run-paused-orphan",
+				mode: "single",
+				state: "paused",
+				startedAt: 100,
+				lastUpdate: 300,
+				endedAt: 300,
+				steps: [{ agent: "scout", status: "complete" }],
+			}), "utf-8");
+
+			// Failed orphaned run
+			const failedDir = path.join(asyncRoot, "run-failed-orphan");
+			fs.mkdirSync(failedDir, { recursive: true });
+			fs.writeFileSync(path.join(failedDir, "status.json"), JSON.stringify({
+				runId: "run-failed-orphan",
+				mode: "single",
+				state: "failed",
+				startedAt: 100,
+				lastUpdate: 400,
+				endedAt: 400,
+				steps: [{ agent: "reviewer", status: "failed", error: "interrupted" }],
+			}), "utf-8");
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+				kill: () => true,
+				now: () => 500,
+			});
+
+			const text = textContent(result);
+			assert.equal(result.isError, undefined);
+			// Active runs should be listed
+			assert.match(text, /run-active/);
+			assert.match(text, /Active async runs/);
+			// Orphaned runs should also be listed in a separate section
+			assert.match(text, /Recently stopped\/orphaned runs/);
+			assert.match(text, /run-paused-orphan/);
+			assert.match(text, /run-failed-orphan/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("omits orphaned section when no paused/failed runs exist", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-no-orphan-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+
+			const activeDir = path.join(asyncRoot, "run-active-only");
+			fs.mkdirSync(activeDir, { recursive: true });
+			fs.writeFileSync(path.join(activeDir, "status.json"), JSON.stringify({
+				runId: "run-active-only",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{ agent: "worker", status: "running", startedAt: 100 }],
+			}), "utf-8");
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+				kill: () => true,
+				now: () => 500,
+			});
+
+			const text = textContent(result);
+			assert.equal(result.isError, undefined);
+			assert.match(text, /run-active-only/);
+			assert.doesNotMatch(text, /Recently stopped\/orphaned runs/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows orphaned section even when no active runs exist", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-orphan-only-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+
+			const pausedDir = path.join(asyncRoot, "run-paused-only");
+			fs.mkdirSync(pausedDir, { recursive: true });
+			fs.writeFileSync(path.join(pausedDir, "status.json"), JSON.stringify({
+				runId: "run-paused-only",
+				mode: "single",
+				state: "paused",
+				startedAt: 100,
+				lastUpdate: 300,
+				endedAt: 300,
+				steps: [{ agent: "worker", status: "complete" }],
+			}), "utf-8");
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+				kill: () => true,
+				now: () => 500,
+			});
+
+			const text = textContent(result);
+			assert.equal(result.isError, undefined);
+			assert.match(text, /Recently stopped\/orphaned runs/);
+			assert.match(text, /run-paused-only/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not trigger reconciliation side effects when listing orphaned paused/failed runs", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-orphan-no-reconcile-"));
+		const route = createNestedRoute("run-orphan-no-reconcile");
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+
+			// Create a paused run with a stale nested descendant.
+			const asyncDir = path.join(asyncRoot, "run-orphan-no-reconcile");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-orphan-no-reconcile",
+				mode: "single",
+				state: "paused",
+				startedAt: 100,
+				lastUpdate: 300,
+				endedAt: 300,
+				steps: [{ agent: "orchestrator", status: "complete" }],
+			}), "utf-8");
+
+			// Write a nested event for a descendant still marked as running.
+			writeNestedEvent(route, {
+				type: "subagent.nested.updated",
+				ts: 150,
+				parentRunId: "run-orphan-no-reconcile",
+				parentStepIndex: 0,
+				child: {
+					id: "nested-orphan-child",
+					parentRunId: "run-orphan-no-reconcile",
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: "run-orphan-no-reconcile", stepIndex: 0 }],
+					state: "running",
+					agent: "reviewer",
+					lastUpdate: 150,
+				},
+			});
+
+			// Record file state before listing.
+			const beforeDirEntries = new Set(fs.readdirSync(asyncDir));
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+				kill: () => true,
+				now: () => 500,
+			});
+
+			const text = textContent(result);
+			assert.equal(result.isError, undefined);
+			assert.match(text, /Recently stopped\/orphaned runs/);
+			assert.match(text, /run-orphan-no-reconcile/);
+
+			// No reconciliation side effects: async dir should not have new files.
+			const afterDirEntries = new Set(fs.readdirSync(asyncDir));
+			assert.deepEqual(afterDirEntries, beforeDirEntries, "listing orphaned runs should not write new files into the async dir");
+
+			// No nested result files should have been written.
+			const nestedResultsDir = path.join(resultsDir, "nested", "run-orphan-no-reconcile");
+			assert.ok(!fs.existsSync(nestedResultsDir), "listing orphaned runs should not create nested result files");
+
+			// Nested route directory itself should remain unchanged (no spurious registry.json).
+			const routeDir = path.dirname(path.resolve(route.eventSink));
+			const routeDirEntries = new Set(fs.readdirSync(routeDir));
+			assert.ok(!routeDirEntries.has("registry.json"), "listing orphaned runs should not write registry.json into the nested route directory");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+});
+
+describe("owner-dead root run nested descendant reconciliation (issue #37 blocker 1)", () => {
+	it("reconciles nested descendants before state filter when owner is dead", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-owner-dead-nested-"));
+		const route = createNestedRoute("run-owner-dead-nested");
+		const routeRootDir = path.dirname(route.eventSink);
+		const nestedDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "run-owner-dead-nested", "nested-child-owner-dead");
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const asyncDir = path.join(asyncRoot, "run-owner-dead-nested");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.mkdirSync(nestedDir, { recursive: true });
+
+			// Root run is running, ownerPid is dead, runner pid is alive.
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-owner-dead-nested",
+				mode: "single",
+				state: "running",
+				pid: 11111,
+				ownerPid: 999,
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{ agent: "orchestrator", status: "running", startedAt: 100 }],
+			}), "utf-8");
+
+			// Nested descendant is still running, also with the dead owner.
+			fs.writeFileSync(path.join(nestedDir, "status.json"), JSON.stringify({
+				runId: "nested-child-owner-dead",
+				mode: "single",
+				state: "running",
+				pid: 44444,
+				ownerPid: 999,
+				startedAt: 150,
+				lastUpdate: 150,
+				steps: [{ agent: "worker", status: "running", startedAt: 150 }],
+			}), "utf-8");
+
+			writeNestedEvent(route, {
+				type: "subagent.nested.started",
+				ts: 150,
+				parentRunId: "run-owner-dead-nested",
+				parentStepIndex: 0,
+				child: {
+					id: "nested-child-owner-dead",
+					parentRunId: "run-owner-dead-nested",
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: "run-owner-dead-nested", stepIndex: 0 }],
+					asyncDir: nestedDir,
+					pid: 44444,
+					state: "running",
+					agent: "worker",
+					startedAt: 150,
+					lastUpdate: 150,
+				},
+			});
+
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 500,
+			});
+
+			const text = textContent(result);
+			assert.equal(result.isError, undefined);
+			// Root was reconciled to failed (owner dead), so it appears in orphaned section.
+			assert.match(text, /run-owner-dead-nested/);
+			assert.match(text, /Recently stopped\/orphaned runs/);
+			// Nested descendant must have been reconciled during the active pass
+			// (before state filter), so it shows as failed even though registry.json
+			// never existed before the listing.
+			assert.match(text, /nested-child-owner-dead.*failed/);
+			// The nested registry should have been materialized as a side effect of
+			// the active-pass nested reconciliation.
+			assert.ok(fs.existsSync(path.join(routeRootDir, "registry.json")), "registry.json should be materialized during active-pass reconciliation");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(routeRootDir, { recursive: true, force: true });
+			fs.rmSync(nestedDir, { recursive: true, force: true });
+		}
+	});
+
+	it("shows nested descendant final state in default no-id listing when registry.json was never materialized", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-status-owner-dead-default-listing-"));
+		const route = createNestedRoute("run-owner-dead-default");
+		const routeRootDir = path.dirname(route.eventSink);
+		const nestedDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", "run-owner-dead-default", "nested-child-default");
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const asyncDir = path.join(asyncRoot, "run-owner-dead-default");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.mkdirSync(nestedDir, { recursive: true });
+
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "run-owner-dead-default",
+				mode: "single",
+				state: "running",
+				pid: 22222,
+				ownerPid: 999,
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{ agent: "orchestrator", status: "running", startedAt: 100 }],
+			}), "utf-8");
+
+			fs.writeFileSync(path.join(nestedDir, "status.json"), JSON.stringify({
+				runId: "nested-child-default",
+				mode: "single",
+				state: "running",
+				pid: 55555,
+				ownerPid: 999,
+				startedAt: 150,
+				lastUpdate: 150,
+				steps: [{ agent: "worker", status: "running", startedAt: 150 }],
+			}), "utf-8");
+
+			writeNestedEvent(route, {
+				type: "subagent.nested.started",
+				ts: 150,
+				parentRunId: "run-owner-dead-default",
+				parentStepIndex: 0,
+				child: {
+					id: "nested-child-default",
+					parentRunId: "run-owner-dead-default",
+					parentStepIndex: 0,
+					depth: 1,
+					path: [{ runId: "run-owner-dead-default", stepIndex: 0 }],
+					asyncDir: nestedDir,
+					pid: 55555,
+					state: "running",
+					agent: "worker",
+					startedAt: 150,
+					lastUpdate: 150,
+				},
+			});
+
+			// Default status listing (no id).
+			const result = inspectSubagentStatus({}, {
+				asyncDirRoot: asyncRoot,
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 500,
+			});
+
+			const text = textContent(result);
+			assert.equal(result.isError, undefined);
+			// Root should be in the orphaned section.
+			assert.match(text, /Recently stopped\/orphaned runs/);
+			assert.match(text, /run-owner-dead-default/);
+			// The nested descendant must show as failed in the listing, not lost.
+			assert.match(text, /nested-child-default.*failed/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(routeRootDir, { recursive: true, force: true });
+			fs.rmSync(nestedDir, { recursive: true, force: true });
+		}
+	});
+});

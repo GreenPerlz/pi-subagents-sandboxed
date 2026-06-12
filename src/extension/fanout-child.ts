@@ -12,6 +12,7 @@ import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
 import { loadConfig } from "./config.ts";
+import { shutdownOwnedAsyncJobs } from "../runs/background/session-shutdown-cascade.ts";
 import {
 	ASYNC_DIR,
 	SUBAGENT_ASYNC_STARTED_EVENT,
@@ -174,9 +175,23 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 	};
 
 	const { handleStarted, handleComplete } = createAsyncJobTracker(pi, state, ASYNC_DIR);
-	pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted);
-	pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete);
+	const eventUnsubscribes = [
+		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted),
+		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete),
+	];
+
+	const nestedControlTimer = startNestedControlInboxListener(pi, state);
+
+	if (typeof pi.on === "function") {
+		pi.on("session_shutdown", () => {
+			shutdownOwnedAsyncJobs(state);
+			for (const unsubscribe of eventUnsubscribes) {
+				try { unsubscribe(); } catch { /* best effort */ }
+			}
+			if (nestedControlTimer) clearInterval(nestedControlTimer);
+			state.asyncJobs.clear();
+		});
+	}
 
 	pi.registerTool(tool);
-	startNestedControlInboxListener(pi, state);
 }

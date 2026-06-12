@@ -169,7 +169,7 @@ describe("subagent extension child mode", () => {
 			if (!registeredTool || registeredTool.name !== "subagent") throw new Error("child-safe subagent tool not registered");
 			const eventOnCount = calls.filter((call) => call === "events.on").length;
 			const registerToolCount = calls.filter((call) => call === "registerTool").length;
-			const unexpected = calls.filter((call) => call !== "registerTool" && call !== "events.on");
+			const unexpected = calls.filter((call) => call !== "registerTool" && call !== "events.on" && call !== "on");
 			if (unexpected.length > 0) throw new Error("Unexpected parent-surface registrations: " + unexpected.join(", "));
 			if (registerToolCount !== 1) throw new Error("Expected exactly 1 registerTool call, got " + registerToolCount);
 			if (eventOnCount !== 2) throw new Error("Expected exactly 2 events.on calls for async tracking, got " + eventOnCount);

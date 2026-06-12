@@ -610,6 +610,7 @@ export interface AsyncStatus {
 	endedAt?: number;
 	lastUpdate?: number;
 	pid?: number;
+	ownerPid?: number;
 	cwd?: string;
 	currentStep?: number;
 	chainStepCount?: number;

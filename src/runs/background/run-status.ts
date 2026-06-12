@@ -116,8 +116,13 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		}
 		try {
 			const runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], resultsDir, kill: deps.kill, now: deps.now });
+			const orphanedRuns = listAsyncRuns(asyncDirRoot, { states: ["paused", "failed"], resultsDir, kill: deps.kill, now: deps.now, reconcile: false });
+			let text = formatAsyncRunList(runs);
+			if (orphanedRuns.length > 0) {
+				text += "\n\n" + formatAsyncRunList(orphanedRuns, "Recently stopped/orphaned runs");
+			}
 			return {
-				content: [{ type: "text", text: formatAsyncRunList(runs) }],
+				content: [{ type: "text", text }],
 				details: { mode: "single", results: [] },
 			};
 		} catch (error) {

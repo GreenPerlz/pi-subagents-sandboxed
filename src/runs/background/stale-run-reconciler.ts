@@ -325,6 +325,15 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 
 	const liveness = checkPidLiveness(effectiveStatus.pid, options.kill);
 	if (liveness !== "dead") {
+		// Check whether the owner (parent session) process is gone.
+		// If so, the runner is orphaned even though its PID is still alive.
+		if (typeof effectiveStatus.ownerPid === "number" && effectiveStatus.ownerPid > 0) {
+			const ownerLiveness = checkPidLiveness(effectiveStatus.ownerPid, options.kill);
+			if (ownerLiveness === "dead") {
+				const message = `Owner process ${effectiveStatus.ownerPid} exited while async runner ${effectiveStatus.pid} was still running. Marked run failed as orphaned by stale-run reconciliation.`;
+				return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now, message);
+			}
+		}
 		const staleAfterMs = options.staleAlivePidMs ?? 24 * 60 * 60 * 1000;
 		const lastUpdate = effectiveStatus.lastUpdate ?? effectiveStatus.startedAt;
 		if (now - lastUpdate <= staleAfterMs) return { status: status ?? null, repaired: false, resultPath };

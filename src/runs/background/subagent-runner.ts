@@ -132,6 +132,7 @@ interface SubagentRunConfig {
 	sandbox?: ResolvedSandboxConfig;
 	progressPaths?: string[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
+	ownerPid?: number;
 }
 
 interface StepResult {
@@ -1363,6 +1364,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		startedAt: overallStartTime,
 		lastUpdate: overallStartTime,
 		pid: process.pid,
+		...(config.ownerPid ? { ownerPid: config.ownerPid } : {}),
 		cwd,
 		currentStep: 0,
 		chainStepCount: steps.length,
@@ -1748,6 +1750,28 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			updateRunnerActivityState(now);
 		}, 1000);
 		activityTimer.unref?.();
+	}
+
+	// Monitor owner process liveness. If the parent Pi session exits without
+	// graceful shutdown (e.g. SIGKILL), the child runner detects the owner death
+	// and pauses itself, preventing orphaned runs from continuing indefinitely.
+	let ownerLivenessTimer: NodeJS.Timeout | undefined;
+	if (config.ownerPid) {
+		const ownerPid = config.ownerPid;
+		ownerLivenessTimer = setInterval(() => {
+			if (interrupted || statusPayload.state !== "running") return;
+			try {
+				process.kill(ownerPid, 0);
+			} catch (error) {
+				const code = typeof error === "object" && error !== null && "code" in error
+					? (error as NodeJS.ErrnoException).code : undefined;
+				if (code === "ESRCH") {
+					console.warn(`[pi-subagents] Owner process ${ownerPid} is gone. Pausing async run ${id}.`);
+					interruptRunner();
+				}
+			}
+		}, 3000);
+		ownerLivenessTimer.unref?.();
 	}
 
 	const interruptRunner = () => {
@@ -2574,6 +2598,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	if (activityTimer) {
 		clearInterval(activityTimer);
 		activityTimer = undefined;
+	}
+	if (ownerLivenessTimer) {
+		clearInterval(ownerLivenessTimer);
+		ownerLivenessTimer = undefined;
 	}
 	const effectiveSessionFile = sessionFile ?? latestSessionFile;
 	const runEndedAt = Date.now();

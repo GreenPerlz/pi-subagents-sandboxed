@@ -184,4 +184,80 @@ describe("async stale-run reconciliation", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("marks a live-runner run as orphaned when the owner pid is dead", () => {
+		const root = tempRoot("pi-orphan-owner-dead-");
+		try {
+			const asyncDir = path.join(root, "run-orphan");
+			const resultsDir = path.join(root, "results");
+			const runnerPid = 99999;
+			const ownerPid = 88888;
+			writeStatus(asyncDir, {
+				runId: "run-orphan",
+				mode: "single",
+				state: "running",
+				pid: runnerPid,
+				ownerPid,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [{ agent: "worker", status: "running", startedAt: 1000 }],
+			});
+
+			let killCalls: Array<{ pid: number; signal: number | string | undefined }> = [];
+			const result = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: (pid: number, signal?: NodeJS.Signals | 0) => {
+					killCalls.push({ pid, signal });
+					if (pid === runnerPid) return true; // runner is alive
+					if (pid === ownerPid) throw errno("ESRCH"); // owner is dead
+					throw errno("ESRCH");
+				},
+				now: () => 2000,
+			});
+
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+			assert.match(result.message ?? '', /orphaned/);
+			assert.match(result.message ?? '', new RegExp(String(ownerPid)));
+			// Runner PID and owner PID should both have been checked.
+			assert.ok(killCalls.some((c) => c.pid === runnerPid && c.signal === 0));
+			assert.ok(killCalls.some((c) => c.pid === ownerPid && c.signal === 0));
+			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
+			assert.equal(status.state, "failed");
+			assert.match(status.steps[0].error, /orphaned/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not mark run as orphaned when owner pid is still alive", () => {
+		const root = tempRoot("pi-orphan-owner-alive-");
+		try {
+			const asyncDir = path.join(root, "run-alive");
+			const resultsDir = path.join(root, "results");
+			const runnerPid = 99999;
+			const ownerPid = 88888;
+			writeStatus(asyncDir, {
+				runId: "run-alive",
+				mode: "single",
+				state: "running",
+				pid: runnerPid,
+				ownerPid,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [{ agent: "worker", status: "running", startedAt: 1000 }],
+			});
+
+			const result = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: () => true, // all pids alive
+				now: () => 2000,
+			});
+
+			assert.equal(result.repaired, false);
+			assert.equal(result.status?.state, "running");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });

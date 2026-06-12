@@ -4,7 +4,7 @@ import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
 import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode, type TokenUsage } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
-import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedEvents, projectNestedRegistryForRoot } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedEvents, projectNestedRegistryForRoot, readNestedRegistry } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
@@ -122,7 +122,7 @@ function deriveAsyncActivityState(asyncDir: string, status: AsyncStatus): { acti
 	};
 }
 
-function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string }, nestedWarnings: string[] = []): AsyncRunSummary {
+function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string }, nestedWarnings: string[] = [], options?: { readOnly?: boolean }): AsyncRunSummary {
 	if (status.sessionId !== undefined && typeof status.sessionId !== "string") {
 		throw new Error(`Invalid async status '${path.join(asyncDir, "status.json")}': sessionId must be a string.`);
 	}
@@ -133,9 +133,14 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	let nestedChildren: NestedRunSummary[] = status.nestedChildren ?? [];
 	if (nestedChildren.length === 0 && nestedWarnings.length === 0) {
 		try {
-			nestedChildren = status.nestedRoute
-				? projectNestedEvents(status.nestedRoute).children
-				: projectNestedRegistryForRoot(status.runId || path.basename(asyncDir))?.children ?? [];
+			if (options?.readOnly) {
+				const route = status.nestedRoute ?? findNestedRouteForRootId(status.runId || path.basename(asyncDir));
+				nestedChildren = route ? readNestedRegistry(route).children : [];
+			} else {
+				nestedChildren = status.nestedRoute
+					? projectNestedEvents(status.nestedRoute).children
+					: projectNestedRegistryForRoot(status.runId || path.basename(asyncDir))?.children ?? [];
+			}
 		} catch (error) {
 			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
 		}
@@ -256,16 +261,34 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 			: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
 		const status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
 		if (!status) continue;
+		if (!matchesRunScope({ sessionId: status.sessionId, cwd: status.cwd }, options)) continue;
 		const nestedWarnings: string[] = [];
-		try {
-			const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
-			if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
-		} catch (error) {
-			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+		// When reconciliation repaired a run (e.g. owner dead → failed),
+		// reconcile nested descendants before the state filter so that the
+		// nested registry is materialized. The later read-only orphaned pass
+		// relies on registry.json existing; it cannot call projectNestedEvents()
+		// itself because tests require orphan listing to stay side-effect-free.
+		if (reconciliation?.repaired) {
+			try {
+				const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
+				if (nestedRoute) {
+					reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+					projectNestedEvents(nestedRoute);
+				}
+			} catch (error) {
+				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+			}
 		}
-		const summary = statusToSummary(asyncDir, status, nestedWarnings);
-		if (allowedStates && !allowedStates.has(summary.state)) continue;
-		if (!matchesRunScope(summary, options)) continue;
+		if (allowedStates && !allowedStates.has(status.state)) continue;
+		if (options.reconcile !== false && !reconciliation?.repaired) {
+			try {
+				const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
+				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+			} catch (error) {
+				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+			}
+		}
+		const summary = statusToSummary(asyncDir, status, nestedWarnings, { readOnly: options.reconcile === false });
 		runs.push(summary);
 	}
 

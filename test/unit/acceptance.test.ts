@@ -76,7 +76,10 @@ describe("acceptance gates", () => {
 		const resolved = resolveEffectiveAcceptance({
 			agentName: "worker",
 			task: "Implement a fix",
-			explicit: { criteria: ["Patch the bug"], stopRules: ["Do not stop after analysis"] },
+			explicit: {
+				criteria: [{ id: "schema", must: "Patch the bug", evidence: ["diff-summary"] }],
+				stopRules: ["Do not stop after analysis"],
+			},
 		});
 		const prompt = formatAcceptancePrompt(resolved);
 
@@ -85,6 +88,12 @@ describe("acceptance gates", () => {
 		assert.match(prompt, /same session for a bounded self-review\/repair loop/);
 		assert.match(prompt, /Patch the bug/);
 		assert.match(prompt, /```acceptance-report/);
+		assert.match(prompt, /Use the exact criterion IDs shown above/);
+		assert.match(prompt, /"id": "schema"/);
+		assert.doesNotMatch(prompt, /"id": "criterion-1"/);
+		assert.match(prompt, /Required evidence: diff-summary/);
+		assert.match(prompt, /"diffSummary": "summary of the final diff"/);
+		assert.equal(typeof parseAcceptanceReport(prompt).report?.diffSummary, "string");
 
 		const initialLedger = {
 			status: "rejected" as const,
@@ -111,7 +120,33 @@ describe("acceptance gates", () => {
 		assert.match(finalizationPrompt, /Stop rules are hard constraints/);
 		assert.match(finalizationPrompt, /Previous finalization failure/);
 		assert.match(finalizationPrompt, /exactly one fenced JSON block/);
+		assert.match(finalizationPrompt, /Use the exact criterion IDs shown above/);
+		assert.match(finalizationPrompt, /"id": "schema"/);
+		assert.doesNotMatch(finalizationPrompt, /"id": "criterion-1"/);
+		assert.match(finalizationPrompt, /Required evidence: diff-summary/);
+		assert.match(finalizationPrompt, /"diffSummary": "summary of the final diff"/);
+		assert.equal(typeof parseAcceptanceReport(finalizationPrompt).report?.diffSummary, "string");
 	});
+
+	it("generated report examples satisfy combined global and criterion evidence", async () => withTempRepo(async (cwd) => {
+		const acceptance = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Implement a fix",
+			explicit: {
+				criteria: [{ id: "schema", must: "Patch the bug", evidence: ["tests-added", "validation-output", "diff-summary"] }],
+				evidence: ["changed-files", "commands-run"],
+			},
+		});
+		const parsed = parseAcceptanceReport(formatAcceptancePrompt(acceptance));
+		assert.ok(parsed.report);
+		assert.deepEqual(parsed.report.changedFiles, ["path/to/changed-file"]);
+		assert.deepEqual(parsed.report.testsAddedOrUpdated, ["path/to/test-file"]);
+		assert.deepEqual(parsed.report.validationOutput, ["validation result"]);
+		assert.equal(typeof parsed.report.diffSummary, "string");
+
+		const ledger = await evaluateAcceptance({ acceptance, output: "", report: parsed.report, cwd });
+		assert.equal(ledger.status, "checked");
+	}));
 
 	it("parses only explicit acceptance-report fences", () => {
 		const parsed = parseAcceptanceReport(report());
@@ -149,6 +184,28 @@ describe("acceptance gates", () => {
 
 		assert.equal(ledger.status, "rejected");
 		assert.match(acceptanceFailureMessage(ledger) ?? "", /tests-added evidence missing/);
+	}));
+
+	it("checked acceptance enforces evidence required by an individual criterion", async () => withTempRepo(async (cwd) => {
+		const acceptance = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Implement a fix",
+			explicit: { criteria: [{ id: "schema", must: "Patch the bug", evidence: ["diff-summary"] }] },
+		});
+		const missing = await evaluateAcceptance({
+			acceptance,
+			output: report({ criteriaSatisfied: [{ id: "schema", status: "satisfied", evidence: "patched" }] }),
+			cwd,
+		});
+		assert.equal(missing.status, "rejected");
+		assert.match(acceptanceFailureMessage(missing) ?? "", /diff-summary evidence missing/);
+
+		const complete = await evaluateAcceptance({
+			acceptance,
+			output: report({ criteriaSatisfied: [{ id: "schema", status: "satisfied", evidence: "patched" }], diffSummary: "one file changed" }),
+			cwd,
+		});
+		assert.equal(complete.status, "checked");
 	}));
 
 	it("checked acceptance rejects not-satisfied required criteria", async () => withTempRepo(async (cwd) => {

@@ -3,6 +3,7 @@ import type {
 	AcceptanceEvidenceKind,
 	AcceptanceInput,
 	AcceptanceProvenanceLevel,
+	AcceptanceReport,
 	ResolvedAcceptanceConfig,
 	ResolvedAcceptanceGate,
 	SubagentRunMode,
@@ -247,6 +248,40 @@ export function acceptanceSelfReviewConfig(acceptance: ResolvedAcceptanceConfig)
 	};
 }
 
+export function requiredAcceptanceEvidence(acceptance: ResolvedAcceptanceConfig): AcceptanceEvidenceKind[] {
+	return [...new Set([
+		...acceptance.evidence,
+		...acceptance.criteria
+			.filter((criterion) => criterion.severity !== "recommended")
+			.flatMap((criterion) => criterion.evidence),
+	])];
+}
+
+export function acceptanceReportExample(
+	acceptance: ResolvedAcceptanceConfig,
+	notes: string,
+): AcceptanceReport {
+	const requiredEvidence = requiredAcceptanceEvidence(acceptance);
+	const report: AcceptanceReport = {
+		criteriaSatisfied: acceptance.criteria.map((criterion) => ({
+			id: criterion.id,
+			status: "satisfied",
+			evidence: `specific proof for ${criterion.id}`,
+		})),
+		changedFiles: requiredEvidence.includes("changed-files") ? ["path/to/changed-file"] : [],
+		testsAddedOrUpdated: requiredEvidence.includes("tests-added") ? ["path/to/test-file"] : [],
+		commandsRun: [{ command: "command", result: "passed", summary: "short result" }],
+		validationOutput: requiredEvidence.includes("validation-output") ? ["validation result"] : [],
+		residualRisks: [],
+		noStagedFiles: true,
+		notes,
+	};
+	if (requiredEvidence.includes("diff-summary")) report.diffSummary = "summary of the final diff";
+	if (requiredEvidence.includes("review-findings")) report.reviewFindings = ["review finding or no-blockers confirmation"];
+	if (requiredEvidence.includes("manual-notes")) report.manualNotes = "manual verification notes";
+	return report;
+}
+
 export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): string {
 	if (acceptance.level === "none") return "";
 	const lines = [
@@ -258,7 +293,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 		"Criteria:",
 		...(acceptance.criteria.length ? acceptance.criteria.map((criterion) => `- ${criterion.id}: ${criterion.must}`) : ["- No explicit criteria were configured; satisfy the requested task and the required evidence/checks below."]),
 		"",
-		`Required evidence: ${acceptance.evidence.join(", ") || "none explicitly requested"}`,
+		`Required evidence: ${requiredAcceptanceEvidence(acceptance).join(", ") || "none explicitly requested"}`,
 	];
 	if (acceptance.verify.length > 0) {
 		lines.push("", "Runtime verification commands configured by parent:");
@@ -273,18 +308,10 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 	}
 	lines.push(
 		"",
+		"Use the exact criterion IDs shown above. Include every required evidence field with the same JSON type shown in the example.",
 		"Finish with a fenced JSON block tagged `acceptance-report` in this shape:",
 		"```acceptance-report",
-		JSON.stringify({
-			criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "specific proof" }],
-			changedFiles: [],
-			testsAddedOrUpdated: [],
-			commandsRun: [{ command: "command", result: "passed", summary: "short result" }],
-			validationOutput: [],
-			residualRisks: [],
-			noStagedFiles: true,
-			notes: "anything else the parent should know",
-		}, null, 2),
+		JSON.stringify(acceptanceReportExample(acceptance, "anything else the parent should know"), null, 2),
 		"```",
 	);
 	return lines.join("\n");

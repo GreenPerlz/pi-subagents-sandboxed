@@ -3,6 +3,7 @@ import type {
 	AcceptanceLedger,
 	ResolvedAcceptanceConfig,
 } from "../../shared/types.ts";
+import { acceptanceReportExample, requiredAcceptanceEvidence } from "./acceptance-contract.ts";
 import { acceptanceFailureMessage } from "./acceptance-evaluation.ts";
 import { stripAcceptanceReport } from "./acceptance-reports.ts";
 
@@ -40,7 +41,7 @@ export function formatAcceptanceFinalizationPrompt(input: {
 		"Criteria:",
 		...(input.acceptance.criteria.length ? input.acceptance.criteria.map((criterion) => `- ${criterion.id}: ${criterion.must}`) : ["- No explicit criteria were configured; satisfy the requested task and required evidence/checks."]),
 		"",
-		`Required evidence: ${input.acceptance.evidence.join(", ") || "none explicitly requested"}`,
+		`Required evidence: ${requiredAcceptanceEvidence(input.acceptance).join(", ") || "none explicitly requested"}`,
 	];
 	if (input.acceptance.verify.length > 0) {
 		lines.push("", "Runtime verification commands that must pass:", ...input.acceptance.verify.map((command) => `- ${command.id}: ${command.command}`));
@@ -64,18 +65,10 @@ export function formatAcceptanceFinalizationPrompt(input: {
 	}
 	lines.push(
 		"",
+		"Use the exact criterion IDs shown above. Include every required evidence field with the same JSON type shown in the example.",
 		"Now do the self-check. If work was missing and you repaired it, report the repaired final state. Finish with exactly one fenced JSON block tagged `acceptance-report`.",
 		"```acceptance-report",
-		JSON.stringify({
-			criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "specific proof from the final state" }],
-			changedFiles: [],
-			testsAddedOrUpdated: [],
-			commandsRun: [{ command: "command", result: "passed", summary: "short result" }],
-			validationOutput: [],
-			residualRisks: [],
-			noStagedFiles: true,
-			notes: "final self-review summary",
-		}, null, 2),
+		JSON.stringify(acceptanceReportExample(input.acceptance, "final self-review summary"), null, 2),
 		"```",
 	);
 	return lines.join("\n");

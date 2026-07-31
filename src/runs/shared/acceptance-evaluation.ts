@@ -12,6 +12,7 @@ import type {
 	ResolvedAcceptanceConfig,
 	ResolvedAcceptanceGate,
 } from "../../shared/types.ts";
+import { requiredAcceptanceEvidence } from "./acceptance-contract.ts";
 import { parseAcceptanceReport } from "./acceptance-reports.ts";
 
 const LEVEL_RANK: Record<AcceptanceProvenanceLevel, number> = {
@@ -64,7 +65,7 @@ function checkNoStagedFiles(cwd: string): AcceptanceRuntimeCheck {
 function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport, cwd: string): AcceptanceRuntimeCheck[] {
 	const checks: AcceptanceRuntimeCheck[] = [];
 	checks.push(...checkCriteriaSatisfied(acceptance.criteria, report));
-	for (const kind of acceptance.evidence) {
+	for (const kind of requiredAcceptanceEvidence(acceptance)) {
 		const present = reportEvidencePresent(report, kind);
 		checks.push({
 			id: `evidence:${kind}`,
@@ -72,7 +73,7 @@ function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: Accep
 			message: present ? `${kind} evidence present.` : `${kind} evidence missing from child report.`,
 		});
 	}
-	if (acceptance.evidence.includes("no-staged-files")) checks.push(checkNoStagedFiles(cwd));
+	if (requiredAcceptanceEvidence(acceptance).includes("no-staged-files")) checks.push(checkNoStagedFiles(cwd));
 	return checks;
 }
 

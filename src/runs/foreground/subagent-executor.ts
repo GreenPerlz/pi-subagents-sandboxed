@@ -1848,7 +1848,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			input.foregroundControl.currentIndex = index;
 			input.foregroundControl.currentActivityState = undefined;
 			input.foregroundControl.currentModel = input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
-			input.foregroundControl.currentThinking = input.agents.find((agent) => agent.name === task.agent)?.thinking;
+			input.foregroundControl.currentThinking = undefined;
 			input.foregroundControl.updatedAt = Date.now();
 			input.foregroundControl.sessionFile = input.sessionFileForIndex(index);
 			input.foregroundControl.interrupt = () => {
@@ -1901,7 +1901,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 						input.foregroundControl.currentIndex = index;
 						input.foregroundControl.currentActivityState = current?.activityState;
 						input.foregroundControl.currentModel = stepResults[0]?.model ?? input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
-						input.foregroundControl.currentThinking = stepResults[0]?.thinking ?? input.agents.find((agent) => agent.name === task.agent)?.thinking;
+						input.foregroundControl.currentThinking = stepResults[0]?.thinking;
 						input.foregroundControl.lastActivityAt = current?.lastActivityAt;
 						input.foregroundControl.currentTool = current?.currentTool;
 						input.foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
@@ -2459,7 +2459,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.currentIndex = 0;
 		foregroundControl.currentActivityState = undefined;
 		foregroundControl.currentModel = modelOverride ?? agentConfig.model;
-		foregroundControl.currentThinking = agentConfig.thinking;
+		foregroundControl.currentThinking = undefined;
 		foregroundControl.updatedAt = Date.now();
 		foregroundControl.sessionFile = sessionFileForIndex(0);
 		foregroundControl.interrupt = () => {
@@ -2479,7 +2479,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				foregroundControl.currentIndex = firstProgress?.index ?? 0;
 				foregroundControl.currentActivityState = firstProgress?.activityState;
 				foregroundControl.currentModel = update.details?.results?.[0]?.model ?? modelOverride ?? agentConfig.model;
-				foregroundControl.currentThinking = update.details?.results?.[0]?.thinking ?? agentConfig.thinking;
+				foregroundControl.currentThinking = update.details?.results?.[0]?.thinking;
 				foregroundControl.lastActivityAt = firstProgress?.lastActivityAt;
 				foregroundControl.currentTool = firstProgress?.currentTool;
 				foregroundControl.currentToolStartedAt = firstProgress?.currentToolStartedAt;
@@ -2536,7 +2536,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.interrupt = undefined;
 		foregroundControl.currentActivityState = r.progress?.activityState;
 		foregroundControl.currentModel = r.model ?? modelOverride ?? agentConfig.model;
-		foregroundControl.currentThinking = r.thinking ?? agentConfig.thinking;
+		foregroundControl.currentThinking = r.thinking;
 		foregroundControl.lastActivityAt = r.progress?.lastActivityAt;
 		foregroundControl.currentTool = r.progress?.currentTool;
 		foregroundControl.currentToolStartedAt = r.progress?.currentToolStartedAt;

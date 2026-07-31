@@ -159,21 +159,32 @@ describe("subagents settings overlay", () => {
 		assert.equal(lines[0]?.length, 160);
 	});
 
-	it("uses shared thinking choices including minimal and xhigh", () => {
-		assert.deepEqual(THINKING_CHOICES, [undefined, "off", "minimal", "low", "medium", "high", "xhigh"]);
+	it("uses shared thinking choices including minimal, xhigh, and max", () => {
+		assert.deepEqual(THINKING_CHOICES, [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 	});
 
-	it("getAgentThinkingChoices returns all levels when no model is set", () => {
+	it("getAgentThinkingChoices offers only unset when no model is configured", () => {
 		const a = agent({ model: undefined });
 		const choices = getAgentThinkingChoices(a, []);
-		assert.deepEqual(choices, [undefined, "off", "minimal", "low", "medium", "high", "xhigh"]);
+		assert.deepEqual(choices, [undefined]);
 	});
 
-	it("getAgentThinkingChoices returns all levels for model without thinkingLevelMap", () => {
+	it("getAgentThinkingChoices returns standard levels for model without thinkingLevelMap", () => {
 		const a = agent({ model: "openai/gpt-5-mini" });
 		const registry = [{ provider: "openai", id: "gpt-5-mini" }];
 		const choices = getAgentThinkingChoices(a, registry);
-		assert.deepEqual(choices, [undefined, "off", "minimal", "low", "medium", "high", "xhigh"]);
+		assert.deepEqual(choices, [undefined, "off", "minimal", "low", "medium", "high"]);
+	});
+
+
+	it("getAgentThinkingChoices uses the current provider for an ambiguous bare model id", () => {
+		const a = agent({ model: "gpt-shared" });
+		const registry = [
+			{ provider: "openai", id: "gpt-shared", reasoning: true },
+			{ provider: "github-copilot", id: "gpt-shared", reasoning: true, thinkingLevelMap: { xhigh: null, max: "max" } },
+		];
+		const choices = getAgentThinkingChoices(a, registry, "github-copilot");
+		assert.deepEqual(choices, [undefined, "off", "minimal", "low", "medium", "high", "max"]);
 	});
 
 	it("getAgentThinkingChoices filters to supported levels for restricted model", () => {
@@ -186,6 +197,18 @@ describe("subagents settings overlay", () => {
 		}];
 		const choices = getAgentThinkingChoices(a, registry);
 		assert.deepEqual(choices, [undefined, "off", "high", "xhigh"]);
+	});
+
+	it("getAgentThinkingChoices includes max only when model metadata explicitly supports it", () => {
+		const a = agent({ model: "deepseek/deepseek-v4-pro" });
+		const registry = [{
+			provider: "deepseek",
+			id: "deepseek-v4-pro",
+			reasoning: true,
+			thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" },
+		}];
+		const choices = getAgentThinkingChoices(a, registry);
+		assert.deepEqual(choices, [undefined, "off", "high", "max"]);
 	});
 
 	it("getAgentThinkingChoices returns only off for non-reasoning model", () => {
@@ -235,6 +258,19 @@ describe("subagents settings overlay", () => {
 		assert.equal(cycleFallbackThinking("deepseek/deepseek-v4-pro", "xhigh", registry), undefined);
 	});
 
+	it("fallback thinking choices include explicitly supported max", () => {
+		const registry = [{
+			provider: "deepseek",
+			id: "deepseek-v4-pro",
+			reasoning: true,
+			thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" },
+		}];
+
+		assert.deepEqual(getFallbackThinkingChoices("deepseek/deepseek-v4-pro", registry), [undefined, "off", "high", "max"]);
+		assert.equal(cycleFallbackThinking("deepseek/deepseek-v4-pro", "high", registry), "max");
+		assert.equal(cycleFallbackThinking("deepseek/deepseek-v4-pro", "max", registry), undefined);
+	});
+
 	it("serializes suffixed fallback thinking while preserving unsuffixed inherited fallbacks", () => {
 		const serialized = serializeAgent(agent({
 			fallbackModels: ["kimi-coding/kimi-for-coding", "openai-codex/gpt-5.4:high"],
@@ -259,10 +295,16 @@ describe("subagents settings overlay", () => {
 		{ provider: "kimi-coding", id: "kimi-for-coding", fullId: "kimi-coding/kimi-for-coding", reasoning: true },
 		{ provider: "openai-codex", id: "gpt-5.4", fullId: "openai-codex/gpt-5.4", reasoning: true },
 		{ provider: "openai", id: "gpt-4o", fullId: "openai/gpt-4o", reasoning: false },
+		{ provider: "openai", id: "gpt-max", fullId: "openai/gpt-max", reasoning: true, thinkingLevelMap: { xhigh: null, max: "max" } },
 		{ provider: "deepseek", id: "v4", fullId: "deepseek/v4", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" } },
 	];
 
-	async function withUserAgentFile(fallbackModels: string[], run: (agentPath: string) => Promise<void>): Promise<void> {
+	async function withUserAgentFile(
+		fallbackModels: string[],
+		run: (agentPath: string) => Promise<void>,
+		model = "openai/gpt-4o",
+		thinking?: string,
+	): Promise<void> {
 		const previousHome = process.env.HOME;
 		const previousUserProfile = process.env.USERPROFILE;
 		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-settings-overlay-"));
@@ -275,8 +317,8 @@ describe("subagents settings overlay", () => {
 			fs.writeFileSync(agentPath, `---
 name: worker
 description: Worker
-model: openai/gpt-4o
-fallbackModels: ${fallbackModels.join(", ")}
+model: ${model}
+fallbackModels: ${fallbackModels.join(", ")}${thinking ? `\nthinking: ${thinking}` : ""}
 ---
 
 Work
@@ -356,6 +398,19 @@ Work
 			const saved = fs.readFileSync(agentPath, "utf-8");
 			assert.match(saved, /^fallbackModels: kimi-coding\/kimi-for-coding:off$/m);
 		});
+	});
+
+	it("cycles to max and persists it for a model that supports it", async () => {
+		await withUserAgentFile([], async (agentPath) => {
+			const overlay = await openSettingsOverlay(path.dirname(agentPath));
+
+			overlay.handleInput("\x1B[B"); // fallbackModels row
+			overlay.handleInput("\x1B[B"); // thinking row
+			overlay.handleInput("t");
+
+			const saved = fs.readFileSync(agentPath, "utf-8");
+			assert.match(saved, /^thinking: max$/m);
+		}, "openai/gpt-max", "high");
 	});
 
 	it("opening and saving an existing unsuffixed fallback keeps it unsuffixed", async () => {

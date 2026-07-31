@@ -42,10 +42,14 @@ interface ShadowingAgentInfo {
 
 export const THINKING_CHOICES = [undefined, ...SUPPORTED_THINKING_LEVELS] as const;
 
-export function getAgentThinkingChoices(agent: AgentConfig, registryModels: Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>): (string | undefined)[] {
-	if (!agent.model) return [undefined, ...SUPPORTED_THINKING_LEVELS];
+export function getAgentThinkingChoices(
+	agent: AgentConfig,
+	registryModels: Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>,
+	preferredProvider?: string,
+): (string | undefined)[] {
+	if (!agent.model) return [undefined];
 	const modelInfos = registryModels.map((m) => toModelInfo(m));
-	const modelInfo = findModelInfo(agent.model, modelInfos);
+	const modelInfo = findModelInfo(agent.model, modelInfos, preferredProvider);
 	const levels = getSupportedThinkingLevels(modelInfo);
 	return [undefined, ...levels];
 }
@@ -336,7 +340,11 @@ class SubagentsSettingsOverlay {
 
 	private cycleThinking(row: Row): void {
 		const available = this.ctx.modelRegistry?.getAvailable?.() ?? [];
-		const choices = getAgentThinkingChoices(row.agent, available as Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>);
+		const choices = getAgentThinkingChoices(
+			row.agent,
+			available as Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: any }>,
+			this.ctx.model?.provider,
+		);
 		const index = choices.findIndex((level) => level === row.agent.thinking);
 		row.agent.thinking = choices[(index + 1 + choices.length) % choices.length];
 		this.save(row.agent);

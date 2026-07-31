@@ -821,7 +821,7 @@ async function runSingleStep(
 
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
-		ctx.onAttemptStart?.({ model: candidate, thinking: resolveEffectiveThinking(candidate, step.thinking) });
+		ctx.onAttemptStart?.({ model: candidate, thinking: resolveEffectiveThinking(candidate, candidate ? undefined : step.thinking) });
 		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 		if (effectiveStructuredOutput) {
 			try {
@@ -1002,7 +1002,6 @@ async function runSingleStep(
 					sessionEnabled: true,
 					sessionFile,
 					model: finalResult?.model ?? step.model,
-					thinking: step.thinking,
 					inheritProjectContext: step.inheritProjectContext,
 					inheritSkills: step.inheritSkills,
 					tools: step.tools,
@@ -1024,7 +1023,8 @@ async function runSingleStep(
 					parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
 					sandbox: closedSandboxRuntime,
 				});
-				ctx.onAttemptStart?.({ model: finalResult?.model ?? step.model, thinking: resolveEffectiveThinking(finalResult?.model ?? step.model, step.thinking) });
+				const finalizationModel = finalResult?.model ?? step.model;
+				ctx.onAttemptStart?.({ model: finalizationModel, thinking: resolveEffectiveThinking(finalizationModel, finalizationModel ? undefined : step.thinking) });
 				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;
 				const finalizationRun = await runPiStreaming(
 					args,
@@ -1116,7 +1116,7 @@ async function runSingleStep(
 		sessionFile: step.sessionFile,
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
-		thinking: resolveEffectiveThinking(finalResult?.model, step.thinking),
+		thinking: resolveEffectiveThinking(finalResult?.model, finalResult?.model ? undefined : step.thinking),
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 		modelAttempts,
 		artifactPaths,

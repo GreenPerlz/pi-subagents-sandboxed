@@ -68,6 +68,7 @@ interface RunSyncResult {
 	messages: unknown[];
 	error?: string;
 	model?: string;
+	thinking?: string;
 	skills?: string[];
 	skillsWarning?: string;
 	attemptedModels?: string[];
@@ -1026,6 +1027,42 @@ process.exit(${exitCode});
 		assert.equal(result.exitCode, 1);
 		assert.deepEqual(result.modelAttempts?.map((attempt) => attempt.success), [false, false]);
 		assert.match(result.error ?? "", /429 quota exceeded/);
+	});
+
+	it("keeps unsupported max thinking off the actual fallback child args", async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "primary quota hit" }],
+					model: "openai/gpt-5.6-sol",
+					errorMessage: "429 quota exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 0,
+		});
+		mockPi.onCall({ output: "fallback succeeded", model: "anthropic/claude-sonnet-4" });
+		const agents = [makeAgent("echo", {
+			model: "openai/gpt-5.6-sol",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+			thinking: "max",
+		})];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "max-thinking-unsupported-fallback",
+			availableModels: [
+				{ provider: "openai", id: "gpt-5.6-sol", fullId: "openai/gpt-5.6-sol", reasoning: true, thinkingLevelMap: { max: "max" } },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4", reasoning: true },
+			],
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(result.attemptedModels, ["openai/gpt-5.6-sol:max", "anthropic/claude-sonnet-4"]);
+		assert.equal(result.thinking, undefined);
+		const fallbackArgs = readCallArgs();
+		assert.deepEqual(fallbackArgs.slice(fallbackArgs.indexOf("--model"), fallbackArgs.indexOf("--model") + 2), ["--model", "anthropic/claude-sonnet-4"]);
 	});
 
 	it("baselines output files per fallback attempt", async () => {

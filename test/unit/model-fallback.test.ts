@@ -118,6 +118,17 @@ describe("model fallback helpers", () => {
 		);
 	});
 
+	it("applies max only to models that explicitly advertise it", () => {
+		const modelsWithMaxSupport = [
+			{ provider: "openai", id: "gpt-5.6-sol", fullId: "openai/gpt-5.6-sol", reasoning: true, thinkingLevelMap: { max: "max" } },
+			{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4", reasoning: true },
+		];
+		assert.deepEqual(
+			buildModelCandidates("gpt-5.6-sol", ["anthropic/claude-sonnet-4"], modelsWithMaxSupport, undefined, "max"),
+			["openai/gpt-5.6-sol:max", "anthropic/claude-sonnet-4"],
+		);
+	});
+
 	it("applies suffix to primary but not unsupported fallback", () => {
 		const mixedModels = [
 			{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini", reasoning: true },

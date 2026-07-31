@@ -20,17 +20,17 @@ describe("model info helpers", () => {
 		assert.equal(findModelInfo("openai/gpt-5-mini:high", ambiguousModels, "github-copilot")?.fullId, "openai/gpt-5-mini");
 	});
 
-	it("keeps the legacy full thinking list for reasoning models without per-level metadata", () => {
+	it("uses standard levels for reasoning models without per-level metadata", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({ provider: "openai", id: "gpt-5", fullId: "openai/gpt-5", reasoning: true }),
-			["off", "minimal", "low", "medium", "high", "xhigh"],
+			["off", "minimal", "low", "medium", "high"],
 		);
 	});
 
-	it("keeps the legacy full thinking list when older model metadata omits reasoning", () => {
+	it("uses standard levels when older model metadata omits reasoning", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({ provider: "openai", id: "gpt-5", fullId: "openai/gpt-5" }),
-			["off", "minimal", "low", "medium", "high", "xhigh"],
+			["off", "minimal", "low", "medium", "high"],
 		);
 	});
 
@@ -44,6 +44,19 @@ describe("model info helpers", () => {
 				thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" },
 			}),
 			["off", "high", "xhigh"],
+		);
+	});
+
+	it("includes max only when per-level metadata explicitly supports it", () => {
+		assert.deepEqual(
+			getSupportedThinkingLevels({
+				provider: "deepseek",
+				id: "deepseek-v4-pro",
+				fullId: "deepseek/deepseek-v4-pro",
+				reasoning: true,
+				thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" },
+			}),
+			["off", "high", "max"],
 		);
 	});
 
@@ -64,6 +77,7 @@ describe("model info helpers", () => {
 		const availableModels: ModelInfo[] = [
 			{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini", reasoning: true },
 			{ provider: "deepseek", id: "v4", fullId: "deepseek/v4", reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" } },
+			{ provider: "deepseek", id: "v4-max", fullId: "deepseek/v4-max", reasoning: true, thinkingLevelMap: { xhigh: null, max: "max" } },
 			{ provider: "openai", id: "gpt-4o", fullId: "openai/gpt-4o", reasoning: false },
 		];
 
@@ -95,8 +109,14 @@ describe("model info helpers", () => {
 			assert.equal(effectiveModelDisplay("deepseek/v4", "high", availableModels), "deepseek/v4:high");
 		});
 
+		it("appends max only for a model that explicitly supports it", () => {
+			assert.equal(effectiveModelDisplay("deepseek/v4-max", "max", availableModels), "deepseek/v4-max:max");
+			assert.equal(effectiveModelDisplay("openai/gpt-5-mini", "max", availableModels), "openai/gpt-5-mini");
+		});
+
 		it("preserves existing thinking suffix on model", () => {
 			assert.equal(effectiveModelDisplay("openai/gpt-5-mini:medium", "high", availableModels), "openai/gpt-5-mini:medium");
+			assert.equal(effectiveModelDisplay("deepseek/v4-max:max", "high", availableModels), "deepseek/v4-max:max");
 		});
 
 		it("returns bare model for non-reasoning model", () => {
@@ -116,6 +136,7 @@ describe("model info helpers", () => {
 		it("preserves config-derived thinking even when no model is known yet", () => {
 			assert.equal(resolveEffectiveThinking(undefined, "high"), "high");
 			assert.equal(resolveEffectiveThinking(undefined, "medium"), "medium");
+			assert.equal(resolveEffectiveThinking(undefined, "max"), "max");
 		});
 
 		it("ignores unrecognized config thinking even when no model is known", () => {

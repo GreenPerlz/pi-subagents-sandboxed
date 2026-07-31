@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- Added the `max` thinking level to subagent settings and clarify selectors for models whose registry metadata explicitly supports it.
 - Packaged builtin agents now request a closed Bubblewrap `host-toolchain` sandbox by default, with fail-closed fallback and explicit per-run opt-out via `sandbox: { provider: "none" }`.
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 

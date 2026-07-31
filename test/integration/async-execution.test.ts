@@ -1183,6 +1183,37 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("background status omits unsupported max thinking before the child starts", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "Done", delay: 1_000 });
+		const id = `async-unsupported-max-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", { model: "anthropic/claude-sonnet-4", thinking: "max" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4", reasoning: true }],
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const statusPath = path.join(asyncDir, "status.json");
+		const deadline = Date.now() + 5_000;
+		let status: AsyncStatusPayload | undefined;
+		while (Date.now() < deadline) {
+			if (fs.existsSync(statusPath)) {
+				status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (status.state === "running") break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.equal(status?.steps?.[0]?.model, "anthropic/claude-sonnet-4");
+		assert.equal(status?.steps?.[0]?.thinking, undefined);
+		await waitForAsyncResultFile(id);
+	});
+
 	it("background runs record fallback attempts and final model", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [{

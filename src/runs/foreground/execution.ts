@@ -179,7 +179,9 @@ async function runSingleAttempt(
 		originalTask?: string;
 	},
 ): Promise<SingleResult> {
-	const modelArg = applyThinkingSuffix(model, agent.thinking);
+	// Model candidates already carry a thinking suffix only when that specific
+	// model supports it. Keep the candidate authoritative across fallbacks.
+	const modelArg = model;
 	const childCwd = options.cwd ?? runtimeCwd;
 	const projectLocalPackageResources = options.sandbox?.packageDiscovery === "project-local"
 		? resolveProjectLocalPiPackageResources(childCwd)
@@ -201,7 +203,6 @@ async function runSingleAttempt(
 		sessionDir: options.sessionDir,
 		sessionFile: options.sessionFile,
 		model,
-		thinking: agent.thinking,
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
@@ -234,6 +235,7 @@ async function runSingleAttempt(
 		messages: [],
 		usage: emptyUsage(),
 		model: modelArg,
+		thinking: resolveEffectiveThinking(modelArg, undefined),
 		artifactPaths: shared.artifactPaths,
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
@@ -981,7 +983,7 @@ async function runAcceptanceFinalizationLoop(input: {
 			input.runtimeCwd,
 			input.agent,
 			prompt,
-			input.result.model,
+			applyThinkingSuffix(input.result.model, input.result.thinking),
 			finalizationOptions,
 			{
 				sessionEnabled: true,
@@ -1271,7 +1273,7 @@ export async function runSync(
 		}
 	}
 
-	result.thinking = resolveEffectiveThinking(result.model, agent.thinking);
+	result.thinking ??= resolveEffectiveThinking(result.model, undefined);
 
 	return result;
 }

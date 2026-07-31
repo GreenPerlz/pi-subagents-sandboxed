@@ -8,7 +8,7 @@ interface ClarifyTestModel {
 	id: string;
 	fullId: string;
 	reasoning?: boolean;
-	thinkingLevelMap?: Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>>;
+	thinkingLevelMap?: Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string | null>>;
 }
 
 interface ClarifyTestComponent {
@@ -17,7 +17,7 @@ interface ClarifyTestComponent {
 	modelSelectedIndex: number;
 	filteredModels: ClarifyTestModel[];
 	getEffectiveModel(stepIndex: number): string;
-	applyThinkingLevel(level: "high"): void;
+	applyThinkingLevel(level: "high" | "max"): void;
 	enterModelSelector(): void;
 	enterThinkingSelector(): void;
 	renderThinkingSelector(): string[];
@@ -112,11 +112,55 @@ describe("chain clarify model display", { skip: !available ? "pi packages not av
 
 		assert.match(rendered, /off - No extended thinking/);
 		assert.match(rendered, /high - Deep reasoning/);
-		assert.match(rendered, /xhigh - Maximum reasoning/);
+		assert.match(rendered, /xhigh - Very high reasoning/);
 		assert.doesNotMatch(rendered, /minimal - Brief reasoning/);
 		assert.doesNotMatch(rendered, /low - Light reasoning/);
 		assert.doesNotMatch(rendered, /medium - Moderate reasoning/);
 	});
+
+	it("shows max only when the selected model explicitly supports it", () => {
+		const component = new ChainClarifyComponent(
+			{ requestRender() {} },
+			{ fg(_key: string, text: string) { return text; } },
+			[{
+				name: "worker",
+				description: "",
+				systemPrompt: "",
+				systemPromptMode: "replace",
+				inheritProjectContext: false,
+				inheritSkills: false,
+				source: "user",
+				filePath: "worker.md",
+				model: "max-model",
+			}],
+			["Task"],
+			"Task",
+			undefined,
+			[{ output: false, outputMode: "inline", reads: false, progress: false, skills: [], model: "max-model" }],
+			[{
+				provider: "test",
+				id: "max-model",
+				fullId: "test/max-model",
+				reasoning: true,
+				thinkingLevelMap: { xhigh: null, max: "max" },
+			}],
+			"test",
+			[],
+			() => {},
+			"single",
+		);
+
+		component.selectedStep = 0;
+		component.enterThinkingSelector();
+		const rendered = component.renderThinkingSelector().join("\n");
+
+		assert.match(rendered, /max - Maximum reasoning/);
+		assert.doesNotMatch(rendered, /xhigh - Very high reasoning/);
+		component.editingStep = 0;
+		component.applyThinkingLevel("max");
+		assert.equal(component.getEffectiveModel(0), "test/max-model:max");
+	});
+
 
 	it("drops thinking when switching to a model that does not support it", () => {
 		const component = new ChainClarifyComponent(

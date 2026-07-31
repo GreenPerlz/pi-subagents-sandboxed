@@ -2742,6 +2742,89 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("journals streaming updates without repeated accumulated snapshots", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const repeatedSnapshot = "x".repeat(128 * 1024);
+		const partialMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: repeatedSnapshot } }],
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "mock/test-model",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+		mockPi.onCall({
+			jsonl: [
+				{
+					type: "message_update",
+					assistantMessageEvent: {
+						type: "toolcall_delta",
+						contentIndex: 0,
+						delta: "x",
+						partial: partialMessage,
+					},
+					message: partialMessage,
+				},
+				{
+					type: "tool_execution_update",
+					toolCallId: "call-1",
+					toolName: "bash",
+					args: { command: repeatedSnapshot },
+					partialResult: { content: [{ type: "text", text: repeatedSnapshot }], details: {} },
+				},
+				events.assistantMessage("Done"),
+			],
+		});
+
+		const id = `async-compact-events-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Journal compact child events",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		await waitForAsyncResultFile(id);
+		const journal = fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf-8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const messageUpdate = journal.find((event) => event.type === "message_update") as {
+			assistantMessageEvent?: Record<string, unknown>;
+		} | undefined;
+		assert.ok(messageUpdate?.assistantMessageEvent);
+		assert.equal(messageUpdate.assistantMessageEvent.delta, "x");
+		assert.equal("partial" in messageUpdate.assistantMessageEvent, false);
+		assert.equal("message" in messageUpdate, false);
+
+		const toolUpdate = journal.find((event) => event.type === "tool_execution_update");
+		assert.equal(toolUpdate?.toolCallId, "call-1");
+		assert.equal(toolUpdate?.toolName, "bash");
+		assert.equal(toolUpdate && "args" in toolUpdate, false);
+		assert.equal(toolUpdate && "partialResult" in toolUpdate, false);
+		assert.ok(fs.statSync(path.join(asyncDir, "events.jsonl")).size < repeatedSnapshot.length);
+	});
+
 	it("background runs stream child events and live output while active", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			steps: [

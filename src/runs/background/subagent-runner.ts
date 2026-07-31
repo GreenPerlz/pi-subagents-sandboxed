@@ -361,8 +361,26 @@ function runPiStreaming(
 
 		const appendChildEvent = (event: Record<string, unknown>) => {
 			if (!childEventContext) return;
+			let journalEvent = event;
+			if (event.type === "message_update") {
+				// Pi emits the entire accumulated message in both `message` and `partial`
+				// with every token delta. Deltas plus message_end retain the event history.
+				const { message: _message, ...compactMessageUpdate } = event;
+				const assistantEvent = event.assistantMessageEvent;
+				if (assistantEvent && typeof assistantEvent === "object" && !Array.isArray(assistantEvent)) {
+					const { partial: _partial, ...compactAssistantEvent } = assistantEvent as Record<string, unknown>;
+					journalEvent = { ...compactMessageUpdate, assistantMessageEvent: compactAssistantEvent };
+				} else {
+					journalEvent = compactMessageUpdate;
+				}
+			} else if (event.type === "tool_execution_update") {
+				// Tool updates repeat fixed args and accumulated output snapshots. The start/end
+				// events carry those payloads; keep only update identity in the journal.
+				const { args: _args, partialResult: _partialResult, ...compactToolUpdate } = event;
+				journalEvent = compactToolUpdate;
+			}
 			appendJsonl(childEventContext.eventsPath, JSON.stringify({
-				...event,
+				...journalEvent,
 				subagentSource: "child",
 				subagentRunId: childEventContext.runId,
 				subagentStepIndex: childEventContext.stepIndex,

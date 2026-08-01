@@ -24,6 +24,10 @@ interface SubagentParamsSchema {
 			minimum?: number;
 			description?: string;
 		};
+		worktree?: {
+			type?: string;
+			description?: string;
+		};
 		id?: {
 			type?: string;
 			description?: string;
@@ -138,6 +142,13 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.ok(concurrencySchema, "concurrency schema should exist");
 		assert.equal(concurrencySchema.minimum, 1);
 		assert.match(String(concurrencySchema.description ?? ""), /parallel/i);
+	});
+
+	it("describes guarded shared worktree execution", () => {
+		const worktreeSchema = SubagentParams?.properties?.worktree;
+		assert.ok(worktreeSchema, "worktree schema should exist");
+		assert.equal(worktreeSchema.type, "boolean");
+		assert.match(String(worktreeSchema.description ?? ""), /every affected agent must permit/i);
 	});
 
 	it("accepts per-run sandbox configuration", () => {

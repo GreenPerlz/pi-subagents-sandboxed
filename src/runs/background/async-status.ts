@@ -42,6 +42,8 @@ export interface AsyncRunSummary {
 	asyncDir: string;
 	sessionId?: string;
 	state: "queued" | "running" | "complete" | "failed" | "paused";
+	error?: string;
+	worktreeExecutionError?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -183,6 +185,8 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		asyncDir,
 		...(status.sessionId ? { sessionId: status.sessionId } : {}),
 		state: status.state,
+		...(status.error ? { error: status.error } : {}),
+		...(status.worktreeExecutionError ? { worktreeExecutionError: status.worktreeExecutionError } : {}),
 		activityState,
 		lastActivityAt,
 		currentTool: status.currentTool,
@@ -362,6 +366,7 @@ export function formatAsyncRunList(runs: AsyncRunSummary[], heading = "Active as
 	const lines = [`${heading}: ${runs.length}`, ""];
 	for (const run of runs) {
 		lines.push(`- ${formatRunHeader(run)}`);
+		if (run.error) lines.push(`  Error: ${run.error}`);
 		for (const step of run.steps) {
 			lines.push(`  ${formatStepLine(step)}`);
 			lines.push(...formatNestedRunStatusLines(step.children, { indent: "    ", maxLines: 12 }));

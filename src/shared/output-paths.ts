@@ -40,14 +40,20 @@ export function shouldPersistSavedOutput(params: {
 	outputMode?: "inline" | "file-only";
 	tools?: string[];
 }): boolean {
-	return params.output !== false && params.output !== "false";
+	if (params.output === false || params.output === "false") return false;
+
+	// Inline runs without an explicit output target stay inline. A file-only
+	// request is itself an intentional persistence request and receives the
+	// generated tmp path when no target was supplied.
+	return params.outputMode === "file-only"
+		|| (typeof params.output === "string" && params.output.length > 0);
 }
 
 export function resolveSavedOutputDir(runtimeCwd: string, requestedCwd?: string): string {
 	const baseCwd = resolveBaseCwd(runtimeCwd, requestedCwd);
 	const repoRoot = resolveGitTopLevel(baseCwd);
-	// Only preserved markdown reports go in repo-local tmp/. Session logs, async status,
-	// and runner output logs continue to live in the existing runtime temp/session dirs.
+	// Only explicitly requested preserved markdown reports go in repo-local tmp/.
+	// Session logs, async status, and runner output logs continue to live in the existing runtime temp/session dirs.
 	return path.join(repoRoot ?? baseCwd, "tmp");
 }
 

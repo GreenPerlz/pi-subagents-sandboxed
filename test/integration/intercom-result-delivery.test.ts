@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR } from "../../src/shared/types.ts";
 import type { MockPi } from "../support/helpers.ts";
@@ -21,7 +22,7 @@ interface ExecutorResult {
 	details?: {
 		mode?: string;
 		runId?: string;
-		results?: Array<{ agent?: string; finalOutput?: string }>;
+		results?: Array<{ agent?: string; exitCode?: number; finalOutput?: string }>;
 		asyncId?: string;
 	};
 }
@@ -122,6 +123,20 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		}
 		assert.ok(callFile, `expected mock pi call at index ${index}`);
 		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+	}
+
+	function initGitRepo(repoDir: string): void {
+		fs.mkdirSync(repoDir, { recursive: true });
+		const runGit = (args: string[]) => {
+			const result = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+		};
+		runGit(["init", "-q"]);
+		runGit(["config", "user.email", "test@example.com"]);
+		runGit(["config", "user.name", "Test"]);
+		fs.writeFileSync(path.join(repoDir, "README.txt"), "base\n", "utf-8");
+		runGit(["add", "README.txt"]);
+		runGit(["commit", "-qm", "base"]);
 	}
 
 	function makeExecutor(options: { bridgeMode?: "always" | "off"; agents?: ReturnType<typeof makeAgent>[]; acknowledgeResults?: boolean } = {}) {
@@ -246,6 +261,154 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		assert.match(String(payload.message ?? ""), /2\. b — completed/);
 		assert.match(result.content[0]?.text ?? "", /Delivered parallel subagent results via intercom\./);
 		assert.equal(result.details?.results?.every((entry) => entry.finalOutput === undefined), true);
+	});
+
+	it("captures a foreground worktree patch before intercom receipt and leaves it integratable after cleanup", async () => {
+		const repoDir = path.join(tempDir, "repo");
+		initGitRepo(repoDir);
+		mockPi.onCall({
+			output: "Worktree child output",
+			writeFiles: [{ path: "captured.txt", content: "captured by worker\n" }],
+		});
+		const { executor, events } = makeExecutor();
+		const ctx = makeMinimalCtx(repoDir);
+		ctx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
+
+		const result = await executor.execute(
+			"parallel-worktree-intercom",
+			{ tasks: [{ agent: "worker", task: "Write the captured file" }], worktree: true },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		const intercomPayload = events.emitted.find((entry) => entry.channel === "subagent:result-intercom")?.payload as { message?: string } | undefined;
+		const worktreeList = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+		assert.equal(worktreeList.status, 0);
+		assert.equal((worktreeList.stdout.match(/^worktree /gm) ?? []).length, 1, "temporary child worktree should be cleaned up");
+		const patchDir = path.join(tempDir, "subagent-artifacts", "worktree-diffs");
+		const patchFiles = fs.existsSync(patchDir) ? fs.readdirSync(patchDir).filter((file) => file.endsWith(".patch")) : [];
+		assert.equal(patchFiles.length, 1, "expected one captured patch after worktree cleanup");
+		const patchPath = path.join(patchDir, patchFiles[0]!);
+		assert.match(fs.readFileSync(patchPath, "utf-8"), /captured\.txt/);
+		assert.match(result.content[0]?.text ?? "", /Full patches:/);
+		assert.match(intercomPayload?.message ?? "", /Full patches:/);
+
+		const apply = spawnSync("git", ["-C", repoDir, "apply", "--check", patchPath], { encoding: "utf-8" });
+		assert.equal(apply.status, 0, `captured patch should apply cleanly: ${apply.stderr}`);
+		const applied = spawnSync("git", ["-C", repoDir, "apply", patchPath], { encoding: "utf-8" });
+		assert.equal(applied.status, 0, `captured patch should remain integratable: ${applied.stderr}`);
+		assert.equal(fs.readFileSync(path.join(repoDir, "captured.txt"), "utf-8"), "captured by worker\n");
+	});
+
+	it("captures a failed top-level worktree patch before intercom receipt and leaves it integratable after cleanup", async () => {
+		const repoDir = path.join(tempDir, "failed-parallel-repo");
+		initGitRepo(repoDir);
+		mockPi.onCall({
+			output: "Worker failed after writing",
+			exitCode: 1,
+			stderr: "worker failed",
+			writeFiles: [{ path: "captured-failure.txt", content: "captured before failure\n" }],
+		});
+		const { executor, events } = makeExecutor();
+		const result = await executor.execute(
+			"failed-parallel-worktree-intercom",
+			{ tasks: [{ agent: "worker", task: "Write then fail" }], worktree: true },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(repoDir),
+		);
+
+		const intercomPayload = events.emitted.find((entry) => entry.channel === "subagent:result-intercom")?.payload as { message?: string } | undefined;
+		assert.equal(result.details?.results?.[0]?.exitCode, 1);
+		assert.match(result.content[0]?.text ?? "", /Full patches:/);
+		assert.match(intercomPayload?.message ?? "", /Full patches:/);
+		const patchDir = /Full patches: (.+)/.exec(result.content[0]?.text ?? "")?.[1];
+		assert.ok(patchDir, "failed result should include the captured patch directory");
+		const patchPath = path.join(patchDir, "task-0-worker.patch");
+		assert.match(fs.readFileSync(patchPath, "utf-8"), /captured-failure\.txt/);
+		const apply = spawnSync("git", ["-C", repoDir, "apply", "--check", patchPath], { encoding: "utf-8" });
+		assert.equal(apply.status, 0, `failed child patch should apply cleanly: ${apply.stderr}`);
+		const worktreeList = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+		assert.equal((worktreeList.stdout.match(/^worktree /gm) ?? []).length, 1, "temporary child worktree should be cleaned after capture");
+	});
+
+	it("captures a failed chain worktree patch before intercom receipt and leaves it integratable after cleanup", async () => {
+		const repoDir = path.join(tempDir, "failed-chain-repo");
+		initGitRepo(repoDir);
+		mockPi.onCall({
+			output: "Chain worker failed after writing",
+			exitCode: 1,
+			stderr: "chain worker failed",
+			writeFiles: [{ path: "captured-chain-failure.txt", content: "captured before chain failure\n" }],
+		});
+		const { executor, events } = makeExecutor();
+		const ctx = makeMinimalCtx(repoDir);
+		ctx.sessionManager.getSessionFile = () => path.join(tempDir, "failed-chain-parent.jsonl");
+
+		const result = await executor.execute(
+			"failed-chain-worktree-intercom",
+			{
+				chain: [{ parallel: [{ agent: "worker", task: "Write then fail in chain" }], worktree: true }],
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		assert.equal(result.isError, true);
+		const intercomPayload = events.emitted.find((entry) => entry.channel === "subagent:result-intercom")?.payload as { message?: string } | undefined;
+		assert.equal(result.details?.results?.[0]?.exitCode, 1);
+		assert.match(result.content[0]?.text ?? "", /Full patches:/);
+		assert.match(intercomPayload?.message ?? "", /Full patches:/);
+		const patchDir = /Full patches: (.+)/.exec(result.content[0]?.text ?? "")?.[1];
+		assert.ok(patchDir, "failed chain result should include the captured patch directory");
+		const patchPath = path.join(patchDir, "task-0-worker.patch");
+		assert.match(fs.readFileSync(patchPath, "utf-8"), /captured-chain-failure\.txt/);
+		const apply = spawnSync("git", ["-C", repoDir, "apply", "--check", patchPath], { encoding: "utf-8" });
+		assert.equal(apply.status, 0, `failed chain patch should apply cleanly: ${apply.stderr}`);
+		const worktreeList = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+		assert.equal((worktreeList.stdout.match(/^worktree /gm) ?? []).length, 1, "temporary chain worktree should be cleaned after capture");
+	});
+
+	it("captures a chain worktree patch before intercom receipt and leaves it integratable after cleanup", async () => {
+		const repoDir = path.join(tempDir, "chain-repo");
+		initGitRepo(repoDir);
+		mockPi.onCall({
+			output: "Chain worktree child output",
+			writeFiles: [{ path: "captured-chain.txt", content: "captured by chain worker\n" }],
+		});
+		const { executor, events } = makeExecutor();
+		const ctx = makeMinimalCtx(repoDir);
+		ctx.sessionManager.getSessionFile = () => path.join(tempDir, "chain-parent.jsonl");
+
+		const result = await executor.execute(
+			"chain-worktree-intercom",
+			{
+				chain: [{ parallel: [{ agent: "worker", task: "Write the captured chain file" }], worktree: true }],
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		const intercomPayload = events.emitted.find((entry) => entry.channel === "subagent:result-intercom")?.payload as { message?: string } | undefined;
+		const worktreeList = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+		assert.equal(worktreeList.status, 0);
+		assert.equal((worktreeList.stdout.match(/^worktree /gm) ?? []).length, 1, "temporary chain worktree should be cleaned up");
+		const resultText = result.content[0]?.text ?? "";
+		assert.match(resultText, /Full patches:/);
+		assert.match(intercomPayload?.message ?? "", /Full patches:/);
+		const patchDir = /Full patches: (.+)/.exec(resultText)?.[1];
+		assert.ok(patchDir, "chain result should include the captured patch directory");
+		const patchPath = path.join(patchDir, "task-0-worker.patch");
+		assert.match(fs.readFileSync(patchPath, "utf-8"), /captured-chain\.txt/);
+
+		const apply = spawnSync("git", ["-C", repoDir, "apply", "--check", patchPath], { encoding: "utf-8" });
+		assert.equal(apply.status, 0, `captured chain patch should apply cleanly: ${apply.stderr}`);
+		const applied = spawnSync("git", ["-C", repoDir, "apply", patchPath], { encoding: "utf-8" });
+		assert.equal(applied.status, 0, `captured chain patch should remain integratable: ${applied.stderr}`);
+		assert.equal(fs.readFileSync(path.join(repoDir, "captured-chain.txt"), "utf-8"), "captured by chain worker\n");
 	});
 
 	it("chain runs emit one grouped event containing all executed children", async () => {

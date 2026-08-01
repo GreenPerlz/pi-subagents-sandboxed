@@ -219,6 +219,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				`Updated: ${updated}`,
 				`Dir: ${asyncDir}`,
 				outputPath ? `Output: ${outputPath}` : undefined,
+				status.error ? `Error: ${status.error}` : undefined,
 				reconciliation.message ? `Diagnosis: ${reconciliation.message}` : undefined,
 				reconciliation.resultPath && fs.existsSync(reconciliation.resultPath) ? `Result: ${reconciliation.resultPath}` : undefined,
 			].filter((line): line is string => Boolean(line));
@@ -257,13 +258,20 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 	if (resultPath) {
 		try {
 			const raw = fs.readFileSync(resultPath, "utf-8");
-			const data = JSON.parse(raw) as { id?: string; runId?: string; agent?: string; success?: boolean; summary?: string; exitCode?: number; state?: string; sessionFile?: string; results?: Array<{ agent?: string; sessionFile?: string }> };
-			const status = data.success ? "complete" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
+			const data = JSON.parse(raw) as { id?: string; runId?: string; agent?: string; success?: boolean; summary?: string; worktreeExecutionError?: string; exitCode?: number; state?: string; sessionFile?: string; results?: Array<{ agent?: string; sessionFile?: string }> };
+			const status = data.worktreeExecutionError
+				? "failed"
+				: data.state === "paused"
+					? "paused"
+					: data.state === "failed" || data.success === false
+						? "failed"
+						: data.success || data.exitCode === 0 ? "complete" : "failed";
 			const runId = data.runId ?? data.id ?? resolvedId;
 			const lines = [`Run: ${runId}`, `State: ${status}`, `Result: ${resultPath}`];
 			const children = Array.isArray(data.results) ? data.results : data.agent ? [{ agent: data.agent, sessionFile: data.sessionFile }] : [];
 			lines.push(formatResumeGuidance(runId, children, data.sessionFile));
 			if (data.summary) lines.push("", data.summary);
+			if (data.worktreeExecutionError && !data.summary?.includes(data.worktreeExecutionError)) lines.push("", `Execution error: ${data.worktreeExecutionError}`);
 			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [] } };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

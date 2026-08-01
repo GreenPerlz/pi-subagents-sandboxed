@@ -10,6 +10,7 @@
 
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
@@ -91,6 +92,7 @@ interface ChainResultItem {
 	attemptedModels?: string[];
 	skills?: string[];
 	acceptance?: { status?: string; verifyRuns?: Array<{ status?: string }>; childReport?: unknown; runtimeChecks?: Array<{ status?: string; id?: string }> };
+	savedOutputPath?: string;
 }
 
 interface ChainExecutionResult {
@@ -269,6 +271,19 @@ process.exit(child.status ?? 0);
 		assert.equal(result.details.results.length, 2);
 		assert.equal(result.details.results[0].agent, "analyst");
 		assert.equal(result.details.results[1].agent, "reporter");
+	});
+
+	it("keeps omitted chain output inline without a repo-local report", async () => {
+		mockPi.onCall({ output: "inline chain output" });
+		const agents = [makeAgent("analyst")];
+		const result = await executeChain(
+			makeChainParams([{ agent: "analyst", task: "Analyze" }], agents, { chainDir: tempDir }),
+		);
+
+		assert.ok(!result.isError, `chain should succeed: ${JSON.stringify(result.content)}`);
+		assert.equal(result.details.results[0]?.finalOutput, "inline chain output");
+		assert.equal(result.details.results[0]?.savedOutputPath, undefined);
+		assert.equal(fs.existsSync(path.join(tempDir, "tmp")), false);
 	});
 
 	it("passes file-only saved-output references through {previous}", async () => {
@@ -1274,6 +1289,53 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 
 		assert.ok(!result.isError, `should succeed: ${JSON.stringify(result.content)}`);
 		assert.equal(result.details.results.length, 2);
+	});
+
+	it("preserves chain worktrees after a post-child artifact rejection", async () => {
+		const repoDir = path.join(tempDir, "rejected-chain-repo");
+		fs.mkdirSync(repoDir, { recursive: true });
+		for (const args of [["init"], ["config", "user.email", "tests@example.com"], ["config", "user.name", "Chain Tests"]]) {
+			const result = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(result.status, 0, result.stderr);
+		}
+		fs.writeFileSync(path.join(repoDir, "tracked.txt"), "initial\n", "utf-8");
+		for (const args of [["add", "-A"], ["commit", "-m", "initial"]]) {
+			const result = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(result.status, 0, result.stderr);
+		}
+		const runId = "chain-artifact-rejection";
+		const artifactsDir = path.join(repoDir, "artifacts");
+		fs.mkdirSync(path.join(artifactsDir, `${runId}_worker_0_output.md`), { recursive: true });
+		mockPi.onCall({
+			output: "Chain worker edited before artifact failure",
+			writeFiles: [{ path: "chain-rejected.txt", content: "recover chain edit\n" }],
+		});
+		let preservedWorktree: string | undefined;
+		try {
+			const result = await executeChain!(makeChainParams(
+				[{ parallel: [{ agent: "worker", task: "Write then fail artifact persistence" }], worktree: true }],
+				[makeAgent("worker")],
+				{
+					runId,
+					ctx: makeMinimalCtx(repoDir),
+					artifactsDir,
+					artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: false, includeMetadata: false },
+				},
+			));
+			const text = result.content[0]?.text ?? "";
+			assert.equal(result.isError, true);
+			assert.match(text, /failed unexpectedly/i);
+			assert.match(text, /Full patches:/);
+			assert.match(text, /Recoverable worktree path/i);
+			const listing = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+			preservedWorktree = [...listing.stdout.matchAll(/^worktree (.+)$/gm)]
+				.map((match) => match[1])
+				.find((candidate) => candidate && path.resolve(candidate) !== path.resolve(repoDir));
+			assert.ok(preservedWorktree, "post-child rejection must preserve the edited worktree");
+			assert.equal(fs.readFileSync(path.join(preservedWorktree!, "chain-rejected.txt"), "utf-8"), "recover chain edit\n");
+		} finally {
+			if (preservedWorktree) spawnSync("git", ["-C", repoDir, "worktree", "remove", "--force", preservedWorktree], { encoding: "utf-8" });
+		}
 	});
 
 	it("aggregates parallel outputs for next sequential step", async () => {

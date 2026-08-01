@@ -6,8 +6,21 @@ import { afterEach, describe, it } from "node:test";
 import { serializeAgent } from "../../src/agents/agent-serializer.ts";
 import { parseChain, serializeChain } from "../../src/agents/chain-serializer.ts";
 import { discoverAgents, discoverAgentsAll, type AgentConfig } from "../../src/agents/agents.ts";
+import { parseFrontmatter } from "../../src/agents/frontmatter.ts";
+import { collectAgentOverridePaths, validateAgentOverridePolicy } from "../../src/runs/shared/agent-override-policy.ts";
 
 const tempDirs: string[] = [];
+
+function readDocumentedAgentFrontmatter(relativePath: string, name: string): Record<string, string> {
+	const content = fs.readFileSync(path.join(process.cwd(), relativePath), "utf-8");
+	for (const match of content.matchAll(/```yaml\s*\n([\s\S]*?)```/g)) {
+		const frontmatterBlock = match[1]?.match(/^(---\s*\n[\s\S]*?\n---)(?:\s*\n|$)/)?.[1];
+		if (!frontmatterBlock) continue;
+		const frontmatter = parseFrontmatter(frontmatterBlock).frontmatter;
+		if (frontmatter.name === name) return frontmatter;
+	}
+	assert.fail(`missing documented custom-agent frontmatter for ${name} in ${relativePath}`);
+}
 
 afterEach(() => {
 	while (tempDirs.length > 0) {
@@ -18,6 +31,26 @@ afterEach(() => {
 });
 
 describe("agent frontmatter acceptance and override policy", () => {
+	it("keeps documented custom agents discoverable and parallel designers read-only", () => {
+		const examples = [
+			["skills/improve-codebase-architecture/INTERFACE-DESIGN.md", "ralph-designer"],
+			["skills/improve-codebase-architecture/SKILL.md", "scout"],
+			["skills/pi-subagents/sandboxing.md", "sandbox-work"],
+			["skills/pi-subagents/SKILL.md", "sandbox-work"],
+			["README.md", "sandbox-work"],
+			["README.md", "auditor"],
+		] as const;
+		for (const [relativePath, name] of examples) {
+			const frontmatter = readDocumentedAgentFrontmatter(relativePath, name);
+			assert.ok(frontmatter.description?.trim(), `${name} needs a meaningful description`);
+		}
+		const ralph = readDocumentedAgentFrontmatter("skills/improve-codebase-architecture/INTERFACE-DESIGN.md", "ralph-designer");
+		const tools = (ralph.tools ?? "").split(",").map((tool) => tool.trim()).filter(Boolean).sort();
+		assert.deepEqual(tools, ["bash", "find", "grep", "ls", "read"]);
+		assert.equal(tools.includes("edit"), false);
+		assert.equal(tools.includes("write"), false);
+	});
+
 	it("serializes typed acceptance defaults and allowed override paths", () => {
 		const agent: AgentConfig = {
 			name: "work",
@@ -30,12 +63,12 @@ describe("agent frontmatter acceptance and override policy", () => {
 			filePath: "/tmp/work.md",
 			acceptanceSelfReview: true,
 			acceptanceMaxFinalizationTurns: 7,
-			canBeChangedByAgent: ["acceptance.*", "sandbox.provider"],
+			canBeChangedByAgent: ["worktree", "acceptance.*", "sandbox.provider"],
 		};
 		const serialized = serializeAgent(agent);
 		assert.match(serialized, /acceptanceSelfReview: true/);
 		assert.match(serialized, /acceptanceMaxFinalizationTurns: 7/);
-		assert.match(serialized, /canBeChangedByAgent: acceptance\.\*, sandbox\.provider/);
+		assert.match(serialized, /canBeChangedByAgent: worktree, acceptance\.\*, sandbox\.provider/);
 	});
 
 	it("defaults acceptance self-review on, turn budget to three, and paths to deny-all", () => {
@@ -52,6 +85,9 @@ Work
 		const worker = discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker");
 		assert.equal(worker?.acceptanceSelfReview, true);
 		assert.equal(worker?.acceptanceMaxFinalizationTurns, 3);
+		assert.equal(worker?.output, undefined);
+		assert.equal(worker?.defaultReads, undefined);
+		assert.equal(worker?.defaultProgress, false);
 		assert.deepEqual(worker?.canBeChangedByAgent, []);
 	});
 
@@ -120,8 +156,14 @@ Do work
 
 		assert.deepEqual(agents.map((agent) => agent.name).sort(), ["explore", "orchestrator", "research", "review", "work"]);
 		const work = agents.find((candidate) => candidate.name === "work");
+		const orchestrator = agents.find((candidate) => candidate.name === "orchestrator");
 		assert.equal(work?.defaultContext, "fresh", "work should default to fresh context");
+		assert.ok(orchestrator?.canBeChangedByAgent?.includes("worktree"), "orchestrator should allow a parent-owned worktree");
+		assert.equal(orchestrator?.defaultReads, undefined);
+		assert.equal(orchestrator?.defaultProgress, false);
 		for (const agent of agents) {
+			assert.equal(agent.defaultProgress, false, `${agent.name} should not opt into progress by default`);
+			assert.equal(agent.output, undefined, `${agent.name} should not create an implicit output report`);
 			assert.equal(agent.acceptanceSelfReview, true, `${agent.name} should enable same-session self-review`);
 			assert.equal(agent.acceptanceMaxFinalizationTurns, 3, `${agent.name} should default to three self-review turns`);
 			assert.ok(agent.canBeChangedByAgent?.includes("acceptance.criteria"), `${agent.name} should allow parent acceptance criteria`);
@@ -144,6 +186,76 @@ Do work
 				packageDiscovery: "closed",
 			}, `${agent.name} should default to a closed bubblewrap sandbox`);
 		}
+	});
+
+	it("accepts the complete packaged parent-owned orchestrator launch without per-run overrides", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-packaged-orchestrator-launch-"));
+		tempDirs.push(dir);
+		const agents = discoverAgentsAll(dir).builtin;
+		const topLevelLaunch = {
+			tasks: [{
+				agent: "orchestrator",
+				task: "Own one issue in the assigned worktree; relay inline findings and review the current diff.",
+			}],
+			worktree: true,
+			async: true,
+		};
+
+		assert.deepEqual(Object.keys(topLevelLaunch).sort(), ["async", "tasks", "worktree"]);
+		assert.deepEqual(validateAgentOverridePolicy(topLevelLaunch, agents), []);
+		assert.deepEqual([...collectAgentOverridePaths(topLevelLaunch).get("orchestrator")!], ["worktree"]);
+		const orchestrator = agents.find((agent) => agent.name === "orchestrator");
+		assert.ok(orchestrator);
+		assert.equal(orchestrator.canBeChangedByAgent?.some((path) => path.startsWith("sandbox")), false, "orchestrator should rely on its sandbox frontmatter default");
+
+		for (const nestedLaunch of [
+			{ agent: "explore", task: "Explore the issue and return findings inline.", async: false },
+			{ agent: "work", task: "Implement the issue in this cwd without committing or staging.", async: false },
+			{ agent: "review", task: "Inspect the actual current diff in fresh context.", async: false },
+		]) {
+			assert.deepEqual(Object.keys(nestedLaunch).sort(), ["agent", "async", "task"]);
+			assert.deepEqual(validateAgentOverridePolicy(nestedLaunch, agents), []);
+			const nestedAgent = agents.find((agent) => agent.name === nestedLaunch.agent);
+			assert.equal(nestedAgent?.defaultContext, "fresh", `${nestedLaunch.agent} should use fresh context by default`);
+			assert.equal(nestedAgent?.output, undefined, `${nestedLaunch.agent} should not save output by default`);
+			assert.equal(nestedAgent?.defaultReads, undefined, `${nestedLaunch.agent} should not read a default report`);
+			assert.equal(nestedAgent?.defaultProgress, false, `${nestedLaunch.agent} should not create progress by default`);
+			assert.equal(nestedAgent?.sandbox?.provider, "bubblewrap", `${nestedLaunch.agent} should resolve its own sandbox default`);
+		}
+	});
+
+	it("requires an explicit worktree opt-in for custom parallel writers", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-custom-parallel-writer-"));
+		tempDirs.push(dir);
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "parallel-work.md"), `---
+name: parallel-work
+description: Independent worktree writer
+tools: read, grep, find, ls, bash, edit, write
+canBeChangedByAgent: worktree
+---
+Implement the assigned task without committing.
+`, "utf-8");
+
+		const custom = discoverAgents(dir, "project").agents.find((agent) => agent.name === "parallel-work");
+		assert.ok(custom, "custom parallel writer should be discovered");
+		assert.deepEqual(validateAgentOverridePolicy({
+			tasks: [{ agent: "parallel-work", task: "Implement independently" }],
+			worktree: true,
+		}, [custom]), []);
+
+		const packagedWork = discoverAgentsAll(dir).builtin.find((agent) => agent.name === "work");
+		assert.ok(packagedWork);
+		assert.equal(packagedWork.canBeChangedByAgent?.includes("worktree"), false, "packaged work should remain opt-in for worktree overrides");
+		assert.deepEqual(validateAgentOverridePolicy({
+			tasks: [{ agent: "work", task: "Implement independently" }],
+			worktree: true,
+		}, [packagedWork]), [{
+			agent: "work",
+			paths: ["worktree"],
+			allowed: packagedWork.canBeChangedByAgent ?? [],
+		}]);
 	});
 });
 

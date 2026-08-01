@@ -8,8 +8,10 @@ import {
 	cleanupWorktrees,
 	createWorktrees,
 	diffWorktrees,
+	WorktreeDiffCaptureError,
 	findWorktreeTaskCwdConflict,
 	formatWorktreeDiffSummary,
+	formatRecoverableWorktreePaths,
 	resolveExpectedWorktreeAgentCwd,
 	type WorktreeSetup,
 } from "../../src/runs/shared/worktree.ts";
@@ -123,6 +125,45 @@ describe("worktree", () => {
 		}
 	});
 
+	it("preserves capture cause identity and metadata", () => {
+		const cause = Object.assign(new Error("git failed"), { code: "E_CAPTURE", detail: "retain me" });
+		const error = new WorktreeDiffCaptureError({
+			diffDir: "/tmp/worktree-diffs",
+			recoverableWorktreePaths: ["/tmp/recoverable-worktree"],
+		}, cause);
+
+		assert.equal(error.cause, cause);
+		assert.equal((error.cause as { code?: string }).code, "E_CAPTURE");
+		assert.equal((error.cause as { detail?: string }).detail, "retain me");
+		assert.equal((error.cause as Error).stack, cause.stack);
+	});
+
+	it("formats preserved worktree paths for unexpected execution rejection recovery", () => {
+		const setup = { worktrees: [{ path: "/tmp/worktree-a" }, { path: "/tmp/worktree-b" }] } as WorktreeSetup;
+		assert.equal(
+			formatRecoverableWorktreePaths(setup),
+			"Recoverable worktree paths: /tmp/worktree-a, /tmp/worktree-b.",
+		);
+		assert.equal(formatRecoverableWorktreePaths(undefined), "");
+	});
+
+	it("preserves worktrees when execution rejects after a child edit", async () => {
+		const repoDir = createRepo("pi-worktree-rejected-execution-");
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = createWorktrees(repoDir, "rejected-execution", 1);
+			const worktreePath = setup.worktrees[0]!.path;
+			fs.writeFileSync(path.join(worktreePath, "rejected.txt"), "recover me\n", "utf-8");
+			await assert.rejects(Promise.reject(new Error("child callback rejected after edit")), /child callback rejected/);
+			cleanupWorktrees(setup, { preserve: true });
+			assert.equal(fs.readFileSync(path.join(worktreePath, "rejected.txt"), "utf-8"), "recover me\n");
+			assert.match(git(repoDir, ["branch", "--list", setup.worktrees[0]!.branch]), new RegExp(setup.worktrees[0]!.branch));
+		} finally {
+			if (setup) cleanupWorktrees(setup);
+			cleanupRepo(repoDir);
+		}
+	});
+
 	it("findWorktreeTaskCwdConflict allows omitted or matching task cwd values", () => {
 		const sharedCwd = path.join("/tmp", "repo");
 		assert.equal(
@@ -197,6 +238,56 @@ describe("worktree", () => {
 			const summary = formatWorktreeDiffSummary(diffs);
 			assert.match(summary, /=== Worktree Changes ===/);
 			assert.match(summary, /Full patches:/);
+		} finally {
+			if (setup) cleanupWorktrees(setup);
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("throws capture errors and preserves worktrees for recovery", () => {
+		const repoDir = createRepo("pi-worktree-capture-failure-");
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = createWorktrees(repoDir, "capture-failure", 1, { agents: ["agent-a"] });
+			const worktree = setup.worktrees[0]!;
+			const workerFile = path.join(worktree.path, "worker-change.txt");
+			fs.writeFileSync(workerFile, "recover me\n", "utf-8");
+			const conflictingDiffDir = path.join(repoDir, "diffs-file");
+			fs.writeFileSync(conflictingDiffDir, "not a directory\n", "utf-8");
+
+			assert.throws(
+				() => diffWorktrees(setup!, ["agent-a"], conflictingDiffDir),
+				(error: unknown) => {
+					assert.ok(error instanceof WorktreeDiffCaptureError);
+					assert.equal(error.taskIndex, undefined);
+					assert.equal(error.diffDir, conflictingDiffDir);
+					assert.deepEqual(error.recoverableWorktreePaths, [worktree.path]);
+					assert.match(error.message, /Recoverable worktree path/i);
+					return true;
+				},
+			);
+			assert.equal(fs.existsSync(worktree.path), true, "capture failure must preserve the worktree path");
+			assert.match(git(repoDir, ["branch", "--list", worktree.branch]), new RegExp(worktree.branch));
+			cleanupWorktrees(setup, { preserve: true });
+			assert.equal(fs.existsSync(worktree.path), true, "preserve cleanup must not remove the recoverable worktree");
+
+			fs.rmSync(conflictingDiffDir, { force: true });
+			const taskFailureDir = path.join(repoDir, "task-failure-diffs");
+			fs.mkdirSync(path.join(taskFailureDir, "task-0-agent-a.patch"), { recursive: true });
+			assert.throws(
+				() => diffWorktrees(setup!, ["agent-a"], taskFailureDir),
+				(error: unknown) => {
+					assert.ok(error instanceof WorktreeDiffCaptureError);
+					assert.equal(error.taskIndex, 0);
+					assert.equal(error.taskAgent, "agent-a");
+					assert.equal(error.worktreePath, worktree.path);
+					return true;
+				},
+			);
+			fs.rmSync(taskFailureDir, { recursive: true, force: true });
+			const diffs = diffWorktrees(setup, ["agent-a"], path.join(repoDir, "recovered-diffs"));
+			assert.equal(diffs.length, 1);
+			assert.match(fs.readFileSync(diffs[0]!.patchPath, "utf-8"), /worker-change\.txt/);
 		} finally {
 			if (setup) cleanupWorktrees(setup);
 			cleanupRepo(repoDir);

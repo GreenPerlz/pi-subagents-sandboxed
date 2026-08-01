@@ -10,12 +10,15 @@ interface MockPiResponse {
 	delay?: number;
 	keepAliveAfterFinalMessageMs?: number;
 	jsonl?: unknown[];
+	writeFiles?: Array<{ path: string; content: string }>;
 	steps?: Array<{
 		delay?: number;
 		jsonl?: unknown[];
 		stderr?: string;
 	}>;
 	echoEnv?: string[];
+	blockArtifactOutput?: boolean;
+	blockRunnerEventsAfterChild?: boolean;
 }
 
 export interface MockPi {

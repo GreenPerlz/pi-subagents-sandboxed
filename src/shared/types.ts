@@ -175,6 +175,8 @@ export interface SubagentResultIntercomChild {
 export interface SubagentResultIntercomPayload {
 	to: string;
 	message: string;
+	/** Top-level async execution failure; child statuses must not override this. */
+	worktreeExecutionError?: string;
 	requestId?: string;
 	runId: string;
 	mode: SubagentRunMode;
@@ -601,6 +603,9 @@ export interface AsyncStatus {
 	sessionId?: string;
 	mode: SubagentRunMode;
 	state: "queued" | "running" | "complete" | "failed" | "paused";
+	error?: string;
+	/** Unexpected async worktree execution/lifecycle failures that must override child success. */
+	worktreeExecutionError?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;

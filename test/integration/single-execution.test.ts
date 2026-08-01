@@ -699,6 +699,10 @@ process.exit(${exitCode});
 				name: "async",
 				params: { agent: "two", task: "Review", model: "provider/model", async: true },
 			},
+			{
+				name: "worktree",
+				params: { tasks: [{ agent: "two", task: "Review" }], worktree: true },
+			},
 		] as const;
 
 		for (const testCase of cases) {
@@ -710,7 +714,7 @@ process.exit(${exitCode});
 				makeMinimalCtx(tempDir),
 			);
 			assert.equal(result.isError, true, testCase.name);
-			assert.match(result.content[0]?.text ?? "", /denied model/, testCase.name);
+			assert.match(result.content[0]?.text ?? "", new RegExp(`denied ${testCase.name === "worktree" ? "worktree" : "model"}`), testCase.name);
 		}
 		assert.equal(mockPi.callCount(), 0);
 	});
@@ -2169,18 +2173,18 @@ process.exit(${exitCode});
 		assert.match(saved, /review findings/);
 	});
 
-	it("auto-saves inline output to repo-local tmp without changing inline display output", async () => {
+	it("keeps omitted inline output in memory without a repo-local report", async () => {
 		mockPi.onCall({ output: "inline review output" });
 		const agents = makeAgentConfigs(["echo"]);
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {
-			runId: "inline-auto-save",
+			runId: "inline-no-save",
 		});
 
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.finalOutput, "inline review output");
-		assert.match(result.savedOutputPath ?? "", /\/tmp\//);
-		assert.equal(fs.readFileSync(result.savedOutputPath!, "utf-8").includes("inline review output"), true);
+		assert.equal(result.savedOutputPath, undefined);
+		assert.equal(fs.existsSync(path.join(tempDir, "tmp")), false);
 	});
 
 	it("executor keeps the working output file and also writes a per-run saved-output artifact for relative outputs", async () => {

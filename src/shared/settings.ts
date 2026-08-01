@@ -230,7 +230,7 @@ export function resolveStepBehavior(
 	stepOverrides: StepOverrides,
 	chainSkills?: string[],
 ): ResolvedStepBehavior {
-	// Output: step override > frontmatter > implicit auto-save only (no explicit output file)
+	// Output: step override > frontmatter; omitted output remains inline-only.
 	const stepOutput = normalizeOutputOverride(stepOverrides.output);
 	const output =
 		stepOutput !== undefined
@@ -322,8 +322,8 @@ export function buildChainInstructions(
 		prefixParts.push(`[Read from: ${files.join(", ")}]`);
 	}
 
-	// OUTPUT - parent/runtime persistence is automatic; child tasks do not need
-	// file-write instructions for report saving.
+	// OUTPUT - explicit output paths are preserved by the runtime; omitted output
+	// remains inline-only and needs no report-file instruction.
 
 	// Progress instructions in suffix (less critical)
 	if (behavior.progress) {
@@ -374,7 +374,7 @@ export function resolveParallelBehaviors(
 		// Build subdirectory path for this parallel task
 		const subdir = path.join(`parallel-${stepIndex}`, `${taskIndex}-${task.agent}`);
 
-		// Output: task override > agent default (namespaced) > implicit auto-save only
+		// Output: task override > agent default; omitted output remains inline-only.
 		// Absolute paths pass through unchanged; relative paths get namespaced under subdir
 		let output: string | false | undefined;
 		const taskOutput = normalizeOutputOverride(task.output);

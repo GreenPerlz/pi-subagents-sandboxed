@@ -306,6 +306,7 @@ describe("result watcher", () => {
 			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
 			const firstSession = path.join(resultsDir, "a-session.jsonl");
 			const missingSession = path.join(resultsDir, "b-session.jsonl");
+			const captureErrorNotice = "Failed to capture async worktree changes; recover from the preserved worktree. Full patches: /tmp/async-worktree-diffs";
 			try {
 				fs.writeFileSync(firstSession, "", "utf-8");
 				fs.writeFileSync(path.join(resultsDir, "async-1.json"), JSON.stringify({
@@ -316,8 +317,10 @@ describe("result watcher", () => {
 					success: true,
 					state: "complete",
 					summary: "Combined summary",
+					worktreeSummary: "=== Worktree Changes ===\n\nFull patches: /tmp/async-worktree-diffs",
+					worktreeCaptureError: captureErrorNotice,
 					results: [
-						{ agent: "a", output: "Result from a", success: true, sessionFile: firstSession, artifactPaths: { outputPath: "/tmp/a-output.md" }, intercomTarget: "subagent-a-run-123-1" },
+						{ agent: "a", output: `Result from a\n\n${captureErrorNotice}`, success: true, sessionFile: firstSession, artifactPaths: { outputPath: "/tmp/a-output.md" }, intercomTarget: "subagent-a-run-123-1" },
 						{ agent: "b", output: "Result from b", success: false, sessionFile: missingSession, artifactPaths: { outputPath: "/tmp/b-output.md" }, intercomTarget: "subagent-b-run-123-2" },
 					],
 					sessionId: "session-1",
@@ -338,9 +341,86 @@ describe("result watcher", () => {
 			assert.equal(eventData.status, "failed");
 			const message = String(eventData.message ?? "");
 			assert.match(message, /Revive child: subagent\(\{ action: "resume", id: "async-1", index: 0, message: "\.\.\." \}\)/);
+			assert.match(message, /Full patches: \/tmp\/async-worktree-diffs/);
+			assert.equal(message.split(captureErrorNotice).length - 1, 1, "capture errors should not be duplicated by the watcher");
 			assert.ok(message.includes(`Session: ${firstSession}`));
 			assert.equal(message.includes(missingSession), false);
 			assert.equal(emitted.some((entry) => entry.event === "subagent:async-complete"), true);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not report a top-level async execution rejection as successful when children succeeded", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-execution-error-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const listeners = new Map<string, Set<(payload: unknown) => void>>();
+			const pi = {
+				events: {
+					on(event: string, handler: (payload: unknown) => void) {
+						const eventListeners = listeners.get(event) ?? new Set();
+						eventListeners.add(handler);
+						listeners.set(event, eventListeners);
+						return () => eventListeners.delete(handler);
+					},
+					emit(event: string, data: unknown) {
+						emitted.push({ event, data });
+						for (const handler of listeners.get(event) ?? []) handler(data);
+						if (event === "subagent:result-intercom") {
+							const requestId = data && typeof data === "object" ? (data as { requestId?: unknown }).requestId : undefined;
+							if (typeof requestId === "string") setImmediate(() => pi.events.emit("subagent:result-intercom-delivery", { requestId, delivered: true }));
+						}
+					},
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			const executionError = "Parallel lifecycle failed unexpectedly: artifact aggregation rejected; Recoverable worktree path: /tmp/pi-worktree-run-0.";
+			const resultPath = path.join(resultsDir, "async-execution-error.json");
+			try {
+				fs.writeFileSync(resultPath, JSON.stringify({
+					id: "async-execution-error",
+					runId: "run-execution-error",
+					agent: "parallel:a+b",
+					mode: "parallel",
+					success: false,
+					state: "failed",
+					summary: "Child results were collected before the lifecycle rejection.",
+					worktreeExecutionError: executionError,
+					results: [
+						{ agent: "a", output: "Successful child a", success: true },
+						{ agent: "b", output: "Successful child b", success: true },
+					],
+					sessionId: "session-1",
+					asyncDir: "/tmp/run-execution-error",
+					intercomTarget: "subagent-chat-main",
+				}), "utf-8");
+				watcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			} finally {
+				watcher.stopResultWatcher();
+			}
+
+			const intercomPayload = emitted.find((entry) => entry.event === "subagent:result-intercom")?.data as {
+				status?: string;
+				worktreeExecutionError?: string;
+				message?: string;
+				children?: Array<{ status?: string }>;
+			} | undefined;
+			assert.equal(intercomPayload?.status, "failed");
+			assert.equal(intercomPayload?.worktreeExecutionError, executionError);
+			assert.equal(intercomPayload?.children?.[0]?.status, "failed");
+			assert.match(intercomPayload?.message ?? "", /Execution error:/);
+			assert.match(intercomPayload?.message ?? "", /Recoverable worktree path: \/tmp\/pi-worktree-run-0/);
+			const completion = emitted.find((entry) => entry.event === "subagent:async-complete")?.data as {
+				state?: string;
+				results?: Array<{ status?: string }>;
+			} | undefined;
+			assert.equal(completion?.state, "failed");
+			assert.equal(completion?.results?.[0]?.status, "failed");
+			assert.equal(fs.existsSync(resultPath), false);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}

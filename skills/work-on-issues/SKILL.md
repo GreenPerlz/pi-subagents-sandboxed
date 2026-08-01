@@ -7,7 +7,7 @@ description: "Run a general issue-work loop with Pi subagents: gather issues fro
 
 This skill runs a general issue execution loop with Pi subagents.
 
-It is intentionally more general than a repo-specific Ralph loop: use it when the parent should collect issues from whatever source is available—GitHub, GitLab, Jira, Linear, local files, or a user-provided spec—decide what can run in parallel, launch one orchestrator per issue, help stuck children, and integrate successful results afterward.
+The default issue slice is parent-assigned and runtime-managed: one orchestrator gets one isolated worktree for the issue lifetime, returns explorer findings inline, embeds relevant findings in one same-cwd worker task, forbids worker commits, then gives an abstract handoff to a fresh reviewer that inspects the actual current `git diff`. Before the runtime removes that temporary worktree, it captures the worker patch/diff evidence for integration. It is intentionally more general than a repo-specific Ralph loop: use it when the parent should collect issues from whatever source is available—GitHub, GitLab, Jira, Linear, local files, or a user-provided spec—decide what can run in parallel, launch one orchestrator per issue, help stuck children, and integrate successful results afterward.
 
 ## Required companion skills
 
@@ -66,23 +66,27 @@ If a source is weakly structured, create the best faithful normalized summary yo
 
 ## Core model
 
-- **Parent session**: gathers issues, orders them, decides which ones are parallel-safe, launches one per-issue `orchestrator` child in an isolated worktree, answers blocker questions, checks status when children look stuck, integrates successful work serially, and decides what to do next.
-- **`orchestrator` child**: owns exactly one issue in exactly one worktree. It may use nested `explore`, `work`, and `review` subagents for that issue only.
-- **Nested `work`**: the only writer inside the orchestrator worktree.
-- **Nested `review` agents**: read-only validation, critique, and investigation.
+- **Parent session**: gathers issues, orders them, assigns one issue per orchestrator, owns integration, answers blocker questions, checks status when children look stuck, and applies captured patches serially after runtime cleanup.
+- **`orchestrator` child**: owns exactly one issue in exactly one parent-assigned runtime worktree for the duration of its run. It relays inline `explore` findings to one same-cwd `work` child, then passes an abstract handoff to a fresh same-cwd `review` child; runtime captures the resulting diff before removing the worktree.
+- **Nested `work`**: the only writer inside the orchestrator worktree; it edits directly and must not commit or stage.
+- **Nested `review` agents**: read-only validation, critique, and investigation of the actual current diff before patch capture.
+- **Runtime patch evidence**: captured patch files and diff summaries are integration artifacts, not repo-local Markdown context handoffs.
 
 The parent owns the queue and integration. Children own only their assigned issue.
 
 ## Hard rules
 
 - Assign each issue to exactly one orchestrator.
-- Parallel issue implementation must use `worktree: true`.
+- Each default issue launch uses one orchestrator task with `worktree: true`; every affected agent must permit the guarded shared worktree request.
 - Never run two write-capable issue agents in the same checkout.
-- If the repo is dirty and `worktree: true` would be unsafe, stop and ask the user.
+- Keep nested explore/work/review children foreground with `async: false` in the orchestrator's inherited cwd; do not create nested worktrees. The runtime also suppresses an ambient `asyncByDefault` for omitted-`async` orchestrator loop calls.
+- A dirty repo is acceptable only when it is the explicitly assigned isolated worktree and its existing diff belongs to this issue; do not overwrite unrelated parent work.
+- The assigned worktree is temporary runtime state: do not assume its cwd or uncommitted diff remains available after orchestration completes; use the runtime-captured patch/diff returned by the run.
 - If the user supplied explicit issues, do not pull unrelated backlog items.
 - Respect dependencies: if issue A blocks issue B, do not run B before A.
 - Be conservative about conflict risk: when in doubt, run fewer issues in parallel.
 - Give every orchestrator the full normalized issue context: identifier, source, title, body, comments/notes, acceptance criteria, validation, non-goals, blockers, and integration policy.
+- Do not request `output`, `outputMode: "file-only"`, `progress`, or `reads` for the default loop. Child results stay inline and no repo-local context/plan/progress/report Markdown is created unless explicitly requested.
 - Use sandboxed subagents by default. Do not silently fall back to unsandboxed children.
 - Do not merge incomplete or red work.
 - Integrate successful issue work serially unless the user explicitly asked for PR-only, patch-only, or worktree-only output.
@@ -120,18 +124,7 @@ If intercom/contact-supervisor is unavailable, warn the user that children canno
 
 ## Sandbox default
 
-Use repo-specific docs if they define a subagent policy. Otherwise use:
-
-```typescript
-const issueSandbox = {
-  provider: "bubblewrap",
-  profile: "host-toolchain",
-  network: "host",
-  auth: "pi-json",
-  fallback: "fail",
-  packageDiscovery: "closed"
-};
-```
+Use repo-specific docs if they define a subagent policy. Packaged agents declare the closed Bubblewrap `host-toolchain` defaults in their frontmatter, so the default issue launch omits `sandbox` and relies on those agent-owned defaults. Add a per-run sandbox override only for an explicitly permitted custom agent; do not weaken the packaged default by adding a redundant override.
 
 ## Issue sources
 
@@ -227,42 +220,33 @@ Each handoff should include:
 
 The handoff must clearly state:
 
-- you own exactly one issue;
-- stay in the assigned worktree;
-- use nested subagents only for this issue;
+- you own exactly one issue and one parent-assigned runtime worktree for this run;
+- stay in that worktree and keep nested children in its inherited cwd;
+- launch nested explore/work/review with `async: false` so each result is available for the next handoff;
+- return explorer findings inline, embed relevant findings in the worker task, and do not create report handoff files by default;
+- the worker edits the same cwd but must not commit or stage;
+- pass only an abstract worker handoff to a fresh reviewer, which must inspect actual current `git diff` before runtime patch capture;
+- report the captured patch/diff path or summary for later integration, without treating it as a Markdown context handoff;
 - ask the supervisor only for real blockers or missing decisions;
 - return a concise final summary.
 
-### 2. Launch orchestrators in parallel worktrees
+### 2. Launch one orchestrator in one parent-owned worktree
 
-Use one `orchestrator` task per issue:
+For the default issue loop, use one orchestrator task and one runtime-created, parent-assigned worktree. Keep the result inline; do not create a repo-local report handoff. The orchestrator's nested children inherit the worktree and share its current diff. Completion captures the reviewed patch/diff before the runtime removes the temporary worktree.
 
 ```typescript
 subagent({
-  tasks: [
-    {
-      agent: "orchestrator",
-      label: "Issue <id>",
-      task: "Orchestrate exactly this issue in this isolated worktree.\n\nPrimary context:\n- Source: ...\n- Title: ...\n- Acceptance criteria: ...\n- Validation: ...\n- Non-goals: ...\n- Blockers: ...\n- Parent policy: commit green work, ask on blockers, return concise final summary.",
-      output: "tmp/issues/issue-<id>.md",
-      outputMode: "file-only",
-      progress: true,
-      acceptance: {
-        criteria: ["This issue is completed or a blocker is reported with evidence"],
-        evidence: ["changed files", "validation", "review verdict", "commit or blocker summary"],
-        maxFinalizationTurns: 2
-      }
-    }
-  ],
-  concurrency: 3,
+  tasks: [{
+    agent: "orchestrator",
+    label: "Issue <id>",
+    task: "Orchestrate exactly this issue in this isolated worktree. Return explorer findings inline and embed relevant findings in same-cwd work. Work must edit without committing or staging. Pass only an abstract work handoff to a fresh reviewer, which must inspect actual current git diff.\n\nPrimary context:\n- Source: ...\n- Title: ...\n- Acceptance criteria: ...\n- Validation: ...\n- Non-goals: ...\n- Blockers: ...\n- Parent policy: preserve the reviewed worktree diff and report blockers inline."
+  }],
   worktree: true,
-  context: "fresh",
-  async: true,
-  sandbox: issueSandbox
+  async: true
 })
 ```
 
-Do not edit the parent checkout while issue orchestrators are running.
+Run a second issue only after the first worktree is reviewed/integrated, unless the user explicitly requests multiple independent worktrees and accepts their integration policy. Do not edit the parent checkout while an isolated orchestrator is running.
 
 ## Supervision, check-ins, and stuck children
 
@@ -284,22 +268,17 @@ Classify each issue result as:
 - **partial** — useful progress exists, but not enough to integrate/close confidently;
 - **failed** — the child did not produce usable work.
 
-Read saved file-only outputs as needed before integrating.
+Use the inline result and the runtime-captured worktree patch/diff evidence as the integration handoff. The temporary runtime worktree may already be gone when the result arrives, so do not try to recover a current cwd diff after cleanup. Only inspect an output file when the user explicitly requested `output`/`outputMode: "file-only"`; captured `.patch` files are runtime integration artifacts, not repo-local Markdown context.
 
 ## Integrate serially
 
 Unless the user asked for PR-only, patch-only, or worktree-only output:
 
-1. Integrate completed issues one at a time.
-2. Cherry-pick/merge/apply the orchestrator result into the main checkout.
-3. Resolve only mechanical conflicts yourself; escalate risky conflicts.
-4. Re-run focused validation after each integration, especially after multiple issue branches land.
-5. Update the upstream source of truth when requested or appropriate:
-   - tracker comment;
-   - tracker close/status update;
-   - local issue file note;
-   - progress log.
-6. Mark the issue done only after successful integration and only when all acceptance criteria are satisfied.
+1. Integrate completed issues one at a time from the reviewed patch captured by runtime (and its diff summary); the worker must not create a commit as a handoff.
+2. Preserve/apply that captured patch through the parent-owned integration workflow after runtime cleanup, then resolve only mechanical conflicts; escalate risky conflicts.
+3. Re-run focused validation after each integration, especially after multiple issue passes.
+4. Update the upstream source of truth when requested or appropriate (tracker comment, tracker status, or local issue source). Do not create a progress/report Markdown handoff by default.
+5. Mark the issue done only after successful integration and only when all acceptance criteria are satisfied.
 
 If integrating one completed issue invalidates another worktree's result, reclassify the second issue as needing a rebase/fix pass instead of pretending both are done.
 
@@ -333,5 +312,5 @@ When discovery mode is exhausted, you may report `COMPLETE`.
 ## Recommended prompt
 
 ```text
-/skill:work-on-issues Work through the issues for this repo. If I named specific issues, only do those. Otherwise discover the real issue source—GitHub, GitLab, Jira, Linear, local files, or repo docs—sort dependencies, batch what can safely run in parallel, launch one orchestrator per issue in worktrees, answer blocker questions, integrate successful work serially, and continue until everything eligible is done or blocked.
+/skill:work-on-issues Work through the issues for this repo. If I named specific issues, only do those. Otherwise discover the real issue source—GitHub, GitLab, Jira, Linear, local files, or repo docs—sort dependencies, launch one parent-owned isolated-worktree orchestrator per ready issue (serialize by default), keep explore/work/review handoffs inline, answer blocker questions, integrate reviewed diffs serially, and continue until everything eligible is done or blocked.
 ```

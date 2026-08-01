@@ -9,6 +9,56 @@ export interface WorktreeSetup {
 	baseCommit: string;
 }
 
+export interface WorktreeDiffCaptureErrorContext {
+	taskIndex?: number;
+	taskAgent?: string;
+	diffDir: string;
+	patchPath?: string;
+	worktreePath?: string;
+	recoverableWorktreePaths: string[];
+}
+
+export class WorktreeDiffCaptureError extends Error {
+	readonly cause!: unknown;
+	readonly taskIndex?: number;
+	readonly taskAgent?: string;
+	readonly diffDir: string;
+	readonly patchPath?: string;
+	readonly worktreePath?: string;
+	readonly recoverableWorktreePaths: string[];
+
+	constructor(context: WorktreeDiffCaptureErrorContext, cause: unknown) {
+		const causeMessage = cause instanceof Error ? cause.message : String(cause);
+		const task = context.taskAgent
+			? `task ${context.taskIndex === undefined ? "?" : context.taskIndex + 1} (${context.taskAgent})`
+			: "worktree diff capture";
+		const worktreePaths = context.recoverableWorktreePaths.length > 0
+			? context.recoverableWorktreePaths.join(", ")
+			: "none recorded";
+		super(
+			`Failed to capture ${task}: ${causeMessage}. `
+			+ `Diff directory: ${context.diffDir}. `
+			+ `Recoverable worktree path${context.recoverableWorktreePaths.length === 1 ? "" : "s"}: ${worktreePaths}. `
+			+ "The worktree was preserved; recover changes there or retry capture before cleanup.",
+		);
+		// ErrorOptions.cause is newer than this project's runtime/type target. Define
+		// the standard non-enumerable property directly so the original error (and
+		// its type, stack, and metadata) remains available on every supported target.
+		Object.defineProperty(this, "cause", {
+			value: cause,
+			configurable: true,
+			writable: true,
+		});
+		this.name = "WorktreeDiffCaptureError";
+		this.taskIndex = context.taskIndex;
+		this.taskAgent = context.taskAgent;
+		this.diffDir = context.diffDir;
+		this.patchPath = context.patchPath;
+		this.worktreePath = context.worktreePath;
+		this.recoverableWorktreePaths = [...context.recoverableWorktreePaths];
+	}
+}
+
 interface WorktreeInfo {
 	path: string;
 	agentCwd: string;
@@ -16,6 +66,13 @@ interface WorktreeInfo {
 	index: number;
 	nodeModulesLinked: boolean;
 	syntheticPaths: string[];
+}
+
+/** Format paths that remain actionable when an unexpected lifecycle rejection prevents trusted cleanup. */
+export function formatRecoverableWorktreePaths(setup: WorktreeSetup | undefined): string {
+	if (!setup || setup.worktrees.length === 0) return "";
+	const paths = setup.worktrees.map((worktree) => worktree.path);
+	return `Recoverable worktree path${paths.length === 1 ? "" : "s"}: ${paths.join(", ")}.`;
 }
 
 interface WorktreeDiff {
@@ -468,14 +525,6 @@ function captureWorktreeDiff(
 	};
 }
 
-function writeEmptyPatch(patchPath: string): void {
-	try {
-		fs.writeFileSync(patchPath, "", "utf-8");
-	} catch {
-		// Diff artifact writing is best-effort in error paths.
-	}
-}
-
 function cleanupSingleWorktree(repoCwd: string, worktree: WorktreeInfo): void {
 	try { runGitChecked(repoCwd, ["worktree", "remove", "--force", worktree.path]); } catch {
 		// Cleanup is best-effort to avoid masking caller errors.
@@ -523,11 +572,14 @@ export function createWorktrees(cwd: string, runId: string, count: number, optio
 }
 
 export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: string): WorktreeDiff[] {
+	const recoverableWorktreePaths = setup.worktrees.map((worktree) => worktree.path);
 	try {
 		fs.mkdirSync(diffsDir, { recursive: true });
-	} catch {
-		// Returning no diffs is safer than failing the whole command on artifact-dir issues.
-		return [];
+	} catch (error) {
+		throw new WorktreeDiffCaptureError({
+			diffDir: diffsDir,
+			recoverableWorktreePaths,
+		}, error);
 	}
 
 	const diffs: WorktreeDiff[] = [];
@@ -537,17 +589,28 @@ export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: 
 		const patchPath = path.join(diffsDir, `task-${index}-${safePatchAgentName(agent)}.patch`);
 		try {
 			diffs.push(captureWorktreeDiff(setup, worktree, agent, patchPath));
-		} catch {
-			// Preserve execution flow; failed diff capture maps to an empty per-task patch.
-			writeEmptyPatch(patchPath);
-			diffs.push(emptyDiff(index, agent, worktree.branch, patchPath));
+		} catch (error) {
+			throw new WorktreeDiffCaptureError({
+				taskIndex: index,
+				taskAgent: agent,
+				diffDir: diffsDir,
+				patchPath,
+				worktreePath: worktree.path,
+				recoverableWorktreePaths,
+			}, error);
 		}
 	}
 
 	return diffs;
 }
 
-export function cleanupWorktrees(setup: WorktreeSetup): void {
+export interface CleanupWorktreesOptions {
+	/** Keep all temporary worktrees and branches so their changes can be recovered. */
+	preserve?: boolean;
+}
+
+export function cleanupWorktrees(setup: WorktreeSetup, options?: CleanupWorktreesOptions): void {
+	if (options?.preserve) return;
 	for (let index = setup.worktrees.length - 1; index >= 0; index--) {
 		cleanupSingleWorktree(setup.cwd, setup.worktrees[index]!);
 	}

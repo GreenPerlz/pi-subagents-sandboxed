@@ -37,6 +37,7 @@ interface AsyncResultFile {
 	mode?: string;
 	state?: string;
 	success?: boolean;
+	worktreeExecutionError?: string;
 	cwd?: string;
 	sessionFile?: string;
 	results?: Array<{ agent?: string; success?: boolean; sessionFile?: string; intercomTarget?: string }>;
@@ -84,6 +85,7 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 	}
 	const success = data.success;
 	if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': success must be a boolean.`);
+	const worktreeExecutionError = validateOptionalString(data, "worktreeExecutionError", resultPath);
 	return {
 		id: validateOptionalString(data, "id", resultPath),
 		runId: validateOptionalString(data, "runId", resultPath),
@@ -93,6 +95,7 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 		cwd: validateOptionalString(data, "cwd", resultPath),
 		sessionFile: validateOptionalString(data, "sessionFile", resultPath),
 		...(typeof success === "boolean" ? { success } : {}),
+		...(worktreeExecutionError ? { worktreeExecutionError } : {}),
 		...(results ? { results } : {}),
 	};
 }

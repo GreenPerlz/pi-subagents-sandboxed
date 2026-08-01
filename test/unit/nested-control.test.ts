@@ -361,6 +361,35 @@ describe("nested control routing", () => {
 		}
 	});
 
+	it("keeps every orchestrator inline-loop child synchronous when async is only configured by default", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-orchestrator-default-sync-loop-"));
+		const mockPi = createMockPi();
+		try {
+			mockPi.install();
+			mockPi.onCall({ output: "explore findings inline" });
+			mockPi.onCall({ output: "review verdict inline" });
+			const route = createNestedRoute("root-orchestrator-default-sync-loop");
+			routeRoots.push(path.dirname(route.eventSink));
+			setRalphOrchestratorNestedEnv(route, "orchestrator-default-sync-loop-run");
+			const executor = createExecutor(createState(), [
+				{ name: "explore", description: "Explorer", prompt: "Explore" },
+				{ name: "review", description: "Reviewer", prompt: "Review" },
+			], true, { emit() {}, on() { return () => {}; } }, true);
+
+			const explore = await executor.execute("run", { agent: "explore", task: "inspect" }, new AbortController().signal, undefined, ctx(root));
+			const review = await executor.execute("run", { agent: "review", task: "review" }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(explore.isError, undefined);
+			assert.match(text(explore), /explore findings inline/);
+			assert.equal(review.isError, undefined);
+			assert.match(text(review), /review verdict inline/);
+			assert.equal(mockPi.callCount(), 2);
+		} finally {
+			mockPi.uninstall();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps orchestrator nested worker launches synchronous when async is only configured by default", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-default-sync-worker-"));
 		try {

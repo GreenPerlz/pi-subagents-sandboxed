@@ -14,6 +14,7 @@ export const GUARDED_AGENT_OVERRIDE_PATHS = [
 	"progress",
 	"outputSchema",
 	"share",
+	"worktree",
 	"maxSubagentDepth",
 	"acceptance.*",
 	"sandbox.*",
@@ -31,6 +32,7 @@ export const GUARDED_AGENT_OVERRIDE_LEAVES = [
 	"progress",
 	"outputSchema",
 	"share",
+	"worktree",
 	"maxSubagentDepth",
 	"acceptance.criteria",
 	"acceptance.evidence",
@@ -64,6 +66,7 @@ export interface AgentOverridePolicyParams {
 	progress?: unknown;
 	outputSchema?: unknown;
 	share?: unknown;
+	worktree?: unknown;
 	maxSubagentDepth?: unknown;
 	acceptance?: AcceptanceInput;
 	sandbox?: unknown;
@@ -143,7 +146,7 @@ function addSandboxPaths(paths: Set<string>, sandbox: unknown): void {
 }
 
 function addAgentScopedPaths(paths: Set<string>, value: unknown): void {
-	for (const key of ["cwd", "context", "model", "output", "outputMode", "reads", "progress", "outputSchema", "share", "maxSubagentDepth"]) {
+	for (const key of ["cwd", "context", "model", "output", "outputMode", "reads", "progress", "outputSchema", "share", "worktree", "maxSubagentDepth"]) {
 		addPath(paths, value, key);
 	}
 	if ((hasOwn(value, "skill") && value.skill !== undefined) || (hasOwn(value, "skills") && value.skills !== undefined)) paths.add("skills");
@@ -153,7 +156,7 @@ function addAgentScopedPaths(paths: Set<string>, value: unknown): void {
 
 function addTopLevelPaths(paths: Set<string>, params: AgentOverridePolicyParams): void {
 	// These values are shared by every affected child in a multi-agent launch.
-	for (const key of ["cwd", "context", "share", "maxSubagentDepth"]) addPath(paths, params, key);
+	for (const key of ["cwd", "context", "share", "worktree", "maxSubagentDepth"]) addPath(paths, params, key);
 	addSandboxPaths(paths, params.sandbox);
 }
 

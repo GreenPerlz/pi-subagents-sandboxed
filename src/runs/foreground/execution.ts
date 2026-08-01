@@ -53,7 +53,7 @@ import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diag
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
 import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable } from "../../sandbox/write-inference.ts";
-import { resolveSavedOutputPath } from "../../shared/output-paths.ts";
+import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
@@ -188,7 +188,7 @@ async function runSingleAttempt(
 		: undefined;
 	const closedSandboxRuntime = Boolean(options.sandbox && options.sandbox.packageDiscovery !== "ambient");
 	const effectiveSavedOutputPath = options.savedOutputPath
-		?? (options.runId
+		?? (options.runId && shouldPersistSavedOutput({ output: options.outputPath, outputMode: options.outputMode })
 			? resolveSavedOutputPath({ runtimeCwd, requestedCwd: options.cwd, agent: agent.name, runId: options.runId, index: options.index })
 			: undefined);
 	const effectiveSystemPrompt = appendSavedOutputSystemPrompt(shared.systemPrompt, {
@@ -1062,7 +1062,7 @@ export async function runSync(
 		};
 	}
 	const implicitSavedOutputPath = options.savedOutputPath
-		?? (options.runId
+		?? (options.runId && shouldPersistSavedOutput({ output: options.outputPath, outputMode: options.outputMode })
 			? resolveSavedOutputPath({ runtimeCwd, requestedCwd: options.cwd, agent: agentName, runId: options.runId, index: options.index })
 			: undefined);
 	const outputModeValidationError = validateFileOnlyOutputMode(options.outputMode, options.outputPath ?? implicitSavedOutputPath, `Single run (${agentName})`);

@@ -69,6 +69,8 @@ import {
 	findWorktreeTaskCwdConflict,
 	formatWorktreeDiffSummary,
 	formatWorktreeTaskCwdConflict,
+	formatRecoverableWorktreePaths,
+	WorktreeDiffCaptureError,
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import {
@@ -941,6 +943,7 @@ async function emitForegroundResultIntercom(input: {
 	results: SingleResult[];
 	chainSteps?: number;
 	nestedChildren?: NestedRunSummary[];
+	worktreeSummary?: string;
 }): Promise<ReturnType<typeof buildSubagentResultIntercomPayload> | null> {
 	if (!input.intercomBridge.active || !input.intercomBridge.orchestratorTarget) return null;
 	const children = input.results.flatMap((result, index) => result.detached ? [] : [{
@@ -965,6 +968,7 @@ async function emitForegroundResultIntercom(input: {
 		children: attachNestedChildrenToResultChildren(input.runId, children, input.nestedChildren),
 		...(typeof input.chainSteps === "number" ? { chainSteps: input.chainSteps } : {}),
 	});
+	if (input.worktreeSummary) payload.message = `${payload.message}\n\n${input.worktreeSummary}`;
 	const delivered = await deliverSubagentResultIntercomEvent(input.pi.events, payload);
 	if (!delivered) return null;
 	return payload;
@@ -977,6 +981,7 @@ async function maybeBuildForegroundIntercomReceipt(input: {
 	mode: SubagentRunMode;
 	details: Details;
 	nestedChildren?: NestedRunSummary[];
+	worktreeSummary?: string;
 }): Promise<{ text: string; details: Details } | null> {
 	const payload = await emitForegroundResultIntercom({
 		pi: input.pi,
@@ -986,10 +991,11 @@ async function maybeBuildForegroundIntercomReceipt(input: {
 		results: input.details.results,
 		...(typeof input.details.totalSteps === "number" ? { chainSteps: input.details.totalSteps } : {}),
 		...(input.nestedChildren?.length ? { nestedChildren: input.nestedChildren } : {}),
+		...(input.worktreeSummary ? { worktreeSummary: input.worktreeSummary } : {}),
 	});
 	if (!payload) return null;
 	return {
-		text: formatSubagentResultReceipt({ mode: input.mode, runId: input.runId, payload }),
+		text: `${formatSubagentResultReceipt({ mode: input.mode, runId: input.runId, payload })}${input.worktreeSummary ? `\n\n${input.worktreeSummary}` : ""}`,
 		details: stripDetailsOutputsForIntercomReceipt(input.details),
 	};
 }
@@ -1005,6 +1011,12 @@ function isRalphNestedWorkerAgentName(agent: unknown): boolean {
 		|| agent.endsWith("-work")
 		|| agent.endsWith("-worker")
 	);
+}
+
+function isOrchestratorInlineLoopAgentName(agent: unknown): boolean {
+	if (typeof agent !== "string") return false;
+	return ["explore", "explorer", "work", "worker", "review", "reviewer"]
+		.some((name) => agent === name || agent.endsWith(`-${name}`));
 }
 
 function collectRalphNestedLaunchAgentTargets(params: SubagentParamsLike): string[] {
@@ -1031,14 +1043,22 @@ function collectRalphNestedLaunchAgentTargets(params: SubagentParamsLike): strin
 	return targets;
 }
 
+function isOrchestratorNestedLaunch(input: {
+	params: SubagentParamsLike;
+	inheritedNestedRoute?: NestedRouteInfo;
+	nestedParentAddress?: NestedRunAddress;
+}, matchesAgent: (agent: unknown) => boolean): boolean {
+	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "orchestrator") return false;
+	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return false;
+	return collectRalphNestedLaunchAgentTargets(input.params).some(matchesAgent);
+}
+
 function isRalphOrchestratorNestedWorkerLaunch(input: {
 	params: SubagentParamsLike;
 	inheritedNestedRoute?: NestedRouteInfo;
 	nestedParentAddress?: NestedRunAddress;
 }): boolean {
-	if (process.env[SUBAGENT_CHILD_AGENT_ENV] !== "orchestrator") return false;
-	if (!input.inheritedNestedRoute || !input.nestedParentAddress) return false;
-	return collectRalphNestedLaunchAgentTargets(input.params).some(isRalphNestedWorkerAgentName);
+	return isOrchestratorNestedLaunch(input, isRalphNestedWorkerAgentName);
 }
 
 function validateAcceptanceForExecution(params: SubagentParamsLike): AgentToolResult<Details> | null {
@@ -1664,7 +1684,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		results: chainDetails.results,
 		...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
 	});
-	const intercomReceipt = chainDetails && !chainDetails.results.some((result) => result.interrupted || result.detached)
+	const intercomReceipt = chainDetails && !chainResult.worktreeCaptureFailed && !chainResult.worktreePreserved && !chainDetails.results.some((result) => result.interrupted || result.detached)
 		? await maybeBuildForegroundIntercomReceipt({
 			pi: deps.pi,
 			intercomBridge: data.intercomBridge,
@@ -1672,6 +1692,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			mode: "chain",
 			details: chainDetails,
 			...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
+			...(chainResult.worktreeSummary ? { worktreeSummary: chainResult.worktreeSummary } : {}),
 		})
 		: null;
 	if (intercomReceipt) {
@@ -2142,6 +2163,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	);
 	if (errorResult) return errorResult;
 
+	let preserveWorktree = false;
 	try {
 		const duplicateOutputError = findDuplicateParallelOutputPath({
 			tasks,
@@ -2238,17 +2260,35 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			results: details.results,
 			...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
 		});
-		if (interrupted) {
+
+		let worktreeSuffix = "";
+		try {
+			worktreeSuffix = buildParallelWorktreeSuffix(worktreeSetup, artifactsDir, tasks);
+		} catch (error) {
+			preserveWorktree = true;
+			const message = error instanceof WorktreeDiffCaptureError
+				? error.message
+				: `Failed to capture parallel worktree changes: ${error instanceof Error ? error.message : String(error)}`;
 			return {
-				content: [{ type: "text", text: `Parallel run paused after interrupt (${interrupted.agent}). Waiting for explicit next action.` }],
+				content: [{ type: "text", text: message }],
+				isError: true,
+				details,
+			};
+		}
+
+		if (interrupted) {
+			const message = `Parallel run paused after interrupt (${interrupted.agent}). Waiting for explicit next action.`;
+			return {
+				content: [{ type: "text", text: worktreeSuffix ? `${message}\n\n${worktreeSuffix}` : message }],
 				details,
 			};
 		}
 		const detachedIndex = results.findIndex((result) => result.detached);
 		const detached = detachedIndex >= 0 ? results[detachedIndex] : undefined;
 		if (detached) {
+			const message = `Parallel run detached for intercom coordination (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.`;
 			return {
-				content: [{ type: "text", text: `Parallel run detached for intercom coordination (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
+				content: [{ type: "text", text: worktreeSuffix ? `${message}\n\n${worktreeSuffix}` : message }],
 				details,
 			};
 		}
@@ -2261,6 +2301,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			mode: "parallel",
 			details,
 			...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
+			...(worktreeSuffix ? { worktreeSummary: worktreeSuffix } : {}),
 		});
 		if (intercomReceipt) {
 			return {
@@ -2268,8 +2309,6 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				details: intercomReceipt.details,
 			};
 		}
-
-		const worktreeSuffix = buildParallelWorktreeSuffix(worktreeSetup, artifactsDir, tasks);
 		const ok = results.filter((result) => result.exitCode === 0).length;
 		const downgradeNote = backgroundRequestedWhileClarifying ? " (background requested, but clarify kept this run foreground)" : "";
 		const aggregatedOutput = aggregateParallelOutputs(
@@ -2291,8 +2330,38 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			content: [{ type: "text", text: fullContent }],
 			details,
 		};
+	} catch (error) {
+		// Promise.all/mapConcurrent can reject before sibling callbacks settle. Keep
+		// the worktrees even when capture may race with a late child edit; a patch
+		// is useful evidence, but the preserved paths are the recovery authority.
+		preserveWorktree = true;
+		const executionMessage = error instanceof Error ? error.message : String(error);
+		let recoveryNotice = formatRecoverableWorktreePaths(worktreeSetup);
+		let worktreeSuffix = "";
+		try {
+			worktreeSuffix = buildParallelWorktreeSuffix(worktreeSetup, artifactsDir, tasks);
+		} catch (captureError) {
+			recoveryNotice = captureError instanceof WorktreeDiffCaptureError
+				? captureError.message
+				: `${recoveryNotice}${recoveryNotice ? " " : ""}Failed to capture parallel worktree changes: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
+		}
+		const details = compactForegroundDetails({
+			mode: "parallel",
+			runId,
+			results: liveResults.filter((result): result is SingleResult => result !== undefined),
+			progress: params.includeProgress ? allProgress : undefined,
+			artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
+		});
+		const lines = [`Parallel execution failed unexpectedly: ${executionMessage}`];
+		if (worktreeSuffix) lines.push(worktreeSuffix);
+		if (recoveryNotice) lines.push(recoveryNotice);
+		return {
+			content: [{ type: "text", text: lines.join("\n\n") }],
+			isError: true,
+			details,
+		};
 	} finally {
-		if (worktreeSetup) cleanupWorktrees(worktreeSetup);
+		if (worktreeSetup) cleanupWorktrees(worktreeSetup, { preserve: preserveWorktree });
 	}
 }
 
@@ -2826,13 +2895,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			&& ctx.hasUI
 			&& !(effectiveParams.chain?.some(isParallelStep) ?? false);
 
-		const ralphNestedWorkerLaunch = isRalphOrchestratorNestedWorkerLaunch({
+		const nestedLaunchContext = {
 			params: effectiveParams,
 			inheritedNestedRoute,
 			nestedParentAddress,
-		});
+		};
+		const ralphNestedWorkerLaunch = isRalphOrchestratorNestedWorkerLaunch(nestedLaunchContext);
+		const orchestratorInlineLoopLaunch = isOrchestratorNestedLaunch(nestedLaunchContext, isOrchestratorInlineLoopAgentName);
 
-		const requestedAsync = ralphNestedWorkerLaunch && effectiveParams.async === undefined
+		// The orchestrator must consume explore/work/review results before it can
+		// construct the next handoff. An ambient async default must not detach these
+		// omitted-async loop calls; an explicit async value still wins.
+		const requestedAsync = orchestratorInlineLoopLaunch && effectiveParams.async === undefined
 			? false
 			: effectiveParams.async ?? deps.asyncByDefault;
 		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;

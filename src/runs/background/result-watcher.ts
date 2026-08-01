@@ -61,6 +61,9 @@ type ResultFileData = {
 	sessionFile?: string;
 	asyncDir?: string;
 	intercomTarget?: string;
+	worktreeSummary?: string;
+	worktreeCaptureError?: string;
+	worktreeExecutionError?: string;
 };
 
 function sanitizeNestedResultChildren(value: unknown, resultPath: string, label: string): NestedRunSummary[] | undefined {
@@ -163,6 +166,11 @@ export function createResultWatcher(
 				};
 			}), nestedChildren);
 
+			const topLevelFailure = Boolean(data.worktreeCaptureError || data.worktreeExecutionError)
+				|| (data.state !== "paused" && (data.success === false || data.state === "failed"));
+			if (topLevelFailure && normalizedChildren.length > 0 && !normalizedChildren.some((child) => child.status === "failed")) {
+				normalizedChildren[0]!.status = "failed";
+			}
 			const intercomTarget = data.intercomTarget?.trim();
 			if (intercomTarget) {
 				const mode = data.mode === "single" || data.mode === "parallel" || data.mode === "chain"
@@ -176,7 +184,11 @@ export function createResultWatcher(
 					children: normalizedChildren,
 					asyncId: data.id,
 					asyncDir: data.asyncDir,
+					...(data.worktreeExecutionError ? { worktreeExecutionError: data.worktreeExecutionError } : {}),
 				});
+				for (const worktreeNotice of [data.worktreeExecutionError, data.worktreeCaptureError, data.worktreeSummary]) {
+					if (worktreeNotice && !payload.message.includes(worktreeNotice)) payload.message = `${payload.message}\n\n${worktreeNotice}`;
+				}
 				const delivered = await deliverSubagentResultIntercomEvent(pi.events, payload);
 				if (!delivered) {
 					console.error(`Subagent async grouped result intercom delivery was not acknowledged for '${resultPath}'.`);

@@ -18,7 +18,16 @@ Show this to the user, then immediately proceed to Step 2. The user reads and th
 
 ### 2. Spawn sandboxed subagents
 
-Confirm available agents with `subagent({ action: "list" })`, then spawn 3+ read-only `ralph-designer` Pi subagents in parallel. Each must produce a **radically different** interface for the deepened module. Use the repo's `docs/agents/subagents.md` policy when present; otherwise use the default bubblewrap sandbox below.
+Confirm available agents with `subagent({ action: "list" })`, then spawn 3+ read-only custom `ralph-designer` Pi subagents in parallel. `ralph-designer` is not a packaged builtin: define the custom agent with `canBeChangedByAgent: output, context, sandbox.*` because this example overrides `output`, shared `context`, and sandbox fields. (Alternatively use a packaged read-only agent and remove those guarded overrides.) Each must produce a **radically different** interface for the deepened module. Use the repo's `docs/agents/subagents.md` policy when present; otherwise use the default bubblewrap sandbox below.
+
+```yaml
+---
+name: ralph-designer
+description: Read-only alternative interface designer for deepening candidates
+tools: read, grep, find, ls, bash
+canBeChangedByAgent: output, context, sandbox.*
+---
+```
 
 ```ts
 subagent({

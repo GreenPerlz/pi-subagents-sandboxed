@@ -177,6 +177,8 @@ interface GroupedResultIntercomMessageInput {
 	children: SubagentResultIntercomChild[];
 	asyncId?: string;
 	asyncDir?: string;
+	/** Top-level async lifecycle failure; do not derive success from child results. */
+	worktreeExecutionError?: string;
 	chainSteps?: number;
 }
 
@@ -205,6 +207,8 @@ function formatSubagentResultIntercomMessage(input: {
 	children: SubagentResultIntercomChild[];
 	asyncId?: string;
 	asyncDir?: string;
+	/** Top-level async lifecycle failure; do not derive success from child results. */
+	worktreeExecutionError?: string;
 	chainSteps?: number;
 }): string {
 	const counts = countStatuses(input.children);
@@ -221,6 +225,9 @@ function formatSubagentResultIntercomMessage(input: {
 	}
 	if (input.asyncId) lines.push(`Async id: ${input.asyncId}`);
 	if (input.asyncDir) lines.push(`Async dir: ${input.asyncDir}`);
+	if (input.worktreeExecutionError) {
+		lines.push("", "Execution error:", input.worktreeExecutionError);
+	}
 	const resumeGuidance = asyncResumeGuidance(input);
 	if (resumeGuidance) lines.push(resumeGuidance);
 	if (input.children.some((child) => child.intercomTarget)) {
@@ -246,12 +253,13 @@ function formatSubagentResultIntercomMessage(input: {
 }
 
 export function buildSubagentResultIntercomPayload(input: GroupedResultIntercomMessageInput): SubagentResultIntercomPayload {
-	const children = input.children.map((child) => ({
+	const children = input.children.map((child, index) => ({
 		...child,
+		...(input.worktreeExecutionError && index === 0 ? { status: "failed" as const } : {}),
 		summary: child.summary.trim() || "(no output)",
 		children: compactNestedResultChildren(child.children),
 	}));
-	const status = resolveGroupedStatus(children);
+	const status = input.worktreeExecutionError ? "failed" : resolveGroupedStatus(children);
 	const summary = formatStatusCounts(countStatuses(children));
 	const firstChild = children[0];
 	const payload: SubagentResultIntercomPayload = {
@@ -264,6 +272,7 @@ export function buildSubagentResultIntercomPayload(input: GroupedResultIntercomM
 		children,
 		...(input.asyncId ? { asyncId: input.asyncId } : {}),
 		...(input.asyncDir ? { asyncDir: input.asyncDir } : {}),
+		...(input.worktreeExecutionError ? { worktreeExecutionError: input.worktreeExecutionError } : {}),
 		...(typeof input.chainSteps === "number" ? { chainSteps: input.chainSteps } : {}),
 		...(firstChild?.agent ? { agent: firstChild.agent } : {}),
 		...(firstChild?.index !== undefined ? { index: firstChild.index } : {}),

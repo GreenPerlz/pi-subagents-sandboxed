@@ -115,13 +115,13 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		removeTempDir(tempDir);
 	});
 
-	function makeExecutor(agents = [makeAgent("echo")]) {
+	function makeExecutor(agents = [makeAgent("echo")], artifactsDir = tempDir) {
 		return createSubagentExecutor({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
 			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
 			config: {},
 			asyncByDefault: false,
-			tempArtifactsDir: tempDir,
+			tempArtifactsDir: artifactsDir,
 			getSubagentSessionRoot: () => tempDir,
 			expandTilde: (value: string) => value,
 			discoverAgents: () => ({ agents }),
@@ -132,6 +132,28 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		const callFile = fs.readdirSync(mockPi.dir).find((name) => name.startsWith("call-"));
 		assert.ok(callFile, "expected a recorded mock pi call");
 		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+	}
+
+	function initGitRepo(repoDir: string): void {
+		fs.mkdirSync(repoDir, { recursive: true });
+		for (const args of [["init"], ["config", "user.email", "tests@example.com"], ["config", "user.name", "Parallel Tests"]]) {
+			const result = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(result.status, 0, result.stderr);
+		}
+		fs.writeFileSync(path.join(repoDir, "tracked.txt"), "initial\n", "utf-8");
+		for (const args of [["add", "-A"], ["commit", "-m", "initial"]]) {
+			const result = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(result.status, 0, result.stderr);
+		}
+	}
+
+	function cleanupGitWorktrees(repoDir: string): void {
+		const listing = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+		for (const match of listing.stdout.matchAll(/^worktree (.+)$/gm)) {
+			const worktreePath = match[1];
+			if (!worktreePath || path.resolve(worktreePath) === path.resolve(repoDir)) continue;
+			spawnSync("git", ["-C", repoDir, "worktree", "remove", "--force", worktreePath], { encoding: "utf-8" });
+		}
 	}
 
 	function installFakeBwrap(): { recordDir: string; restore: () => void } {
@@ -294,6 +316,67 @@ process.exit(child.status ?? 0);
 
 		assert.ok(liveModels.includes("runtime/gpt-4o-mini"), "live updates should replace the configured fallback with the runtime model");
 		assert.equal(liveModels.at(-1), "runtime/gpt-4o-mini");
+	});
+
+	it("preserves top-level worktrees after a post-child artifact rejection", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "rejected-parallel-repo");
+		initGitRepo(repoDir);
+		const artifactsDir = path.join(tempDir, "subagent-artifacts");
+		const previousArtifactsEnv = process.env.MOCK_PI_ARTIFACTS_DIR;
+		process.env.MOCK_PI_ARTIFACTS_DIR = artifactsDir;
+		mockPi.onCall({
+			output: "Parallel worker edited before artifact failure",
+			writeFiles: [{ path: "parallel-rejected.txt", content: "recover parallel edit\n" }],
+			blockArtifactOutput: true,
+		});
+		try {
+			const executor = makeExecutor([makeAgent("echo")], artifactsDir);
+			const ctx = makeMinimalCtx(repoDir);
+			ctx.sessionManager.getSessionFile = () => path.join(tempDir, "session.jsonl");
+			const result = await executor.execute(
+				"parallel-artifact-rejection",
+				{ tasks: [{ agent: "echo", task: "Write then fail artifact persistence" }], worktree: true },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+			const text = result.content[0]?.text ?? "";
+			assert.equal(result.isError, true, text);
+			assert.match(text, /failed unexpectedly/i);
+			assert.match(text, /Full patches:/);
+			assert.match(text, /Recoverable worktree path/i);
+			const patchPath = path.join(artifactsDir, "worktree-diffs", "task-0-echo.patch");
+			assert.ok(fs.existsSync(patchPath), `expected captured patch at ${patchPath}`);
+			assert.match(fs.readFileSync(patchPath, "utf-8"), /parallel-rejected\.txt/);
+			const listing = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+			const worktreePath = [...listing.stdout.matchAll(/^worktree (.+)$/gm)]
+				.map((match) => match[1])
+				.find((candidate) => candidate && path.resolve(candidate) !== path.resolve(repoDir));
+			assert.ok(worktreePath, "post-child rejection must preserve the edited worktree");
+			assert.equal(fs.readFileSync(path.join(worktreePath!, "parallel-rejected.txt"), "utf-8"), "recover parallel edit\n");
+		} finally {
+			cleanupGitWorktrees(repoDir);
+			if (previousArtifactsEnv === undefined) delete process.env.MOCK_PI_ARTIFACTS_DIR;
+			else process.env.MOCK_PI_ARTIFACTS_DIR = previousArtifactsEnv;
+		}
+	});
+
+	it("keeps omitted top-level parallel output inline without a repo-local report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "Parallel inline output" });
+		const executor = makeExecutor();
+
+		const result = await executor.execute(
+			"parallel-inline-no-save",
+			{ tasks: [{ agent: "echo", task: "Review" }] },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.results?.[0]?.finalOutput, "Parallel inline output");
+		assert.equal(result.details?.results?.[0]?.savedOutputPath, undefined);
+		assert.equal(fs.existsSync(path.join(tempDir, "tmp")), false);
 	});
 
 	it("top-level parallel relative outputs keep the explicit file and report tmp history paths", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

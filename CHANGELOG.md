@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Changed
+- Made packaged issue orchestration parent-owned by default: one isolated worktree, inline explorer findings embedded in a same-cwd no-commit worker task, and a fresh reviewer that inspects the current `git diff`.
+- Made omitted output inline-only with no repo-local Markdown report; explicit output/file-only persistence and explicit legacy reads/progress behavior remain available.
+- Added guarded `worktree` overrides; shared worktree requests now require permission from every affected agent, and the packaged orchestrator explicitly permits them.
 - Added authoritative per-agent acceptance defaults and deny-by-default `canBeChangedByAgent` policies for explicit run overrides, enforced consistently before foreground/background/chain/parallel/dynamic child launch.
 - Acceptance self-review is now controlled per agent and defaults to enabled for all agents with a three-turn budget; set `acceptanceSelfReview: false` to opt an agent out.
 - Added exact and segment-aware wildcard override paths, management/frontmatter serialization, bundled agent policies, and a concise settings reference for the complete configuration surface.
@@ -11,6 +14,7 @@
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 
 ### Fixed
+- Orchestrator explore/work/review loop children now stay foreground when `asyncByDefault` is enabled, preserving the inline result needed for each parent-built handoff.
 - Acceptance finalization keeps the configured provider-qualified model (including OpenRouter routes) instead of replacing it with provider-local child telemetry.
 - Foreground/non-async child runs no longer expose `contact_supervisor`; only async/background children receive the injected supervisor bridge tooling, while clarify-to-background launches keep that bridge behavior.
 

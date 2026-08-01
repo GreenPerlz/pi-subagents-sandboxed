@@ -24,8 +24,10 @@ Custom user/project agents and chains may still exist. Use `subagent({ action: "
 ## Core rules
 
 - Keep one parent decision-maker. Children inspect, research, implement, or review; the parent synthesizes and decides next actions.
-- Use one writer at a time against the active checkout. Parallel writers require `worktree: true`.
+- Default issue orchestration owns one isolated worktree in the parent: `explore`, `work`, and fresh `review` run foreground with `async: false`, explorer findings return inline, the worker edits the same cwd without committing, and the reviewer inspects the current `git diff`.
+- Use one writer at a time against the active checkout. Parallel writers require `worktree: true`, and every affected agent must permit that guarded shared override.
 - Prefer fresh context for `review` and `research` runs unless inherited conversation state is explicitly needed.
+- Omit `output`, `outputMode: "file-only"`, `progress`, and `reads` by default. Results stay inline and no repo-local context/plan/progress/report Markdown is created unless one of those options is explicitly requested.
 - Use `work` for edits, `review` for adversarial checks, and `research` for external facts.
 - Do not let ordinary children run nested subagents. A child can call `subagent` only when its resolved builtin tools explicitly include `subagent`; default packaged agents do not.
 - Prefer `async: true` for subagent runs by default. Use foreground/synchronous runs mainly when you need the child result immediately in the current turn.
@@ -48,29 +50,23 @@ For broad questions, run 2-3 `research` agents in parallel with distinct angles:
 
 ### Implement then review
 
-Use one `work` to implement the accepted scope, then fresh `review` agents to inspect the actual diff. Prefer launching the workflow async unless you explicitly need the result inline.
+For one issue, keep the parent in control of one isolated worktree. Run each nested `explore`, `work`, and fresh `review` with `async: false`; return exploration inline, embed the relevant findings in one worker task, forbid worker commits, then give the reviewer only an abstract handoff and require it to inspect the actual current `git diff`.
 
 ```typescript
 subagent({
-  chain: [
-    { agent: "work", task: "Implement the approved change and validate it." },
-    {
-      parallel: [
-        { agent: "review", task: "Review the resulting diff for correctness and regressions." },
-        { agent: "review", task: "Review tests, validation, and edge cases." },
-        { agent: "review", task: "Review simplicity, maintainability, and unnecessary complexity." }
-      ]
-    }
-  ],
-  async: true
+  tasks: [{
+    agent: "orchestrator",
+    task: "Own exactly this issue in the assigned worktree. Explore inline, embed relevant findings in one same-cwd work task that must not commit, then give a fresh reviewer an abstract handoff and require it to inspect current git diff."
+  }],
+  worktree: true
 })
 ```
 
-After reviews return, synthesize fixes worth doing now. If fixes are accepted, launch exactly one `work` agent to apply them.
+After review returns, the orchestrator may launch exactly one follow-up `work` agent for blockers. Do not use nested worktrees or report files for this default loop.
 
 ### Review-only
 
-Use fresh `review` runs for current diffs, plans, issues, PRs, or proposed solutions. Ask for file/line evidence and concise findings. Do not ask them to edit unless the user explicitly wants a writer pass. Prefer async review runs unless the current turn depends on the answer immediately.
+Use a fresh `review` run for current diffs, plans, issues, PRs, or proposed solutions. Ask it to inspect the actual current `git diff` and `git status`, cite file/line evidence, and return concise findings inline. Do not ask it to edit unless the user explicitly wants a writer pass. Prefer async review runs unless the current turn depends on the answer immediately.
 
 ```typescript
 subagent({
@@ -86,7 +82,15 @@ subagent({
 
 If you need to explain, tune, or modify sandboxing, read [sandboxing.md](sandboxing.md) before changing anything. It covers config precedence, mounts, auth modes, package discovery, writable-vs-read-only behavior, and how implemented Bubblewrap profiles are created/edited in this codebase.
 
-Packaged builtin agents request a closed Bubblewrap `host-toolchain` sandbox by default:
+Packaged builtin agents carry their sandbox defaults in agent frontmatter; packaged launches should omit a per-run `sandbox` override. The following shape is for a **custom agent only**, and that agent must declare matching permission (for example, `canBeChangedByAgent: sandbox.*`) before a parent may provide these fields:
+
+```yaml
+---
+name: sandbox-work
+description: Sandboxed implementation agent for a selected issue
+canBeChangedByAgent: sandbox.*
+---
+```
 
 ```typescript
 sandbox: {
@@ -99,29 +103,27 @@ sandbox: {
 }
 ```
 
-Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider: "none" }` only when the user explicitly approves an unsandboxed exception. Use `extraReadOnlyMounts` for narrow toolchain/input access and `extraWritableMounts` only for caches, outputs, or work directories. Do not invent new profile names in prompts or config; only implemented profiles work.
+Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider: "none" }` only with a custom agent whose policy permits the requested `sandbox.provider` override and when the user explicitly approves an unsandboxed exception. Use `extraReadOnlyMounts` for narrow toolchain/input access and `extraWritableMounts` only for caches, outputs, or work directories. Do not invent new profile names in prompts or config; only implemented profiles work.
 
 Parallel sandboxed tasks with write-capable tools require `worktree: true`; otherwise use read-only review tasks in parallel.
 
 ## Per-issue orchestrators
 
-For parallel issue work, prefer one parent session plus per-issue `orchestrator` children. For a reusable parent workflow, use the `work-on-issues` skill.
+For one issue, use one parent-owned isolated worktree and one `orchestrator` child. Its nested `explore`, `work`, and fresh `review` children inherit that cwd; no nested worktree or repository-local report handoff is needed. The explorer returns inline findings, the parent embeds them in the worker task, and the reviewer inspects the actual current diff.
 
 ```typescript
 subagent({
-  tasks: [
-    { agent: "orchestrator", label: "Issue #123", task: "Orchestrate exactly this issue: ...", output: "tmp/issues/issue-123.md", outputMode: "file-only" },
-    { agent: "orchestrator", label: "Issue #124", task: "Orchestrate exactly this issue: ...", output: "tmp/issues/issue-124.md", outputMode: "file-only" }
-  ],
-  concurrency: 2,
+  tasks: [{
+    agent: "orchestrator",
+    label: "Issue #123",
+    task: "Orchestrate exactly this issue in the assigned worktree. Keep explore findings inline, pass relevant findings to same-cwd work, forbid commits, and pass an abstract worker handoff to a fresh reviewer that inspects current git diff."
+  }],
   worktree: true,
-  context: "fresh",
-  async: true,
-  sandbox: { provider: "bubblewrap", profile: "host-toolchain", network: "host", auth: "pi-json", fallback: "fail", packageDiscovery: "closed" }
+  async: true
 })
 ```
 
-Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `work`, and `review` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, parallel batch planning, serial integration of successful worktree commits/PRs, and final close decisions.
+Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `work`, and `review` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, worktree ownership, serial integration, and final close decisions.
 
 ## Status and control
 
@@ -143,24 +145,10 @@ Ask children to report:
 - validation evidence
 - blockers, risks, and decisions needing parent approval
 
-For large outputs, use `outputMode: "file-only"` so the parent receives a concise file reference instead of a huge transcript. Subagent runs now auto-save a repo-local `tmp/` report by default unless output is explicitly disabled; explicit `output` is still fine when you want a stable working file too. In `file-only` mode, the returned pointer targets the explicit `output` path when one is set; otherwise it points at the auto-saved repo-local `tmp/...md` file.
+For deliberately large outputs, use an explicit `output` path with `outputMode: "file-only"` so the parent receives a concise file reference instead of a huge transcript. An omitted output stays inline-only; `file-only` without a path remains an intentional request and may use a generated runtime path. Do not rely on implicit repository-local reports.
 
 ## Saved output paths
 
-Preserved subagent output should live in the runtime's repo-local `tmp/` area, and `tmp/` should stay in `.gitignore`.
+Saved Markdown is opt-in. Use an explicit `output` path when a report is an intentional project artifact, or use `outputMode: "file-only"` when a generated runtime path is acceptable. Inline runs without an output request create no repo-local report; session logs, async status files, and runner `.log`/`.jsonl` artifacts remain in runtime session/temp areas.
 
-Current convention:
-
-- saved reports go under the current worktree or cwd `tmp/` directory
-- every run auto-persists a markdown report there unless output is explicitly disabled
-- each run creates a fresh markdown file like `tmp/<agent>-<runId>.md`
-- parallel/chain siblings may add an index or numeric collision suffix
-- saved files include run identity metadata so later work/review loops are traceable
-- child agents do not need to write these report files themselves; the runtime persists them after completion
-- saved-output/tmp awareness is injected as child runtime context/system-prompt guidance, not as extra task-body instructions
-- keep child task text focused on the actual job; do not pad it with report-writing directions just to get persistence
-- later subagents may inspect repo-local `tmp/` for prior reports when that context is useful
-- session logs, async status files, and runner `.log`/`.jsonl` artifacts remain in the runtime session/temp areas, not repo `tmp/`
-
-This keeps review/explore outputs out of tracked repo files while
-preserving per-run history for debugging and follow-up passes.
+`reads` and `progress` remain supported as explicit/legacy opt-ins. A parent should embed relevant inline findings in the next task for normal orchestration instead of asking children to communicate through context, plan, or progress files.

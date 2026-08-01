@@ -44,6 +44,8 @@ import {
 	findWorktreeTaskCwdConflict,
 	formatWorktreeDiffSummary,
 	formatWorktreeTaskCwdConflict,
+	formatRecoverableWorktreePaths,
+	WorktreeDiffCaptureError,
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import {
@@ -191,17 +193,14 @@ function ensureParallelProgressFile(
 	return true;
 }
 
-function appendParallelWorktreeSummary(
-	output: string,
+function captureParallelWorktreeSummary(
 	worktreeSetup: WorktreeSetup | undefined,
 	diffsDir: string,
 	agents: string[],
-): string {
-	if (!worktreeSetup) return output;
+): string | undefined {
+	if (!worktreeSetup) return undefined;
 	const diffs = diffWorktrees(worktreeSetup, agents, diffsDir);
-	const diffSummary = formatWorktreeDiffSummary(diffs);
-	if (!diffSummary) return output;
-	return `${output}\n\n${diffSummary}`;
+	return formatWorktreeDiffSummary(diffs) || undefined;
 }
 
 async function runParallelChainTasks(input: ParallelChainRunInput): Promise<SingleResult[]> {
@@ -438,6 +437,12 @@ interface ChainExecutionParams {
 interface ChainExecutionResult {
 	content: Array<{ type: "text"; text: string }>;
 	details: Details;
+	/** Runtime-captured worktree diff summary that must survive intercom relay and cleanup. */
+	worktreeSummary?: string;
+	/** Capture failures must remain inline so preserved worktree paths are not hidden by an intercom receipt. */
+	worktreeCaptureFailed?: boolean;
+	/** Unexpected rejection preserves worktrees because sibling callbacks may still be settling. */
+	worktreePreserved?: boolean;
 	isError?: boolean;
 	/** User requested async execution via TUI - caller should dispatch to executeAsyncChain */
 	requestedAsync?: {
@@ -488,6 +493,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	const dynamicGroupStatuses: ChainExecutionDetailsInput["dynamicGroupStatuses"] = {};
 	const allProgress: AgentProgress[] = [];
 	const allArtifactPaths: ArtifactPaths[] = [];
+	const worktreeSummaries: string[] = [];
 
 	const chainAgents: string[] = chainSteps.map((step) =>
 		isParallelStep(step)
@@ -671,6 +677,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				}
 			}
 
+			let preserveWorktree = false;
 			try {
 				const agentNames = step.parallel.map((task) => task.agent);
 				const parallelBehaviors = resolveParallelBehaviors(step.parallel, agents, stepIndex, chainSkills)
@@ -748,26 +755,50 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					if (result.progress) allProgress.push(result.progress);
 					if (result.artifactPaths) allArtifactPaths.push(result.artifactPaths);
 				}
+
+				let worktreeSummaryForStep: string | undefined;
+				try {
+					worktreeSummaryForStep = captureParallelWorktreeSummary(
+						worktreeSetup,
+						path.join(chainDir, "worktree-diffs", `step-${stepIndex}`),
+						agentNames,
+					);
+				} catch (error) {
+					preserveWorktree = true;
+					if (!(error instanceof WorktreeDiffCaptureError)) throw error;
+					const captureResult = buildChainExecutionErrorResult(error.message, makeDetailsInput({
+						currentStepIndex: stepIndex,
+						currentFlatIndex: globalTaskIndex - step.parallel.length,
+					}));
+					return { ...captureResult, worktreeCaptureFailed: true };
+				}
+				if (worktreeSummaryForStep) worktreeSummaries.push(worktreeSummaryForStep);
+				const worktreeSummaryForResult = worktreeSummaries.join("\n\n");
+
 				const interruptedIndexInStep = parallelResults.findIndex((result) => result.interrupted);
 				const interrupted = interruptedIndexInStep >= 0 ? parallelResults[interruptedIndexInStep] : undefined;
 				if (interrupted) {
+					const message = `Chain paused after interrupt at step ${stepIndex + 1} (${interrupted.agent}). Waiting for explicit next action.`;
 					return {
-						content: [{ type: "text", text: `Chain paused after interrupt at step ${stepIndex + 1} (${interrupted.agent}). Waiting for explicit next action.` }],
+						content: [{ type: "text", text: worktreeSummaryForResult ? `${message}\n\n${worktreeSummaryForResult}` : message }],
 						details: buildChainExecutionDetails(makeDetailsInput({
 							currentStepIndex: stepIndex,
 							currentFlatIndex: globalTaskIndex - step.parallel.length + interruptedIndexInStep,
 						})),
+						...(worktreeSummaryForResult ? { worktreeSummary: worktreeSummaryForResult } : {}),
 					};
 				}
 				const detachedIndexInStep = parallelResults.findIndex((result) => result.detached);
 				const detached = detachedIndexInStep >= 0 ? parallelResults[detachedIndexInStep] : undefined;
 				if (detached) {
+					const message = `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.`;
 					return {
-						content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
+						content: [{ type: "text", text: worktreeSummaryForResult ? `${message}\n\n${worktreeSummaryForResult}` : message }],
 						details: buildChainExecutionDetails(makeDetailsInput({
 							currentStepIndex: stepIndex,
 							currentFlatIndex: globalTaskIndex - step.parallel.length + detachedIndexInStep,
 						})),
+						...(worktreeSummaryForResult ? { worktreeSummary: worktreeSummaryForResult } : {}),
 					};
 				}
 
@@ -784,12 +815,13 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						error: errorMsg,
 					});
 					return {
-						content: [{ type: "text", text: summary }],
+						content: [{ type: "text", text: worktreeSummaryForResult ? `${summary}\n\n${worktreeSummaryForResult}` : summary }],
 						isError: true,
 						details: buildChainExecutionDetails(makeDetailsInput({
 							currentStepIndex: stepIndex,
 							currentFlatIndex: globalTaskIndex - step.parallel.length + failures[0]!.originalIndex,
 						})),
+						...(worktreeSummaryForResult ? { worktreeSummary: worktreeSummaryForResult } : {}),
 					};
 				}
 
@@ -814,14 +846,43 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					};
 				});
 				prev = aggregateParallelOutputs(taskResults);
-				prev = appendParallelWorktreeSummary(
-					prev,
-					worktreeSetup,
-					path.join(chainDir, "worktree-diffs", `step-${stepIndex}`),
-					agentNames,
-				);
+				if (worktreeSummaryForStep) prev = `${prev}\n\n${worktreeSummaryForStep}`;
+			} catch (error) {
+				// mapConcurrent rejects as soon as one callback rejects, while sibling
+				// callbacks may still be editing. Preserve first, then capture only as
+				// supplemental evidence; never let cleanup race away the only changes.
+				preserveWorktree = true;
+				const executionMessage = error instanceof Error ? error.message : String(error);
+				let recoveryNotice = formatRecoverableWorktreePaths(worktreeSetup);
+				let captureFailed = false;
+				let worktreeSummary: string | undefined;
+				try {
+					worktreeSummary = captureParallelWorktreeSummary(
+						worktreeSetup,
+						path.join(chainDir, "worktree-diffs", `step-${stepIndex}`),
+						step.parallel.map((task) => task.agent),
+					);
+				} catch (captureError) {
+					captureFailed = true;
+					recoveryNotice = captureError instanceof WorktreeDiffCaptureError
+						? captureError.message
+						: `${recoveryNotice}${recoveryNotice ? " " : ""}Failed to capture parallel worktree changes: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
+				}
+				const lines = [`Parallel chain step ${stepIndex + 1} failed unexpectedly: ${executionMessage}`];
+				if (worktreeSummary) lines.push(worktreeSummary);
+				if (recoveryNotice) lines.push(recoveryNotice);
+				const captureResult = buildChainExecutionErrorResult(lines.join("\n\n"), makeDetailsInput({
+					currentStepIndex: stepIndex,
+					currentFlatIndex: globalTaskIndex,
+				}));
+				return {
+					...captureResult,
+					...(worktreeSummary ? { worktreeSummary } : {}),
+					worktreePreserved: true,
+					...(captureFailed ? { worktreeCaptureFailed: true } : {}),
+				};
 			} finally {
-				if (worktreeSetup) cleanupWorktrees(worktreeSetup);
+				if (worktreeSetup) cleanupWorktrees(worktreeSetup, { preserve: preserveWorktree });
 			}
 		} else if (isDynamicParallelStep(step)) {
 			const dynamicAgentConfig = agents.find((agent) => agent.name === step.parallel.agent);
@@ -1259,9 +1320,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	}
 
 	const summary = buildChainSummary(chainSteps, results, chainDir, "completed");
+	const worktreeSummary = worktreeSummaries.join("\n\n");
 
 	return {
-		content: [{ type: "text", text: summary }],
+		content: [{ type: "text", text: worktreeSummary ? `${summary}\n\n${worktreeSummary}` : summary }],
 		details: buildChainExecutionDetails(makeDetailsInput()),
+		...(worktreeSummary ? { worktreeSummary } : {}),
 	};
 }

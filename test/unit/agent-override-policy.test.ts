@@ -61,6 +61,18 @@ describe("agent override policy", () => {
 		assert.match(formatAgentOverridePolicyError(violations), /remove the denied overrides or recommend an agent-definition change to the user/);
 	});
 
+	it("requires a shared top-level worktree request from every affected agent", () => {
+		const params = { tasks: [{ agent: "one", task: "a" }, { agent: "two", task: "b" }], worktree: true };
+		const one = makeAgent("one", { canBeChangedByAgent: ["worktree"] });
+		const two = makeAgent("two", { canBeChangedByAgent: [] });
+		assert.deepEqual(validateAgentOverridePolicy(params, [one, two]), [{
+			agent: "two",
+			paths: ["worktree"],
+			allowed: [],
+		}]);
+		assert.deepEqual(validateAgentOverridePolicy(params, [one, makeAgent("two", { canBeChangedByAgent: ["worktree"] })]), []);
+	});
+
 	it("treats top-level chain skill as a shared override", () => {
 		const paths = collectAgentOverridePaths({
 			chain: [{ agent: "one", task: "a" }, { agent: "two", task: "b" }],
@@ -73,11 +85,11 @@ describe("agent override policy", () => {
 	it("collects guarded fields across static and dynamic chain targets", () => {
 		const paths = collectAgentOverridePaths({
 			chain: [
-				{ parallel: [{ agent: "a", task: "a", outputSchema: { type: "object" }, output: "a.md" }], cwd: "shared" },
+				{ parallel: [{ agent: "a", task: "a", outputSchema: { type: "object" }, output: "a.md" }], cwd: "shared", worktree: true },
 				{ expand: { from: { output: "items", path: "/items" } }, parallel: { agent: "b", task: "{item}", acceptance: { criteria: ["review"] } }, collect: { as: "results" } },
 			],
 		});
-		assert.deepEqual([...paths.get("a")!].sort(), ["cwd", "output", "outputSchema"]);
+		assert.deepEqual([...paths.get("a")!].sort(), ["cwd", "output", "outputSchema", "worktree"]);
 		assert.deepEqual([...paths.get("b")!].sort(), ["acceptance.criteria"]);
 	});
 });

@@ -54,6 +54,26 @@ describe("result intercom formatter", () => {
 		assert.match(payload.message, /Session: \/tmp\/a-session\.jsonl/);
 	});
 
+	it("forces grouped async failure and preserves execution recovery evidence", () => {
+		const executionError = "Parallel lifecycle failed unexpectedly: aggregation rejected; Recoverable worktree path: /tmp/pi-worktree-run-0.";
+		const payload = buildSubagentResultIntercomPayload({
+			to: "chat",
+			runId: "run-execution-error",
+			mode: "parallel",
+			source: "async",
+			asyncId: "run-execution-error",
+			children: [{ agent: "worker", status: "completed", summary: "Child completed" }],
+			worktreeExecutionError: executionError,
+		});
+
+		assert.equal(payload.status, "failed");
+		assert.equal(payload.summary, "1 failed");
+		assert.equal(payload.worktreeExecutionError, executionError);
+		assert.equal(payload.children[0]?.status, "failed");
+		assert.match(payload.message, /Execution error:/);
+		assert.match(payload.message, /Recoverable worktree path: \/tmp\/pi-worktree-run-0/);
+	});
+
 	it("advertises async revive only for single-child results with an existing session", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-intercom-"));
 		try {

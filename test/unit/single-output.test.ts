@@ -89,7 +89,7 @@ describe("appendSavedOutputSystemPrompt", () => {
 		});
 		assert.match(output, /Base prompt/);
 		assert.match(output, /this run's saved output path is: \/repo\/report\.md/);
-		assert.match(output, /repo-local saved reports live under: \/repo\/tmp/);
+		assert.match(output, /saved output files for this run live under: \/repo\/tmp/);
 		assert.match(output, /do not write or manage report files yourself/i);
 	});
 });

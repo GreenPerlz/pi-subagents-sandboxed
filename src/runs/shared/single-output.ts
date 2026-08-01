@@ -45,10 +45,10 @@ export function appendSavedOutputSystemPrompt(
 	const savedDir = path.dirname(savedPath ?? primaryPath!);
 	const note = [
 		"Subagent output runtime:",
-		"- final subagent outputs are persisted automatically by the runtime",
+		"- this run has an explicit saved-output request; the runtime preserves the final response at the configured path",
 		...(primaryPath ? [`- this run's saved output path is: ${primaryPath}`] : []),
 		"- do not write or manage report files yourself unless the task explicitly asks you to edit a real working file",
-		`- repo-local saved reports live under: ${savedDir}`,
+		`- saved output files for this run live under: ${savedDir}`,
 		"- consult prior reports there only when another instruction explicitly tells you to",
 	].join("\n");
 	return systemPrompt ? `${systemPrompt}\n\n${note}` : note;

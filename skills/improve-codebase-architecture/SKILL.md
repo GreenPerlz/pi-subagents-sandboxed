@@ -34,7 +34,16 @@ This skill is _informed_ by the project's domain model. The domain language give
 
 Read the project's domain glossary and any ADRs in the area you're touching first.
 
-Then use a sandboxed Pi subagent to walk the codebase. Confirm agents with `subagent({ action: "list" })`, then launch a fresh-context async `scout` or `context-builder` with the repo's default sandbox from `docs/agents/subagents.md` when present. Keep it read-only:
+Then use a sandboxed Pi subagent to walk the codebase. Confirm agents with `subagent({ action: "list" })`, then launch a fresh-context async custom `scout` or `context-builder` with the repo's default sandbox from `docs/agents/subagents.md` when present. These names are not packaged builtins: define the selected custom agent with `canBeChangedByAgent: context, sandbox.*` (or use packaged `explore` and omit the guarded overrides). Keep it read-only:
+
+```yaml
+---
+name: scout
+description: Read-only architecture scout for codebase deepening opportunities
+tools: read, grep, find, ls, bash
+canBeChangedByAgent: context, sandbox.*
+---
+```
 
 ```ts
 subagent({

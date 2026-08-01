@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -119,6 +120,75 @@ function writeSessionFile(args) {
 	}
 }
 
+function writeResponseFiles(response) {
+	if (!Array.isArray(response.writeFiles)) return;
+	for (const file of response.writeFiles) {
+		if (!file || typeof file.path !== "string" || typeof file.content !== "string") continue;
+		const filePath = path.resolve(process.cwd(), file.path);
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, file.content, "utf-8");
+	}
+}
+
+function blockArtifactOutput(response) {
+	if (!response.blockArtifactOutput) return;
+	const artifactsDir = process.env.MOCK_PI_ARTIFACTS_DIR;
+	const runId = process.env.PI_SUBAGENT_RUN_ID;
+	const agent = process.env.PI_SUBAGENT_CHILD_AGENT;
+	if (!artifactsDir || !runId || !agent) return;
+	const index = process.env.PI_SUBAGENT_CHILD_INDEX;
+	const suffix = index ? `_${index}` : "";
+	fs.mkdirSync(path.join(artifactsDir, `${runId}_${agent}${suffix}_output.md`), { recursive: true });
+}
+
+function blockRunnerEventsAfterChild(response) {
+	if (!response.blockRunnerEventsAfterChild) return;
+	const eventsPath = process.env.MOCK_PI_RUNNER_EVENTS_PATH;
+	if (!eventsPath) return;
+	const monitorCode = `
+import fs from "node:fs";
+import path from "node:path";
+const target = ${JSON.stringify(eventsPath)};
+const deadline = Date.now() + 15_000;
+let blocked = false;
+const block = () => {
+	if (blocked) return;
+	blocked = true;
+	try {
+		fs.rmSync(target, { force: true });
+		fs.mkdirSync(target);
+	} catch {}
+	try { watcher?.close(); } catch {}
+	process.exit(0);
+};
+const check = () => {
+	let content = "";
+	try { content = fs.readFileSync(target, "utf-8"); } catch {}
+	if (content.includes('"type":"subagent.step.completed"')) {
+		block();
+		return;
+	}
+	if (Date.now() >= deadline) {
+		try { watcher?.close(); } catch {}
+		process.exit(0);
+	}
+};
+let watcher;
+try {
+	watcher = fs.watch(path.dirname(target), (_event, fileName) => {
+		if (!fileName || fileName.toString() === path.basename(target)) check();
+	});
+} catch {}
+const poll = () => {
+	check();
+	if (!blocked && Date.now() < deadline) setTimeout(poll, 1);
+};
+poll();
+`;
+	const monitor = spawn(process.execPath, ["--input-type=module", "-e", monitorCode], { detached: true, stdio: "ignore" });
+	monitor.unref();
+}
+
 async function writeStdout(text) {
 	if (process.stdout.write(text)) return;
 	await new Promise((resolve) => process.stdout.once("drain", resolve));
@@ -189,6 +259,9 @@ async function main() {
 	const jsonMode = isJsonMode(args);
 	const response = claimNextResponse(queueDir) ?? defaultResponse();
 	writeSessionFile(args);
+	writeResponseFiles(response);
+	blockArtifactOutput(response);
+	blockRunnerEventsAfterChild(response);
 	fs.writeFileSync(
 		path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`),
 		JSON.stringify({ args }),

@@ -14,7 +14,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
+import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import type { SubagentState } from "../../src/shared/types.ts";
 import type { MockPi } from "../support/helpers.ts";
 
 interface AsyncExecutionResult {
@@ -40,6 +42,7 @@ interface AsyncResultPayload {
 	sessionId?: string;
 	mode?: string;
 	summary?: string;
+	worktreeExecutionError?: string;
 	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown }; sandbox?: SandboxDiagnosticsPayload }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; error?: string }> }> };
@@ -48,6 +51,8 @@ interface AsyncResultPayload {
 interface AsyncStatusPayload {
 	sessionId?: string;
 	activityState?: string;
+	error?: string;
+	worktreeExecutionError?: string;
 	currentTool?: string;
 	currentPath?: string;
 	state?: string;
@@ -173,6 +178,26 @@ function readMockPiArgs(mockPi: MockPi, index: number): string[] {
 	const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[] };
 	assert.ok(Array.isArray(payload.args), "expected recorded args");
 	return payload.args;
+}
+
+function createWatcherState(currentSessionId: string | null, baseCwd = process.cwd()): SubagentState {
+	return {
+		baseCwd,
+		currentSessionId,
+		asyncJobs: new Map(),
+		foregroundControls: new Map(),
+		lastForegroundControlId: null,
+		cleanupTimers: new Map(),
+		lastUiContext: null,
+		poller: null,
+		completionSeen: new Map(),
+		watcher: null,
+		watcherRestartTimer: null,
+		resultFileCoalescer: {
+			schedule: () => false,
+			clear: () => {},
+		},
+	};
 }
 
 function installFakeBwrap(rootDir: string): { recordDir: string; restore: () => void } {
@@ -1229,6 +1254,141 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("captures failed async worktree child changes before cleanup", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const repoDir = createRepo("pi-subagent-async-worktree-failure-");
+		try {
+			mockPi.onCall({
+				output: "Async worker failed after writing",
+				exitCode: 1,
+				stderr: "async worker failed",
+				writeFiles: [{ path: "async-captured.txt", content: "captured before async failure\n" }],
+			});
+			const id = `async-worktree-failure-${Date.now().toString(36)}`;
+			const result = executeAsyncChain!(id, {
+				chain: [{ parallel: [{ agent: "worker", task: "Write then fail" }], worktree: true }],
+				agents: [makeAgent("worker")],
+				ctx: { pi: { events: createEventBus() }, cwd: repoDir, currentSessionId: null },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+			});
+			assert.ok(!result.isError);
+			const resultPath = await waitForAsyncResultFile(id, 30_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, false);
+			assert.equal(payload.state, "failed");
+			assert.match(payload.summary ?? "", /Full patches:/);
+			const asyncDir = path.join(ASYNC_DIR, id);
+			const patchPath = path.join(asyncDir, "worktree-diffs", "step-0", "task-0-worker.patch");
+			assert.ok(fs.existsSync(patchPath), `expected captured patch at ${patchPath}`);
+			assert.match(fs.readFileSync(patchPath, "utf-8"), /async-captured\.txt/);
+			const apply = spawnSync("git", ["-C", repoDir, "apply", "--check", patchPath], { encoding: "utf-8" });
+			assert.equal(apply.status, 0, `failed async child patch should apply cleanly: ${apply.stderr}`);
+			const worktreeList = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+			assert.equal((worktreeList.stdout.match(/^worktree /gm) ?? []).length, 1, "temporary async worktree should be cleaned after capture");
+		} finally {
+			removeTempDir(repoDir);
+		}
+	});
+
+	it("serializes successful async children when outer lifecycle event aggregation rejects", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const repoDir = createRepo("pi-subagent-async-worktree-lifecycle-");
+		const watcherResultsDir = createTempDir("pi-subagent-async-watcher-");
+		let preservedWorktree: string | undefined;
+		const id = `async-worktree-lifecycle-${Date.now().toString(36)}`;
+		const previousEventsPath = process.env.MOCK_PI_RUNNER_EVENTS_PATH;
+		process.env.MOCK_PI_RUNNER_EVENTS_PATH = path.join(ASYNC_DIR, id, "events.jsonl");
+		try {
+			mockPi.onCall({
+				output: "Async worker completed before lifecycle rejection",
+				keepAliveAfterFinalMessageMs: 100,
+				writeFiles: [{ path: "async-rejected.txt", content: "recover async edit\n" }],
+				blockRunnerEventsAfterChild: true,
+			});
+			const result = executeAsyncChain!(id, {
+				chain: [{ parallel: [{ agent: "worker", task: "Write then reject lifecycle event aggregation" }], worktree: true }],
+				agents: [makeAgent("worker")],
+				ctx: { pi: { events: createEventBus() }, cwd: repoDir, currentSessionId: null },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				controlIntercomTarget: "subagent-chat-main",
+				maxSubagentDepth: 2,
+			});
+			assert.ok(!result.isError);
+			const resultPath = await waitForAsyncResultFile(id, 30_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+			assert.equal(payload.success, false);
+			assert.equal(payload.state, "failed");
+			assert.equal(payload.exitCode, 1);
+			assert.equal(payload.results.length, 1);
+			assert.equal(payload.results[0]?.success, true, "successful child result must survive the outer lifecycle catch");
+			assert.equal(payload.results[0]?.output, "Async worker completed before lifecycle rejection");
+			assert.ok(payload.worktreeExecutionError);
+			assert.match(payload.worktreeExecutionError, /^Parallel lifecycle failed unexpectedly:/);
+			assert.match(payload.worktreeExecutionError, /Recoverable worktree path/i);
+			assert.equal(status.state, "failed");
+			assert.equal(status.worktreeExecutionError, payload.worktreeExecutionError);
+			assert.match(status.error ?? "", /^Parallel lifecycle failed unexpectedly:/);
+			assert.equal(status.steps?.[0]?.status, "failed");
+			assert.match(payload.summary ?? "", /Async worker completed before lifecycle rejection/);
+			assert.match(payload.summary ?? "", /Parallel lifecycle failed unexpectedly:/);
+
+			const worktreeList = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
+			preservedWorktree = [...worktreeList.stdout.matchAll(/^worktree (.+)$/gm)]
+				.map((match) => match[1])
+				.find((candidate) => candidate && path.resolve(candidate) !== path.resolve(repoDir));
+			assert.ok(preservedWorktree, "outer lifecycle rejection must preserve the edited worktree");
+			assert.equal(fs.readFileSync(path.join(preservedWorktree!, "async-rejected.txt"), "utf-8"), "recover async edit\n");
+
+			const watcherEvents = createEventBus();
+			const intercomEvents: unknown[] = [];
+			const completionEvents: unknown[] = [];
+			watcherEvents.on("subagent:result-intercom", (data) => {
+				intercomEvents.push(data);
+				const requestId = data && typeof data === "object" ? (data as { requestId?: unknown }).requestId : undefined;
+				if (typeof requestId === "string") {
+					setImmediate(() => watcherEvents.emit("subagent:result-intercom-delivery", { requestId, delivered: true }));
+				}
+			});
+			watcherEvents.on("subagent:async-complete", (data) => completionEvents.push(data));
+			const watcherResultPath = path.join(watcherResultsDir, `${id}.json`);
+			fs.copyFileSync(resultPath, watcherResultPath);
+			const watcher = createResultWatcher({ events: watcherEvents }, createWatcherState(null, repoDir), watcherResultsDir, 60_000);
+			try {
+				watcher.primeExistingResults();
+				const deadline = Date.now() + 5_000;
+				while (completionEvents.length === 0) {
+					if (Date.now() > deadline) assert.fail("timed out waiting for watcher completion");
+					await new Promise((resolve) => setTimeout(resolve, 25));
+				}
+			} finally {
+				watcher.stopResultWatcher();
+			}
+			const intercomPayload = intercomEvents[0] as { status?: string; worktreeExecutionError?: string; message?: string; children?: Array<{ status?: string }> } | undefined;
+			assert.equal(intercomPayload?.status, "failed");
+			assert.notEqual(intercomPayload?.status, "complete");
+			assert.equal(intercomPayload?.worktreeExecutionError, payload.worktreeExecutionError);
+			assert.equal(intercomPayload?.children?.[0]?.status, "failed");
+			assert.match(intercomPayload?.message ?? "", /Execution error:/);
+			assert.match(intercomPayload?.message ?? "", /Recoverable worktree path/i);
+			const completion = completionEvents[0] as { state?: string; results?: Array<{ status?: string }> } | undefined;
+			assert.equal(completion?.state, "failed");
+			assert.notEqual(completion?.state, "complete");
+			assert.equal(completion?.results?.[0]?.status, "failed");
+			assert.equal(fs.existsSync(watcherResultPath), false);
+		} finally {
+			if (preservedWorktree) {
+				spawnSync("git", ["-C", repoDir, "worktree", "remove", "--force", preservedWorktree], { encoding: "utf-8" });
+			}
+			fs.rmSync(path.join(ASYNC_DIR, id), { recursive: true, force: true });
+			if (previousEventsPath === undefined) delete process.env.MOCK_PI_RUNNER_EVENTS_PATH;
+			else process.env.MOCK_PI_RUNNER_EVENTS_PATH = previousEventsPath;
+			removeTempDir(watcherResultsDir);
+			removeTempDir(repoDir);
+		}
+	});
+
 	it("readStatus caches by mtime (second call uses cache)", () => {
 		const dir = createTempDir();
 		try {
@@ -1554,6 +1714,36 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(statusPayload.state, "failed");
 		assert.equal(statusPayload.steps?.[0]?.status, "failed");
 		assert.equal(statusPayload.steps?.[0]?.exitCode, 1);
+	});
+
+	it("background omitted output stays inline without a repo-local report", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "async inline output" });
+		const id = `async-inline-no-save-${Date.now().toString(36)}`;
+		const run = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(run.details.asyncId, id);
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.match(payload.summary ?? "", /async inline output/);
+		assert.equal(payload.results[0]?.output, "async inline output");
+		assert.equal(fs.existsSync(path.join(tempDir, "tmp")), false);
 	});
 
 	it("background file-only runs write full output but return only a file reference", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

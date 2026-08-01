@@ -93,9 +93,12 @@ This page is the compact reference for persistent extension settings, agent Mark
 
 ### Files and execution behavior
 
-- **`output`** — Sets the default saved-output filename for single-agent runs. A permitted run override may replace or disable it.
-- **`defaultReads`** — Lists files the runtime asks the agent to read before chain or parallel work. A permitted `reads` override may replace or disable the list.
-- **`defaultProgress`** — Enables maintenance of `progress.md` by default. Read-only/review tasks may suppress progress when it would be inappropriate.
+- **`output`** — Sets an intentional default saved-output filename for single-agent runs. Omitted output is inline-only; a permitted run override may replace or disable the configured path.
+- **`defaultReads`** — Opt-in list of files the runtime asks the agent to read before chain or parallel work. Omitted reads do not create or consult context/plan files.
+- **`defaultProgress`** — Opt-in maintenance of `progress.md`; it is disabled when omitted, and read-only/review tasks may suppress it when inappropriate.
+
+Session logs, async status, and debug artifacts remain runtime/session data; they are distinct from repo-local saved-output reports, which require an explicit output or file-only request.
+
 - **`interactive`** — Is parsed for compatibility with older definitions. It is not currently enforced by the runtime.
 - **`maxSubagentDepth`** — Tightens how deeply this agent's children may delegate. It cannot loosen a stricter inherited limit.
 
@@ -107,7 +110,7 @@ This page is the compact reference for persistent extension settings, agent Mark
 
 `canBeChangedByAgent` accepts exact paths and segment wildcards such as `model`, `acceptance.*`, `sandbox.*`, or the global `*`. Malformed or unsupported patterns fail closed, and management-created definitions reject patterns that cannot match a guarded setting.
 
-Guarded paths are `cwd`, `context`, `model`, `skills`, `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `maxSubagentDepth`, every `acceptance.<field>`, and every `sandbox.<field>`. A shared override in a multi-agent launch must be allowed by every affected agent.
+Guarded paths are `cwd`, `context`, `model`, `skills`, `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, every `acceptance.<field>`, and every `sandbox.<field>`. A shared override in a multi-agent launch must be allowed by every affected agent; this includes a shared `worktree: true` request. The packaged `orchestrator` explicitly opts into `worktree`; other agents remain deny-by-default unless their definition opts in.
 
 ### Agent sandbox
 
@@ -156,7 +159,7 @@ Guarded paths are `cwd`, `context`, `model`, `skills`, `output`, `outputMode`, `
 - **`model`** — Overrides the target model for a single/task run. The target agent must permit `model`.
 - **`skill`** — Adds, replaces, or disables skills for the relevant child or chain. It maps to the guarded `skills` path.
 - **`output`** — Sets an output path or `false` to disable saved output. The target agent must permit `output`.
-- **`outputMode`** — Uses `inline` or `file-only` result delivery. `file-only` requires an output path, including an automatically generated one where supported.
+- **`outputMode`** — Uses `inline` or `file-only` result delivery. `file-only` is an intentional persistence request and may use an automatically generated runtime path when no explicit output path is supplied.
 - **`reads`** — Supplies files to read before work or `false` to disable reads. The target agent must permit `reads`.
 - **`progress`** — Enables or disables progress-file tracking. The target agent must permit `progress`.
 - **`outputSchema`** — Requires strict structured output matching a JSON Schema object. The target agent must permit `outputSchema`.
@@ -167,7 +170,7 @@ Guarded paths are `cwd`, `context`, `model`, `skills`, `output`, `outputMode`, `
 - **`async`** — Selects background or foreground execution. It is an orchestration control and is not governed by `canBeChangedByAgent`.
 - **`clarify`** — Opens the human clarification editor where supported. Human edits occur after raw agent-generated override preflight.
 - **`concurrency`** — Sets simultaneous workers for top-level parallel mode. It is an orchestration control rather than an agent-specific override.
-- **`worktree`** — Isolates parallel writers in Git worktrees. It requires a clean Git repository and is not an agent-specific override.
+- **`worktree`** — Isolates parallel writers in Git worktrees. It requires a clean Git repository, and every affected agent must permit the guarded `worktree` override.
 - **`chainDir`** — Sets the persistent directory for chain artifacts and named outputs. It is an orchestration path rather than a child-agent override.
 - **`sessionDir`** — Sets the child session-log directory. It takes precedence over `defaultSessionDir`.
 - **`artifacts`** — Enables or disables debug artifacts for the run. It does not alter the child agent's capabilities.

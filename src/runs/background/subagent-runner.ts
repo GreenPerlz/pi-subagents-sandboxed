@@ -82,6 +82,8 @@ import {
 	findWorktreeTaskCwdConflict,
 	formatWorktreeDiffSummary,
 	formatWorktreeTaskCwdConflict,
+	formatRecoverableWorktreePaths,
+	WorktreeDiffCaptureError,
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -1243,19 +1245,16 @@ function prepareParallelTaskRun(
 	};
 }
 
-function appendParallelWorktreeSummary(
-	previousOutput: string,
+function captureParallelWorktreeSummary(
 	worktreeSetup: WorktreeSetup | undefined,
 	asyncDir: string,
 	stepIndex: number,
 	group: Extract<RunnerStep, { parallel: SubagentStep[] }>,
-): string {
-	if (!worktreeSetup) return previousOutput;
+): string | undefined {
+	if (!worktreeSetup) return undefined;
 	const diffsDir = path.join(asyncDir, "worktree-diffs", `step-${stepIndex}`);
 	const diffs = diffWorktrees(worktreeSetup, group.parallel.map((task) => task.agent), diffsDir);
-	const diffSummary = formatWorktreeDiffSummary(diffs);
-	if (!diffSummary) return previousOutput;
-	return `${previousOutput}\n\n${diffSummary}`;
+	return formatWorktreeDiffSummary(diffs) || undefined;
 }
 
 function ensureParallelProgressFile(cwd: string, group: Extract<RunnerStep, { parallel: SubagentStep[] }>): void {
@@ -1264,12 +1263,15 @@ function ensureParallelProgressFile(cwd: string, group: Extract<RunnerStep, { pa
 	writeInitialProgressFile(cwd);
 }
 
+type ParallelStepResult = Awaited<ReturnType<typeof runSingleStep>> & { skipped?: boolean };
+
 async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const { id, steps, resultPath, cwd, placeholder, taskIndex, totalTasks, maxOutput, artifactsDir, artifactConfig } =
 		config;
 	let previousOutput = "";
 	const outputs: ChainOutputMap = {};
 	const results: StepResult[] = [];
+	const worktreeSummaries: string[] = [];
 	const overallStartTime = Date.now();
 	const shareEnabled = config.share === true;
 	const asyncDir = config.asyncDir;
@@ -1279,6 +1281,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG;
 	let activeChildInterrupt: (() => void) | undefined;
 	let interrupted = false;
+	let worktreeCaptureError: string | undefined;
+	let worktreeExecutionError: string | undefined;
 	let currentActivityState: ActivityState | undefined;
 	let activityTimer: NodeJS.Timeout | undefined;
 	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
@@ -2174,6 +2178,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				}
 			}
 
+			let preserveWorktree = false;
 			try {
 				if (group.worktree) ensureParallelProgressFile(cwd, group);
 				const groupStartTime = Date.now();
@@ -2188,10 +2193,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					runId: id,
 					stepIndex,
 				});
-				const parallelResults = await mapConcurrent(
-					group.parallel,
-					concurrency,
-					async (task, taskIdx) => {
+				let parallelResults: ParallelStepResult[] = [];
+				let parallelExecutionError: string | undefined;
+				let worktreeSummaryForGroup: string | undefined;
+				try {
+					parallelResults = await mapConcurrent(
+						group.parallel,
+						concurrency,
+						async (task, taskIdx) => {
 						const fi = groupStartFlatIndex + taskIdx;
 						if (aborted && failFast) {
 							const skippedAt = Date.now();
@@ -2289,9 +2298,75 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						if (singleResult.exitCode !== 0 && failFast) aborted = true;
 						return { ...singleResult, skipped: false };
 					},
-				);
+					);
+				} catch (error) {
+					preserveWorktree = true;
+					const executionBase = `Parallel execution failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`;
+					try {
+						worktreeSummaryForGroup = captureParallelWorktreeSummary(worktreeSetup, asyncDir, stepIndex, group);
+					} catch (captureError) {
+						worktreeCaptureError = captureError instanceof WorktreeDiffCaptureError
+							? captureError.message
+							: `Failed to capture parallel worktree changes: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
+					}
+					const recoveryPaths = formatRecoverableWorktreePaths(worktreeSetup);
+					parallelExecutionError = `${executionBase}${recoveryPaths ? `; ${recoveryPaths}` : ""}`;
+					worktreeExecutionError = worktreeExecutionError
+						? `${worktreeExecutionError}\n${parallelExecutionError}`
+						: parallelExecutionError;
+					statusPayload.worktreeExecutionError = worktreeExecutionError;
+					const stepError = worktreeCaptureError
+						? `${parallelExecutionError}\n${worktreeCaptureError}`
+						: parallelExecutionError;
+					const endedAt = Date.now();
+					for (let taskIndex = 0; taskIndex < group.parallel.length; taskIndex++) {
+						const step = statusPayload.steps[groupStartFlatIndex + taskIndex];
+						if (!step) continue;
+						step.status = "failed";
+						step.endedAt = endedAt;
+						step.durationMs = step.startedAt ? endedAt - step.startedAt : 0;
+						step.exitCode = 1;
+						step.error = step.error ? `${step.error}\n${stepError}` : stepError;
+					}
+					statusPayload.error = stepError;
+					statusPayload.lastUpdate = endedAt;
+					writeStatusPayload();
+					parallelResults = group.parallel.map((task) => ({
+						agent: task.agent,
+						output: "(parallel execution failed unexpectedly)",
+						error: parallelExecutionError,
+						exitCode: 1,
+						skipped: false,
+					}));
+				}
 
 				flatIndex += group.parallel.length;
+
+				// Materialize child results before post-child lifecycle work. If status,
+				// artifact, or event aggregation rejects, successful child output must
+				// remain available in the serialized top-level failure.
+				for (const pr of parallelResults) {
+					results.push({
+						agent: pr.agent,
+						output: pr.output,
+						error: pr.error,
+						success: pr.exitCode === 0,
+						exitCode: pr.exitCode,
+						skipped: pr.skipped,
+						sessionFile: pr.sessionFile,
+						intercomTarget: pr.intercomTarget,
+						model: pr.model,
+						thinking: pr.thinking,
+						attemptedModels: pr.attemptedModels,
+						modelAttempts: pr.modelAttempts,
+						artifactPaths: pr.artifactPaths,
+						structuredOutput: pr.structuredOutput,
+						structuredOutputPath: pr.structuredOutputPath,
+						structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
+						acceptance: pr.acceptance,
+						sandbox: pr.sandbox,
+					});
+				}
 
 				for (let t = 0; t < group.parallel.length; t++) {
 					const fi = groupStartFlatIndex + t;
@@ -2311,28 +2386,23 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.lastUpdate = Date.now();
 				writeStatusPayload();
 
-				for (const pr of parallelResults) {
-					results.push({
-						agent: pr.agent,
-						output: pr.output,
-						error: pr.error,
-						success: pr.exitCode === 0,
-						exitCode: pr.exitCode,
-						skipped: pr.skipped,
-						sessionFile: pr.sessionFile,
-						intercomTarget: pr.intercomTarget,
-						model: pr.model,
-						thinking: pr.thinking,
-						attemptedModels: pr.attemptedModels,
-						modelAttempts: pr.modelAttempts,
-						artifactPaths: pr.artifactPaths,
-							structuredOutput: pr.structuredOutput,
-							structuredOutputPath: pr.structuredOutputPath,
-							structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
-							acceptance: pr.acceptance,
-							sandbox: pr.sandbox,
-						});
+				if (!parallelExecutionError) {
+					try {
+						worktreeSummaryForGroup = captureParallelWorktreeSummary(worktreeSetup, asyncDir, stepIndex, group);
+					} catch (error) {
+						preserveWorktree = true;
+						worktreeCaptureError = error instanceof WorktreeDiffCaptureError
+							? error.message
+							: `Failed to capture parallel worktree changes: ${error instanceof Error ? error.message : String(error)}`;
+						statusPayload.error = worktreeCaptureError;
+						for (let taskIndex = 0; taskIndex < group.parallel.length; taskIndex++) {
+							const step = statusPayload.steps[groupStartFlatIndex + taskIndex];
+							if (!step) continue;
+							step.error = step.error ? `${step.error}\n${worktreeCaptureError}` : worktreeCaptureError;
+						}
 					}
+				}
+
 				for (let t = 0; t < group.parallel.length; t++) {
 					const outputName = group.parallel[t]?.outputName;
 					if (outputName) outputs[outputName] = outputEntryFromAsyncResult({
@@ -2345,29 +2415,68 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 				previousOutput = aggregateParallelOutputs(
 					parallelResults.map((r) => ({
-					agent: r.agent,
-					output: r.output,
-					exitCode: r.exitCode,
-					error: r.error,
-					model: r.model,
-					attemptedModels: r.attemptedModels,
-				})),
+						agent: r.agent,
+						output: r.output,
+						exitCode: r.exitCode,
+						error: r.error,
+						model: r.model,
+						attemptedModels: r.attemptedModels,
+					})),
 				);
-				previousOutput = appendParallelWorktreeSummary(previousOutput, worktreeSetup, asyncDir, stepIndex, group);
+				if (worktreeSummaryForGroup) {
+					previousOutput = `${previousOutput}\n\n${worktreeSummaryForGroup}`;
+					worktreeSummaries.push(worktreeSummaryForGroup);
+				}
+				if (worktreeCaptureError) previousOutput = `${previousOutput}\n\n${worktreeCaptureError}`;
 
 				appendJsonl(eventsPath, JSON.stringify({
 					type: "subagent.parallel.completed",
 					ts: Date.now(),
 					runId: id,
 					stepIndex,
-					success: parallelResults.every((r) => r.exitCode === 0 || r.exitCode === -1),
+					success: !worktreeCaptureError && parallelResults.every((r) => r.exitCode === 0 || r.exitCode === -1),
 				}));
 
-				if (parallelResults.some((r) => r.exitCode !== 0 && r.exitCode !== -1)) {
+				if (worktreeCaptureError || parallelResults.some((r) => r.exitCode !== 0 && r.exitCode !== -1)) {
 					break;
 				}
+			} catch (error) {
+				// Also guard status/artifact aggregation after the child await. Any
+				// rejection before the normal capture point makes cleanup untrusted.
+				preserveWorktree = true;
+				const executionBase = `Parallel lifecycle failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`;
+				let recoveryNotice = formatRecoverableWorktreePaths(worktreeSetup);
+				let capturedSummary: string | undefined;
+				try {
+					capturedSummary = captureParallelWorktreeSummary(worktreeSetup, asyncDir, stepIndex, group);
+				} catch (captureError) {
+					recoveryNotice = captureError instanceof WorktreeDiffCaptureError
+						? captureError.message
+						: `${recoveryNotice}${recoveryNotice ? " " : ""}Failed to capture parallel worktree changes: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
+				}
+				if (capturedSummary) worktreeSummaries.push(capturedSummary);
+				const lifecycleError = `${executionBase}${recoveryNotice ? `; ${recoveryNotice}` : ""}`;
+				worktreeExecutionError = worktreeExecutionError
+					? `${worktreeExecutionError}\n${lifecycleError}`
+					: lifecycleError;
+				statusPayload.worktreeExecutionError = worktreeExecutionError;
+				statusPayload.error = lifecycleError;
+				const endedAt = Date.now();
+				for (let taskIndex = 0; taskIndex < group.parallel.length; taskIndex++) {
+					const step = statusPayload.steps[groupStartFlatIndex + taskIndex];
+					if (!step) continue;
+					step.status = "failed";
+					const finishedAt = step.endedAt ?? endedAt;
+					step.endedAt = finishedAt;
+					step.durationMs = step.durationMs ?? (step.startedAt ? finishedAt - step.startedAt : 0);
+					step.exitCode = 1;
+					step.error = step.error ? `${step.error}\n${lifecycleError}` : lifecycleError;
+				}
+				statusPayload.lastUpdate = endedAt;
+				writeStatusPayload();
+				break;
 			} finally {
-				if (worktreeSetup) cleanupWorktrees(worktreeSetup);
+				if (worktreeSetup) cleanupWorktrees(worktreeSetup, { preserve: preserveWorktree });
 			}
 		} else {
 			const seqStep = step as SubagentStep;
@@ -2525,6 +2634,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			truncated = true;
 		}
 	}
+	if (worktreeSummaries.length > 0) summary = summary ? `${summary}\n\n${worktreeSummaries.join("\n\n")}` : worktreeSummaries.join("\n\n");
+	if (worktreeExecutionError) summary = summary ? `${summary}\n\n${worktreeExecutionError}` : worktreeExecutionError;
+	if (worktreeCaptureError) summary = summary ? `${summary}\n\n${worktreeCaptureError}` : worktreeCaptureError;
 
 	const resultMode = config.resultMode ?? statusPayload.mode;
 	const agentName = flatSteps.length === 1
@@ -2572,7 +2684,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	}
 	const effectiveSessionFile = sessionFile ?? latestSessionFile;
 	const runEndedAt = Date.now();
-	statusPayload.state = interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed";
+	statusPayload.state = worktreeCaptureError || worktreeExecutionError ? "failed" : interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed";
+	statusPayload.worktreeExecutionError = worktreeExecutionError;
 	statusPayload.activityState = undefined;
 	statusPayload.endedAt = runEndedAt;
 	statusPayload.lastUpdate = runEndedAt;
@@ -2587,16 +2700,21 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 	writeStatusPayload();
-	appendJsonl(
-		eventsPath,
-		JSON.stringify({
-			type: "subagent.run.completed",
-			ts: runEndedAt,
-			runId: id,
-			status: statusPayload.state,
-			durationMs: runEndedAt - overallStartTime,
-		}),
-	);
+	try {
+		appendJsonl(
+			eventsPath,
+			JSON.stringify({
+				type: "subagent.run.completed",
+				ts: runEndedAt,
+				runId: id,
+				status: statusPayload.state,
+				durationMs: runEndedAt - overallStartTime,
+			}),
+		);
+	} catch (error) {
+		// A final event-journal failure must not mask the serialized run result.
+		console.error(`Failed to append async completion event for '${id}':`, error);
+	}
 	writeRunLog(logPath, {
 		id,
 		mode: statusPayload.mode,
@@ -2622,9 +2740,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			id,
 			agent: agentName,
 			mode: resultMode,
-			success: !interrupted && results.every((r) => r.success),
-			state: interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed",
-			summary: interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
+			success: !worktreeCaptureError && !worktreeExecutionError && !interrupted && results.every((r) => r.success),
+			state: worktreeCaptureError || worktreeExecutionError ? "failed" : interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed",
+			summary: worktreeCaptureError || worktreeExecutionError ? summary : interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
 			results: results.map((r) => ({
 				agent: r.agent,
 				output: r.output,
@@ -2651,7 +2769,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			})),
 			outputs,
 			workflowGraph: statusPayload.workflowGraph,
-			exitCode: interrupted || results.every((r) => r.success) ? 0 : 1,
+			...(worktreeSummaries.length > 0 ? { worktreeSummary: worktreeSummaries.join("\n\n") } : {}),
+			...(worktreeCaptureError ? { worktreeCaptureError } : {}),
+			...(worktreeExecutionError ? { worktreeExecutionError } : {}),
+			exitCode: !worktreeCaptureError && !worktreeExecutionError && (interrupted || results.every((r) => r.success)) ? 0 : 1,
 			timestamp: runEndedAt,
 			durationMs: runEndedAt - overallStartTime,
 			truncated,

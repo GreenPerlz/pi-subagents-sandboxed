@@ -35,9 +35,19 @@ Related behavior:
 
 ### Per run
 
+Packaged agents (`explore`, `orchestrator`, `research`, `review`, and `work`) provide their sandbox defaults in frontmatter; omit a per-run sandbox override for them. A per-run override is only runnable for a custom agent whose frontmatter grants the matching guarded permission:
+
+```yaml
+---
+name: sandbox-work
+description: Sandboxed implementation agent for a selected issue
+canBeChangedByAgent: sandbox.*
+---
+```
+
 ```ts
 subagent({
-  agent: "worker",
+  agent: "sandbox-work", // custom agent; not a packaged builtin
   task: "Fix the selected issue",
   sandbox: {
     provider: "bubblewrap",

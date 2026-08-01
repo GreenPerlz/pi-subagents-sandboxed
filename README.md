@@ -25,6 +25,7 @@ Main changes from the upstream v0.27.0 baseline:
 - Added a closed child Pi runtime path for sandboxed children, reducing ambient extension/tool discovery.
 - Mounted systemd-resolved DNS state for host networking where needed.
 - Mounted `/dev` in Bubblewrap so Node child processes and the built-in bash tool can open `/dev/null`.
+- Adjusted bundled orchestration defaults: one parent-owned worktree with inline explore/work/review handoffs, no worker commits, and no implicit repo-local Markdown reports.
 - Adjusted bundled work/review defaults and prompt guidance for this sandbox-focused fork.
 
 This is a local safety/containment feature, not a claim of hostile-code-grade isolation. The current goal is: **make packaged subagent delegation safer by default, while preserving explicit opt-outs and configurable access when a run needs broader host access.**
@@ -39,25 +40,25 @@ pi install npm:pi-subagents-sandboxed
 
 `pi-subagents-sandboxed` is a replacement fork of `pi-subagents`, not a companion package. Do not install or enable both in the same Pi environment; keep only one `subagent` extension active so slash commands, bundled agents, and the `subagent` tool resolve unambiguously.
 
-That installs the extension and the packaged agents. Because those packaged agents request Bubblewrap by default, install `bwrap` before your first run or explicitly opt out with `sandbox: { provider: "none" }` for a run. See the parent design in [docs/prd/sandboxed-subagents.md](docs/prd/sandboxed-subagents.md).
+That installs the extension and the packaged agents. Because those packaged agents request Bubblewrap by default, install `bwrap` before your first run. If you need an unsandboxed or differently sandboxed run, use a custom agent whose `canBeChangedByAgent` explicitly permits the requested `sandbox.*` fields; do not add a per-run sandbox override to a packaged agent. See the [sandboxing reference](skills/pi-subagents/sandboxing.md).
 
 ## Sandboxed subagents
 
-The packaged builtin agents (`explore`, `orchestrator`, `research`, `review`, and `work`) request `bubblewrap` with the `host-toolchain` profile, host networking, `pi-json` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. To opt a specific run out, pass `sandbox: { provider: "none" }`.
+The packaged builtin agents (`explore`, `orchestrator`, `research`, `review`, and `work`) request `bubblewrap` with the `host-toolchain` profile, host networking, `pi-json` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. A per-run sandbox override is only runnable when every affected agent explicitly permits the requested `sandbox.*` fields.
 
 ### Bubblewrap requirements
 
-The MVP sandbox provider is `bubblewrap`, which shells out to `bwrap`. Install Bubblewrap with your OS package manager before running the packaged agents (for example, `sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, or `sudo pacman -S bubblewrap`). If Bubblewrap is missing, sandboxed runs fail closed by default and the error points back to this section and the [sandbox PRD](docs/prd/sandboxed-subagents.md).
+The MVP sandbox provider is `bubblewrap`, which shells out to `bwrap`. Install Bubblewrap with your OS package manager before running the packaged agents (for example, `sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, or `sudo pacman -S bubblewrap`). If Bubblewrap is missing, sandboxed runs fail closed by default and the error points back to this section and the [sandboxing reference](skills/pi-subagents/sandboxing.md).
 
 The only supported MVP profile is `host-toolchain`. It preserves original host paths and read-only mounts common host toolchain/runtime paths such as `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, and `/etc` where present, plus the Pi/package/temp paths needed to run the child. The child cwd/worktree is mounted read-only or writable according to write inference below.
 
 ### Configure sandboxing
 
-Per run:
+Per run (using a custom agent explicitly opted into sandbox overrides; packaged `work` must use its frontmatter defaults):
 
 ```ts
 subagent({
-  agent: "work",
+  agent: "sandbox-work",
   task: "Fix the selected issue",
   sandbox: {
     provider: "bubblewrap",
@@ -85,6 +86,18 @@ sandboxBashWrite: true
 sandboxExtraReadOnlyMounts: /opt/project-toolchain
 sandboxExtraWritableMounts: .cache/subagent-build
 sandboxPackageDiscovery: project-local
+```
+
+The `sandbox-work` example requires a custom agent such as `.pi/agents/sandbox-work.md`:
+
+```yaml
+---
+name: sandbox-work
+description: Implementation agent with explicit sandbox override permission
+tools: read, grep, find, ls, bash, edit, write
+canBeChangedByAgent: sandbox.*
+---
+Implement the assigned task without committing.
 ```
 
 Dedicated subagent settings (`~/.pi/agent/subagents.json` or `.pi/subagents.json`; legacy `settings.json -> subagents` is still read):
@@ -211,7 +224,7 @@ Those are ordinary Pi requests. Pi decides whether to call `subagent`, which age
 | See running work | “Show active async runs.” |
 | Check setup | “Check whether subagents are configured correctly.” |
 
-The extension ships with builtin agents you can use immediately. In this fork, each packaged builtin agent is sandboxed by default; pass `sandbox: { provider: "none" }` for an explicit per-run opt-out.
+The extension ships with builtin agents you can use immediately. In this fork, each packaged builtin agent is sandboxed by default. Keep packaged launches on those defaults; use a custom agent with an explicit `sandbox.*` permission when a per-run opt-out or alternate sandbox is intentional.
 
 ## Builtin agents in plain English
 
@@ -229,13 +242,7 @@ A simple rule of thumb: use `explore` to map the codebase, `research` before you
 
 Builtin agents inherit your current Pi default model by default. This keeps new installs from depending on a provider you may not have configured. If you want a role to use a specific model, set an override instead of copying the bundled agent file.
 
-For one run, put the override in the command:
-
-```text
-/run review[model=anthropic/claude-sonnet-4:high] "Review this diff"
-```
-
-For a persistent override, edit settings. This example pins the review everywhere, adds a backup model for provider failures, and keeps the other builtins on your normal default model:
+For a one-run model override, use a custom agent whose frontmatter explicitly permits `model`; keep packaged launches on their inherited model. For a persistent override, edit settings. This example pins the review everywhere, adds a backup model for provider failures, and keeps the other builtins on your normal default model:
 
 ```json
 {
@@ -281,15 +288,15 @@ Check whether subagents and intercom are set up correctly.
 
 ## Recommended orchestration pattern (scaffolding)
 
-Use orchestration as parent-agent guidance, not as a runtime workflow mode. For implementation work, the recommended loop is:
+Use orchestration as parent-agent guidance, not as a runtime workflow mode. The default implementation loop owns one isolated worktree in the parent and keeps handoffs inline:
 
 ```text
-clarify → work → fresh reviews → work
+parent-owned worktree → explore (inline findings) → work (same cwd, no commit) → fresh review (inspect current git diff) → optional work fix
 ```
 
-Use the optional prompt shortcuts below when you want the pattern to be repeatable.
+The parent runs nested `explore`, `work`, and `review` foreground with `async: false`, embeds relevant explorer findings in the worker task, then passes only an abstract worker handoff to the fresh reviewer. Omitted-`async` orchestrator loop calls are also kept foreground when `asyncByDefault` is enabled. Do not create `tmp/`, context, plan, or progress Markdown for this loop unless an explicit `output`, `progress`, or `reads` option is intentional. Use the optional prompt shortcuts below when you want the pattern to be repeatable.
 
-Packaged `work` defaults to fresh context when a launch omits `context`; pass `context: "fork"` when you intentionally want a forked child run.
+Packaged agents use their declared context defaults (`work` is fresh); omit `context` for the safe packaged shape. An explicit `context: "fork"` is runnable only for an agent whose frontmatter permits the `context` override.
 
 Child-safety boundaries are enforced at runtime. Spawned child sessions do not receive the bundled `pi-subagents` skill, and forked child context filtering removes parent-only subagent artifacts (including old hidden orchestration-instruction messages, slash/status/control messages, and prior parent `subagent` tool-call/tool-result history) while preserving ordinary prose and unrelated tool calls/results. By default, children do not register the `subagent` tool and receive boundary instructions that they are not the parent orchestrator and must not propose or run subagents. The explicit exception is an agent whose resolved builtin `tools` includes `subagent`; that child gets a child-safe `subagent` tool for the fanout work the parent assigned, still bounded by `maxSubagentDepth`.
 
@@ -326,7 +333,7 @@ The child can use one dedicated coordination tool:
 
 - `contact_supervisor`: the child contacts the parent/supervisor session that delegated the task. Use `reason: "need_decision"` for blocking decisions or clarification, and `reason: "progress_update"` for short non-blocking updates when a discovery changes the plan. Do not ask for clarification when the only conflict is review-only/no-edit versus progress-writing or artifact-writing instructions; no-edit wins.
 
-Child-side routine completion handoffs are still not expected. With the intercom bridge active, parent-side `pi-subagents` sends grouped completion results through `pi-intercom`: one grouped message per foreground parent `subagent` run and one per completed async result file. Acknowledged foreground delivery returns a compact receipt with artifact/session paths; if unacknowledged, the normal full output is preserved. Grouped messages include child intercom targets, full child summaries, and compact nested child summaries under the parent child that launched them.
+Child-side routine completion handoffs are still not expected. With the intercom bridge active, parent-side `pi-subagents` sends grouped completion results through `pi-intercom`: one grouped message per foreground parent `subagent` run and one per completed async result file. Acknowledged foreground delivery returns a compact receipt with artifact/session paths; if unacknowledged, the normal full output is preserved. Grouped messages include child intercom targets, full child summaries, and compact nested child summaries under the parent child that launched them. For the default issue loop, use the inline child result in the parent task rather than a repo-local handoff file.
 
 If a child appears stalled, needs-attention notices can show up in the parent session with useful next actions, such as checking `subagent({ action: "status" })`, interrupting the run, or nudging the child.
 
@@ -391,15 +398,15 @@ For a shared task, list agents and place one `--` before the task:
 Append `[key=value,...]` to an agent name to override defaults for that step:
 
 ```text
-/chain research[output=context.md] "check docs" -> work[reads=context.md] "apply implications"
-/run research[model=anthropic/claude-sonnet-4] summarize the current API docs
-/parallel review[skills=code-review+security] "review backend" -> review[model=openai/gpt-5-mini] "review frontend"
+/chain research "check docs and return concise findings" -> work "apply the relevant inline findings"
+/run research "summarize the current API docs"
+/parallel review "review backend" -> review "review frontend"
 ```
 
 | Key | Example | Description |
 |-----|---------|-------------|
-| `output` | `output=context.md` | Write results to a file. For `/chain` and `/parallel`, relative paths live under the chain directory; for `/run`, relative paths resolve against cwd. |
-| `outputMode` | `outputMode=file-only` | Return only a concise file reference for saved output instead of the full saved content. Requires `output`; default is `inline`. |
+| `output` | `output=reports/research.md` | Explicitly write results to a file. For `/chain` and `/parallel`, relative paths live under the chain directory; for `/run`, relative paths resolve against cwd. Omit it for inline-only results. |
+| `outputMode` | `outputMode=file-only` | Return only a concise file reference for intentional saved output instead of full content. `file-only` requests persistence and may use a generated runtime path; default is `inline`. |
 | `reads` | `reads=a.md+b.md` | Read files before executing. `+` separates multiple paths. |
 | `model` | `model=anthropic/claude-sonnet-4` | Override model for this step. |
 | `skills` | `skills=planning+review` | Override injected skills. `+` separates multiple skills. |
@@ -417,22 +424,15 @@ Add `--bg` to run in the background:
 /parallel research "research frontend constraints" -> review "review backend diff" --bg
 ```
 
-Add `--fork` to start each child from a real branched session created from the parent’s current leaf:
+Packaged agents keep their safe fresh-context defaults in these runnable shapes:
 
 ```text
-/run review "review this diff" --fork
-/chain research "check external constraints" -> review "review this branch" --fork
-/parallel research "research frontend constraints" -> review "audit backend" --fork
+/run review "review this diff"
+/chain research "check external constraints" -> review "review this branch"
+/parallel research "research frontend constraints" -> review "audit backend"
 ```
 
-You can combine them in either order:
-
-```text
-/run review "review this diff" --fork --bg
-/run review "review this diff" --bg --fork
-```
-
-Background runs are detached. If the parent agent has other independent work, it should keep working. If it has nothing useful to do until the background result arrives, it should end the turn instead of running sleep or status-polling loops. Pi will deliver the completion when the run finishes.
+`--fork` is an explicit `context` override. Use it only with custom agents whose frontmatter includes `canBeChangedByAgent: context`; do not add it to the packaged `research`, `review`, or `work` examples. Background runs are detached. If the parent agent has other independent work, it should keep working. If it has nothing useful to do until the background result arrives, it should end the turn instead of running sleep or status-polling loops. Pi will deliver the completion when the run finishes.
 
 Use `work` as the single writer for implementation work, then use fresh `review` runs to check the result before applying any follow-up fixes.
 
@@ -538,9 +538,7 @@ systemPromptMode: replace
 inheritProjectContext: false
 inheritSkills: false
 skills: safe-bash, chrome-devtools
-output: context.md
-defaultReads: context.md
-defaultProgress: true
+# output/defaultReads/defaultProgress are explicit legacy opt-ins
 interactive: true
 maxSubagentDepth: 1
 acceptanceSelfReview: true
@@ -566,14 +564,14 @@ Important fields:
 | `inheritSkills` | Keeps or strips Pi’s discovered skills catalog. |
 | `defaultContext` | Optional `fresh` or `fork` launch context default for this agent. |
 | `skills` | Injects specific skills directly, regardless of `inheritSkills`. |
-| `output` | Default single-agent output file. |
-| `defaultReads` | Files to read before running in chain/parallel behavior. |
-| `defaultProgress` | Maintain `progress.md`. |
+| `output` | Explicit default single-agent output file; omitted output stays inline-only. |
+| `defaultReads` | Explicit opt-in files to read before chain/parallel behavior. |
+| `defaultProgress` | Explicit opt-in maintenance of `progress.md`; omitted by default. |
 | `interactive` | Parsed for compatibility but not enforced in v1. |
 | `maxSubagentDepth` | Tightens nested delegation for this agent’s children. |
 | `acceptanceSelfReview` | After initial completion, continue the same session to check and repair the submission against the parent's acceptance criteria. It defaults to `true`; set it to `false` to opt an agent out. |
 | `acceptanceMaxFinalizationTurns` | Default self-review budget, an integer from 1 to 10 (default `3`); dormant when self-review is disabled. |
-| `canBeChangedByAgent` | Comma-separated exact override paths or segment wildcards (`*`, `acceptance.*`, `sandbox.*`) allowed for parent-provided run overrides. Omitted/empty denies all agent-specific overrides. |
+| `canBeChangedByAgent` | Comma-separated exact override paths or segment wildcards (`*`, `acceptance.*`, `sandbox.*`) allowed for parent-provided run overrides; `worktree` permits a shared worktree request. Omitted/empty denies all agent-specific overrides. |
 
 ### Tool and extension selection
 
@@ -613,30 +611,25 @@ Chains are reusable workflows stored separately from agent files. Use `.chain.md
 
 Nested subdirectories are discovered recursively. If both `.chain.md` and `.chain.json` define the same parsed runtime chain name in the same scope, `.chain.json` wins. If user and project scopes define the same parsed runtime chain name, the project chain wins. Chains support the same optional `package` frontmatter as agents; `name: review-flow` plus `package: code-analysis` runs as `code-analysis.review-flow`.
 
-Example:
+Example (inline handoff; no repository-local files are created):
 
 ```md
 ---
 name: research-work
-description: Gather context then plan implementation
+description: Gather context then implement from inline findings
 ---
 
 ## research
 phase: Context
 label: Map auth flow
-as: context
-output: context.md
 
-Analyze the codebase for {task}
+Analyze the codebase for {task}. Return concise findings inline.
 
 ## work
-phase: Planning
-label: Implementation plan
-reads: context.md
-model: anthropic/claude-sonnet-4-5:high
-progress: true
+phase: Implementation
+label: Apply the relevant findings
 
-Create an implementation plan based on {outputs.context}
+Implement the approved change using the prior inline findings: {previous}. Do not create a report or progress file unless explicitly requested.
 ```
 
 Each `.chain.md` `## agent-name` section is a step. Config lines such as `phase`, `label`, `as`, `outputSchema`, `output`, `outputMode`, `reads`, `model`, `skills`, and `progress` go immediately after the header. A blank line separates config from task text. In saved `.chain.md` files, `outputSchema` is a path to a JSON Schema file; direct tool calls and `.chain.json` files can pass the schema object inline.
@@ -770,13 +763,13 @@ These are the parameters the LLM passes when it calls the `subagent` tool. Most 
 { agent: "research", task: "investigate", output: false }
 { agent: "research", task: "write a large report", output: "reports/research.md", outputMode: "file-only" }
 
-// Forked context
-{ agent: "work", task: "continue this thread", context: "fork" }
+// Packaged agents use their declared fresh-context defaults
+{ agent: "work", task: "continue this thread" }
 
 // Parallel
 { tasks: [{ agent: "research", task: "a" }, { agent: "review", task: "b" }] }
 { tasks: [{ agent: "research", task: "audit auth", count: 3 }] }
-{ tasks: [{ agent: "research", task: "audit frontend" }, { agent: "review", task: "audit backend" }], context: "fork" }
+{ tasks: [{ agent: "research", task: "audit frontend" }, { agent: "review", task: "audit backend" }] }
 
 // Chain
 { chain: [
@@ -792,10 +785,11 @@ These are the parameters the LLM passes when it calls the `subagent` tool. Most 
 // Chain with fan-out/fan-in
 { chain: [
   { agent: "research", task: "Gather context", phase: "Context", label: "Map code", as: "context" },
+  // Requires the opt-in `parallel-work` agent shown in Worktree isolation.
   { parallel: [
-    { agent: "work", task: "Implement feature A from {outputs.context}", label: "Feature A", as: "featureA" },
-    { agent: "work", task: "Implement feature B from {outputs.context}", label: "Feature B", as: "featureB" }
-  ], concurrency: 2, failFast: true },
+    { agent: "parallel-work", task: "Implement feature A from {outputs.context}", label: "Feature A", as: "featureA" },
+    { agent: "parallel-work", task: "Implement feature B from {outputs.context}", label: "Feature B", as: "featureB" }
+  ], concurrency: 2, failFast: true, worktree: true },
   { agent: "review", task: "Review {outputs.featureA} and {outputs.featureB}" }
 ]}
 
@@ -834,10 +828,10 @@ These are the parameters the LLM passes when it calls the `subagent` tool. Most 
   { agent: "work", task: "Plan from this scan: {outputs.scan}" }
 ] }
 
-// Worktree isolation
+// Worktree isolation (requires the explicit opt-in project agent shown below)
 { tasks: [
-  { agent: "work", task: "Implement auth" },
-  { agent: "work", task: "Implement API" }
+  { agent: "parallel-work", task: "Implement auth" },
+  { agent: "parallel-work", task: "Implement API" }
 ], worktree: true }
 ```
 
@@ -866,10 +860,7 @@ Agent definitions are not loaded into context by default. Management actions let
   tools: "read, bash, mcp:github/search_repositories",
   extensions: "",
   skills: "parallel-research",
-  thinking: "high",
-  output: "context.md",
-  reads: "shared-context.md",
-  progress: true
+  thinking: "high"
 }}
 
 { action: "create", config: {
@@ -877,8 +868,8 @@ Agent definitions are not loaded into context by default. Management actions let
   description: "Research then review",
   scope: "project",
   steps: [
-    { agent: "research", task: "Scan {task}", output: "context.md" },
-    { agent: "review", task: "Review {previous}", reads: ["context.md"] }
+    { agent: "research", task: "Scan {task}; return concise findings inline" },
+    { agent: "review", task: "Review the prior inline findings: {previous}" }
   ]
 }}
 
@@ -899,17 +890,17 @@ Agent definitions are not loaded into context by default. Management actions let
 | `action` | string | - | `list`, `get`, `create`, `update`, `delete`, `status`, `interrupt`, `resume`, or `doctor`. |
 | `chainName` | string | - | Chain name for management actions. |
 | `config` | object/string | - | Agent or chain config for create/update. |
-| `output` | `string \| false` | agent default | Override single-agent output file. |
-| `outputMode` | `"inline" \| "file-only"` | `inline` | Return saved output inline or as a concise saved-file reference. `file-only` requires an `output` path. |
+| `output` | `string \| false` | omitted | Explicitly save a single-agent output file; omitted output is inline-only. `false` disables a configured default. |
+| `outputMode` | `"inline" \| "file-only"` | `inline` | Return explicit saved output inline or as a concise saved-file reference. `file-only` is an intentional persistence request and may use a generated path when no output path is supplied. |
 | `skill` | `string \| string[] \| false` | agent default | Override skills or disable all. |
 | `model` | string | agent default | Override model. Explicit model changes require the target agent to allow `model`. |
 | `maxSubagentDepth` | integer | config/agent default | Override nested depth for affected children; each target agent must allow `maxSubagentDepth`. |
 | `tasks` | array | - | Top-level parallel tasks. Supports `agent`, `task`, `cwd`, `count`, `output`, `outputMode`, `reads`, `progress`, `skill`, `model`, and `acceptance`. |
 | `sandbox` | object | settings/agent default | Per-run sandbox fields; each affected agent must allow the provided `sandbox.<field>` paths. |
 | `concurrency` | number | config or `4` | Top-level parallel concurrency. |
-| `worktree` | boolean | false | Create isolated git worktrees for parallel tasks. |
+| `worktree` | boolean | false | Create isolated git worktrees for parallel tasks. It is guarded and every affected agent must permit a shared request. |
 | `chain` | array | - | Sequential, static parallel, and dynamic fanout chain steps. Sequential steps and parallel child tasks support `phase`, `label`, `as`, `outputSchema`, and `acceptance` in addition to the usual execution fields. Dynamic fanout uses `expand`, one child `parallel` template, and `collect`; group-level acceptance is not supported because there is no child session to finalize. |
-| `context` | `fresh \| fork` | agent default or `fresh` | `fork` creates real branched sessions from the parent leaf. Packaged `work` defaults to `fresh`; use `context: "fork"` when inherited session context is needed. Explicit context changes require every affected agent to allow `context`. |
+| `context` | `fresh \| fork` | agent default or `fresh` | `fork` creates real branched sessions from the parent leaf. Packaged `work` defaults to `fresh`; explicit context changes require every affected agent to allow `context`. |
 | `chainDir` | string | temp chain dir | Persistent directory for chain artifacts. |
 | `clarify` | boolean | true for chains | Show TUI preview/edit flow. |
 | `agentScope` | `user \| project \| both` | `both` | Agent discovery scope. Project wins on collisions. |
@@ -922,7 +913,7 @@ Agent definitions are not loaded into context by default. Management actions let
 | `sessionDir` | string | derived | Override session log directory. |
 | `acceptance` | object | omitted | Explicit acceptance contract. Self-review defaults to enabled for all agents with three turns; the target agent or an allowed run override may disable it. |
 
-`context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. It never silently downgrades to `fresh`. In multi-agent runs, if any requested agent has `defaultContext: fork` and the launch omits `context`, the whole invocation uses forked context; pass `context: "fresh"` when you intentionally want a fresh run.
+An explicit `context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. It never silently downgrades to `fresh`; the target agent must permit the override. In multi-agent runs, if any requested agent has `defaultContext: fork` and the launch omits `context`, the whole invocation uses forked context; pass `context: "fresh"` only when every affected agent permits that explicit override.
 
 Use `outputMode: "file-only"` when a saved output may be large and the parent only needs a pointer. The returned text is a compact reference like `Output saved to: /abs/report.md (48.2 KB, 2847 lines). Read this file if needed.` Failed runs and save errors still return normal inline output for debugging. In chains, later `{previous}` steps receive the same compact reference when the prior step used file-only mode.
 
@@ -948,19 +939,47 @@ subagent({ action: "doctor" })
 
 ## Worktree isolation
 
-Parallel agents can clobber each other if they edit the same checkout. `worktree: true` gives each parallel child its own git worktree branched from `HEAD`.
+Parallel agents can clobber each other if they edit the same checkout. `worktree: true` gives each parallel child its own git worktree branched from `HEAD`. For issue orchestration, the default is one parent-owned worktree: launch one `orchestrator` task with `worktree: true`, then let its inline explore → same-cwd work → fresh review loop share that worktree.
 
 ```ts
 { tasks: [
-  { agent: "work", task: "Implement auth", count: 2 },
-  { agent: "work", task: "Implement API" }
+  { agent: "orchestrator", task: "Own this one issue in the assigned worktree; relay explorer findings inline, have work edit without committing, then have a fresh reviewer inspect the current git diff." }
+], worktree: true }
+```
+
+Generic independent parallel work remains available for agents that explicitly opt into the guarded `worktree` override. Packaged `work` intentionally does not grant that override; define a project agent when independent writer worktrees are desired:
+
+```md
+<!-- .pi/agents/parallel-work.md -->
+---
+name: parallel-work
+description: Independent worktree writer
+tools: read, grep, find, ls, bash, edit, write
+sandboxProvider: bubblewrap
+sandboxProfile: host-toolchain
+sandboxNetwork: host
+sandboxAuth: pi-json
+sandboxFallback: fail
+sandboxPackageDiscovery: closed
+defaultContext: fresh
+canBeChangedByAgent: worktree
+---
+Implement the assigned task without committing; leave the diff in the worktree.
+```
+
+Then launch the opt-in agent:
+
+```ts
+{ tasks: [
+  { agent: "parallel-work", task: "Implement auth", count: 2 },
+  { agent: "parallel-work", task: "Implement API" }
 ], worktree: true }
 
 { chain: [
   { agent: "research", task: "Gather context" },
   { parallel: [
-    { agent: "work", task: "Implement feature A from {previous}" },
-    { agent: "work", task: "Implement feature B from {previous}" }
+    { agent: "parallel-work", task: "Implement feature A from {previous}" },
+    { agent: "parallel-work", task: "Implement feature B from {previous}" }
   ], worktree: true },
   { agent: "review", task: "Review all changes from {previous}" }
 ]}
@@ -974,7 +993,7 @@ Requirements:
 - task-level `cwd` overrides must be omitted or match the shared cwd
 - configured `worktreeSetupHook` must return valid JSON before timeout
 
-After a worktree parallel step completes, per-agent diff stats are appended to the output and full patch files are written to artifacts. Worktrees and temp branches are cleaned up in `finally` blocks.
+After a worktree parallel step completes, the runtime captures per-agent diff stats and full patch files before any intercom receipt or `finally` cleanup. The captured patch directory is included in the inline result and grouped intercom message, so the parent can apply that patch after the temporary worktrees are removed. Worktrees and temp branches are then cleaned up in `finally` blocks; do not rely on the child cwd still existing.
 
 ## Configuration
 
@@ -1119,13 +1138,13 @@ Supported key identifiers include single keys (`f12`, `escape`), modifiers (`ctr
 
 ## Files, logs, and observability
 
-Each chain run creates a user-scoped temp directory like:
+Each chain run may use a user-scoped runtime directory like:
 
 ```text
 <tmpdir>/pi-subagents-<scope>/chain-runs/{runId}/
 ```
 
-It may contain files such as `context.md`, `plan.md`, `progress.md`, and `parallel-{stepIndex}/.../output.md`. Directories older than 24 hours are cleaned up on extension startup.
+The default inline workflow does not create repository-local context, plan, progress, or report Markdown. Explicit `output`, `reads`, or `progress` settings may create intentional files in the configured/runtime location; directories older than 24 hours are cleaned up on extension startup. These runtime/session debug artifacts are separate from repo-local output reports.
 
 Debug artifacts live under `{sessionDir}/subagent-artifacts/` or a user-scoped temp artifact directory. Per task you may see:
 
@@ -1185,7 +1204,7 @@ Self-review finalization never counts as `reviewed`, and it never counts as `ver
 
 ### Per-agent override policy
 
-Every explicit agent-specific run override is checked against the target agent's `canBeChangedByAgent` frontmatter list before any child starts. Guarded paths include `cwd`, `context`, `model`, `skills` (`skill` maps here), `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `maxSubagentDepth`, each provided `acceptance.<field>`, and each provided `sandbox.<field>`. Use exact entries or segment-aware wildcards such as `*`, `acceptance.*`, and `sandbox.*`; substring matches are not used. Management rejects patterns that cannot match the guarded surface, and malformed manually-authored patterns fail closed rather than being normalized. A shared top-level override must be allowed by every affected agent. Clarify-TUI edits made by a human are applied after this raw-request preflight and are not treated as agent-generated overrides.
+Every explicit agent-specific run override is checked against the target agent's `canBeChangedByAgent` frontmatter list before any child starts. Guarded paths include `cwd`, `context`, `model`, `skills` (`skill` maps here), `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, each provided `acceptance.<field>`, and each provided `sandbox.<field>`. Use exact entries or segment-aware wildcards such as `*`, `acceptance.*`, and `sandbox.*`; substring matches are not used. Management rejects patterns that cannot match the guarded surface, and malformed manually-authored patterns fail closed rather than being normalized. A shared top-level override—including `worktree: true`—must be allowed by every affected agent. Clarify-TUI edits made by a human are applied after this raw-request preflight and are not treated as agent-generated overrides.
 
 ## Live progress
 

@@ -19,12 +19,12 @@ const OutputOverride = Type.Unsafe({
 		{ type: "string" },
 		{ type: "boolean" },
 	],
-	description: "Output filename/path (string), or false to disable file output. Explicit output changes require the target agent to permit output.",
+	description: "Explicit output filename/path (string), or false to disable file output. Omitted output stays inline-only. Explicit output changes require the target agent to permit output.",
 });
 
 const OutputModeOverride = Type.String({
 	enum: ["inline", "file-only"],
-	description: "Return saved output inline (default) or only a concise file reference. file-only requires output to be a path; explicit changes require outputMode permission.",
+	description: "Return inline output (default) or only a concise reference to an intentional saved output. file-only requests persistence; explicit changes require outputMode permission.",
 });
 
 const ReadsOverride = Type.Unsafe({
@@ -217,7 +217,7 @@ const ChainItem = Type.Object({
 	concurrency: Type.Optional(Type.Number({ description: "Max concurrent tasks (default: 4)" })),
 	failFast: Type.Optional(Type.Boolean({ description: "Stop on first failure (default: false)" })),
 	worktree: Type.Optional(Type.Boolean({
-		description: "Create isolated git worktrees for each parallel task."
+		description: "Create isolated git worktrees for each parallel task. Every affected agent must permit the shared worktree override."
 	})),
 }, {
 	description: "Chain step: use {agent, task?, ...} for sequential, {parallel: [...]} for static concurrent execution, or {expand, parallel: {...}, collect} for dynamic fanout.",
@@ -273,14 +273,14 @@ export const SubagentParams = Type.Object({
 			{ type: "object", additionalProperties: true },
 			{ type: "string" },
 		],
-		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, tools (comma-separated), extensions (comma-separated), skills (comma-separated), thinking, output, reads, progress, maxSubagentDepth, acceptanceSelfReview, acceptanceMaxFinalizationTurns, canBeChangedByAgent (comma-separated). Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. String values must be valid JSON."
+		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, tools (comma-separated), extensions (comma-separated), skills, thinking, explicit output, reads, progress, maxSubagentDepth, acceptanceSelfReview, acceptanceMaxFinalizationTurns, canBeChangedByAgent (comma-separated). Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. String values must be valid JSON."
 	})),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: [{agent, task, count?, output?, outputMode?, reads?, progress?}, ...]" })),
 	concurrency: Type.Optional(Type.Integer({ minimum: 1, description: "Top-level PARALLEL mode only: max concurrent tasks. Defaults to config.parallel.concurrency or 4." })),
 	worktree: Type.Optional(Type.Boolean({
 		description: "Create isolated git worktrees for each parallel task. " +
 			"Prevents filesystem conflicts. Requires clean git state. " +
-			"Per-worktree diffs included in output."
+			"Every affected agent must permit the shared worktree override; per-worktree diffs are included in output."
 	})),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "CHAIN mode: sequential pipeline where each step's response becomes {previous} for the next. Use {task}, {previous}, {chain_dir} in task templates." })),
 	context: Type.Optional(Type.String({
@@ -308,7 +308,7 @@ export const SubagentParams = Type.Object({
 			{ type: "string" },
 			{ type: "boolean" },
 		],
-		description: "Output file for single agent (string), or false to disable. Relative paths resolve against cwd.",
+		description: "Explicit output file for single agent (string), or false to disable. Omit for inline-only output; relative paths resolve against cwd.",
 	})),
 	outputMode: Type.Optional(OutputModeOverride),
 	skill: Type.Optional(SkillOverride),

@@ -164,7 +164,8 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 		label: "Subagent",
 		description: [
 			"Delegate to subagents from child-safe fanout mode.",
-			"For goal-style requests such as /goal, goal, active goal, or work until evidence says done, use explicit acceptance on the delegated run: criteria for the target, evidence/verify for proof, stopRules for constraints, and maxFinalizationTurns for the bounded loop.",
+			"Explicit agent-specific overrides are deny-by-default and must be listed by each target agent's canBeChangedByAgent policy; denied paths fail before child spawn.",
+			"For goal-style requests such as /goal, goal, active goal, or work until evidence says done, use explicit acceptance on the delegated run: criteria for the target, evidence/verify for proof, stopRules for constraints, selfReview only to override the target agent default, and maxFinalizationTurns for the bounded loop.",
 			"Allowed management/control actions: list, get, status, interrupt, resume, doctor.",
 			"Agent config mutation actions create, update, and delete are blocked in this mode.",
 		].join("\n"),

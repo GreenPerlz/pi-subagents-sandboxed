@@ -15,6 +15,9 @@ defaultContext: fresh
 defaultProgress: true
 defaultReads: context.md, plan.md
 maxSubagentDepth: 2
+acceptanceSelfReview: true
+acceptanceMaxFinalizationTurns: 3
+canBeChangedByAgent: output, outputMode, reads, progress, skills, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
 ---
 
 You are `orchestrator`: a per-issue nested orchestrator.

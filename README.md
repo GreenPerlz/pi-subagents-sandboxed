@@ -519,6 +519,8 @@ Builtin agents opt into project instruction inheritance by default so they follo
 
 ### Agent frontmatter
 
+See [docs/settings-reference.md](docs/settings-reference.md) for a compact reference covering every persistent setting, agent frontmatter field, acceptance field, and common run option.
+
 A typical agent looks like this:
 
 ```yaml
@@ -541,6 +543,9 @@ defaultReads: context.md
 defaultProgress: true
 interactive: true
 maxSubagentDepth: 1
+acceptanceSelfReview: true
+acceptanceMaxFinalizationTurns: 3
+canBeChangedByAgent: output, outputMode, reads, progress
 ---
 
 Your system prompt goes here.
@@ -566,6 +571,9 @@ Important fields:
 | `defaultProgress` | Maintain `progress.md`. |
 | `interactive` | Parsed for compatibility but not enforced in v1. |
 | `maxSubagentDepth` | Tightens nested delegation for this agent’s children. |
+| `acceptanceSelfReview` | After initial completion, continue the same session to check and repair the submission against the parent's acceptance criteria. It defaults to `true`; set it to `false` to opt an agent out. |
+| `acceptanceMaxFinalizationTurns` | Default self-review budget, an integer from 1 to 10 (default `3`); dormant when self-review is disabled. |
+| `canBeChangedByAgent` | Comma-separated exact override paths or segment wildcards (`*`, `acceptance.*`, `sandbox.*`) allowed for parent-provided run overrides. Omitted/empty denies all agent-specific overrides. |
 
 ### Tool and extension selection
 
@@ -894,12 +902,14 @@ Agent definitions are not loaded into context by default. Management actions let
 | `output` | `string \| false` | agent default | Override single-agent output file. |
 | `outputMode` | `"inline" \| "file-only"` | `inline` | Return saved output inline or as a concise saved-file reference. `file-only` requires an `output` path. |
 | `skill` | `string \| string[] \| false` | agent default | Override skills or disable all. |
-| `model` | string | agent default | Override model. |
+| `model` | string | agent default | Override model. Explicit model changes require the target agent to allow `model`. |
+| `maxSubagentDepth` | integer | config/agent default | Override nested depth for affected children; each target agent must allow `maxSubagentDepth`. |
 | `tasks` | array | - | Top-level parallel tasks. Supports `agent`, `task`, `cwd`, `count`, `output`, `outputMode`, `reads`, `progress`, `skill`, `model`, and `acceptance`. |
+| `sandbox` | object | settings/agent default | Per-run sandbox fields; each affected agent must allow the provided `sandbox.<field>` paths. |
 | `concurrency` | number | config or `4` | Top-level parallel concurrency. |
 | `worktree` | boolean | false | Create isolated git worktrees for parallel tasks. |
 | `chain` | array | - | Sequential, static parallel, and dynamic fanout chain steps. Sequential steps and parallel child tasks support `phase`, `label`, `as`, `outputSchema`, and `acceptance` in addition to the usual execution fields. Dynamic fanout uses `expand`, one child `parallel` template, and `collect`; group-level acceptance is not supported because there is no child session to finalize. |
-| `context` | `fresh \| fork` | agent default or `fresh` | `fork` creates real branched sessions from the parent leaf. Packaged `work` defaults to `fresh`; use `context: "fork"` when inherited session context is needed. |
+| `context` | `fresh \| fork` | agent default or `fresh` | `fork` creates real branched sessions from the parent leaf. Packaged `work` defaults to `fresh`; use `context: "fork"` when inherited session context is needed. Explicit context changes require every affected agent to allow `context`. |
 | `chainDir` | string | temp chain dir | Persistent directory for chain artifacts. |
 | `clarify` | boolean | true for chains | Show TUI preview/edit flow. |
 | `agentScope` | `user \| project \| both` | `both` | Agent discovery scope. Project wins on collisions. |
@@ -908,9 +918,9 @@ Agent definitions are not loaded into context by default. Management actions let
 | `maxOutput` | object | 200KB, 5000 lines | Final output truncation limits. |
 | `artifacts` | boolean | true | Write debug artifacts. |
 | `includeProgress` | boolean | false | Include full progress in result. |
-| `share` | boolean | false | Upload session export to GitHub Gist. |
+| `share` | boolean | false | Upload session export to GitHub Gist; explicit changes require every affected agent to allow `share`. |
 | `sessionDir` | string | derived | Override session log directory. |
-| `acceptance` | object | omitted | Explicit acceptance contract. When present, the child gets a structured contract, then the runtime continues the same session for a bounded self-review/repair loop before evaluating acceptance. |
+| `acceptance` | object | omitted | Explicit acceptance contract. Self-review defaults to enabled for all agents with three turns; the target agent or an allowed run override may disable it. |
 
 `context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. It never silently downgrades to `fresh`. In multi-agent runs, if any requested agent has `defaultContext: fork` and the launch omits `context`, the whole invocation uses forked context; pass `context: "fresh"` when you intentionally want a fresh run.
 
@@ -1146,7 +1156,7 @@ Async runs write:
 
 `acceptance` is an explicit contract. Omit it for lightweight runs. Set it on single runs, top-level parallel task items, sequential chain steps, static parallel task items, and dynamic fanout child templates when the child must prove the work meets concrete criteria. Do not set it on static parallel groups or dynamic fanout aggregate groups; those groups do not own a same-session child turn.
 
-If you are coming from Codex Goals, `acceptance` is the subagent equivalent for one delegated run. When a user says `/goal`, “goal”, “active goal”, “continue until evidence says done”, or “verify against a goal”, translate that into an acceptance contract: `criteria` are the target, `evidence` and `verify` are proof, `stopRules` are constraints, and `maxFinalizationTurns` is the bounded loop budget.
+If you are coming from Codex Goals, `acceptance` is the subagent equivalent for one delegated run. When a user says `/goal`, “goal”, “active goal”, “continue until evidence says done”, or “verify against a goal”, translate that into an acceptance contract: `criteria` are the target, `evidence` and `verify` are proof, `stopRules` are constraints, `selfReview` can override the target agent default, and `maxFinalizationTurns` is its loop budget. Self-review defaults to enabled for all agents with three turns; set `acceptanceSelfReview: false` in an agent definition to opt out.
 
 ```ts
 {
@@ -1161,7 +1171,7 @@ If you are coming from Codex Goals, `acceptance` is the subagent equivalent for 
 }
 ```
 
-When `acceptance` is present, the initial child prompt includes a standardized acceptance section and asks for a fenced `acceptance-report` JSON block. After the child’s initial completion, the runtime continues the same persisted child session with an acceptance finalization prompt. The child can repair omissions in that same session, then must return the final `acceptance-report`. Missing or malformed finalization reports reject the run when the loop limit is reached.
+When `acceptance` is present, the child prompt includes a standardized acceptance section and asks for a fenced `acceptance-report` JSON block. When self-review is enabled, the runtime continues the same persisted child session with a bounded acceptance finalization prompt so the child can repair omissions and return the final report; when disabled, the initial response is evaluated once. Missing or malformed required reports reject the run.
 
 Public acceptance config is evidence-driven. There is no public `level` field and no `acceptance: "checked"` shorthand. Runtime provenance is derived from what actually happened:
 
@@ -1172,6 +1182,10 @@ Public acceptance config is evidence-driven. There is no public `level` field an
 - `rejected`: attestation, structural checks, verification, review, or finalization failed.
 
 Self-review finalization never counts as `reviewed`, and it never counts as `verified` unless configured runtime verification commands actually pass. The visible child output remains the initial answer; finalization reports and residual risks are stored in the acceptance ledger and async/status details.
+
+### Per-agent override policy
+
+Every explicit agent-specific run override is checked against the target agent's `canBeChangedByAgent` frontmatter list before any child starts. Guarded paths include `cwd`, `context`, `model`, `skills` (`skill` maps here), `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `maxSubagentDepth`, each provided `acceptance.<field>`, and each provided `sandbox.<field>`. Use exact entries or segment-aware wildcards such as `*`, `acceptance.*`, and `sandbox.*`; substring matches are not used. Management rejects patterns that cannot match the guarded surface, and malformed manually-authored patterns fail closed rather than being normalized. A shared top-level override must be allowed by every affected agent. Clarify-TUI edits made by a human are applied after this raw-request preflight and are not treated as agent-generated overrides.
 
 ## Live progress
 

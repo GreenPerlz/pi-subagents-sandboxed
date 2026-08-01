@@ -3,11 +3,15 @@
 ## [Unreleased]
 
 ### Changed
+- Added authoritative per-agent acceptance defaults and deny-by-default `canBeChangedByAgent` policies for explicit run overrides, enforced consistently before foreground/background/chain/parallel/dynamic child launch.
+- Acceptance self-review is now controlled per agent and defaults to enabled for all agents with a three-turn budget; set `acceptanceSelfReview: false` to opt an agent out.
+- Added exact and segment-aware wildcard override paths, management/frontmatter serialization, bundled agent policies, and a concise settings reference for the complete configuration surface.
 - Added the `max` thinking level to subagent settings and clarify selectors for models whose registry metadata explicitly supports it.
 - Packaged builtin agents now request a closed Bubblewrap `host-toolchain` sandbox by default, with fail-closed fallback and explicit per-run opt-out via `sandbox: { provider: "none" }`.
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 
 ### Fixed
+- Acceptance finalization keeps the configured provider-qualified model (including OpenRouter routes) instead of replacing it with provider-local child telemetry.
 - Foreground/non-async child runs no longer expose `contact_supervisor`; only async/background children receive the injected supervisor bridge tooling, while clarify-to-background launches keep that bridge behavior.
 
 ## [0.27.0] - 2026-05-30

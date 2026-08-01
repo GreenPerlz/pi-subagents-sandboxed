@@ -22,6 +22,9 @@ export type AgentSource = "builtin" | "user" | "project";
 type SystemPromptMode = "append" | "replace";
 export type AgentDefaultContext = "fresh" | "fork";
 
+export const DEFAULT_ACCEPTANCE_SELF_REVIEW = true;
+export const DEFAULT_ACCEPTANCE_MAX_FINALIZATION_TURNS = 3;
+
 export function defaultSystemPromptMode(name: string): SystemPromptMode {
 	return name === "delegate" ? "append" : "replace";
 }
@@ -93,6 +96,12 @@ export interface AgentConfig {
 	defaultProgress?: boolean;
 	interactive?: boolean;
 	maxSubagentDepth?: number;
+	/** Whether explicit acceptance contracts default to same-session self-review. */
+	acceptanceSelfReview?: boolean;
+	/** Default bounded self-review turn count when acceptance self-review is enabled. */
+	acceptanceMaxFinalizationTurns?: number;
+	/** Explicit run paths this agent definition permits a parent to override. */
+	canBeChangedByAgent?: string[];
 	disabled?: boolean;
 	sandbox?: AgentSandboxConfig;
 	extraFields?: Record<string, string>;
@@ -870,6 +879,16 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		}
 
 		const parsedMaxSubagentDepth = Number(frontmatter.maxSubagentDepth);
+		const parsedAcceptanceMaxFinalizationTurns = Number(frontmatter.acceptanceMaxFinalizationTurns);
+		const acceptanceMaxFinalizationTurns = Number.isInteger(parsedAcceptanceMaxFinalizationTurns)
+			&& parsedAcceptanceMaxFinalizationTurns >= 1
+			&& parsedAcceptanceMaxFinalizationTurns <= 10
+			? parsedAcceptanceMaxFinalizationTurns
+			: DEFAULT_ACCEPTANCE_MAX_FINALIZATION_TURNS;
+		const acceptanceSelfReview = frontmatter.acceptanceSelfReview === "true"
+			? true
+			: DEFAULT_ACCEPTANCE_SELF_REVIEW;
+		const canBeChangedByAgent = frontmatterStringList(frontmatter.canBeChangedByAgent) ?? [];
 		const sandbox = buildAgentSandboxConfig(frontmatter);
 
 		agents.push({
@@ -899,6 +918,9 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 				Number.isInteger(parsedMaxSubagentDepth) && parsedMaxSubagentDepth >= 0
 					? parsedMaxSubagentDepth
 					: undefined,
+			acceptanceSelfReview,
+			acceptanceMaxFinalizationTurns,
+			canBeChangedByAgent,
 			sandbox,
 			extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
 		});

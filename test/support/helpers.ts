@@ -60,6 +60,9 @@ interface AgentConfig {
 	progress?: boolean;
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
+	acceptanceSelfReview?: boolean;
+	acceptanceMaxFinalizationTurns?: number;
+	canBeChangedByAgent?: string[];
 	sandbox?: Record<string, unknown>;
 }
 
@@ -71,6 +74,9 @@ export function makeAgentConfigs(names: string[]): AgentConfig[] {
 		systemPromptMode: "replace",
 		inheritProjectContext: false,
 		inheritSkills: false,
+		acceptanceSelfReview: true,
+		acceptanceMaxFinalizationTurns: 3,
+		canBeChangedByAgent: ["*"],
 	}));
 }
 
@@ -82,6 +88,9 @@ export function makeAgent(name: string, overrides: Partial<AgentConfig> = {}): A
 		systemPromptMode: "replace",
 		inheritProjectContext: false,
 		inheritSkills: false,
+		acceptanceSelfReview: true,
+		acceptanceMaxFinalizationTurns: 3,
+		canBeChangedByAgent: ["*"],
 		...overrides,
 	};
 }

@@ -509,6 +509,45 @@ process.exit(${exitCode});
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	it("evaluates acceptance once when agent self-review defaults off", async () => {
+		mockPi.onCall({ output: acceptanceReport() });
+		const agents = [makeAgent("worker", { acceptanceSelfReview: false })];
+
+		const result = await runSync(tempDir, agents, "worker", "Create a one-pass acceptance report", {
+			runId: "guard-acceptance-one-pass",
+			acceptance: { criteria: ["Create the report"], maxFinalizationTurns: 3 },
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.acceptance?.status, "checked");
+		assert.equal(result.acceptance?.finalization, undefined);
+		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("preserves provider-qualified model routing across acceptance finalization", async () => {
+		mockPi.onCall({ output: acceptanceReport() });
+		mockPi.onCall({ output: acceptanceReport() });
+		const agents = [makeAgent("worker", { model: "openrouter/openai/gpt-4o" })];
+
+		const result = await runSync(tempDir, agents, "worker", "Create a routed acceptance report", {
+			runId: "guard-acceptance-openrouter-model",
+			acceptance: { criteria: ["Create the report"], selfReview: true, maxFinalizationTurns: 1 },
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(mockPi.callCount(), 2);
+		const callFiles = fs.readdirSync(mockPi.dir)
+			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.sort();
+		for (const callFile of callFiles) {
+			const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[] };
+			const args = payload.args ?? [];
+			const modelIndex = args.indexOf("--model");
+			assert.notEqual(modelIndex, -1);
+			assert.equal(args[modelIndex + 1], "openrouter/openai/gpt-4o");
+		}
+	});
+
 	it("stops acceptance finalization at max turns when self-review never satisfies criteria", async () => {
 		mockPi.onCall({ output: "```acceptance-report\n{bad-json\n```" });
 		mockPi.onCall({ output: formatAcceptanceReport([{ id: "criterion-1", status: "not-satisfied", evidence: "still missing after first self-review" }]) });
@@ -611,6 +650,69 @@ process.exit(${exitCode});
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.progress.status, "completed");
 		assert.equal(result.finalOutput, "Applied edit");
+	});
+
+	it("rejects denied acceptance overrides before spawning a child", async () => {
+		const executor = makeExecutor([makeAgent("worker", { canBeChangedByAgent: [] })]);
+		const result = await executor.execute(
+			"denied-acceptance-override",
+			{ agent: "worker", task: "Implement the fix", acceptance: { criteria: ["Fix it"], selfReview: true } },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /acceptance\.criteria, acceptance\.selfReview/);
+		assert.match(result.content[0]?.text ?? "", /remove the denied overrides or recommend an agent-definition change to the user/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rejects denied parallel, chain, dynamic, and async overrides before spawning", async () => {
+		const executor = makeExecutor([
+			makeAgent("one", { canBeChangedByAgent: ["outputSchema"] }),
+			makeAgent("two", { canBeChangedByAgent: [] }),
+		]);
+		const cases = [
+			{
+				name: "parallel",
+				params: { tasks: [{ agent: "two", task: "Review", model: "provider/model" }] },
+			},
+			{
+				name: "chain",
+				params: { chain: [{ agent: "two", task: "Review", model: "provider/model" }] },
+			},
+			{
+				name: "dynamic",
+				params: {
+					chain: [
+						{ agent: "one", task: "List items", as: "items", outputSchema: { type: "object" } },
+						{
+							expand: { from: { output: "items", path: "/items" }, maxItems: 1 },
+							parallel: { agent: "two", task: "Review {item}", model: "provider/model" },
+							collect: { as: "results" },
+						},
+					],
+				},
+			},
+			{
+				name: "async",
+				params: { agent: "two", task: "Review", model: "provider/model", async: true },
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			const result = await executor.execute(
+				`denied-${testCase.name}-override`,
+				testCase.params,
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(result.isError, true, testCase.name);
+			assert.match(result.content[0]?.text ?? "", /denied model/, testCase.name);
+		}
+		assert.equal(mockPi.callCount(), 0);
 	});
 
 	it("returns error for unknown agent", async () => {
@@ -2123,6 +2225,36 @@ process.exit(${exitCode});
 			assert.deepEqual(JSON.parse(result.finalOutput ?? "{}"), {
 				PI_SUBAGENT_DEPTH: "1",
 				PI_SUBAGENT_MAX_DEPTH: "1",
+			});
+		} finally {
+			if (prevDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+			else process.env.PI_SUBAGENT_DEPTH = prevDepth;
+			if (prevMaxDepth === undefined) delete process.env.PI_SUBAGENT_MAX_DEPTH;
+			else process.env.PI_SUBAGENT_MAX_DEPTH = prevMaxDepth;
+		}
+	});
+
+	it("executor run override tightens an inherited nested max depth", async () => {
+		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"] });
+		const executor = makeExecutor([makeAgent("echo", { canBeChangedByAgent: ["maxSubagentDepth"] })]);
+		const prevDepth = process.env.PI_SUBAGENT_DEPTH;
+		const prevMaxDepth = process.env.PI_SUBAGENT_MAX_DEPTH;
+		process.env.PI_SUBAGENT_DEPTH = "1";
+		process.env.PI_SUBAGENT_MAX_DEPTH = "5";
+
+		try {
+			const response = await executor.execute(
+				"nested-depth-override",
+				{ agent: "echo", task: "Task", maxSubagentDepth: 2 },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			const result = response.details.results[0]!;
+			assert.equal(response.isError, undefined);
+			assert.deepEqual(JSON.parse(result.finalOutput ?? "{}"), {
+				PI_SUBAGENT_DEPTH: "2",
+				PI_SUBAGENT_MAX_DEPTH: "2",
 			});
 		} finally {
 			if (prevDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;

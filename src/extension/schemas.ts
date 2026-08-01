@@ -11,7 +11,7 @@ const SkillOverride = Type.Unsafe({
 		{ type: "boolean" },
 		{ type: "string" },
 	],
-	description: "Skill name(s) to inject (comma-separated), array of strings, or boolean (false disables, true uses default)",
+	description: "Skill name(s) to inject (comma-separated), array of strings, or boolean (false disables, true uses default). Explicit skill changes map to the guarded skills path.",
 });
 
 const OutputOverride = Type.Unsafe({
@@ -19,12 +19,12 @@ const OutputOverride = Type.Unsafe({
 		{ type: "string" },
 		{ type: "boolean" },
 	],
-	description: "Output filename/path (string), or false to disable file output",
+	description: "Output filename/path (string), or false to disable file output. Explicit output changes require the target agent to permit output.",
 });
 
 const OutputModeOverride = Type.String({
 	enum: ["inline", "file-only"],
-	description: "Return saved output inline (default) or only a concise file reference. file-only requires output to be a path.",
+	description: "Return saved output inline (default) or only a concise file reference. file-only requires output to be a path; explicit changes require outputMode permission.",
 });
 
 const ReadsOverride = Type.Unsafe({
@@ -32,7 +32,7 @@ const ReadsOverride = Type.Unsafe({
 		{ type: "array", items: { type: "string" } },
 		{ type: "boolean" },
 	],
-	description: "Files to read before running (array of filenames), or false to disable",
+	description: "Files to read before running (array of filenames), or false to disable. Explicit changes require reads permission."
 });
 
 const SandboxOverride = Type.Object({
@@ -106,6 +106,7 @@ const AcceptanceOverride = Type.Unsafe({
 		verify: { type: "array", items: AcceptanceVerifyCommandSchema },
 		review: AcceptanceReviewGateSchema,
 		stopRules: { type: "array", items: { type: "string" } },
+		selfReview: { type: "boolean", description: "Enable same-session self-review for this contract; omitted uses the target agent default." },
 		maxFinalizationTurns: { type: "integer", minimum: 1, maximum: 10 },
 	},
 	additionalProperties: false,
@@ -118,7 +119,7 @@ const AcceptanceOverride = Type.Unsafe({
 			{ required: ["stopRules"] },
 		],
 	}],
-	description: "Optional acceptance contract. Use this for goal-style requests such as /goal, goal, active goal, or work until evidence says done: criteria define the target, evidence/verify define proof, stopRules define constraints, and maxFinalizationTurns defines the bounded loop. When present, the child must complete a same-session self-review/repair loop before acceptance is evaluated.",
+	description: "Optional acceptance contract. Use this for goal-style requests such as /goal, goal, active goal, or work until evidence says done: criteria define the target, evidence/verify define proof, stopRules define constraints, and maxFinalizationTurns defines the bounded loop when selfReview is enabled. Omitted selfReview uses the target agent default; all agents default to three same-session repair turns.",
 });
 
 const TaskItem = Type.Object({
@@ -272,7 +273,7 @@ export const SubagentParams = Type.Object({
 			{ type: "object", additionalProperties: true },
 			{ type: "string" },
 		],
-		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, tools (comma-separated), extensions (comma-separated), skills (comma-separated), thinking, output, reads, progress, maxSubagentDepth. Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. String values must be valid JSON."
+		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, tools (comma-separated), extensions (comma-separated), skills (comma-separated), thinking, output, reads, progress, maxSubagentDepth, acceptanceSelfReview, acceptanceMaxFinalizationTurns, canBeChangedByAgent (comma-separated). Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. String values must be valid JSON."
 	})),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: [{agent, task, count?, output?, outputMode?, reads?, progress?}, ...]" })),
 	concurrency: Type.Optional(Type.Integer({ minimum: 1, description: "Top-level PARALLEL mode only: max concurrent tasks. Defaults to config.parallel.concurrency or 4." })),
@@ -284,15 +285,16 @@ export const SubagentParams = Type.Object({
 	chain: Type.Optional(Type.Array(ChainItem, { description: "CHAIN mode: sequential pipeline where each step's response becomes {previous} for the next. Use {task}, {previous}, {chain_dir} in task templates." })),
 	context: Type.Optional(Type.String({
 		enum: ["fresh", "fork"],
-		description: "'fresh' or 'fork' to branch from parent session. If omitted, any requested agent with defaultContext: 'fork' makes the whole invocation forked; otherwise the default is 'fresh'.",
+		description: "'fresh' or 'fork' to branch from parent session. If omitted, any requested agent with defaultContext: 'fork' makes the whole invocation forked; otherwise the default is 'fresh'. The target agent must permit this override.",
 	})),
+	maxSubagentDepth: Type.Optional(Type.Integer({ minimum: 0, description: "Override the maximum nested subagent depth for affected children; each target agent must permit this override." })),
 	chainDir: Type.Optional(Type.String({ description: "Persistent directory for chain artifacts. Default: a user-scoped temp directory under <tmpdir>/ (auto-cleaned after 24h)" })),
 	async: Type.Optional(Type.Boolean({ description: "Run in background (default: false, or per config)" })),
 	agentScope: Type.Optional(Type.String({ description: "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" })),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(Type.String({ description: "Override cwd for affected children; each target agent must permit cwd." })),
 	artifacts: Type.Optional(Type.Boolean({ description: "Write debug artifacts (default: true)" })),
 	includeProgress: Type.Optional(Type.Boolean({ description: "Include full progress in result (default: false)" })),
-	share: Type.Optional(Type.Boolean({ description: "Upload session to GitHub Gist for sharing (default: false)" })),
+	share: Type.Optional(Type.Boolean({ description: "Upload session to GitHub Gist for sharing (default: false); explicit share changes require every affected agent to permit share." })),
 	sessionDir: Type.Optional(
 		Type.String({ description: "Directory to store session logs (default: temp; enables sessions even if share=false)" }),
 	),
@@ -310,6 +312,6 @@ export const SubagentParams = Type.Object({
 	})),
 	outputMode: Type.Optional(OutputModeOverride),
 	skill: Type.Optional(SkillOverride),
-	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" })),
+	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4'); the target agent must permit model." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 });

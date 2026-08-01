@@ -30,6 +30,7 @@ const ACCEPTANCE_KEYS = new Set([
 	"verify",
 	"review",
 	"stopRules",
+	"selfReview",
 	"maxFinalizationTurns",
 ]);
 
@@ -56,7 +57,7 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 		errors.push(`${pathLabel}.level is no longer supported; configure criteria, evidence, verify, and review directly.`);
 	}
 	if (Object.hasOwn(value, "finalization")) {
-		errors.push(`${pathLabel}.finalization is not supported; acceptance contracts always run the self-review loop.`);
+		errors.push(`${pathLabel}.finalization is not supported; use selfReview and maxFinalizationTurns.`);
 	}
 	if (Object.hasOwn(value, "reason")) {
 		errors.push(`${pathLabel}.reason is not supported because acceptance is disabled by omitting the field.`);
@@ -154,6 +155,10 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 		}
 	}
 
+	if (value.selfReview !== undefined && typeof value.selfReview !== "boolean") {
+		errors.push(`${pathLabel}.selfReview must be a boolean.`);
+	}
+
 	if (value.maxFinalizationTurns !== undefined) {
 		if (!Number.isInteger(value.maxFinalizationTurns) || Number(value.maxFinalizationTurns) < 1 || Number(value.maxFinalizationTurns) > MAX_FINALIZATION_TURNS) {
 			errors.push(`${pathLabel}.maxFinalizationTurns must be an integer from 1 to ${MAX_FINALIZATION_TURNS}.`);
@@ -200,6 +205,10 @@ export function resolveEffectiveAcceptance(input: {
 	async?: boolean;
 	dynamic?: boolean;
 	dynamicGroup?: boolean;
+	/** Agent frontmatter default; omitted means self-review is enabled. */
+	agentAcceptanceSelfReview?: boolean;
+	/** Agent frontmatter default turn budget. */
+	agentAcceptanceMaxFinalizationTurns?: number;
 }): ResolvedAcceptanceConfig {
 	if (input.explicit === undefined) {
 		return {
@@ -221,6 +230,15 @@ export function resolveEffectiveAcceptance(input: {
 	const criteria = normalizeCriteria(explicit.criteria, evidence);
 	const verify = explicit.verify ?? [];
 	const stopRules = explicit.stopRules ?? [];
+	const selfReview = explicit.selfReview ?? input.agentAcceptanceSelfReview ?? true;
+	const requestedMaxTurns = explicit.maxFinalizationTurns
+		?? input.agentAcceptanceMaxFinalizationTurns
+		?? DEFAULT_FINALIZATION_MAX_TURNS;
+	const configuredMaxTurns = Number.isInteger(requestedMaxTurns)
+		&& requestedMaxTurns >= 1
+		&& requestedMaxTurns <= MAX_FINALIZATION_TURNS
+		? requestedMaxTurns
+		: DEFAULT_FINALIZATION_MAX_TURNS;
 	return {
 		level: deriveAcceptanceLevel(explicit),
 		explicit: true,
@@ -230,7 +248,9 @@ export function resolveEffectiveAcceptance(input: {
 		verify,
 		...(explicit.review ? { review: explicit.review } : {}),
 		stopRules,
-		finalization: { mode: "self-review-loop", maxTurns: explicit.maxFinalizationTurns ?? DEFAULT_FINALIZATION_MAX_TURNS },
+		finalization: selfReview
+			? { mode: "self-review-loop", maxTurns: configuredMaxTurns }
+			: { mode: "none", maxTurns: 0 },
 	};
 }
 
@@ -287,8 +307,10 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 	const lines = [
 		"",
 		"## Acceptance Contract",
-		"Completion is not accepted from prose alone. End the initial response with a structured acceptance report.",
-		"After the initial response, the runtime will continue this same session for a bounded self-review/repair loop before accepting the run.",
+		"Completion is not accepted from prose alone. End the response with a structured acceptance report.",
+		...(shouldRunAcceptanceFinalization(acceptance)
+			? ["After the initial response, the runtime will continue this same session for a bounded self-review/repair loop before accepting the run."]
+			: ["This contract is evaluated once from the response; same-session self-review is disabled for this run."]),
 		"",
 		"Criteria:",
 		...(acceptance.criteria.length ? acceptance.criteria.map((criterion) => `- ${criterion.id}: ${criterion.must}`) : ["- No explicit criteria were configured; satisfy the requested task and the required evidence/checks below."]),

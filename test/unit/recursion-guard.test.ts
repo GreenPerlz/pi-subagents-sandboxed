@@ -9,6 +9,7 @@ import {
 	resolveTopLevelParallelMaxTasks,
 	resolveChildMaxSubagentDepth,
 	resolveCurrentMaxSubagentDepth,
+	resolveRunMaxSubagentDepth,
 } from "../../src/shared/types.ts";
 
 let savedDepth: string | undefined;
@@ -61,6 +62,24 @@ describe("resolveCurrentMaxSubagentDepth", () => {
 		delete process.env.PI_SUBAGENT_MAX_DEPTH;
 		assert.equal(resolveCurrentMaxSubagentDepth(undefined), 2);
 		assert.equal(resolveCurrentMaxSubagentDepth(-1), 2);
+	});
+});
+
+describe("resolveRunMaxSubagentDepth", () => {
+	it("lets an explicit top-level override replace config", () => {
+		delete process.env.PI_SUBAGENT_MAX_DEPTH;
+		assert.equal(resolveRunMaxSubagentDepth(4, 2), 4);
+	});
+
+	it("lets an explicit nested override tighten but not loosen the inherited maximum", () => {
+		process.env.PI_SUBAGENT_MAX_DEPTH = "5";
+		assert.equal(resolveRunMaxSubagentDepth(1, 2), 1);
+		assert.equal(resolveRunMaxSubagentDepth(8, 2), 5);
+	});
+
+	it("retains inherited resolution when no explicit override is provided", () => {
+		process.env.PI_SUBAGENT_MAX_DEPTH = "5";
+		assert.equal(resolveRunMaxSubagentDepth(undefined, 1), 5);
 	});
 });
 

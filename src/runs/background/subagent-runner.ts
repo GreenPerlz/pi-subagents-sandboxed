@@ -996,12 +996,18 @@ async function runSingleStep(
 					maxTurns,
 					...(previousFailure ? { previousFailure } : {}),
 				});
+				// Keep the configured provider-qualified candidate for continuation;
+				// child telemetry may report only the provider-local model id.
+				const finalizationModel = modelAttempts.find((attempt) => attempt.success)?.model
+					?? attemptedModels.at(-1)
+					?? step.model
+					?? finalResult?.model;
 				const { args, env, tempDir } = buildPiArgs({
 					baseArgs: ["--mode", "json", "-p"],
 					task: prompt,
 					sessionEnabled: true,
 					sessionFile,
-					model: finalResult?.model ?? step.model,
+					model: finalizationModel,
 					inheritProjectContext: step.inheritProjectContext,
 					inheritSkills: step.inheritSkills,
 					tools: step.tools,
@@ -1023,7 +1029,6 @@ async function runSingleStep(
 					parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
 					sandbox: closedSandboxRuntime,
 				});
-				const finalizationModel = finalResult?.model ?? step.model;
 				ctx.onAttemptStart?.({ model: finalizationModel, thinking: resolveEffectiveThinking(finalizationModel, finalizationModel ? undefined : step.thinking) });
 				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;
 				const finalizationRun = await runPiStreaming(
@@ -1041,7 +1046,7 @@ async function runSingleStep(
 				);
 				cleanupTempDir(tempDir);
 				modelAttempts.push({
-					model: finalResult?.model ?? finalizationRun.model ?? step.model ?? "default",
+					model: finalizationModel ?? finalizationRun.model ?? "default",
 					success: finalizationRun.exitCode === 0 && !finalizationRun.error,
 					exitCode: finalizationRun.exitCode,
 					error: finalizationRun.error,

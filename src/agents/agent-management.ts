@@ -11,6 +11,8 @@ import {
 	defaultInheritProjectContext,
 	defaultInheritSkills,
 	defaultSystemPromptMode,
+	DEFAULT_ACCEPTANCE_MAX_FINALIZATION_TURNS,
+	DEFAULT_ACCEPTANCE_SELF_REVIEW,
 	discoverAgentsAll,
 	buildRuntimeName,
 	frontmatterNameForConfig,
@@ -18,6 +20,8 @@ import {
 } from "./agents.ts";
 import { serializeAgent } from "./agent-serializer.ts";
 import { serializeChain, serializeJsonChain } from "./chain-serializer.ts";
+import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
+import { invalidAgentOverridePatterns } from "../runs/shared/agent-override-policy.ts";
 import { discoverAvailableSkills } from "./skills.ts";
 import type { Details } from "../shared/types.ts";
 
@@ -212,6 +216,11 @@ function parseStepList(raw: unknown): { steps?: ChainStepConfig[]; error?: strin
 			if (typeof s.progress === "boolean") step.progress = s.progress;
 			else return { error: `config.steps[${i}].progress must be a boolean.` };
 		}
+		if (hasKey(s, "acceptance")) {
+			const acceptanceErrors = validateAcceptanceInput(s.acceptance, `config.steps[${i}].acceptance`);
+			if (acceptanceErrors.length > 0) return { error: acceptanceErrors.join(" ") };
+			step.acceptance = s.acceptance as ChainStepConfig["acceptance"];
+		}
 		steps.push(step);
 	}
 	return { steps };
@@ -313,6 +322,35 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			target.maxSubagentDepth = cfg.maxSubagentDepth;
 		} else return "config.maxSubagentDepth must be an integer >= 0 or false when provided.";
 	}
+	if (hasKey(cfg, "acceptanceSelfReview")) {
+		if (typeof cfg.acceptanceSelfReview !== "boolean") return "config.acceptanceSelfReview must be a boolean when provided.";
+		target.acceptanceSelfReview = cfg.acceptanceSelfReview;
+	}
+	if (hasKey(cfg, "acceptanceMaxFinalizationTurns")) {
+		if (cfg.acceptanceMaxFinalizationTurns === false || cfg.acceptanceMaxFinalizationTurns === "") {
+			target.acceptanceMaxFinalizationTurns = DEFAULT_ACCEPTANCE_MAX_FINALIZATION_TURNS;
+		} else if (typeof cfg.acceptanceMaxFinalizationTurns !== "number"
+			|| !Number.isInteger(cfg.acceptanceMaxFinalizationTurns)
+			|| cfg.acceptanceMaxFinalizationTurns < 1
+			|| cfg.acceptanceMaxFinalizationTurns > 10) {
+			return "config.acceptanceMaxFinalizationTurns must be an integer from 1 to 10, false, or empty string when provided.";
+		} else {
+			target.acceptanceMaxFinalizationTurns = cfg.acceptanceMaxFinalizationTurns;
+		}
+	}
+	if (hasKey(cfg, "canBeChangedByAgent")) {
+		let paths: string[];
+		if (cfg.canBeChangedByAgent === false || cfg.canBeChangedByAgent === "") paths = [];
+		else if (typeof cfg.canBeChangedByAgent === "string") paths = parseCsv(cfg.canBeChangedByAgent);
+		else if (Array.isArray(cfg.canBeChangedByAgent) && cfg.canBeChangedByAgent.every((value) => typeof value === "string")) {
+			paths = [...new Set(cfg.canBeChangedByAgent.map((value) => value.trim()).filter(Boolean))];
+		} else return "config.canBeChangedByAgent must be a comma-separated string, string array, or false when provided.";
+		const invalidPaths = invalidAgentOverridePatterns(paths);
+		if (invalidPaths.length > 0) {
+			return `config.canBeChangedByAgent contains unsupported override patterns: ${invalidPaths.join(", ")}. Use exact paths or segment wildcards from the documented guarded override surface.`;
+		}
+		target.canBeChangedByAgent = paths;
+	}
 	return undefined;
 }
 
@@ -382,6 +420,9 @@ function formatAgentDetail(agent: AgentConfig): string {
 	if (agent.defaultReads?.length) lines.push(`Reads: ${agent.defaultReads.join(", ")}`);
 	if (agent.defaultProgress) lines.push("Progress: true");
 	if (agent.maxSubagentDepth !== undefined) lines.push(`Max subagent depth: ${agent.maxSubagentDepth}`);
+	lines.push(`Acceptance self-review: ${agent.acceptanceSelfReview === true ? "true" : "false"}`);
+	lines.push(`Acceptance max finalization turns: ${agent.acceptanceMaxFinalizationTurns ?? DEFAULT_ACCEPTANCE_MAX_FINALIZATION_TURNS}`);
+	lines.push(`Can be changed by agent: ${agent.canBeChangedByAgent?.length ? agent.canBeChangedByAgent.join(", ") : "(none; deny by default)"}`);
 	if (agent.systemPrompt.trim()) lines.push("", "System Prompt:", agent.systemPrompt);
 	return lines.join("\n");
 }
@@ -531,6 +572,9 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 		systemPromptMode: defaultSystemPromptMode(name),
 		inheritProjectContext: defaultInheritProjectContext(name),
 		inheritSkills: defaultInheritSkills(),
+		acceptanceSelfReview: DEFAULT_ACCEPTANCE_SELF_REVIEW,
+		acceptanceMaxFinalizationTurns: DEFAULT_ACCEPTANCE_MAX_FINALIZATION_TURNS,
+		canBeChangedByAgent: [],
 	};
 	const applyError = applyAgentConfig(agent, cfg);
 	if (applyError) return result(applyError, true);

@@ -979,11 +979,19 @@ async function runAcceptanceFinalizationLoop(input: {
 		delete finalizationOptions.structuredOutput;
 		delete finalizationOptions.onUpdate;
 		finalizationOptions.allowIntercomDetach = false;
+		// Child telemetry can report a provider-local model id (for example
+		// `openai/gpt-4o`) even when the configured candidate was explicitly
+		// routed through `openrouter/openai/gpt-4o`. Finalization must continue
+		// with the configured/attempted candidate, not that telemetry label.
+		const finalizationModel = input.result.modelAttempts?.find((attempt) => attempt.success)?.model
+			?? input.result.attemptedModels?.at(-1)
+			?? input.options.modelOverride
+			?? input.agent.model
 		const finalizationResult = await runSingleAttempt(
 			input.runtimeCwd,
 			input.agent,
 			prompt,
-			applyThinkingSuffix(input.result.model, input.result.thinking),
+			applyThinkingSuffix(finalizationModel, input.result.thinking),
 			finalizationOptions,
 			{
 				sessionEnabled: true,
@@ -1079,6 +1087,8 @@ export async function runSync(
 		async: options.acceptanceContext?.async,
 		dynamic: options.acceptanceContext?.dynamic,
 		dynamicGroup: options.acceptanceContext?.dynamicGroup,
+		agentAcceptanceSelfReview: agent.acceptanceSelfReview,
+		agentAcceptanceMaxFinalizationTurns: agent.acceptanceMaxFinalizationTurns,
 	});
 	if (shouldRunAcceptanceFinalization(effectiveAcceptance) && !options.sessionFile) {
 		const sessionDir = options.sessionDir ?? mkdtempSync(path.join(os.tmpdir(), "pi-subagent-finalization-"));

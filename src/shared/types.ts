@@ -281,6 +281,8 @@ export interface AcceptanceConfig {
 	verify?: AcceptanceVerifyCommand[];
 	review?: AcceptanceReviewGate;
 	stopRules?: string[];
+	/** Explicitly enable/disable same-session self-review; omitted uses the agent default. */
+	selfReview?: boolean;
 	maxFinalizationTurns?: number;
 }
 
@@ -1038,6 +1040,18 @@ export function resolveCurrentMaxSubagentDepth(configMaxDepth?: number): number 
 	return normalizeMaxSubagentDepth(process.env.PI_SUBAGENT_MAX_DEPTH)
 		?? normalizeMaxSubagentDepth(configMaxDepth)
 		?? DEFAULT_SUBAGENT_MAX_DEPTH;
+}
+
+/**
+ * Resolve an explicit run override without allowing a nested caller to loosen
+ * the maximum inherited from its parent. When no override is supplied, retain
+ * the existing inherited-then-config resolution semantics.
+ */
+export function resolveRunMaxSubagentDepth(override: unknown, configMaxDepth?: number): number {
+	const normalizedOverride = normalizeMaxSubagentDepth(override);
+	if (normalizedOverride === undefined) return resolveCurrentMaxSubagentDepth(configMaxDepth);
+	const inherited = normalizeMaxSubagentDepth(process.env.PI_SUBAGENT_MAX_DEPTH);
+	return inherited === undefined ? normalizedOverride : Math.min(inherited, normalizedOverride);
 }
 
 export function resolveChildMaxSubagentDepth(parentMaxDepth: number, agentMaxDepth?: number): number {

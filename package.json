@@ -29,6 +29,7 @@
     "src/**/*.ts",
     "*.mjs",
     "agents/",
+    "docs/",
     "skills/**/*",
     "prompts/**/*",
     "README.md",

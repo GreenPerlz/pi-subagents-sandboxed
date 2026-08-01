@@ -17,6 +17,65 @@ afterEach(() => {
 	}
 });
 
+describe("agent frontmatter acceptance and override policy", () => {
+	it("serializes typed acceptance defaults and allowed override paths", () => {
+		const agent: AgentConfig = {
+			name: "work",
+			description: "Work",
+			systemPrompt: "Do work",
+			systemPromptMode: "replace",
+			inheritProjectContext: true,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/tmp/work.md",
+			acceptanceSelfReview: true,
+			acceptanceMaxFinalizationTurns: 7,
+			canBeChangedByAgent: ["acceptance.*", "sandbox.provider"],
+		};
+		const serialized = serializeAgent(agent);
+		assert.match(serialized, /acceptanceSelfReview: true/);
+		assert.match(serialized, /acceptanceMaxFinalizationTurns: 7/);
+		assert.match(serialized, /canBeChangedByAgent: acceptance\.\*, sandbox\.provider/);
+	});
+
+	it("defaults acceptance self-review on, turn budget to three, and paths to deny-all", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-override-defaults-"));
+		tempDirs.push(dir);
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---
+name: worker
+description: Worker
+---
+Work
+`, "utf-8");
+		const worker = discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker");
+		assert.equal(worker?.acceptanceSelfReview, true);
+		assert.equal(worker?.acceptanceMaxFinalizationTurns, 3);
+		assert.deepEqual(worker?.canBeChangedByAgent, []);
+	});
+
+	it("parses typed acceptance fields and comma-separated paths", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-override-parse-"));
+		tempDirs.push(dir);
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---
+name: worker
+description: Worker
+acceptanceSelfReview: true
+acceptanceMaxFinalizationTurns: 8
+canBeChangedByAgent: cwd, acceptance.*, sandbox.*
+---
+Work
+`, "utf-8");
+		const worker = discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker");
+		assert.equal(worker?.acceptanceSelfReview, true);
+		assert.equal(worker?.acceptanceMaxFinalizationTurns, 8);
+		assert.deepEqual(worker?.canBeChangedByAgent, ["cwd", "acceptance.*", "sandbox.*"]);
+	});
+});
+
 describe("agent frontmatter defaultContext", () => {
 	it("serializes defaultContext into agent frontmatter", () => {
 		const agent: AgentConfig = {
@@ -62,6 +121,12 @@ Do work
 		assert.deepEqual(agents.map((agent) => agent.name).sort(), ["explore", "orchestrator", "research", "review", "work"]);
 		const work = agents.find((candidate) => candidate.name === "work");
 		assert.equal(work?.defaultContext, "fresh", "work should default to fresh context");
+		for (const agent of agents) {
+			assert.equal(agent.acceptanceSelfReview, true, `${agent.name} should enable same-session self-review`);
+			assert.equal(agent.acceptanceMaxFinalizationTurns, 3, `${agent.name} should default to three self-review turns`);
+			assert.ok(agent.canBeChangedByAgent?.includes("acceptance.criteria"), `${agent.name} should allow parent acceptance criteria`);
+			assert.ok(agent.canBeChangedByAgent?.includes("acceptance.selfReview"), `${agent.name} should allow explicit self-review overrides`);
+		}
 	});
 
 	it("loads packaged agents with bubblewrap sandbox defaults", () => {

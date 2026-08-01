@@ -15,6 +15,22 @@ Review the diff
 `;
 
 describe("chain serializer", () => {
+	it("round-trips markdown acceptance selfReview configuration", () => {
+		const chain = parseChain(`---
+name: acceptance-chain
+description: Acceptance chain
+---
+
+## work
+acceptance: {"criteria":["Patch bug"],"selfReview":true,"maxFinalizationTurns":2}
+
+Implement the fix
+`, "project", "/tmp/acceptance-chain.md");
+	assert.deepEqual(chain.steps[0]?.acceptance, { criteria: ["Patch bug"], selfReview: true, maxFinalizationTurns: 2 });
+	const serialized = serializeChain(chain);
+	assert.match(serialized, /acceptance: \{"criteria":\["Patch bug"\],"selfReview":true,"maxFinalizationTurns":2\}/);
+	});
+
 	it("round-trips step outputMode", () => {
 		const parsed = parseChain(chainContent, "project", "/tmp/review-chain.md");
 

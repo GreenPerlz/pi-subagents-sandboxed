@@ -11,6 +11,9 @@ sandboxNetwork: host
 sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
+acceptanceSelfReview: true
+acceptanceMaxFinalizationTurns: 3
+canBeChangedByAgent: output, outputMode, progress, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
 output: research.md
 defaultProgress: true
 ---

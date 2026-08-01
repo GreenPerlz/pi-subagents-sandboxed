@@ -44,6 +44,48 @@ describe("agent management config parsing", () => {
 		assert.match(readText(result), /config must be valid JSON:/);
 	});
 
+	it("persists per-agent acceptance defaults and override permissions", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const created = handleCreate(
+			{
+				config: {
+					name: "worker",
+					description: "Worker",
+					scope: "project",
+					acceptanceSelfReview: true,
+					acceptanceMaxFinalizationTurns: 6,
+					canBeChangedByAgent: ["acceptance.*", "sandbox.provider"],
+				},
+			},
+			ctx,
+		);
+
+		assert.equal(created.isError, false);
+		const content = fs.readFileSync(path.join(tempDir, ".pi", "agents", "worker.md"), "utf-8");
+		assert.match(content, /^acceptanceSelfReview: true$/m);
+		assert.match(content, /^acceptanceMaxFinalizationTurns: 6$/m);
+		assert.match(content, /^canBeChangedByAgent: acceptance\.\*, sandbox\.provider$/m);
+		const got = handleManagementAction("get", { agent: "worker" }, ctx);
+		assert.match(readText(got), /Acceptance self-review: true/);
+		assert.match(readText(got), /Can be changed by agent: acceptance\.\*, sandbox\.provider/);
+	});
+
+	it("rejects override policy typos during agent management", () => {
+		const result = handleCreate(
+			{
+				config: {
+					name: "worker",
+					description: "Worker",
+					canBeChangedByAgent: ["model.", "acceptance.unknown"],
+				},
+			},
+			{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(readText(result), /unsupported override patterns: model\., acceptance\.unknown/);
+	});
+
 	it("creates, gets, updates, and deletes a packaged agent by runtime name", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const created = handleCreate(

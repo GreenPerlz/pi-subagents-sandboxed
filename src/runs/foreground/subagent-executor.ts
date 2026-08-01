@@ -61,6 +61,7 @@ import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { inspectSubagentStatus } from "../background/run-status.ts";
 import { applyForceTopLevelAsyncOverride } from "../background/top-level-async.ts";
 import { validateAcceptanceInput } from "../shared/acceptance.ts";
+import { validateAndFormatAgentOverridePolicy } from "../shared/agent-override-policy.ts";
 import {
 	cleanupWorktrees,
 	createWorktrees,
@@ -101,6 +102,7 @@ import {
 	resolveTopLevelParallelMaxTasks,
 	resolveChildMaxSubagentDepth,
 	resolveCurrentMaxSubagentDepth,
+	resolveRunMaxSubagentDepth,
 	wrapForkTask,
 } from "../../shared/types.ts";
 
@@ -135,6 +137,7 @@ export interface SubagentParamsLike {
 	concurrency?: number;
 	worktree?: boolean;
 	context?: "fresh" | "fork";
+	maxSubagentDepth?: number;
 	async?: boolean;
 	clarify?: boolean;
 	share?: boolean;
@@ -1392,7 +1395,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		currentModelProvider: ctx.model?.provider,
 	};
 	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
-	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const currentMaxSubagentDepth = resolveRunMaxSubagentDepth(params.maxSubagentDepth, deps.config.maxSubagentDepth);
 	const currentProvider = ctx.model?.provider;
 	const controlIntercomTarget = intercomBridge.active ? intercomBridge.orchestratorTarget : undefined;
 	const childIntercomTarget = intercomBridge.active ? (agent: string, index: number) => resolveSubagentIntercomTarget(id, agent, index) : undefined;
@@ -1563,7 +1566,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 	const normalized = normalizeSkillInput(params.skill);
 	const chainSkills = normalized === false ? [] : (normalized ?? []);
 	const chain = wrapChainTasksForFork(params.chain as ChainStep[], params.context);
-	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const currentMaxSubagentDepth = resolveRunMaxSubagentDepth(params.maxSubagentDepth, deps.config.maxSubagentDepth);
 	const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
 	const sandbox = resolveSandboxConfig({
 		settings: sandboxSettings,
@@ -1983,7 +1986,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		agentConfigs.push(config);
 	}
 
-	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const currentMaxSubagentDepth = resolveRunMaxSubagentDepth(params.maxSubagentDepth, deps.config.maxSubagentDepth);
 	const maxSubagentDepths = agentConfigs.map((config) =>
 		resolveChildMaxSubagentDepth(currentMaxSubagentDepth, config.maxSubagentDepth),
 	);
@@ -2335,7 +2338,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const rawOutput = params.output !== undefined ? params.output : agentConfig.output;
 	let effectiveOutput = normalizeSingleOutputOverride(rawOutput, agentConfig.output);
 	const effectiveOutputMode = params.outputMode ?? "inline";
-	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const currentMaxSubagentDepth = resolveRunMaxSubagentDepth(params.maxSubagentDepth, deps.config.maxSubagentDepth);
 	const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, agentConfig.maxSubagentDepth);
 
 	if (params.clarify === true && ctx.hasUI) {
@@ -2786,6 +2789,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const normalized = normalizeRepeatedParallelCounts(paramsWithResolvedCwd);
 		if (normalized.error) return normalized.error;
 		const normalizedParams = normalized.params!;
+		// Keep the pre-default, raw request for override policy. In particular,
+		// context inferred from agent frontmatter is not a caller override.
+		const rawOverrideParams = normalizedParams;
 
 		let effectiveParams = applyForceTopLevelAsyncOverride(
 			normalizedParams,
@@ -2876,6 +2882,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			allowClarifyTaskPrompt,
 		);
 		if (validationError) return validationError;
+
+		const overridePolicyError = validateAndFormatAgentOverridePolicy(rawOverrideParams, discoveredAgents);
+		if (overridePolicyError) {
+			return validationErrorResult(getRequestedModeLabel(effectiveParams), overridePolicyError);
+		}
 
 		let sessionFileForIndex: (idx?: number) => string | undefined = () => undefined;
 		try {

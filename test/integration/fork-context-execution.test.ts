@@ -132,6 +132,18 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 	function makeExecutorWithDiscoverAgents(discoverAgentsImpl: typeof discoverAgents, config: Record<string, unknown> = {}) {
 		let sessionName: string | undefined;
 		const eventsApi = createEventBus();
+		const discoverForTest = (cwd: string, scope: "user" | "project" | "both") => {
+			const discovered = discoverAgentsImpl(cwd, scope);
+			return {
+				...discovered,
+				agents: discovered.agents.map((agent) => ({
+					...agent,
+					acceptanceSelfReview: agent.acceptanceSelfReview ?? true,
+					acceptanceMaxFinalizationTurns: agent.acceptanceMaxFinalizationTurns ?? 3,
+					canBeChangedByAgent: agent.canBeChangedByAgent ?? ["*"],
+				})),
+			};
+		};
 		return Object.assign(createSubagentExecutor({
 			pi: {
 				events: eventsApi,
@@ -147,7 +159,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			tempArtifactsDir: tempDir,
 			getSubagentSessionRoot: () => tempDir,
 			expandTilde: (p: string) => p,
-			discoverAgents: discoverAgentsImpl,
+			discoverAgents: discoverForTest,
 		}), { eventsApi });
 	}
 
@@ -219,7 +231,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		fs.writeFileSync(
 			filePath,
-			`---\nname: ${name}\ndescription: ${name} agent\nmodel: ${model}\n---\n\nUse ${model}.\n`,
+			`---\nname: ${name}\ndescription: ${name} agent\nmodel: ${model}\ncanBeChangedByAgent: *\n---\n\nUse ${model}.\n`,
 			"utf-8",
 		);
 	}

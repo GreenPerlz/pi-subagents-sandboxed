@@ -659,6 +659,42 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	it("async single preserves provider-qualified model routing across acceptance finalization", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const report = [
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "report created" }],
+				residualRisks: [],
+			}),
+			"```",
+		].join("\n");
+		mockPi.onCall({ output: report });
+		mockPi.onCall({ output: report });
+		const id = `async-acceptance-openrouter-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Create a routed acceptance report",
+			agentConfig: makeAgent("worker", { model: "openrouter/openai/gpt-4o" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-acceptance-openrouter" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sessionFile: path.join(tempDir, "async-acceptance-openrouter-session.jsonl"),
+			acceptance: { criteria: ["Create the report"], selfReview: true, maxFinalizationTurns: 1 },
+		});
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+
+		assert.equal(result.success, true);
+		assert.equal(mockPi.callCount(), 2);
+		for (const index of [0, 1]) {
+			const args = readMockPiArgs(mockPi, index);
+			const modelIndex = args.indexOf("--model");
+			assert.notEqual(modelIndex, -1);
+			assert.equal(args[modelIndex + 1], "openrouter/openai/gpt-4o");
+		}
+	});
+
 	it("async single preserves successful acceptance when finalization turn exits nonzero with valid output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const report = [
 			"```acceptance-report",
@@ -801,6 +837,47 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(result.results[0]?.acceptance?.reviewResult?.status, "needs-parent-decision");
 		assert.equal(status.steps?.[0]?.acceptance?.status, "rejected");
 		assert.equal(status.steps?.[0]?.acceptance?.finalization?.status, "completed");
+	});
+
+	it("async executor run override tightens an inherited nested max depth", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"] });
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("worker", { canBeChangedByAgent: ["maxSubagentDepth"] })] }),
+		});
+		const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+		const previousMaxDepth = process.env.PI_SUBAGENT_MAX_DEPTH;
+		process.env.PI_SUBAGENT_DEPTH = "1";
+		process.env.PI_SUBAGENT_MAX_DEPTH = "5";
+
+		try {
+			const response = await executor.execute(
+				"async-nested-depth-override",
+				{ agent: "worker", task: "Report depth", maxSubagentDepth: 2, async: true },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			const asyncId = response.details?.asyncId;
+			assert.ok(asyncId, "expected asyncId");
+			const resultPath = await waitForAsyncResultFile(asyncId, 10_000);
+			const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.deepEqual(JSON.parse(result.results[0]?.output ?? "{}"), {
+				PI_SUBAGENT_DEPTH: "2",
+				PI_SUBAGENT_MAX_DEPTH: "2",
+			});
+		} finally {
+			if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+			else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+			if (previousMaxDepth === undefined) delete process.env.PI_SUBAGENT_MAX_DEPTH;
+			else process.env.PI_SUBAGENT_MAX_DEPTH = previousMaxDepth;
+		}
 	});
 
 	it("top-level async chain suppresses progress for {task} review-only tasks", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

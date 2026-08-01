@@ -1,4 +1,5 @@
 import type { ChainConfig, ChainStepConfig } from "./agents.ts";
+import type { AcceptanceInput } from "../shared/types.ts";
 import { buildRuntimeName, frontmatterNameForConfig, parsePackageName } from "./identity.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../runs/shared/chain-outputs.ts";
@@ -71,6 +72,17 @@ function parseStepBody(agent: string, sectionBody: string): ChainStepConfig {
 					.map((v) => v.trim())
 					.filter(Boolean);
 				step.skills = skills.length > 0 ? skills : false;
+			}
+			continue;
+		}
+		if (key === "acceptance") {
+			try {
+				const parsed = JSON.parse(rawValue) as unknown;
+				const errors = validateAcceptanceInput(parsed, `chain step ${agent} acceptance`);
+				if (errors.length > 0) throw new Error(errors.join(" "));
+				step.acceptance = parsed as AcceptanceInput;
+			} catch (error) {
+				throw new Error(`Invalid acceptance for chain step '${agent}': ${error instanceof Error ? error.message : String(error)}`);
 			}
 			continue;
 		}
@@ -248,6 +260,7 @@ export function serializeChain(config: ChainConfig): string {
 		if (step.skills === false) lines.push("skills: false");
 		else if (Array.isArray(step.skills) && step.skills.length > 0) lines.push(`skills: ${step.skills.join(", ")}`);
 		if (step.progress !== undefined) lines.push(`progress: ${step.progress ? "true" : "false"}`);
+		if (step.acceptance !== undefined) lines.push(`acceptance: ${JSON.stringify(step.acceptance)}`);
 		lines.push("");
 		lines.push(step.task ?? "");
 		if (i < config.steps.length - 1) lines.push("");

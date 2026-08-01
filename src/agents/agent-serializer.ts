@@ -21,6 +21,9 @@ export const KNOWN_FIELDS = new Set([
 	"defaultProgress",
 	"interactive",
 	"maxSubagentDepth",
+	"acceptanceSelfReview",
+	"acceptanceMaxFinalizationTurns",
+	"canBeChangedByAgent",
 	"sandboxProvider",
 	"sandboxProfile",
 	"sandboxNetwork",
@@ -80,6 +83,16 @@ export function serializeAgent(config: AgentConfig): string {
 	if (typeof maxSubagentDepth === "number" && Number.isInteger(maxSubagentDepth) && maxSubagentDepth >= 0) {
 		lines.push(`maxSubagentDepth: ${maxSubagentDepth}`);
 	}
+	lines.push(`acceptanceSelfReview: ${config.acceptanceSelfReview === true ? "true" : "false"}`);
+	const acceptanceMaxFinalizationTurns = typeof config.acceptanceMaxFinalizationTurns === "number"
+		&& Number.isInteger(config.acceptanceMaxFinalizationTurns)
+		&& config.acceptanceMaxFinalizationTurns >= 1
+		&& config.acceptanceMaxFinalizationTurns <= 10
+		? config.acceptanceMaxFinalizationTurns
+		: 3;
+	lines.push(`acceptanceMaxFinalizationTurns: ${acceptanceMaxFinalizationTurns}`);
+	const canBeChangedByAgent = joinComma(config.canBeChangedByAgent);
+	if (canBeChangedByAgent) lines.push(`canBeChangedByAgent: ${canBeChangedByAgent}`);
 	if (config.sandbox?.provider) lines.push(`sandboxProvider: ${config.sandbox.provider}`);
 	if (config.sandbox?.profile) lines.push(`sandboxProfile: ${config.sandbox.profile}`);
 	if (config.sandbox?.network) lines.push(`sandboxNetwork: ${config.sandbox.network}`);

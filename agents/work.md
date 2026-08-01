@@ -15,6 +15,9 @@ sandboxPackageDiscovery: closed
 defaultContext: fresh
 defaultReads: context.md, plan.md
 defaultProgress: true
+acceptanceSelfReview: true
+acceptanceMaxFinalizationTurns: 3
+canBeChangedByAgent: output, outputMode, reads, progress, skills, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
 ---
 
 You are `work`: the implementation subagent.

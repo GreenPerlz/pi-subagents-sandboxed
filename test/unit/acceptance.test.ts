@@ -55,20 +55,19 @@ describe("acceptance gates", () => {
 		assert.equal(formatAcceptancePrompt(resolved), "");
 	});
 
-	it("explicit criteria derive checked acceptance and a required finalization loop", () => {
+	it("explicit criteria derive checked acceptance and a three-turn self-review loop by default", () => {
 		const resolved = resolveEffectiveAcceptance({
 			agentName: "worker",
 			task: "Implement a fix",
 			explicit: {
 				criteria: ["Patch the bug"],
 				evidence: ["changed-files", "tests-added", "commands-run", "residual-risks"],
-				maxFinalizationTurns: 2,
 			},
 		});
 
 		assert.equal(resolved.level, "checked");
 		assert.equal(resolved.finalization.mode, "self-review-loop");
-		assert.equal(resolved.finalization.maxTurns, 2);
+		assert.equal(resolved.finalization.maxTurns, 3);
 		assert.equal(shouldRunAcceptanceFinalization(resolved), true);
 	});
 
@@ -79,6 +78,7 @@ describe("acceptance gates", () => {
 			explicit: {
 				criteria: [{ id: "schema", must: "Patch the bug", evidence: ["diff-summary"] }],
 				stopRules: ["Do not stop after analysis"],
+				selfReview: true,
 			},
 		});
 		const prompt = formatAcceptancePrompt(resolved);
@@ -126,6 +126,24 @@ describe("acceptance gates", () => {
 		assert.match(finalizationPrompt, /Required evidence: diff-summary/);
 		assert.match(finalizationPrompt, /"diffSummary": "summary of the final diff"/);
 		assert.equal(typeof parseAcceptanceReport(finalizationPrompt).report?.diffSummary, "string");
+	});
+
+	it("agent defaults and explicit selfReview controls finalization without making max turns active when disabled", () => {
+		const agentDefault = resolveEffectiveAcceptance({
+			agentName: "worker",
+			explicit: { criteria: ["Patch bug"] },
+			agentAcceptanceSelfReview: true,
+			agentAcceptanceMaxFinalizationTurns: 4,
+		});
+		assert.equal(agentDefault.finalization.mode, "self-review-loop");
+		assert.equal(agentDefault.finalization.maxTurns, 4);
+		const disabled = resolveEffectiveAcceptance({
+			agentName: "worker",
+			explicit: { criteria: ["Patch bug"], maxFinalizationTurns: 10 },
+			agentAcceptanceSelfReview: false,
+		});
+		assert.equal(disabled.finalization.mode, "none");
+		assert.equal(disabled.finalization.maxTurns, 0);
 	});
 
 	it("generated report examples satisfy combined global and criterion evidence", async () => withTempRepo(async (cwd) => {
@@ -306,5 +324,6 @@ describe("acceptance gates", () => {
 		assert.deepEqual(validateAcceptanceInput({ verify: [{ id: "missing-command" }] }), ["acceptance.verify[0].command is required."]);
 		assert.deepEqual(validateAcceptanceInput({ criteria: ["Patch bug"], maxFinalizationTurns: 0 }), ["acceptance.maxFinalizationTurns must be an integer from 1 to 10."]);
 		assert.deepEqual(validateAcceptanceInput({ criteria: ["Patch bug"], maxFinalizationTurn: 2 }), ["acceptance.maxFinalizationTurn is not supported."]);
+		assert.deepEqual(validateAcceptanceInput({ criteria: ["Patch bug"], selfReview: "yes" }), ["acceptance.selfReview must be a boolean."]);
 	});
 });

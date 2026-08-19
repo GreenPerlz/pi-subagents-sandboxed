@@ -108,6 +108,60 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("processes atomic result renames when Bun reports only the temporary source filename", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-bun-rename-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const pi = {
+				events: {
+					on: () => () => {},
+					emit(event: string, data: unknown) {
+						emitted.push({ event, data });
+					},
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			let watchCallback: ((event: string, file: string | Buffer | null) => void) | undefined;
+			const fakeWatcher = {
+				on() { return fakeWatcher; },
+				close() {},
+				unref() {},
+			} as unknown as fs.FSWatcher;
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, {
+				fs: {
+					...fs,
+					watch: ((_dir: fs.PathLike, callback: (event: string, file: string | Buffer | null) => void) => {
+						watchCallback = callback;
+						return fakeWatcher;
+					}) as typeof fs.watch,
+				},
+			});
+			const id = "async-bun-atomic";
+			const resultPath = path.join(resultsDir, `${id}.json`);
+			try {
+				watcher.startResultWatcher();
+				fs.writeFileSync(resultPath, JSON.stringify({
+					id,
+					agent: "worker",
+					success: true,
+					state: "complete",
+					summary: "done",
+					sessionId: "session-1",
+				}), "utf-8");
+				watchCallback?.("rename", `.${id}.json.123.456.abcdef.tmp`);
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			} finally {
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(emitted.filter((entry) => entry.event === "subagent:async-complete").length, 1);
+			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("falls back to polling when fs.watch throws EMFILE and preserves grouped intercom delivery", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {

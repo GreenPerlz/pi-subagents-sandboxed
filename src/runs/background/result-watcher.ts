@@ -94,6 +94,16 @@ function shouldFallBackToPolling(error: unknown): boolean {
 	return code === "EMFILE" || code === "ENOSPC";
 }
 
+function resolveResultFileFromWatchEvent(fileName: string): string | undefined {
+	if (fileName.endsWith(".json")) return path.basename(fileName) === fileName ? fileName : undefined;
+	// writeAtomicJson renames `.result.json.<pid>.<time>.<nonce>.tmp` to
+	// `result.json`. Node reports the destination rename, while Bun may report
+	// only the temporary source filename. Recover the destination in either case.
+	const atomicTempMatch = /^\.(.+\.json)\.\d+\.\d+\.[^.]+\.tmp$/.exec(fileName);
+	const resultFile = atomicTempMatch?.[1];
+	return resultFile && path.basename(resultFile) === resultFile ? resultFile : undefined;
+}
+
 export function createResultWatcher(
 	pi: { events: IntercomEventBus },
 	state: SubagentState,
@@ -278,9 +288,9 @@ export function createResultWatcher(
 		try {
 			state.watcher = fsApi.watch(resultsDir, (ev, file) => {
 				if (ev !== "rename" || !file) return;
-				const fileName = file.toString();
-				if (!fileName.endsWith(".json")) return;
-				state.resultFileCoalescer.schedule(fileName);
+				const resultFile = resolveResultFileFromWatchEvent(file.toString());
+				if (!resultFile) return;
+				state.resultFileCoalescer.schedule(resultFile);
 			});
 			state.watcher.on("error", (error) => {
 				if (shouldFallBackToPolling(error)) {

@@ -47,7 +47,7 @@ import {
 	extractTextFromContent,
 } from "../../shared/utils.ts";
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
-import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
+import { getPiSpawnCommand, getPiSpawnEntrypointOverrideForTests } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
@@ -57,7 +57,7 @@ import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/o
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
-import { resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { resolveCandidateLaunchThinking, resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { appendSavedOutputSystemPrompt, captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -203,6 +203,7 @@ async function runSingleAttempt(
 		sessionDir: options.sessionDir,
 		sessionFile: options.sessionFile,
 		model,
+		thinking: resolveCandidateLaunchThinking(model, agent.thinking),
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
@@ -235,7 +236,7 @@ async function runSingleAttempt(
 		messages: [],
 		usage: emptyUsage(),
 		model: modelArg,
-		thinking: resolveEffectiveThinking(modelArg, undefined),
+		thinking: resolveCandidateLaunchThinking(modelArg, agent.thinking),
 		artifactPaths: shared.artifactPaths,
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
@@ -280,7 +281,10 @@ async function runSingleAttempt(
 	let spawnSpec: SpawnableInvocation;
 	let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
 	try {
-		const piSpawnSpec = getPiSpawnCommand(args, options.sandbox ? { preferNodeCli: true } : {});
+		const piSpawnSpec = getPiSpawnCommand(args, {
+			preferNodeCli: true,
+			entrypointOverride: getPiSpawnEntrypointOverrideForTests(),
+		});
 		const piInvocation: SpawnableInvocation = {
 			command: piSpawnSpec.command,
 			args: piSpawnSpec.args,

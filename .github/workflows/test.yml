@@ -2,12 +2,21 @@ name: Tests
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
+  pi-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Require the latest bundled Pi runtime
+        run: npm run check:pi-version
+
   test:
+    needs: pi-version
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -18,8 +27,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-      - name: Install devDependencies
-        run: npm install
+      - name: Install locked dependencies
+        run: npm ci
       - name: Unit tests
         run: npm test
       - name: Integration tests

@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      bundled-pi-runtime:
+        patterns:
+          - "@earendil-works/pi-*"
+          - "pi-subagent-runtime"

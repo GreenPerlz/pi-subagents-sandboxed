@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, resolveEffectiveThinking, type ModelInfo } from "../../src/shared/model-info.ts";
+import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, resolveCandidateLaunchThinking, resolveEffectiveThinking, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -125,6 +125,21 @@ describe("model info helpers", () => {
 
 		it("appends suffix for model not in registry when availableModels is empty array", () => {
 			assert.equal(effectiveModelDisplay("unknown/model", "high", []), "unknown/model:high");
+		});
+	});
+
+	describe("resolveCandidateLaunchThinking", () => {
+		it("uses an explicit supported candidate suffix", () => {
+			assert.equal(resolveCandidateLaunchThinking("openai/gpt-5:high", "low"), "high");
+		});
+
+		it("preserves explicit off and inherited-model thinking", () => {
+			assert.equal(resolveCandidateLaunchThinking("openai/gpt-5", "off"), "off");
+			assert.equal(resolveCandidateLaunchThinking(undefined, "high"), "high");
+		});
+
+		it("does not reapply configured thinking omitted from an unsupported candidate", () => {
+			assert.equal(resolveCandidateLaunchThinking("openai/gpt-5", "max"), undefined);
 		});
 	});
 

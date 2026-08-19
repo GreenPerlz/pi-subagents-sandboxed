@@ -188,7 +188,7 @@ describe("buildPiArgs model wiring", () => {
 	});
 
 
-	it("preserves thinking suffixes on model args", () => {
+	it("passes configured thinking separately from the provider model id", () => {
 		const { args } = buildPiArgs({
 			baseArgs: ["-p"],
 			task: "hello",
@@ -201,8 +201,32 @@ describe("buildPiArgs model wiring", () => {
 
 		assert.equal(applyThinkingSuffix("openai-codex/gpt-5.4-mini", "high"), "openai-codex/gpt-5.4-mini:high");
 		assert.equal(applyThinkingSuffix("openai/gpt-5.6-sol:max", "high"), "openai/gpt-5.6-sol:max");
-		assert.ok(args.includes("--model"));
-		assert.ok(args.includes("openai-codex/gpt-5.4-mini:high"));
+		assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 4), [
+			"--model",
+			"openai-codex/gpt-5.4-mini",
+			"--thinking",
+			"high",
+		]);
+		assert.equal(args.includes("openai-codex/gpt-5.4-mini:high"), false);
+	});
+
+	it("splits an explicit known thinking suffix before launch", () => {
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			model: "openai-codex/gpt-5.6-sol:max",
+			thinking: "high",
+			inheritProjectContext: false,
+			inheritSkills: false,
+		});
+
+		assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 4), [
+			"--model",
+			"openai-codex/gpt-5.6-sol",
+			"--thinking",
+			"max",
+		]);
 	});
 });
 

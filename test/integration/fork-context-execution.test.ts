@@ -1035,14 +1035,14 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		process.env.USERPROFILE = tempHome;
 		const worktreeDir = path.join(tempDir, "worktree");
 		fs.mkdirSync(worktreeDir, { recursive: true });
-		writeProjectOverride(tempDir, "reviewer", "openai/gpt-5-main");
-		writeProjectOverride(worktreeDir, "reviewer", "openai/gpt-5-worktree");
+		writeProjectOverride(tempDir, "review", "openai/gpt-5-main");
+		writeProjectOverride(worktreeDir, "review", "openai/gpt-5-worktree");
 		const executor = makeExecutor();
 
 		try {
 			const result = await executor.execute(
 				"id",
-				{ action: "get", agent: "reviewer", cwd: "worktree" },
+				{ action: "get", agent: "review", cwd: "worktree" },
 				new AbortController().signal,
 				undefined,
 				makeCtx(makeSessionManagerRecorder().manager),

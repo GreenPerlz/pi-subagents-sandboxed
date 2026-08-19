@@ -412,7 +412,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(result.details.asyncId, id);
 			const statusDeadline = Date.now() + 10_000;
 			let status = readStatus(path.join(ASYNC_DIR, id)) as (AsyncStatusPayload & { runId?: string }) | null;
-			while ((!status?.steps?.[0]?.sandbox) && Date.now() < statusDeadline) {
+			while ((!Array.isArray(status?.steps?.[0]?.sandbox?.mounts)) && Date.now() < statusDeadline) {
 				await new Promise((resolve) => setTimeout(resolve, 100));
 				status = readStatus(path.join(ASYNC_DIR, id)) as (AsyncStatusPayload & { runId?: string }) | null;
 			}
@@ -490,7 +490,12 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			}
 			assert.ok(chainStatus?.state === "running" || chainStatus?.state === "complete" || chainStatus?.state === "failed");
 
-			const allBwrapArgs = readAllFakeBwrapArgs(fakeBwrap.recordDir);
+			const bwrapDeadline = Date.now() + 10_000;
+			let allBwrapArgs = readAllFakeBwrapArgs(fakeBwrap.recordDir);
+			while (allBwrapArgs.length < 3 && Date.now() < bwrapDeadline) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				allBwrapArgs = readAllFakeBwrapArgs(fakeBwrap.recordDir);
+			}
 			assert.ok(allBwrapArgs.length >= 3, "expected bwrap to wrap parallel and chain children");
 			const parallelSessionPrefix = path.join(sessionRoot, `async-${parallelId}`);
 			assert.ok(allBwrapArgs.some((args) => args.some((arg) => arg.startsWith(`${parallelSessionPrefix}${path.sep}`))), "parallel child session dir should be mounted");
@@ -1449,6 +1454,42 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(status?.steps?.[0]?.model, "anthropic/claude-sonnet-4");
 		assert.equal(status?.steps?.[0]?.thinking, undefined);
 		await waitForAsyncResultFile(id);
+	});
+
+	it("background setup preserves explicit off and inherited-model thinking", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "off done", delay: 500 });
+		mockPi.onCall({ output: "inherited done", delay: 500 });
+		const cases = [
+			{ id: `async-thinking-off-${Date.now().toString(36)}`, config: makeAgent("worker", { model: "openai/gpt-5-mini", thinking: "off" }), expected: "off" },
+			{ id: `async-thinking-inherited-${Date.now().toString(36)}`, config: makeAgent("worker", { thinking: "high" }), expected: "high" },
+		];
+		for (const item of cases) {
+			executeAsyncSingle(item.id, {
+				agent: "worker",
+				task: "Do work",
+				agentConfig: item.config,
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+			});
+		}
+
+		for (const item of cases) {
+			const statusPath = path.join(ASYNC_DIR, item.id, "status.json");
+			const deadline = Date.now() + 5_000;
+			let status: AsyncStatusPayload | undefined;
+			while (Date.now() < deadline) {
+				if (fs.existsSync(statusPath)) {
+					status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+					if (status.steps?.length) break;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			assert.equal(status?.steps?.[0]?.thinking, item.expected);
+			await waitForAsyncResultFile(item.id);
+		}
 	});
 
 	it("background runs record fallback attempts and final model", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

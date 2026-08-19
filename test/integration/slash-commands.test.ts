@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { ASYNC_DIR } from "../../src/shared/types.ts";
 
@@ -209,8 +209,28 @@ async function captureSlashCommandParams(
 }
 
 describe("slash command custom message delivery", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
+	let suiteHome: string;
+	let previousHome: string | undefined;
+	let previousUserProfile: string | undefined;
+
 	beforeEach(() => {
 		clearSlashSnapshots?.();
+		previousHome = process.env.HOME;
+		previousUserProfile = process.env.USERPROFILE;
+		suiteHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-slash-command-home-"));
+		process.env.HOME = suiteHome;
+		process.env.USERPROFILE = suiteHome;
+		const agentsDir = path.join(suiteHome, ".agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "scout.md"), "---\nname: scout\ndescription: Test scout\n---\n\nInspect.\n", "utf-8");
+	});
+
+	afterEach(() => {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		fs.rmSync(suiteHome, { recursive: true, force: true });
 	});
 
 	it("/run accepts an agent without a task", async () => {

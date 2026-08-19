@@ -6,7 +6,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { resolveProjectLocalPiPackageResources } from "../../agents/pi-packages.ts";
-import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
+import { PI_CHILD_RUNTIME_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
@@ -86,7 +86,7 @@ import {
 	WorktreeDiffCaptureError,
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
-import { resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { resolveCandidateLaunchThinking, resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { writeInitialProgressFile } from "../../shared/settings.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
 import {
@@ -119,7 +119,7 @@ interface SubagentRunConfig {
 	asyncDir: string;
 	sessionId?: string | null;
 	piPackageRoot?: string;
-	piArgv1?: string;
+	piEntrypointOverride?: string;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	controlConfig?: ResolvedControlConfig;
@@ -267,7 +267,7 @@ function runPiStreaming(
 	outputFile: string,
 	env?: Record<string, string | undefined>,
 	piPackageRoot?: string,
-	piArgv1?: string,
+	piEntrypointOverride?: string,
 	maxSubagentDepth?: number,
 	childEventContext?: ChildEventContext,
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void,
@@ -279,8 +279,8 @@ function runPiStreaming(
 		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv(maxSubagentDepth) };
 		const piSpawnSpec = getPiSpawnCommand(args, {
 			...(piPackageRoot ? { piPackageRoot } : {}),
-			...(piArgv1 ? { argv1: piArgv1 } : {}),
-			...(sandbox ? { preferNodeCli: true } : {}),
+			...(piEntrypointOverride ? { entrypointOverride: piEntrypointOverride } : {}),
+			preferNodeCli: true,
 		});
 		let spawnSpec: SpawnableInvocation;
 		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;
@@ -579,7 +579,7 @@ function runPiStreaming(
 function resolvePiPackageRootFallback(): string {
 	const root = resolveInstalledPiPackageRoot();
 	if (root) return root;
-	throw new Error(`Could not resolve ${PI_CODING_AGENT_PACKAGE} package root`);
+	throw new Error(`Could not resolve ${PI_CHILD_RUNTIME_PACKAGE} package root`);
 }
 
 async function exportSessionHtml(sessionFile: string, outputDir: string, piPackageRoot?: string): Promise<string> {
@@ -714,7 +714,7 @@ interface SingleStepContext {
 	flatStepCount: number;
 	outputFile: string;
 	piPackageRoot?: string;
-	piArgv1?: string;
+	piEntrypointOverride?: string;
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void;
 	childIntercomTarget?: string;
 	orchestratorIntercomTarget?: string;
@@ -823,7 +823,7 @@ async function runSingleStep(
 
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
-		ctx.onAttemptStart?.({ model: candidate, thinking: resolveEffectiveThinking(candidate, candidate ? undefined : step.thinking) });
+		ctx.onAttemptStart?.({ model: candidate, thinking: resolveCandidateLaunchThinking(candidate, step.thinking) });
 		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 		if (effectiveStructuredOutput) {
 			try {
@@ -839,6 +839,7 @@ async function runSingleStep(
 			sessionDir,
 			sessionFile: step.sessionFile,
 			model: candidate,
+			thinking: resolveCandidateLaunchThinking(candidate, step.thinking),
 			inheritProjectContext: step.inheritProjectContext,
 			inheritSkills: step.inheritSkills,
 			tools: step.tools,
@@ -869,7 +870,7 @@ async function runSingleStep(
 			ctx.outputFile,
 			env,
 			ctx.piPackageRoot,
-			ctx.piArgv1,
+			ctx.piEntrypointOverride,
 			step.maxSubagentDepth,
 			{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
 			ctx.registerInterrupt,
@@ -1010,6 +1011,7 @@ async function runSingleStep(
 					sessionEnabled: true,
 					sessionFile,
 					model: finalizationModel,
+					thinking: resolveCandidateLaunchThinking(finalizationModel, step.thinking),
 					inheritProjectContext: step.inheritProjectContext,
 					inheritSkills: step.inheritSkills,
 					tools: step.tools,
@@ -1031,7 +1033,7 @@ async function runSingleStep(
 					parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
 					sandbox: closedSandboxRuntime,
 				});
-				ctx.onAttemptStart?.({ model: finalizationModel, thinking: resolveEffectiveThinking(finalizationModel, finalizationModel ? undefined : step.thinking) });
+				ctx.onAttemptStart?.({ model: finalizationModel, thinking: resolveCandidateLaunchThinking(finalizationModel, step.thinking) });
 				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;
 				const finalizationRun = await runPiStreaming(
 					args,
@@ -1039,7 +1041,7 @@ async function runSingleStep(
 					finalizationOutputFile,
 					env,
 					ctx.piPackageRoot,
-					ctx.piArgv1,
+					ctx.piEntrypointOverride,
 					step.maxSubagentDepth,
 					{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
 					ctx.registerInterrupt,
@@ -1123,7 +1125,7 @@ async function runSingleStep(
 		sessionFile: step.sessionFile,
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
-		thinking: resolveEffectiveThinking(finalResult?.model, finalResult?.model ? undefined : step.thinking),
+		thinking: resolveCandidateLaunchThinking(finalResult?.model, step.thinking),
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 		modelAttempts,
 		artifactPaths,
@@ -1995,7 +1997,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					flatIndex: fi, flatStepCount: Math.max(statusPayload.steps.length, 1),
 					outputFile: path.join(asyncDir, `output-${fi}.log`),
 					piPackageRoot: config.piPackageRoot,
-					piArgv1: config.piArgv1,
+					piEntrypointOverride: config.piEntrypointOverride,
 					childIntercomTarget: config.childIntercomTargets?.[fi],
 					orchestratorIntercomTarget: config.controlIntercomTarget,
 					nestedRoute: config.nestedRoute,
@@ -2252,7 +2254,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							flatIndex: fi, flatStepCount: flatSteps.length,
 							outputFile: path.join(asyncDir, `output-${fi}.log`),
 							piPackageRoot: config.piPackageRoot,
-							piArgv1: config.piArgv1,
+							piEntrypointOverride: config.piEntrypointOverride,
 							childIntercomTarget: config.childIntercomTargets?.[fi],
 							orchestratorIntercomTarget: config.controlIntercomTarget,
 							nestedRoute: config.nestedRoute,
@@ -2511,7 +2513,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				flatIndex, flatStepCount: flatSteps.length,
 				outputFile: path.join(asyncDir, `output-${flatIndex}.log`),
 				piPackageRoot: config.piPackageRoot,
-				piArgv1: config.piArgv1,
+				piEntrypointOverride: config.piEntrypointOverride,
 				childIntercomTarget: config.childIntercomTargets?.[flatIndex],
 				orchestratorIntercomTarget: config.controlIntercomTarget,
 				nestedRoute: config.nestedRoute,

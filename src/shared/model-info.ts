@@ -40,6 +40,15 @@ export function resolveEffectiveThinking(model: string | undefined, configThinki
 	return THINKING_LEVELS.find((level) => level === configThinking);
 }
 
+/** Resolve launch thinking when candidate suffixes encode per-model support. */
+export function resolveCandidateLaunchThinking(model: string | undefined, configThinking: string | undefined): string | undefined {
+	const explicitThinking = resolveEffectiveThinking(model, undefined);
+	if (explicitThinking) return explicitThinking;
+	const configuredThinking = resolveEffectiveThinking(undefined, configThinking);
+	if (!model || configuredThinking === "off") return configuredThinking;
+	return undefined;
+}
+
 export function splitKnownThinkingSuffix(model: string): { baseModel: string; thinkingSuffix: string } {
 	const colonIdx = model.lastIndexOf(":");
 	if (colonIdx === -1) return { baseModel: model, thinkingSuffix: "" };

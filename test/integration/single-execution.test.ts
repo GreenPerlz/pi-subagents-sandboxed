@@ -1135,6 +1135,41 @@ process.exit(${exitCode});
 		assert.match(result.error ?? "", /429 quota exceeded/);
 	});
 
+	it("passes explicit thinking off even when the model has no suffix", async () => {
+		mockPi.onCall({ output: "thinking disabled" });
+		const agents = [makeAgent("echo", {
+			model: "openai/gpt-5-mini",
+			thinking: "off",
+		})];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "explicit-thinking-off",
+		});
+
+		assert.equal(result.exitCode, 0);
+		const args = readCallArgs();
+		assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 4), [
+			"--model",
+			"openai/gpt-5-mini",
+			"--thinking",
+			"off",
+		]);
+	});
+
+	it("passes configured thinking when the agent inherits its model", async () => {
+		mockPi.onCall({ output: "inherited model thinking" });
+		const agents = [makeAgent("echo", { thinking: "high" })];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "inherited-model-thinking",
+		});
+
+		assert.equal(result.exitCode, 0);
+		const args = readCallArgs();
+		assert.equal(args.includes("--model"), false);
+		assert.deepEqual(args.slice(args.indexOf("--thinking"), args.indexOf("--thinking") + 2), ["--thinking", "high"]);
+	});
+
 	it("keeps unsupported max thinking off the actual fallback child args", async () => {
 		mockPi.onCall({
 			jsonl: [{

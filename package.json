@@ -32,10 +32,12 @@
     "docs/",
     "skills/**/*",
     "prompts/**/*",
+    "scripts/",
     "README.md",
     "CHANGELOG.md"
   ],
   "scripts": {
+    "check:pi-version": "node scripts/check-pi-version.mjs",
     "test": "npm run test:unit",
     "test:unit": "node --experimental-strip-types --test test/unit/*.test.ts",
     "test:integration": "node --experimental-strip-types --import ./test/support/register-loader.mjs --test test/integration/*.test.ts",
@@ -69,13 +71,14 @@
     }
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "^0.79.0",
+    "@earendil-works/pi-tui": "0.84.2",
     "jiti": "^2.7.0",
+    "pi-subagent-runtime": "npm:@earendil-works/pi-coding-agent@0.84.2",
     "typebox": "^1.1.24"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "^0.79.0",
-    "@earendil-works/pi-ai": "^0.79.0",
-    "@earendil-works/pi-coding-agent": "^0.79.0"
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2"
   }
 }

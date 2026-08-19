@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { encodeNestedPathEnv, parseNestedPathEnv, type NestedPathEntry } from "./nested-path.ts";
 import { resolveMcpDirectToolNames } from "./mcp-direct-tool-allowlist.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "./structured-output.ts";
-import { THINKING_LEVELS } from "../../shared/model-info.ts";
+import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS } from "../../shared/model-info.ts";
 import type { JsonSchemaObject } from "../../shared/types.ts";
 const TASK_ARG_LIMIT = 8000;
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-prompt-runtime.ts");
@@ -110,9 +110,13 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		}
 	}
 
-	const modelArg = applyThinkingSuffix(input.model, input.thinking);
+	const modelArg = input.model ? splitKnownThinkingSuffix(input.model).baseModel : undefined;
 	if (modelArg) {
 		args.push("--model", modelArg);
+	}
+	const thinkingArg = resolveEffectiveThinking(input.model, input.thinking);
+	if (thinkingArg) {
+		args.push("--thinking", thinkingArg);
 	}
 
 	const declaredBuiltinTools = input.tools?.filter((tool) => !(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js"))) ?? [];

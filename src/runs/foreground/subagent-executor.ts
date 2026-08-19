@@ -3044,6 +3044,14 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		};
 
 		const foregroundMode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
+		let foregroundChildren: PersistedForegroundStep[] = [];
+		if (!effectiveAsync) {
+			try {
+				foregroundChildren = initialForegroundChildren(effectiveParams, childSessionFileForIndex);
+			} catch (error) {
+				return toExecutionErrorResult(effectiveParams, error);
+			}
+		}
 		const foregroundControl = effectiveAsync
 			? undefined
 			: {
@@ -3068,7 +3076,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				state: "running",
 				startedAt: foregroundControl.startedAt,
 				updatedAt: foregroundControl.updatedAt,
-				children: initialForegroundChildren(effectiveParams, childSessionFileForIndex),
+				children: foregroundChildren,
 			});
 		}
 

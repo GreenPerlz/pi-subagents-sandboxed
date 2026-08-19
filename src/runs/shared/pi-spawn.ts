@@ -3,6 +3,17 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const PI_CODING_AGENT_PACKAGE = "@earendil-works/pi-coding-agent";
+export const PI_CHILD_RUNTIME_PACKAGE = "pi-subagent-runtime";
+
+let testEntrypointOverride: string | undefined;
+
+export function setPiSpawnEntrypointOverrideForTests(entrypoint: string | undefined): void {
+	testEntrypointOverride = entrypoint;
+}
+
+export function getPiSpawnEntrypointOverrideForTests(): string | undefined {
+	return testEntrypointOverride;
+}
 
 export function findPiPackageRootFromEntry(entryPoint: string): string | undefined {
 	let dir = path.dirname(entryPoint);
@@ -18,7 +29,7 @@ export function findPiPackageRootFromEntry(entryPoint: string): string | undefin
 }
 
 export function resolveInstalledPiPackageRoot(): string | undefined {
-	return findPiPackageRootFromEntry(fileURLToPath(import.meta.resolve(PI_CODING_AGENT_PACKAGE)));
+	return findPiPackageRootFromEntry(fileURLToPath(import.meta.resolve(PI_CHILD_RUNTIME_PACKAGE)));
 }
 
 export function resolvePiPackageRoot(): string | undefined {
@@ -35,8 +46,11 @@ export interface PiSpawnDeps {
 	platform?: NodeJS.Platform;
 	execPath?: string;
 	argv1?: string;
+	entrypointOverride?: string;
 	existsSync?: (filePath: string) => boolean;
+	isExecutable?: (filePath: string) => boolean;
 	readFileSync?: (filePath: string, encoding: "utf-8") => string;
+	env?: Record<string, string | undefined>;
 	resolvePackageJson?: () => string;
 	resolvePackageEntry?: () => string;
 	piPackageRoot?: string;
@@ -62,18 +76,50 @@ function normalizePath(filePath: string): string {
 	return path.isAbsolute(filePath) ? filePath : path.resolve(filePath);
 }
 
+function isNodeRuntime(command: string): boolean {
+	return /^node(?:\.exe)?$/i.test(path.basename(command));
+}
+
+export function resolveNodeRuntime(deps: PiSpawnDeps = {}): string | undefined {
+	const configuredRuntime = deps.execPath ?? process.execPath;
+	if (isNodeRuntime(configuredRuntime)) return configuredRuntime;
+
+	const isExecutable = deps.isExecutable ?? ((filePath: string) => {
+		try {
+			fs.accessSync(filePath, (deps.platform ?? process.platform) === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
+			return fs.statSync(filePath).isFile();
+		} catch {
+			return false;
+		}
+	});
+	const env = deps.env ?? process.env;
+	const pathValue = env.PATH;
+	if (!pathValue) return undefined;
+	const extensions = (deps.platform ?? process.platform) === "win32"
+		? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+		: [""];
+	for (const directory of pathValue.split(path.delimiter)) {
+		if (!directory) continue;
+		for (const extension of extensions) {
+			const candidate = path.join(directory, `node${extension.toLowerCase()}`);
+			if (isExecutable(candidate)) return candidate;
+		}
+	}
+	return undefined;
+}
+
 export function resolvePiPackageBin(deps: PiSpawnDeps = {}): string | undefined {
 	const existsSync = deps.existsSync ?? fs.existsSync;
 	const readFileSync = deps.readFileSync ?? ((filePath, encoding) => fs.readFileSync(filePath, encoding));
 
 	try {
 		const resolvePackageJson = deps.resolvePackageJson ?? (() => {
-			const root = deps.piPackageRoot ?? resolvePiPackageRoot();
+			const root = deps.piPackageRoot;
 			if (root) return path.join(root, "package.json");
 			const packageRoot = deps.resolvePackageEntry
 				? findPiPackageRootFromEntry(deps.resolvePackageEntry())
 				: resolveInstalledPiPackageRoot();
-			if (!packageRoot) throw new Error(`Could not resolve ${PI_CODING_AGENT_PACKAGE} package root`);
+			if (!packageRoot) throw new Error(`Could not resolve ${PI_CHILD_RUNTIME_PACKAGE} package root`);
 			return path.join(packageRoot, "package.json");
 		});
 		const packageJsonPath = resolvePackageJson();
@@ -115,16 +161,26 @@ export function getPiSpawnCommand(args: string[], deps: PiSpawnDeps = {}): PiSpa
 	const platform = deps.platform ?? process.platform;
 	const existsSync = deps.existsSync ?? fs.existsSync;
 	const argv1 = deps.argv1 ?? process.argv[1];
-	const preferMockEntrypoint = deps.preferNodeCli && process.env.MOCK_PI_QUEUE_DIR && argv1 && isRunnableNodeScript(normalizePath(argv1), existsSync);
+	const injectedEntrypoint = deps.entrypointOverride && isRunnableNodeScript(normalizePath(deps.entrypointOverride), existsSync)
+		? normalizePath(deps.entrypointOverride)
+		: undefined;
 	const piCliPath = deps.preferNodeCli
-		? (preferMockEntrypoint ? normalizePath(argv1!) : resolvePiPackageBin(deps))
+		? (injectedEntrypoint ?? resolvePiPackageBin(deps))
 		: platform === "win32"
 			? resolveWindowsPiCliScript(deps)
 			: undefined;
 
+	if (deps.preferNodeCli && !piCliPath) {
+		throw new Error(`Could not resolve the private ${PI_CHILD_RUNTIME_PACKAGE} CLI`);
+	}
+
 	if (piCliPath) {
+		const nodeRuntime = resolveNodeRuntime(deps);
+		if (!nodeRuntime) {
+			throw new Error(`Could not find a Node runtime for ${PI_CHILD_RUNTIME_PACKAGE}`);
+		}
 		return {
-			command: deps.execPath ?? process.execPath,
+			command: nodeRuntime,
 			args: [piCliPath, ...args],
 		};
 	}

@@ -20,8 +20,10 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Install devDependencies
-        run: npm install
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Require the latest bundled Pi runtime
+        run: npm run check:pi-version
       - name: Run tests
         run: npm run test:all
       - name: Publish to npm

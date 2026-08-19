@@ -17,11 +17,11 @@ import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSi
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
-import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
+import { getPiSpawnEntrypointOverrideForTests, resolveInstalledPiPackageRoot, resolveNodeRuntime, resolvePiPackageRoot } from "../shared/pi-spawn.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { resolveChildCwd } from "../../shared/utils.ts";
 import { buildModelCandidates, type AvailableModelInfo } from "../shared/model-fallback.ts";
-import { resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { resolveCandidateLaunchThinking } from "../../shared/model-info.ts";
 import { resolveExpectedWorktreeAgentCwd } from "../shared/worktree.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
@@ -46,7 +46,8 @@ import {
 import { nestedResultsPath, resolveInheritedNestedRouteFromEnv, resolveNestedParentAddressFromEnv, writeNestedEvent } from "../shared/nested-events.ts";
 
 const require = createRequire(import.meta.url);
-const piPackageRoot = resolvePiPackageRoot();
+const hostPiPackageRoot = resolvePiPackageRoot();
+const childPiPackageRoot = resolveInstalledPiPackageRoot();
 
 function resolveJitiCliFromPackageJson(packageJsonPath: string): string | undefined {
 	if (!fs.existsSync(packageJsonPath)) return undefined;
@@ -69,15 +70,15 @@ function resolveJitiCliFromPackageJson(packageJsonPath: string): string | undefi
 function resolveJitiCliPath(): string | undefined {
 	const candidates: Array<() => string | undefined> = [
 		() => require.resolve("jiti/package.json"),
-		() => piPackageRoot
-			? createRequire(path.join(piPackageRoot, "package.json")).resolve("jiti/package.json")
+		() => hostPiPackageRoot
+			? createRequire(path.join(hostPiPackageRoot, "package.json")).resolve("jiti/package.json")
 			: undefined,
 		() => {
 			if (!process.argv[1]) return undefined;
 			const piEntry = fs.realpathSync(process.argv[1]);
 			return createRequire(piEntry).resolve("jiti/package.json");
 		},
-		() => piPackageRoot ? path.join(piPackageRoot, "node_modules", "jiti", "package.json") : undefined,
+		() => hostPiPackageRoot ? path.join(hostPiPackageRoot, "node_modules", "jiti", "package.json") : undefined,
 	];
 	for (const candidate of candidates) {
 		try {
@@ -94,39 +95,12 @@ function resolveJitiCliPath(): string | undefined {
 
 const jitiCliPath = resolveJitiCliPath();
 
-function isGenericJavaScriptRuntime(command: string): boolean {
-	return /^(?:node|bun)(?:\.exe)?$/i.test(path.basename(command));
-}
-
-function findNodeOnPath(): string | undefined {
-	const pathValue = process.env.PATH;
-	if (!pathValue) return undefined;
-	const extensions = process.platform === "win32"
-		? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
-		: [""];
-	for (const directory of pathValue.split(path.delimiter)) {
-		if (!directory) continue;
-		for (const extension of extensions) {
-			const candidate = path.join(directory, `node${extension.toLowerCase()}`);
-			try {
-				fs.accessSync(candidate, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
-				return candidate;
-			} catch {
-				// Continue searching PATH.
-			}
-		}
-	}
-	return undefined;
-}
-
 function resolveAsyncRunnerRuntime(): string | undefined {
-	// npm-installed Pi normally runs under Node/Bun, but standalone Pi releases
-	// expose the Pi executable itself as process.execPath. That executable can
-	// launch Pi commands, not arbitrary Jiti scripts, so use an external Node in
-	// that case.
+	// Standalone Pi exposes its own executable as process.execPath. It cannot run
+	// arbitrary Jiti scripts, so detached helpers share the child-launcher's
+	// external Node resolution instead of treating the host Pi binary as Node.
 	if (!fs.existsSync(process.execPath)) return undefined;
-	if (isGenericJavaScriptRuntime(process.execPath)) return process.execPath;
-	return findNodeOnPath();
+	return resolveNodeRuntime();
 }
 
 interface AsyncExecutionContext {
@@ -445,7 +419,7 @@ export function executeAsyncChain(
 			structured: Boolean(s.outputSchema),
 			cwd: stepCwd,
 			model,
-			thinking: resolveEffectiveThinking(model, undefined),
+			thinking: resolveCandidateLaunchThinking(model, a.thinking),
 			modelCandidates,
 			tools: a.tools,
 			extensions: a.extensions,
@@ -565,8 +539,8 @@ export function executeAsyncChain(
 				sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined,
 				asyncDir,
 				sessionId: ctx.currentSessionId,
-				piPackageRoot,
-				piArgv1: process.argv[1],
+				piPackageRoot: childPiPackageRoot,
+				piEntrypointOverride: getPiSpawnEntrypointOverrideForTests(),
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				controlConfig,
@@ -787,7 +761,7 @@ export function executeAsyncSingle(
 						task: taskWithOutputInstruction,
 						cwd: runnerCwd,
 						model,
-						thinking: resolveEffectiveThinking(model, undefined),
+						thinking: resolveCandidateLaunchThinking(model, agentConfig.thinking),
 						modelCandidates,
 						tools: agentConfig.tools,
 						extensions: agentConfig.extensions,
@@ -824,8 +798,8 @@ export function executeAsyncSingle(
 				sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined,
 				asyncDir,
 				sessionId: ctx.currentSessionId,
-				piPackageRoot,
-				piArgv1: process.argv[1],
+				piPackageRoot: childPiPackageRoot,
+				piEntrypointOverride: getPiSpawnEntrypointOverrideForTests(),
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				controlConfig,

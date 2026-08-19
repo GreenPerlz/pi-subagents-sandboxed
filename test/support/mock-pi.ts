@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setPiSpawnEntrypointOverrideForTests } from "../../src/runs/shared/pi-spawn.ts";
 
 interface MockPiResponse {
 	output?: string;
@@ -84,6 +85,7 @@ export function createMockPi(): MockPi {
 			originalQueueEnv = process.env.MOCK_PI_QUEUE_DIR;
 			process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
 			process.env.MOCK_PI_QUEUE_DIR = queueDir;
+			setPiSpawnEntrypointOverrideForTests(SCRIPT_PATH);
 			originalArgv1 = process.argv[1];
 			process.argv[1] = SCRIPT_PATH;
 		},
@@ -94,6 +96,7 @@ export function createMockPi(): MockPi {
 			else process.env.PATH = originalPath;
 			if (originalQueueEnv === undefined) delete process.env.MOCK_PI_QUEUE_DIR;
 			else process.env.MOCK_PI_QUEUE_DIR = originalQueueEnv;
+			setPiSpawnEntrypointOverrideForTests(undefined);
 			if (originalArgv1 === undefined) delete process.argv[1];
 			else process.argv[1] = originalArgv1;
 			try {

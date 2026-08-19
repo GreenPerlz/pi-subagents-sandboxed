@@ -853,11 +853,15 @@ async function resumeAsyncRun(input: {
 	const effectiveCwd = target.cwd ?? input.requestCwd;
 	const scope: AgentScope = resolveExecutionAgentScope(input.params.agentScope);
 	const discoveredAgents = input.deps.discoverAgents(effectiveCwd, scope).agents;
-	const sessionName = resolveIntercomSessionTarget(input.deps.pi.getSessionName(), input.ctx.sessionManager.getSessionId());
+	const orchestratorTarget = resolveIntercomSessionTarget(
+		input.deps.pi.getSessionName(),
+		input.ctx.sessionManager.getSessionId(),
+		process.env.PI_INTERCOM_SESSION_ID,
+	);
 	const intercomBridge = resolveIntercomBridge({
 		config: input.deps.config.intercomBridge,
 		context: input.params.context,
-		orchestratorTarget: sessionName,
+		orchestratorTarget,
 		cwd: effectiveCwd,
 		extensionDir: process.env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV],
 	});
@@ -2734,7 +2738,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				}
 				let orchestratorTarget: string | undefined;
 				try {
-					orchestratorTarget = resolveIntercomSessionTarget(deps.pi.getSessionName(), ctx.sessionManager.getSessionId());
+					orchestratorTarget = resolveIntercomSessionTarget(
+						deps.pi.getSessionName(),
+						ctx.sessionManager.getSessionId(),
+						process.env.PI_INTERCOM_SESSION_ID,
+					);
 				} catch {}
 				return {
 					content: [{
@@ -2874,11 +2882,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		deps.state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
 		const discoveredAgents = deps.discoverAgents(effectiveCwd, scope).agents;
 		effectiveParams = applyAgentDefaultContext(effectiveParams, discoveredAgents);
-		const sessionName = resolveIntercomSessionTarget(deps.pi.getSessionName(), ctx.sessionManager.getSessionId());
+		const orchestratorTarget = resolveIntercomSessionTarget(
+			deps.pi.getSessionName(),
+			ctx.sessionManager.getSessionId(),
+			process.env.PI_INTERCOM_SESSION_ID,
+		);
 		const intercomBridge = resolveIntercomBridge({
 			config: deps.config.intercomBridge,
 			context: effectiveParams.context,
-			orchestratorTarget: sessionName,
+			orchestratorTarget,
 			cwd: effectiveCwd,
 			extensionDir: process.env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV],
 		});

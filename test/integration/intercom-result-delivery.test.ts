@@ -139,7 +139,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		runGit(["commit", "-qm", "base"]);
 	}
 
-	function makeExecutor(options: { bridgeMode?: "always" | "off"; agents?: ReturnType<typeof makeAgent>[]; acknowledgeResults?: boolean } = {}) {
+	function makeExecutor(options: { bridgeMode?: "always" | "off"; agents?: ReturnType<typeof makeAgent>[]; acknowledgeResults?: boolean; sessionName?: string | null } = {}) {
 		const events = createRecordingEventBus({ acknowledgeResults: options.acknowledgeResults ?? true });
 		const state = {
 			baseCwd: tempDir,
@@ -162,7 +162,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		const executor = createSubagentExecutor!({
 			pi: {
 				events,
-				getSessionName: () => "orchestrator",
+				getSessionName: () => options.sessionName === null ? undefined : options.sessionName ?? "orchestrator",
 				setSessionName: () => {},
 			},
 			state,
@@ -203,6 +203,29 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		assert.doesNotMatch(result.content[0]?.text ?? "", /Full child output from worker/);
 		assert.equal(result.details?.results?.[0]?.finalOutput, undefined);
 		assert.match(String(payload.message ?? ""), /Full child output from worker/);
+	});
+
+	it("routes unnamed parent results to pi-intercom's published broker identity", async () => {
+		mockPi.onCall({ output: "Broker-routed output" });
+		const previousIntercomSessionId = process.env.PI_INTERCOM_SESSION_ID;
+		process.env.PI_INTERCOM_SESSION_ID = "stable-intercom-parent";
+		try {
+			const { executor, events } = makeExecutor({ sessionName: null });
+
+			await executor.execute(
+				"stable-intercom-target",
+				{ agent: "worker", task: "Report through intercom" },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			const payload = events.emitted.find((entry) => entry.channel === "subagent:result-intercom")?.payload as { to?: string } | undefined;
+			assert.equal(payload?.to, "stable-intercom-parent");
+		} finally {
+			if (previousIntercomSessionId === undefined) delete process.env.PI_INTERCOM_SESSION_ID;
+			else process.env.PI_INTERCOM_SESSION_ID = previousIntercomSessionId;
+		}
 	});
 
 	it("falls back to legacy foreground output when the bridge is inactive", async () => {

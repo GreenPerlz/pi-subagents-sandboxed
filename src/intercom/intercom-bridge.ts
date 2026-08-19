@@ -25,7 +25,6 @@ function defaultSubagentConfigDir(agentDir = defaultAgentDir()): string {
 	return path.join(agentDir, "extensions", "subagent");
 }
 
-const DEFAULT_INTERCOM_TARGET_PREFIX = "subagent-chat";
 const CONTACT_SUPERVISOR_TOOL = "contact_supervisor";
 const INTERCOM_BRIDGE_TOOLS = ["intercom", CONTACT_SUPERVISOR_TOOL];
 export const INTERCOM_BRIDGE_MARKER = "Intercom orchestration channel:";
@@ -73,11 +72,14 @@ interface ResolveIntercomBridgeInput {
 	globalNpmRoot?: string | null;
 }
 
-export function resolveIntercomSessionTarget(sessionName: string | undefined, sessionId: string): string {
+export function resolveIntercomSessionTarget(
+	sessionName: string | undefined,
+	sessionId: string,
+	intercomSessionId?: string,
+): string {
 	const trimmedName = sessionName?.trim();
 	if (trimmedName) return trimmedName;
-	const normalizedSessionId = sessionId.startsWith("session-") ? sessionId.slice("session-".length) : sessionId;
-	return `${DEFAULT_INTERCOM_TARGET_PREFIX}-${normalizedSessionId.slice(0, 8)}`;
+	return intercomSessionId?.trim() || sessionId.trim();
 }
 
 function sanitizeIntercomTargetPart(value: string): string {

@@ -48,8 +48,18 @@ describe("resolveIntercomSessionTarget", () => {
 		assert.equal(resolveIntercomSessionTarget("planner", "session-12345678"), "planner");
 	});
 
-	it("uses a runtime-only subagent chat alias when unnamed", () => {
-		assert.equal(resolveIntercomSessionTarget(undefined, "session-12345678"), "subagent-chat-12345678");
+	it("uses the full broker-routable session id when unnamed", () => {
+		assert.equal(
+			resolveIntercomSessionTarget(undefined, "01a019bd-044b-7db9-9dab-73f355d90727"),
+			"01a019bd-044b-7db9-9dab-73f355d90727",
+		);
+	});
+
+	it("prefers pi-intercom's published broker identity when unnamed", () => {
+		assert.equal(
+			resolveIntercomSessionTarget(undefined, "pi-session-id", "stable-intercom-id"),
+			"stable-intercom-id",
+		);
 	});
 });
 

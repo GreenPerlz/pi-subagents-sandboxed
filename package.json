@@ -74,7 +74,7 @@
     "@earendil-works/pi-tui": "0.84.2",
     "jiti": "^2.7.0",
     "pi-subagent-runtime": "npm:@earendil-works/pi-coding-agent@0.84.2",
-    "typebox": "^1.1.24"
+    "typebox": "^1.3.14"
   },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "0.84.2",

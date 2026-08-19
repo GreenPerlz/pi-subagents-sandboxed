@@ -39,6 +39,7 @@ export function defaultInheritSkills(): boolean {
 
 export interface BuiltinAgentOverrideBase {
 	model?: string;
+	fastMode?: boolean;
 	fallbackModels?: string[];
 	thinking?: string;
 	systemPromptMode: SystemPromptMode;
@@ -54,6 +55,7 @@ export interface BuiltinAgentOverrideBase {
 
 interface BuiltinAgentOverrideConfig {
 	model?: string | false;
+	fastMode?: boolean;
 	fallbackModels?: string[] | false;
 	thinking?: string | false;
 	systemPromptMode?: SystemPromptMode;
@@ -80,6 +82,8 @@ export interface AgentConfig {
 	tools?: string[];
 	mcpDirectTools?: string[];
 	model?: string;
+	/** Request the provider priority service tier for eligible models. */
+	fastMode?: boolean;
 	fallbackModels?: string[];
 	thinking?: string;
 	systemPromptMode: SystemPromptMode;
@@ -145,6 +149,7 @@ export interface ChainStepConfig {
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	model?: string;
+	fastMode?: boolean;
 	skills?: string[] | false;
 	progress?: boolean;
 	parallel?: unknown;
@@ -262,6 +267,7 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 	return {
 		model: agent.model,
+		fastMode: agent.fastMode,
 		fallbackModels: agent.fallbackModels ? [...agent.fallbackModels] : undefined,
 		thinking: agent.thinking,
 		systemPromptMode: agent.systemPromptMode,
@@ -279,6 +285,7 @@ function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentOverrideConfig {
 	return {
 		...(override.model !== undefined ? { model: override.model } : {}),
+		...(override.fastMode !== undefined ? { fastMode: override.fastMode } : {}),
 		...(override.fallbackModels !== undefined
 			? { fallbackModels: override.fallbackModels === false ? false : [...override.fallbackModels] }
 			: {}),
@@ -489,6 +496,11 @@ function parseBuiltinOverrideEntry(
 		else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'model'; expected a string or false.`);
 	}
 
+	if ("fastMode" in input) {
+		if (typeof input.fastMode === "boolean") override.fastMode = input.fastMode;
+		else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'fastMode'; expected a boolean.`);
+	}
+
 	if ("thinking" in input) {
 		if (typeof input.thinking === "string" || input.thinking === false) override.thinking = input.thinking;
 		else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'thinking'; expected a string or false.`);
@@ -646,6 +658,7 @@ function applyBuiltinOverride(
 	};
 
 	if (override.model !== undefined) next.model = override.model === false ? undefined : override.model;
+	if (override.fastMode !== undefined) next.fastMode = override.fastMode;
 	if (override.fallbackModels !== undefined) {
 		next.fallbackModels = override.fallbackModels === false ? undefined : [...override.fallbackModels];
 	}
@@ -701,11 +714,12 @@ function applyBuiltinOverrides(
 
 export function buildBuiltinOverrideConfig(
 	base: BuiltinAgentOverrideBase,
-	draft: Pick<AgentConfig, "model" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "disabled" | "systemPrompt" | "skills" | "tools" | "mcpDirectTools">,
+	draft: Pick<AgentConfig, "model" | "fastMode" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "disabled" | "systemPrompt" | "skills" | "tools" | "mcpDirectTools">,
 ): BuiltinAgentOverrideConfig | undefined {
 	const override: BuiltinAgentOverrideConfig = {};
 
 	if (draft.model !== base.model) override.model = draft.model ?? false;
+	if (draft.fastMode !== base.fastMode) override.fastMode = draft.fastMode ?? false;
 	if (!arraysEqual(draft.fallbackModels, base.fallbackModels)) override.fallbackModels = draft.fallbackModels ? [...draft.fallbackModels] : false;
 	if (draft.thinking !== base.thinking) override.thinking = draft.thinking ?? false;
 	if (draft.systemPromptMode !== base.systemPromptMode) override.systemPromptMode = draft.systemPromptMode;
@@ -899,6 +913,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			tools: tools.length > 0 ? tools : undefined,
 			mcpDirectTools: mcpDirectTools.length > 0 ? mcpDirectTools : undefined,
 			model: frontmatter.model,
+			fastMode: frontmatter.fastMode === "true",
 			fallbackModels: fallbackModels && fallbackModels.length > 0 ? fallbackModels : undefined,
 			thinking: frontmatter.thinking,
 			systemPromptMode,

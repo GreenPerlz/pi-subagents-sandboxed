@@ -132,6 +132,7 @@ const TaskItem = Type.Object({
 	reads: Type.Optional(ReadsOverride),
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking for this task" })),
 	model: Type.Optional(Type.String({ description: "Override model for this task (e.g. 'google/gemini-3-pro')" })),
+	fastMode: Type.Optional(Type.Boolean({ description: "Request the provider priority service tier for this task when the resolved model supports it; default off." })),
 	skill: Type.Optional(SkillOverride),
 	acceptance: Type.Optional(AcceptanceOverride),
 });
@@ -152,6 +153,7 @@ const ParallelTaskSchema = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this task" })),
+	fastMode: Type.Optional(Type.Boolean({ description: "Request the provider priority service tier when supported; default off." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 });
 
@@ -179,6 +181,7 @@ const DynamicParallelTemplateSchema = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this task" })),
+	fastMode: Type.Optional(Type.Boolean({ description: "Request the provider priority service tier when supported; default off." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 }, { additionalProperties: false });
 
@@ -204,6 +207,7 @@ const ChainItem = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this step" })),
+	fastMode: Type.Optional(Type.Boolean({ description: "Request the provider priority service tier when supported; default off." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 	parallel: Type.Optional(Type.Unsafe({
 		anyOf: [
@@ -273,7 +277,7 @@ export const SubagentParams = Type.Object({
 			{ type: "object", additionalProperties: true },
 			{ type: "string" },
 		],
-		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, tools (comma-separated), extensions (comma-separated), skills, thinking, explicit output, reads, progress, maxSubagentDepth, acceptanceSelfReview, acceptanceMaxFinalizationTurns, canBeChangedByAgent (comma-separated). Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. String values must be valid JSON."
+		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, fastMode, tools (comma-separated), extensions (comma-separated), skills, thinking, explicit output, reads, progress, maxSubagentDepth, acceptanceSelfReview, acceptanceMaxFinalizationTurns, canBeChangedByAgent (comma-separated). Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, fastMode?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. fastMode requests the provider priority service tier only for eligible resolved candidates and defaults to false. String values must be valid JSON."
 	})),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: [{agent, task, count?, output?, outputMode?, reads?, progress?}, ...]" })),
 	concurrency: Type.Optional(Type.Integer({ minimum: 1, description: "Top-level PARALLEL mode only: max concurrent tasks. Defaults to config.parallel.concurrency or 4." })),
@@ -313,5 +317,6 @@ export const SubagentParams = Type.Object({
 	outputMode: Type.Optional(OutputModeOverride),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4'); the target agent must permit model." })),
+	fastMode: Type.Optional(Type.Boolean({ description: "Request the provider priority service tier for this run when the selected model supports it; default off; the target agent must permit fastMode." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 });

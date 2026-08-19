@@ -26,6 +26,7 @@ export const SUBAGENT_PARENT_PATH_ENV = "PI_SUBAGENT_PARENT_PATH";
 export const SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV = "PI_SUBAGENT_PARENT_CAPABILITY_TOKEN";
 export const SUBAGENT_INTERCOM_EXTENSION_DIR_ENV = "PI_SUBAGENT_INTERCOM_EXTENSION_DIR";
 export const SUBAGENT_INTERCOM_STATE_DIR_ENV = "PI_SUBAGENT_INTERCOM_STATE_DIR";
+export const SUBAGENT_FAST_MODE_ENV = "PI_SUBAGENT_FAST_MODE";
 
 interface BuildPiArgsInput {
 	baseArgs: string[];
@@ -34,6 +35,8 @@ interface BuildPiArgsInput {
 	sessionDir?: string;
 	sessionFile?: string;
 	model?: string;
+	/** Inject service_tier=priority only after the caller proves this candidate eligible. */
+	fastMode?: boolean;
 	thinking?: string;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
@@ -90,7 +93,7 @@ interface BuildPiArgsResult {
 export function applyThinkingSuffix(model: string | undefined, thinking: string | undefined): string | undefined {
 	if (!model || !thinking || thinking === "off") return model;
 	const colonIdx = model.lastIndexOf(":");
-	if (colonIdx !== -1 && THINKING_LEVELS.includes(model.substring(colonIdx + 1))) return model;
+	if (colonIdx !== -1 && THINKING_LEVELS.includes(model.substring(colonIdx + 1) as typeof THINKING_LEVELS[number])) return model;
 	return `${model}:${thinking}`;
 }
 
@@ -216,6 +219,9 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		: "";
 	env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = input.inheritProjectContext ? "1" : "0";
 	env.PI_SUBAGENT_INHERIT_SKILLS = input.inheritSkills ? "1" : "0";
+	// Explicitly clear inherited parent state so nested children resolve their
+	// own candidate independently.
+	env[SUBAGENT_FAST_MODE_ENV] = input.fastMode ? "1" : "0";
 	if (input.intercomSessionName) {
 		env.PI_SUBAGENT_INTERCOM_SESSION_NAME = input.intercomSessionName;
 	}

@@ -63,6 +63,11 @@ function parseStepBody(agent: string, sectionBody: string): ChainStepConfig {
 			if (rawValue) step.model = rawValue;
 			continue;
 		}
+		if (key === "fastmode") {
+			if (rawValue === "true") step.fastMode = true;
+			else if (rawValue === "false") step.fastMode = false;
+			continue;
+		}
 		if (key === "skills") {
 			if (rawValue === "false") {
 				step.skills = false;
@@ -257,6 +262,7 @@ export function serializeChain(config: ChainConfig): string {
 		if (step.reads === false) lines.push("reads: false");
 		else if (Array.isArray(step.reads) && step.reads.length > 0) lines.push(`reads: ${step.reads.join(", ")}`);
 		if (step.model) lines.push(`model: ${step.model}`);
+		if (step.fastMode !== undefined) lines.push(`fastMode: ${step.fastMode ? "true" : "false"}`);
 		if (step.skills === false) lines.push("skills: false");
 		else if (Array.isArray(step.skills) && step.skills.length > 0) lines.push(`skills: ${step.skills.join(", ")}`);
 		if (step.progress !== undefined) lines.push(`progress: ${step.progress ? "true" : "false"}`);

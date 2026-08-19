@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
 import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode, type TokenUsage } from "../../shared/types.ts";
+import type { FastModeStatus } from "../../shared/fast-mode.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedEvents, projectNestedRegistryForRoot, readNestedRegistry } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
@@ -32,6 +33,7 @@ interface AsyncRunStepSummary {
 	skills?: string[];
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	attemptedModels?: string[];
 	error?: string;
 	children?: NestedRunSummary[];
@@ -173,6 +175,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.tokens ? { tokens: step.tokens } : {}),
 			...(step.skills ? { skills: step.skills } : {}),
 			...(step.model ? { model: step.model } : {}),
+			...(step.fastMode ? { fastMode: step.fastMode } : {}),
 			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
 			...(step.error ? { error: step.error } : {}),

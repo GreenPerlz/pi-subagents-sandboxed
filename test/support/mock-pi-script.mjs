@@ -264,7 +264,7 @@ async function main() {
 	blockRunnerEventsAfterChild(response);
 	fs.writeFileSync(
 		path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`),
-		JSON.stringify({ args }),
+		JSON.stringify({ args, env: { PI_SUBAGENT_FAST_MODE: process.env.PI_SUBAGENT_FAST_MODE ?? null } }),
 		"utf-8",
 	);
 

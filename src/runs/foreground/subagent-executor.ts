@@ -10,6 +10,7 @@ import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults }
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
+import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { executeChain } from "./chain-execution.ts";
 import { resolveExecutionAgentScope } from "../../agents/agent-scope.ts";
 import { handleManagementAction } from "../../agents/agent-management.ts";
@@ -121,6 +122,7 @@ interface TaskParam {
 	reads?: string[] | boolean;
 	progress?: boolean;
 	model?: string;
+	fastMode?: boolean;
 	skill?: string | string[] | boolean;
 	acceptance?: AcceptanceInput;
 }
@@ -151,6 +153,7 @@ export interface SubagentParamsLike {
 	artifacts?: boolean;
 	includeProgress?: boolean;
 	model?: string;
+	fastMode?: boolean;
 	skill?: string | string[] | boolean;
 	output?: string | boolean;
 	outputMode?: "inline" | "file-only";
@@ -297,25 +300,51 @@ export function foregroundChildrenFromResults(results: SingleResult[]): Persiste
 		...(result.artifactPaths?.outputPath ? { artifactPath: result.artifactPaths.outputPath } : {}),
 		...(result.model ? { model: result.model } : {}),
 		...(result.thinking ? { thinking: result.thinking } : {}),
+		...(result.fastMode ? { fastMode: result.fastMode } : {}),
 		...(tokenUsageFromSingleResult(result) ? { totalTokens: tokenUsageFromSingleResult(result) } : {}),
 	}));
 }
 
-function initialForegroundChildren(params: SubagentParamsLike, sessionFileForIndex: (idx?: number) => string | undefined): PersistedForegroundStep[] {
-	const agents: string[] = [];
-	if (params.tasks?.length) agents.push(...params.tasks.map((task) => task.agent));
-	else if (params.chain?.length) {
+function initialForegroundChildren(
+	params: SubagentParamsLike,
+	sessionFileForIndex: (idx?: number) => string | undefined,
+	agents: AgentConfig[],
+	availableModels: ModelInfo[],
+	preferredProvider?: string,
+): PersistedForegroundStep[] {
+	const children: Array<{ agent: string; model?: string; fastMode?: boolean }> = [];
+	const addChild = (agent: string, model?: string, fastMode?: boolean): void => {
+		children.push({ agent, model, fastMode });
+	};
+	if (params.tasks?.length) {
+		for (const task of params.tasks) addChild(task.agent, task.model, task.fastMode);
+	} else if (params.chain?.length) {
 		for (const step of params.chain) {
-			if (isParallelStep(step)) agents.push(...step.parallel.map((task) => task.agent));
-			else if ("agent" in step && typeof step.agent === "string") agents.push(step.agent);
+			if (isParallelStep(step)) {
+				for (const task of step.parallel) addChild(task.agent, task.model, task.fastMode);
+			} else if (isDynamicParallelStep(step)) {
+				addChild(step.parallel.agent, step.parallel.model, step.parallel.fastMode);
+			} else if ("agent" in step && typeof step.agent === "string") {
+				addChild(step.agent, step.model, step.fastMode);
+			}
 		}
-	} else if (params.agent) agents.push(params.agent);
-	return agents.map((agent, index) => ({
-		agent,
-		index,
-		status: index === 0 ? "running" : "pending",
-		...(sessionFileForIndex(index) ? { sessionFile: sessionFileForIndex(index) } : {}),
-	}));
+	} else if (params.agent) {
+		addChild(params.agent, params.model, params.fastMode);
+	}
+	return children.map((child, index) => {
+		const config = agents.find((agent) => agent.name === child.agent);
+		const configuredModel = child.model ?? config?.model;
+		const model = configuredModel ? resolveModelCandidate(configuredModel, availableModels, preferredProvider) ?? configuredModel : undefined;
+		const fastMode = resolveFastModeStatus(child.fastMode ?? config?.fastMode, model, availableModels, preferredProvider);
+		return {
+			agent: child.agent,
+			index,
+			status: index === 0 ? "running" : "pending",
+			...(sessionFileForIndex(index) ? { sessionFile: sessionFileForIndex(index) } : {}),
+			...(model ? { model } : {}),
+			...(fastMode ? { fastMode } : {}),
+		};
+	});
 }
 
 function persistForegroundStatus(input: {
@@ -958,6 +987,7 @@ async function emitForegroundResultIntercom(input: {
 			detached: result.detached,
 		}),
 		summary: resultSummaryForIntercom(result),
+		...(result.fastMode ? { fastMode: result.fastMode } : {}),
 		index,
 		artifactPath: result.artifactPaths?.outputPath,
 		sessionPath: result.sessionFile,
@@ -1441,6 +1471,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			task: params.context === "fork" ? wrapForkTask(task.task) : task.task,
 			cwd: task.cwd,
 			...(modelOverrides[index] ? { model: modelOverrides[index] } : {}),
+			...(task.fastMode !== undefined ? { fastMode: task.fastMode } : {}),
 			...(skillOverrides[index] !== undefined ? { skill: skillOverrides[index] } : {}),
 			...(task.output === true ? (agentConfigs[index]?.output ? { output: agentConfigs[index]!.output } : {}) : task.output !== undefined ? { output: task.output } : {}),
 			...(task.outputMode !== undefined ? { outputMode: task.outputMode } : {}),
@@ -1551,6 +1582,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			output: effectiveOutput,
 			outputMode: effectiveOutputMode,
 			modelOverride,
+			fastMode: params.fastMode,
 			maxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
 			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
@@ -1877,6 +1909,12 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			input.foregroundControl.currentActivityState = undefined;
 			input.foregroundControl.currentModel = input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
 			input.foregroundControl.currentThinking = undefined;
+			input.foregroundControl.currentFastMode = resolveFastModeStatus(
+				behavior?.fastMode,
+				input.foregroundControl.currentModel,
+				input.availableModels,
+				input.ctx.model?.provider,
+			);
 			input.foregroundControl.updatedAt = Date.now();
 			input.foregroundControl.sessionFile = input.sessionFileForIndex(index);
 			input.foregroundControl.interrupt = () => {
@@ -1911,6 +1949,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			orchestratorIntercomTarget: input.orchestratorIntercomTarget,
 			nestedRoute: input.foregroundControl?.nestedRoute,
 			modelOverride: input.modelOverrides[index],
+			fastMode: input.behaviors[index]?.fastMode,
 			availableModels: input.availableModels,
 			preferredModelProvider: input.ctx.model?.provider,
 			skills: effectiveSkills === false ? [] : effectiveSkills,
@@ -1930,6 +1969,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 						input.foregroundControl.currentActivityState = current?.activityState;
 						input.foregroundControl.currentModel = stepResults[0]?.model ?? input.modelOverrides[index] ?? input.agents.find((agent) => agent.name === task.agent)?.model;
 						input.foregroundControl.currentThinking = stepResults[0]?.thinking;
+						input.foregroundControl.currentFastMode = stepResults[0]?.fastMode ?? input.foregroundControl.currentFastMode;
 						input.foregroundControl.lastActivityAt = current?.lastActivityAt;
 						input.foregroundControl.currentTool = current?.currentTool;
 						input.foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
@@ -2044,6 +2084,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		...(task.progress !== undefined ? { progress: task.progress } : {}),
 		...(skillOverrides[index] !== undefined ? { skills: skillOverrides[index] } : {}),
 		...(task.model ? { model: task.model } : {}),
+		...(task.fastMode !== undefined ? { fastMode: task.fastMode } : {}),
 	}));
 	const modelOverrides: (string | undefined)[] = tasks.map((_, i) =>
 		resolveModelCandidate(behaviorOverrides[i]?.model ?? agentConfigs[i]?.model, availableModels, currentProvider),
@@ -2087,6 +2128,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			if (override?.output !== undefined) behaviorOverrides[i]!.output = override.output;
 			if (override?.reads !== undefined) behaviorOverrides[i]!.reads = override.reads;
 			if (override?.progress !== undefined) behaviorOverrides[i]!.progress = override.progress;
+			if (override?.fastMode !== undefined) behaviorOverrides[i]!.fastMode = override.fastMode;
 			if (override?.skills !== undefined) {
 				skillOverrides[i] = override.skills;
 				behaviorOverrides[i]!.skills = override.skills;
@@ -2116,6 +2158,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 					task: taskText,
 					cwd: t.cwd,
 					...(modelOverrides[i] ? { model: modelOverrides[i] } : {}),
+					...(behaviorOverrides[i]?.fastMode !== undefined ? { fastMode: behaviorOverrides[i]!.fastMode } : {}),
 					...(skillOverrides[i] !== undefined ? { skill: skillOverrides[i] } : {}),
 					...(behaviorOverrides[i]?.output !== undefined ? { output: behaviorOverrides[i]!.output } : {}),
 					...(behaviorOverrides[i]?.outputMode !== undefined ? { outputMode: behaviorOverrides[i]!.outputMode } : {}),
@@ -2408,6 +2451,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		currentProvider,
 	);
 	let skillOverride: string[] | false | undefined = normalizeSkillInput(params.skill);
+	let fastMode = params.fastMode ?? agentConfig.fastMode ?? false;
 	const rawOutput = params.output !== undefined ? params.output : agentConfig.output;
 	let effectiveOutput = normalizeSingleOutputOverride(rawOutput, agentConfig.output);
 	const effectiveOutputMode = params.outputMode ?? "inline";
@@ -2415,7 +2459,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, agentConfig.maxSubagentDepth);
 
 	if (params.clarify === true && ctx.hasUI) {
-		const behavior = resolveStepBehavior(agentConfig, { output: effectiveOutput, skills: skillOverride });
+		const behavior = resolveStepBehavior(agentConfig, { output: effectiveOutput, skills: skillOverride, fastMode });
 		const availableSkills = discoverAvailableSkills(effectiveCwd);
 
 		const result = await ctx.ui.custom<ChainClarifyResult>(
@@ -2443,6 +2487,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		task = result.templates[0]!;
 		const override = result.behaviorOverrides[0];
 		if (override?.model) modelOverride = override.model;
+		if (override?.fastMode !== undefined) fastMode = override.fastMode;
 		if (override?.output !== undefined) effectiveOutput = normalizeSingleOutputOverride(override.output, agentConfig.output);
 		if (override?.skills !== undefined) skillOverride = override.skills;
 
@@ -2491,6 +2536,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				output: effectiveOutput,
 				outputMode: effectiveOutputMode,
 				modelOverride,
+				fastMode,
 				maxSubagentDepth,
 				worktreeSetupHook: deps.config.worktreeSetupHook,
 				worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
@@ -2536,6 +2582,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.currentActivityState = undefined;
 		foregroundControl.currentModel = modelOverride ?? agentConfig.model;
 		foregroundControl.currentThinking = undefined;
+		foregroundControl.currentFastMode = resolveFastModeStatus(fastMode, modelOverride ?? agentConfig.model, availableModels, currentProvider);
 		foregroundControl.updatedAt = Date.now();
 		foregroundControl.sessionFile = sessionFileForIndex(0);
 		foregroundControl.interrupt = () => {
@@ -2556,6 +2603,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				foregroundControl.currentActivityState = firstProgress?.activityState;
 				foregroundControl.currentModel = update.details?.results?.[0]?.model ?? modelOverride ?? agentConfig.model;
 				foregroundControl.currentThinking = update.details?.results?.[0]?.thinking;
+				foregroundControl.currentFastMode = update.details?.results?.[0]?.fastMode ?? foregroundControl.currentFastMode;
 				foregroundControl.lastActivityAt = firstProgress?.lastActivityAt;
 				foregroundControl.currentTool = firstProgress?.currentTool;
 				foregroundControl.currentToolStartedAt = firstProgress?.currentToolStartedAt;
@@ -2600,6 +2648,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		nestedRoute: foregroundControl?.nestedRoute,
 		index: 0,
 		modelOverride,
+		fastMode,
 		availableModels,
 		preferredModelProvider: currentProvider,
 		skills: effectiveSkills,
@@ -2613,6 +2662,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		foregroundControl.currentActivityState = r.progress?.activityState;
 		foregroundControl.currentModel = r.model ?? modelOverride ?? agentConfig.model;
 		foregroundControl.currentThinking = r.thinking;
+		foregroundControl.currentFastMode = r.fastMode ?? foregroundControl.currentFastMode;
 		foregroundControl.lastActivityAt = r.progress?.lastActivityAt;
 		foregroundControl.currentTool = r.progress?.currentTool;
 		foregroundControl.currentToolStartedAt = r.progress?.currentToolStartedAt;
@@ -2928,6 +2978,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			: discoveredAgents;
 		const foregroundAgents = discoveredAgents.map((agent) => stripContactSupervisorFromAgent(agent));
 		const agents = effectiveAsync ? asyncAgents : foregroundAgents;
+		// Model metadata is resolved by the execution path that needs it. Do not
+		// read the registry here: setup and preflight must preserve their prior
+		// behavior even when a test/runtime registry is unavailable.
+		const availableModels: ModelInfo[] = [];
+		const currentProvider = ctx.model?.provider;
 
 		// Ralph orchestrator sandbox preflight: check gh auth, git probe, and worktree pointer
 		// before launching nested workers, so environmental failures are detected early.
@@ -3047,7 +3102,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		let foregroundChildren: PersistedForegroundStep[] = [];
 		if (!effectiveAsync) {
 			try {
-				foregroundChildren = initialForegroundChildren(effectiveParams, childSessionFileForIndex);
+				foregroundChildren = initialForegroundChildren(effectiveParams, childSessionFileForIndex, agents, availableModels, currentProvider);
 			} catch (error) {
 				return toExecutionErrorResult(effectiveParams, error);
 			}
@@ -3132,6 +3187,23 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					: effectiveParams.agent
 						? [resolveConfiguredModel(effectiveParams.agent, effectiveParams.model as string | undefined)]
 						: [];
+			const configuredFastModeRequests = hasTasks && effectiveParams.tasks
+				? effectiveParams.tasks.map((task) => task.fastMode ?? agents.find((agent) => agent.name === task.agent)?.fastMode)
+				: hasChain && effectiveParams.chain
+					? effectiveParams.chain.flatMap((step) => isParallelStep(step)
+						? step.parallel.map((task) => task.fastMode ?? agents.find((agent) => agent.name === task.agent)?.fastMode)
+						: isDynamicParallelStep(step)
+							? [step.parallel.fastMode ?? agents.find((agent) => agent.name === step.parallel.agent)?.fastMode]
+							: [(step as SequentialStep).fastMode ?? agents.find((agent) => agent.name === (step as SequentialStep).agent)?.fastMode])
+					: effectiveParams.agent
+						? [effectiveParams.fastMode ?? agents.find((agent) => agent.name === effectiveParams.agent)?.fastMode]
+						: [];
+			const configuredFastModes = configuredModels.map((model, index) => resolveFastModeStatus(
+				configuredFastModeRequests[index],
+				model,
+				availableModels,
+				currentProvider,
+			));
 			const leafIntercomTarget = intercomBridge.active && agentsForSummary[0]
 				? resolveSubagentIntercomTarget(runId, agentsForSummary[0], 0)
 				: undefined;
@@ -3159,6 +3231,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const stepTokens = child ? tokenUsageFromResult(child) : approximateTokenUsage(progress?.tokens);
 				const stepModel = child?.model ?? configuredModels[index];
 				const stepThinking = child?.thinking ?? (index === (foregroundControl?.currentIndex ?? 0) ? foregroundControl?.currentThinking : undefined);
+				const stepFastMode = child?.fastMode ?? configuredFastModes[index];
 				return {
 					agent,
 					status: stepStatus,
@@ -3172,6 +3245,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					...(progress?.toolCount !== undefined ? { toolCount: progress.toolCount } : {}),
 					...(stepModel ? { model: stepModel } : {}),
 					...(stepThinking ? { thinking: stepThinking } : {}),
+					...(stepFastMode ? { fastMode: stepFastMode } : {}),
 					...(stepTokens ? { totalTokens: stepTokens } : {}),
 					...(foregroundControl?.startedAt ? { startedAt: foregroundControl.startedAt } : {}),
 					...(child?.error ?? progress?.error ? { error: child?.error ?? progress?.error } : {}),
@@ -3184,6 +3258,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const thinkingFromParams = type === "subagent.nested.completed"
 				? details?.results[currentIndex]?.thinking ?? details?.results.find((child) => child.model)?.thinking
 				: foregroundControl?.currentThinking;
+			const fastModeFromParams = details?.results[currentIndex]?.fastMode ?? configuredFastModes[currentIndex];
 			try {
 				writeNestedEvent(inheritedNestedRoute, {
 					type,
@@ -3216,6 +3291,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						...(foregroundControl?.toolCount !== undefined ? { toolCount: foregroundControl.toolCount } : {}),
 						...(modelFromParams ? { model: modelFromParams } : {}),
 						...(thinkingFromParams ? { thinking: thinkingFromParams } : {}),
+						...(fastModeFromParams ? { fastMode: fastModeFromParams } : {}),
 						...(totalTokens ? { totalTokens } : {}),
 						...(errorText ? { error: errorText } : {}),
 						...(resultText ? { summary: resultText } : {}),

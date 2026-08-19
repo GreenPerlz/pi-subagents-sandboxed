@@ -35,7 +35,8 @@ test("direct @earendil-works runtime imports are declared for CI installs", () =
 	for (const file of [...collectTsFiles(path.join(projectRoot, "src")), ...collectTsFiles(path.join(projectRoot, "test"))]) {
 		const source = fs.readFileSync(file, "utf-8");
 		for (const match of source.matchAll(sourceImportPattern)) {
-			imported.add(match[1] ?? match[2]!);
+			const specifier = match[1] ?? match[2]!;
+			imported.add(specifier.split("/").slice(0, 2).join("/"));
 		}
 	}
 

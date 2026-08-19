@@ -217,6 +217,39 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.thinking, "high");
 	});
 
+	it("promotes the sole foreground fast-mode child status to live and finished headers", () => {
+		const fastMode = { requested: true, eligible: true, active: "unknown" as const, model: "openai/gpt-5.5" };
+		const live = baseState();
+		addForegroundControl(live, "fg-live-fast", { currentAgent: "worker", mode: "single" });
+		addForegroundRun(live, "fg-live-fast", {
+			mode: "single",
+			children: [{ agent: "worker", index: 0, status: "running", fastMode }],
+		});
+		assert.deepEqual(collectRunTree(live)[0]!.fastMode, fastMode);
+
+		const finished = baseState();
+		addForegroundRun(finished, "fg-finished-fast", {
+			mode: "single",
+			children: [{ agent: "worker", index: 0, status: "completed", fastMode }],
+		});
+		assert.deepEqual(collectRunTree(finished)[0]!.fastMode, fastMode);
+	});
+
+	it("keeps finished parallel run model selection independent from fast-mode metadata", () => {
+		const state = baseState();
+		addForegroundRun(state, "fg-finished-parallel-fast", {
+			mode: "parallel",
+			children: [
+				{ agent: "fast", index: 0, status: "completed", fastMode: { requested: true, eligible: "unknown", active: "unknown" } },
+				{ agent: "modeled", index: 1, status: "completed", model: "openai/gpt-4o", thinking: "high" },
+			],
+		});
+		const run = collectRunTree(state)[0]!;
+		assert.strictEqual(run.model, "openai/gpt-4o");
+		assert.strictEqual(run.thinking, "high");
+		assert.strictEqual(run.fastMode, undefined);
+	});
+
 	it("propagates currentThinking to synthesized live foreground step and run", () => {
 		const state = baseState();
 		addForegroundControl(state, "fg-synth-thinking", {
@@ -224,11 +257,13 @@ describe("collectRunTree", () => {
 			mode: "single",
 			currentModel: "openai/gpt-4o",
 			currentThinking: "high",
+			currentFastMode: { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" },
 		});
 		const runs = collectRunTree(state);
 		assert.strictEqual(runs.length, 1);
 		assert.strictEqual(runs[0]!.model, "openai/gpt-4o");
 		assert.strictEqual(runs[0]!.thinking, "high");
+		assert.deepStrictEqual(runs[0]!.fastMode, { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" });
 		assert.strictEqual(runs[0]!.steps.length, 1);
 		assert.strictEqual(runs[0]!.steps[0]!.model, "openai/gpt-4o");
 		assert.strictEqual(runs[0]!.steps[0]!.thinking, "high");
@@ -828,6 +863,31 @@ describe("collectRunTree", () => {
 		}
 	});
 
+	it("keeps persisted parallel run model selection independent from fast-mode metadata", () => {
+		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-persisted-parallel-fast", {
+				runId: "fg-persisted-parallel-fast",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "parallel",
+				state: "complete",
+				updatedAt: 4000,
+				children: [
+					{ agent: "fast", index: 0, status: "completed", fastMode: { requested: true, eligible: "unknown", active: "unknown" } },
+					{ agent: "modeled", index: 1, status: "completed", model: "openai/gpt-4o", thinking: "high" },
+				],
+			});
+			const run = collectRunTree(state, 5000, { foregroundDirRoot, resultsDir })[0]!;
+			assert.strictEqual(run.model, "openai/gpt-4o");
+			assert.strictEqual(run.thinking, "high");
+			assert.strictEqual(run.fastMode, undefined);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("hydrates completed persisted foreground runs after parent session resume", () => {
 		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
 		try {
@@ -1374,6 +1434,7 @@ describe("collectRunTree", () => {
 			const artifactPath = path.join(asyncDir, "output.md");
 			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
 			fs.writeFileSync(artifactPath, "done\n", "utf-8");
+			const fastMode = { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" };
 			writePersistedResult(resultsDir, "result-only", {
 				id: "result-only",
 				sessionId: "session-a",
@@ -1381,7 +1442,7 @@ describe("collectRunTree", () => {
 				mode: "single",
 				state: "complete",
 				asyncDir,
-				results: [{ agent: "worker", success: true, sessionFile, artifactPaths: { outputPath: artifactPath } }],
+				results: [{ agent: "worker", success: true, sessionFile, artifactPaths: { outputPath: artifactPath }, fastMode }],
 			});
 
 			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
@@ -1390,6 +1451,8 @@ describe("collectRunTree", () => {
 			assert.strictEqual(runs[0]!.sessionFile, sessionFile);
 			assert.strictEqual(runs[0]!.artifactPath, artifactPath);
 			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
+			assert.deepStrictEqual(runs[0]!.fastMode, fastMode);
+			assert.deepStrictEqual(runs[0]!.steps[0]!.fastMode, fastMode);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1709,6 +1772,32 @@ describe("collectRunTree", () => {
 		assert.strictEqual(runs[0]!.steps[0]!.thinking, "low");
 		assert.strictEqual(runs[0]!.steps[1]!.model, "claude-sonnet");
 		assert.strictEqual(runs[0]!.steps[1]!.thinking, "high");
+	});
+
+	it("propagates persisted async fast-mode status to UI steps", () => {
+		const { asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			const fastMode = { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" };
+			writePersistedAsyncStatus(asyncDirRoot, "persisted-async-fast-mode", {
+				runId: "persisted-async-fast-mode",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "parallel",
+				state: "complete",
+				startedAt: 1000,
+				endedAt: 4000,
+				lastUpdate: 4000,
+				steps: [
+					{ agent: "fast", status: "complete", index: 0, fastMode },
+					{ agent: "off", status: "complete", index: 1 },
+				],
+			});
+			const runs = collectRunTree(state, 5000, { asyncDirRoot, resultsDir });
+			assert.deepStrictEqual(runs[0]?.steps.map((step) => step.fastMode), [fastMode, undefined]);
+		} finally {
+			fs.rmSync(path.dirname(asyncDirRoot), { recursive: true, force: true });
+		}
 	});
 
 	it("derives run-level model and thinking from persisted async status", () => {

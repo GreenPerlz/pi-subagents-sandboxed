@@ -7,6 +7,7 @@ export const GUARDED_AGENT_OVERRIDE_PATHS = [
 	"cwd",
 	"context",
 	"model",
+	"fastMode",
 	"skills",
 	"output",
 	"outputMode",
@@ -25,6 +26,7 @@ export const GUARDED_AGENT_OVERRIDE_LEAVES = [
 	"cwd",
 	"context",
 	"model",
+	"fastMode",
 	"skills",
 	"output",
 	"outputMode",
@@ -59,6 +61,7 @@ export interface AgentOverridePolicyParams {
 	cwd?: unknown;
 	context?: unknown;
 	model?: unknown;
+	fastMode?: unknown;
 	skill?: unknown;
 	output?: unknown;
 	outputMode?: unknown;
@@ -146,7 +149,7 @@ function addSandboxPaths(paths: Set<string>, sandbox: unknown): void {
 }
 
 function addAgentScopedPaths(paths: Set<string>, value: unknown): void {
-	for (const key of ["cwd", "context", "model", "output", "outputMode", "reads", "progress", "outputSchema", "share", "worktree", "maxSubagentDepth"]) {
+	for (const key of ["cwd", "context", "model", "fastMode", "output", "outputMode", "reads", "progress", "outputSchema", "share", "worktree", "maxSubagentDepth"]) {
 		addPath(paths, value, key);
 	}
 	if ((hasOwn(value, "skill") && value.skill !== undefined) || (hasOwn(value, "skills") && value.skills !== undefined)) paths.add("skills");

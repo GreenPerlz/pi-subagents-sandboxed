@@ -21,6 +21,7 @@ import { getPiSpawnEntrypointOverrideForTests, resolveInstalledPiPackageRoot, re
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { resolveChildCwd } from "../../shared/utils.ts";
 import { buildModelCandidates, type AvailableModelInfo } from "../shared/model-fallback.ts";
+import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { resolveCandidateLaunchThinking } from "../../shared/model-info.ts";
 import { resolveExpectedWorktreeAgentCwd } from "../shared/worktree.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
@@ -156,6 +157,7 @@ interface AsyncSingleParams {
 	output?: string | boolean;
 	outputMode?: "inline" | "file-only";
 	modelOverride?: string;
+	fastMode?: boolean;
 	availableModels?: AvailableModelInfo[];
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
@@ -363,6 +365,7 @@ export function executeAsyncChain(
 			...(s.progress !== undefined ? { progress: s.progress } : {}),
 			...(stepSkillInput !== undefined ? { skills: stepSkillInput } : {}),
 			...(s.model ? { model: s.model } : {}),
+			...(s.fastMode !== undefined ? { fastMode: s.fastMode } : {}),
 		};
 	};
 	const buildSeqStep = (
@@ -409,6 +412,7 @@ export function executeAsyncChain(
 		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`, instructionOutputPath);
 
 		const modelCandidates = buildModelCandidates(behavior.model ?? a.model, a.fallbackModels, availableModels, ctx.currentModelProvider, a.thinking);
+		const fastModeCandidates = modelCandidates.map((candidate) => resolveFastModeStatus(behavior.fastMode, candidate, availableModels, ctx.currentModelProvider));
 		const model = modelCandidates[0];
 		return {
 			agent: s.agent,
@@ -419,6 +423,8 @@ export function executeAsyncChain(
 			structured: Boolean(s.outputSchema),
 			cwd: stepCwd,
 			model,
+			fastMode: behavior.fastMode,
+			fastModeCandidates,
 			thinking: resolveCandidateLaunchThinking(model, a.thinking),
 			modelCandidates,
 			tools: a.tools,
@@ -750,6 +756,7 @@ export function executeAsyncSingle(
 		agentConfig.thinking,
 	);
 	const model = modelCandidates[0];
+	const fastModeCandidates = modelCandidates.map((candidate) => resolveFastModeStatus(params.fastMode ?? agentConfig.fastMode, candidate, availableModels, ctx.currentModelProvider));
 	let spawnResult: { pid?: number; error?: string } = {};
 	try {
 		spawnResult = spawnRunner(
@@ -761,6 +768,8 @@ export function executeAsyncSingle(
 						task: taskWithOutputInstruction,
 						cwd: runnerCwd,
 						model,
+						fastMode: params.fastMode ?? agentConfig.fastMode ?? false,
+						fastModeCandidates,
 						thinking: resolveCandidateLaunchThinking(model, agentConfig.thinking),
 						modelCandidates,
 						tools: agentConfig.tools,

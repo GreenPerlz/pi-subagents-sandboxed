@@ -7,6 +7,7 @@ export const KNOWN_FIELDS = new Set([
 	"description",
 	"tools",
 	"model",
+	"fastMode",
 	"fallbackModels",
 	"thinking",
 	"systemPromptMode",
@@ -56,6 +57,7 @@ export function serializeAgent(config: AgentConfig): string {
 	if (toolsValue) lines.push(`tools: ${toolsValue}`);
 
 	if (config.model) lines.push(`model: ${config.model}`);
+	if (config.fastMode) lines.push("fastMode: true");
 	const fallbackModelsValue = joinComma(config.fallbackModels);
 	if (fallbackModelsValue) lines.push(`fallbackModels: ${fallbackModelsValue}`);
 	if (config.thinking) lines.push(`thinking: ${config.thinking}`);

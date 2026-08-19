@@ -69,6 +69,7 @@ interface RunSyncResult {
 	error?: string;
 	model?: string;
 	thinking?: string;
+	fastMode?: { requested: boolean; eligible: boolean | "unknown"; active: boolean | "unknown"; model?: string };
 	skills?: string[];
 	skillsWarning?: string;
 	attemptedModels?: string[];
@@ -408,6 +409,23 @@ process.exit(${exitCode});
 		});
 	}
 
+	function canonicalFastModeCtx() {
+		const base = makeMinimalCtx(tempDir);
+		return {
+			...base,
+			modelRegistry: {
+				getAvailable: () => [{ provider: "openai", id: "gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" }],
+			},
+		};
+	}
+
+	function readFastModeEnvs(): string[] {
+		return fs.readdirSync(mockPi.dir)
+			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.sort()
+			.map((name) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { env?: { PI_SUBAGENT_FAST_MODE?: string | null } }).env?.PI_SUBAGENT_FAST_MODE ?? "null");
+	}
+
 	it("spawns agent and captures output", async () => {
 		mockPi.onCall({ output: "Hello from mock agent" });
 		const agents = makeAgentConfigs(["echo"]);
@@ -545,6 +563,25 @@ process.exit(${exitCode});
 			const modelIndex = args.indexOf("--model");
 			assert.notEqual(modelIndex, -1);
 			assert.equal(args[modelIndex + 1], "openrouter/openai/gpt-4o");
+		}
+	});
+
+	it("propagates fast mode through every foreground acceptance-finalization request", async () => {
+		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_FAST_MODE"] });
+		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_FAST_MODE"] });
+		const agents = [makeAgent("worker", { model: "openai/gpt-5.5", fastMode: true })];
+		const result = await runSync(tempDir, agents, "worker", "Create a priority acceptance report", {
+			runId: "fast-mode-acceptance-finalization",
+			acceptance: { criteria: ["Create the report"], selfReview: true, maxFinalizationTurns: 1 },
+			availableModels: [{ provider: "openai", id: "gpt-5.5", fullId: "openai/gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" }],
+		});
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(result.fastMode, { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" });
+		const callFiles = fs.readdirSync(mockPi.dir).filter((file) => file.startsWith("call-") && file.endsWith(".json"));
+		assert.equal(callFiles.length, 2);
+		for (const callFile of callFiles) {
+			const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { env?: { PI_SUBAGENT_FAST_MODE?: string | null } };
+			assert.equal(payload.env?.PI_SUBAGENT_FAST_MODE, "1");
 		}
 	});
 
@@ -717,6 +754,44 @@ process.exit(${exitCode});
 			assert.match(result.content[0]?.text ?? "", new RegExp(`denied ${testCase.name === "worktree" ? "worktree" : "model"}`), testCase.name);
 		}
 		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("routes fast mode through public static-chain and dynamic launch boundaries", async () => {
+		const worker = makeAgent("worker", { model: "openai/gpt-5.5", fastMode: true });
+		const scout = makeAgent("scout");
+		const executor = makeExecutor([scout, worker]);
+		mockPi.onCall({ output: "static chain done" });
+		const staticResult = await executor.execute(
+			"fast-static-chain",
+			{ chain: [{ agent: "worker", task: "Do the priority work" }] },
+			new AbortController().signal,
+			undefined,
+			canonicalFastModeCtx(),
+		);
+		assert.equal(staticResult.isError, undefined);
+		assert.equal(staticResult.details.results[0]?.fastMode?.eligible, true);
+
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ name: "a" }] } });
+		mockPi.onCall({ output: "dynamic review done" });
+		const dynamicResult = await executor.execute(
+			"fast-dynamic-chain",
+			{
+				chain: [
+					{ agent: "scout", task: "List targets", as: "targets", outputSchema: { type: "object" } },
+					{
+						expand: { from: { output: "targets", path: "/items" }, maxItems: 1 },
+						parallel: { agent: "worker", task: "Review {item}" },
+						collect: { as: "reviews" },
+					},
+				],
+			},
+			new AbortController().signal,
+			undefined,
+			canonicalFastModeCtx(),
+		);
+		assert.equal(dynamicResult.isError, undefined);
+		assert.equal(dynamicResult.details.results.some((result) => result.fastMode?.eligible === true), true);
+		assert.deepEqual(readFastModeEnvs(), ["1", "0", "1"]);
 	});
 
 	it("returns error for unknown agent", async () => {
@@ -970,6 +1045,38 @@ process.exit(${exitCode});
 		assert.equal(result.modelAttempts?.[1]?.success, true);
 		assert.equal(result.usage.turns, 2);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("evaluates fast mode independently for supported and unsupported fallback candidates", async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "priority candidate failed" }],
+					model: "openai/gpt-5.5",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ jsonl: [events.assistantMessage("Recovered normally", "anthropic/claude-sonnet-4")] });
+		const agents = [makeAgent("echo", { model: "openai/gpt-5.5", fallbackModels: ["anthropic/claude-sonnet-4"], fastMode: true })];
+		const result = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "fallback-fast-mode",
+			availableModels: [
+				{ provider: "openai", id: "gpt-5.5", fullId: "openai/gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4", api: "anthropic-messages", baseUrl: "https://api.anthropic.com" },
+			],
+		});
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.fastMode?.model, "anthropic/claude-sonnet-4");
+		assert.equal(result.fastMode?.eligible, false);
+		const callFiles = fs.readdirSync(mockPi.dir).filter((file) => file.startsWith("call-") && file.endsWith(".json"));
+		assert.equal(callFiles.length, 2);
+		const callEnvs = callFiles.map((file) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, file), "utf-8")) as { env?: { PI_SUBAGENT_FAST_MODE?: string | null } }).env?.PI_SUBAGENT_FAST_MODE);
+		assert.deepEqual(callEnvs.sort(), ["0", "1"]);
 	});
 
 	it("retries with fallback models when provider errors exit zero", async () => {
@@ -1684,19 +1791,21 @@ process.exit(${exitCode});
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const fakeBwrap = installFakeBwrap();
 		try {
-			const executor = makeExecutor([makeAgent("echo")]);
+			const executor = makeExecutor([makeAgent("echo", { model: "openai/gpt-5.5", fastMode: true })]);
 			const result = await executor.execute(
 				"single-sandbox-closed-runtime",
 				{ agent: "echo", task: "Smoke test sandboxed child launch using pi-json auth. Reply exactly: SUBAGENT_SANDBOXED_PI_JSON_OK", sandbox: { provider: "bubblewrap", auth: "pi-json" } },
 				new AbortController().signal,
 				undefined,
-				makeMinimalCtx(tempDir),
+				canonicalFastModeCtx(),
 			);
 
 			assert.equal(result.isError, undefined);
 			assert.match(result.content[0]?.text ?? "", /SUBAGENT_SANDBOXED_PI_JSON_OK/);
 			assert.equal(result.details.results[0]?.sandbox?.fallbackOccurred, false);
 			assert.equal(result.details.results[0]?.sandbox?.auth, "pi-json");
+			assert.equal(result.details.results[0]?.fastMode?.eligible, true);
+			assert.deepEqual(readFastModeEnvs(), ["1"]);
 			const piArgs = readCallArgs();
 			assert.ok(piArgs.includes("--no-extensions"), "sandboxed child should disable extension discovery");
 			assert.ok(piArgs.includes("--no-prompt-templates"), "sandboxed child should disable prompt template discovery");

@@ -58,6 +58,7 @@ import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { resolveCandidateLaunchThinking, resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { resolveFastModeStatus, shouldRequestFastMode } from "../../shared/fast-mode.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { appendSavedOutputSystemPrompt, captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -174,6 +175,7 @@ async function runSingleAttempt(
 		skillsWarning?: string;
 		jsonlPath?: string;
 		artifactPaths?: ArtifactPaths;
+		fastModeStatus?: import("../../shared/fast-mode.ts").FastModeStatus;
 		attemptNotes: string[];
 		outputSnapshot?: SingleOutputSnapshot;
 		originalTask?: string;
@@ -203,6 +205,7 @@ async function runSingleAttempt(
 		sessionDir: options.sessionDir,
 		sessionFile: options.sessionFile,
 		model,
+		fastMode: shouldRequestFastMode(shared.fastModeStatus),
 		thinking: resolveCandidateLaunchThinking(model, agent.thinking),
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
@@ -237,6 +240,7 @@ async function runSingleAttempt(
 		usage: emptyUsage(),
 		model: modelArg,
 		thinking: resolveCandidateLaunchThinking(modelArg, agent.thinking),
+		fastMode: shared.fastModeStatus,
 		artifactPaths: shared.artifactPaths,
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
@@ -991,6 +995,16 @@ async function runAcceptanceFinalizationLoop(input: {
 			?? input.result.attemptedModels?.at(-1)
 			?? input.options.modelOverride
 			?? input.agent.model
+		// Continuation is another provider request. Reuse the successful
+		// candidate's status when available; resolving from the configured
+		// candidate is the fallback for older/incomplete result metadata.
+		const finalizationFastModeStatus = input.result.modelAttempts?.find((attempt) => attempt.success && attempt.model === finalizationModel)?.fastMode
+			?? resolveFastModeStatus(
+				input.options.fastMode ?? input.agent.fastMode,
+				finalizationModel,
+				input.options.availableModels,
+				input.options.preferredModelProvider,
+			);
 		const finalizationResult = await runSingleAttempt(
 			input.runtimeCwd,
 			input.agent,
@@ -1002,10 +1016,16 @@ async function runAcceptanceFinalizationLoop(input: {
 				systemPrompt: input.systemPrompt,
 				resolvedSkillNames: input.resolvedSkillNames,
 				skillsWarning: input.skillsWarning,
+				fastModeStatus: finalizationFastModeStatus,
 				attemptNotes: [],
 				originalTask: prompt,
 			},
 		);
+		// Keep the public aggregate truthful about the candidate used for both
+		// the initial request and same-session continuation. Provider activation
+		// remains unknown because Pi does not expose an authoritative response
+		// flag through this interface.
+		input.result.fastMode = finalizationResult.fastMode ?? finalizationFastModeStatus;
 		sumUsage(input.result.usage, finalizationResult.usage);
 		input.result.progressSummary = {
 			toolCount: (input.result.progressSummary?.toolCount ?? 0) + (finalizationResult.progressSummary?.toolCount ?? 0),
@@ -1152,8 +1172,15 @@ export async function runSync(
 	for (let i = 0; i < modelsToTry.length; i++) {
 		const candidate = modelsToTry[i];
 		if (candidate) attemptedModels.push(candidate);
+		const fastModeStatus = resolveFastModeStatus(
+			options.fastMode ?? agent.fastMode,
+			candidate,
+			options.availableModels,
+			options.preferredModelProvider,
+		);
 		const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
 		const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, options, {
+			fastModeStatus,
 			sessionEnabled,
 			systemPrompt,
 			resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
@@ -1172,6 +1199,7 @@ export async function runSync(
 		const attempt: ModelAttempt = {
 			model: candidate ?? result.model ?? agent.model ?? "default",
 			success: attemptSucceeded,
+			fastMode: result.fastMode,
 			exitCode: result.exitCode,
 			error: result.error,
 			usage: { ...result.usage },
@@ -1223,6 +1251,7 @@ export async function runSync(
 				exitCode: result.exitCode,
 				usage: result.usage,
 				model: result.model,
+				fastMode: result.fastMode,
 				attemptedModels: result.attemptedModels,
 				modelAttempts: result.modelAttempts,
 				durationMs: result.progressSummary?.durationMs,

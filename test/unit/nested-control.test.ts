@@ -95,6 +95,17 @@ function ctx(root: string, sessionFile: string | null = null) {
 	} as any;
 }
 
+function canonicalFastModeCtx(root: string) {
+	return {
+		...ctx(root),
+		modelRegistry: {
+			getAvailable() {
+				return [{ provider: "openai", id: "gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" }];
+			},
+		},
+	} as any;
+}
+
 function createNestedRun(id = "nested-live", state: "running" | "complete" | "failed" | "paused" = "running", extras: Record<string, unknown> = {}) {
 	const route = createNestedRoute("root-control");
 	routeRoots.push(path.dirname(route.eventSink));
@@ -373,16 +384,19 @@ describe("nested control routing", () => {
 			setRalphOrchestratorNestedEnv(route, "orchestrator-default-sync-loop-run");
 			const executor = createExecutor(createState(), [
 				{ name: "explore", description: "Explorer", prompt: "Explore" },
-				{ name: "review", description: "Reviewer", prompt: "Review" },
+				{ name: "review", description: "Reviewer", prompt: "Review", model: "openai/gpt-5.5", fastMode: true },
 			], true, { emit() {}, on() { return () => {}; } }, true);
 
-			const explore = await executor.execute("run", { agent: "explore", task: "inspect" }, new AbortController().signal, undefined, ctx(root));
-			const review = await executor.execute("run", { agent: "review", task: "review" }, new AbortController().signal, undefined, ctx(root));
+			const explore = await executor.execute("run", { agent: "explore", task: "inspect" }, new AbortController().signal, undefined, canonicalFastModeCtx(root));
+			const review = await executor.execute("run", { agent: "review", task: "review" }, new AbortController().signal, undefined, canonicalFastModeCtx(root));
 
 			assert.equal(explore.isError, undefined);
 			assert.match(text(explore), /explore findings inline/);
 			assert.equal(review.isError, undefined);
 			assert.match(text(review), /review verdict inline/);
+			assert.equal(review.details.results[0]?.fastMode?.eligible, true);
+			const calls = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json")).sort();
+			assert.deepEqual(calls.map((name) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { env?: { PI_SUBAGENT_FAST_MODE?: string | null } }).env?.PI_SUBAGENT_FAST_MODE), ["0", "1"]);
 			assert.equal(mockPi.callCount(), 2);
 		} finally {
 			mockPi.uninstall();

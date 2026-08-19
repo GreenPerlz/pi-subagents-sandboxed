@@ -43,7 +43,7 @@ interface AsyncResultPayload {
 	mode?: string;
 	summary?: string;
 	worktreeExecutionError?: string;
-	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown }; sandbox?: SandboxDiagnosticsPayload }>;
+	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; fastMode?: { requested?: boolean; eligible?: boolean | "unknown"; active?: boolean | "unknown"; model?: string }; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown }; sandbox?: SandboxDiagnosticsPayload }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; error?: string }> }> };
 }
@@ -71,6 +71,7 @@ interface AsyncStatusPayload {
 		error?: string;
 		model?: string;
 		thinking?: string;
+		fastMode?: { requested?: boolean; eligible?: boolean | "unknown"; active?: boolean | "unknown"; model?: string };
 		tokens?: { total: number };
 		acceptance?: { status?: string };
 		sandbox?: SandboxDiagnosticsPayload;
@@ -156,6 +157,16 @@ async function waitForAsyncResultFile(id: string, timeoutMs = 15_000): Promise<s
 		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
 	return resultPath;
+}
+
+async function waitForAsyncStatusFile(id: string, timeoutMs = 15_000): Promise<string> {
+	const statusPath = path.join(ASYNC_DIR, id, "status.json");
+	const deadline = Date.now() + timeoutMs;
+	while (!fs.existsSync(statusPath)) {
+		if (Date.now() > deadline) assert.fail(`Timed out waiting for async status file: ${statusPath}`);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	return statusPath;
 }
 
 function readLastMockPiArgs(mockPi: MockPi): string[] {
@@ -378,6 +389,185 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(chainResult.content[0]?.text ?? "", /Async chain:/);
 		assert.match(chainResult.content[0]?.text ?? "", /Do not run sleep timers or polling loops/);
 		await waitForAsyncResultFile(chainId, 10_000);
+	});
+
+	it("public async single honors explicit fast-mode overrides over the agent default", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const availableModel = { provider: "openai", id: "gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" };
+		const ctx = makeMinimalCtx(tempDir);
+		ctx.model = { provider: "openai" };
+		ctx.modelRegistry = { getAvailable: () => [availableModel] };
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("worker", { model: "openai/gpt-5.5", fastMode: false })] }),
+		});
+
+		for (const [index, requested] of [true, false].entries()) {
+			mockPi.onCall({ output: `public async override ${requested}` });
+			const response = await executor.execute(
+				`public-async-fast-mode-${index}`,
+				{ agent: "worker", task: "Run with explicit fast mode", async: true, fastMode: requested },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+			const asyncId = response.details?.asyncId;
+			assert.ok(asyncId, "expected asyncId");
+			const resultPath = await waitForAsyncResultFile(asyncId, 10_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, asyncId, "status.json"), "utf-8")) as AsyncStatusPayload;
+			if (requested) {
+				assert.equal(payload.results[0]?.fastMode?.requested, true);
+				assert.equal(status.steps?.[0]?.fastMode?.requested, true);
+			} else {
+				assert.equal(payload.results[0]?.fastMode, undefined);
+				assert.equal(status.steps?.[0]?.fastMode, undefined);
+			}
+			const call = readMockPiArgs(mockPi, index);
+			const callFile = fs.readdirSync(mockPi.dir)
+				.filter((file) => file.startsWith("call-") && file.endsWith(".json"))
+				.sort()
+				.at(index);
+			assert.ok(callFile);
+			const recorded = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { env?: { PI_SUBAGENT_FAST_MODE?: string | null } };
+			assert.equal(recorded.env?.PI_SUBAGENT_FAST_MODE, requested ? "1" : "0");
+			assert.ok(call.length > 0);
+		}
+	});
+
+	it("persisted async status tracks fast-mode metadata for static parallel candidates", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const availableModels = [
+			{ provider: "openai", id: "gpt-5.5", fullId: "openai/gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" },
+			{ provider: "openai", id: "gpt-5.4", fullId: "openai/gpt-5.4", api: "openai-responses", baseUrl: "https://api.openai.com/v1" },
+		];
+		mockPi.onCall({ output: "parallel fast" });
+		mockPi.onCall({ output: "parallel off" });
+		const id = `async-fast-mode-parallel-${Date.now().toString(36)}`;
+		const launch = executeAsyncChain(id, {
+			chain: [{ parallel: [
+				{ agent: "fast", task: "Use priority mode", model: "openai/gpt-5.5", fastMode: true },
+				{ agent: "off", task: "Do not use priority mode", model: "openai/gpt-5.4", fastMode: false },
+			] }],
+			resultMode: "parallel",
+			agents: [makeAgent("fast"), makeAgent("off", { fastMode: true })],
+			availableModels,
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-fast-parallel" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+		assert.equal(launch.isError, undefined);
+		const statusPath = await waitForAsyncStatusFile(id);
+		const initialStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		assert.equal(initialStatus.steps?.[0]?.fastMode?.model, "openai/gpt-5.5");
+		assert.equal(initialStatus.steps?.[1]?.fastMode, undefined);
+		await waitForAsyncResultFile(id);
+		const finalStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		assert.deepEqual(finalStatus.steps?.map((step) => step.fastMode), [
+			{ requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" },
+			undefined,
+		]);
+	});
+
+	it("persisted async status replaces sequential fast-mode metadata after fallback", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const availableModels = [
+			{ provider: "openai", id: "gpt-5.5", fullId: "openai/gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" },
+			{ provider: "openai", id: "gpt-5.4", fullId: "openai/gpt-5.4", api: "openai-responses", baseUrl: "https://api.openai.com/v1" },
+		];
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "primary failed" }],
+					model: "openai/gpt-5.5",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ jsonl: [events.assistantMessage("fallback succeeded", "openai/gpt-5.4")] });
+		const id = `async-fast-mode-fallback-${Date.now().toString(36)}`;
+		const launch = executeAsyncChain(id, {
+			chain: [{ agent: "worker", task: "Use priority mode with fallback", fastMode: true }],
+			agents: [makeAgent("worker", { model: "openai/gpt-5.5", fallbackModels: ["openai/gpt-5.4"] })],
+			availableModels,
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-fast-fallback" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+		assert.equal(launch.isError, undefined);
+		const statusPath = await waitForAsyncStatusFile(id);
+		const initialStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		assert.equal(initialStatus.steps?.[0]?.fastMode?.model, "openai/gpt-5.5");
+		await waitForAsyncResultFile(id);
+		const finalStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		assert.deepEqual(finalStatus.steps?.[0]?.fastMode, { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.4" });
+		assert.equal(finalStatus.steps?.[0]?.model, "openai/gpt-5.4");
+	});
+
+	it("persisted dynamic async status retains fast-mode metadata after fanout materialization", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const availableModels = [{ provider: "openai", id: "gpt-5.5", fullId: "openai/gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" }];
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }] } });
+		mockPi.onCall({ output: "dynamic fast" });
+		const id = `async-fast-mode-dynamic-${Date.now().toString(36)}`;
+		const launch = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 2 },
+					parallel: { agent: "writer", task: "Handle {target.path}", model: "openai/gpt-5.5", fastMode: true },
+					collect: { as: "results" },
+				},
+			],
+			agents: [makeAgent("producer"), makeAgent("writer")],
+			availableModels,
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-fast-dynamic" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+		assert.equal(launch.isError, undefined);
+		const statusPath = await waitForAsyncStatusFile(id);
+		await waitForAsyncResultFile(id);
+		const finalStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		const writerStep = finalStatus.steps?.find((step) => step.model === "openai/gpt-5.5");
+		assert.deepEqual(writerStep?.fastMode, { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" });
+	});
+
+	it("async single evaluates fast mode for its selected candidate", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const commonParams = {
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		};
+		mockPi.onCall({ output: "async priority done" });
+		const id = `async-fast-mode-${Date.now().toString(36)}`;
+		const launch = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do priority work",
+			agentConfig: makeAgent("worker", { model: "openai/gpt-5.5", fastMode: true }),
+			availableModels: [{ provider: "openai", id: "gpt-5.5", fullId: "openai/gpt-5.5", api: "openai-responses", baseUrl: "https://api.openai.com/v1" }],
+			...commonParams,
+		});
+		assert.match(launch.content[0]?.text ?? "", /Async: worker/);
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as {
+			results?: Array<{ fastMode?: { requested?: boolean; eligible?: boolean | "unknown"; active?: boolean | "unknown"; model?: string } }>;
+		};
+		assert.deepEqual(payload.results?.[0]?.fastMode, { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" });
+		const callFile = fs.readdirSync(mockPi.dir).find((file) => file.startsWith("call-") && file.endsWith(".json"));
+		assert.ok(callFile);
+		const call = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { env?: { PI_SUBAGENT_FAST_MODE?: string | null } };
+		assert.equal(call.env?.PI_SUBAGENT_FAST_MODE, "1");
 	});
 
 	it("sandboxed async single preserves status inspection and mounts child paths", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

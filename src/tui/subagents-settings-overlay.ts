@@ -11,6 +11,7 @@ import {
 } from "../agents/agents.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
 import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, THINKING_LEVELS as SUPPORTED_THINKING_LEVELS, type ModelInfo } from "../shared/model-info.ts";
+import { fastModeSupportForModel, type FastModeSupport } from "../shared/fast-mode.ts";
 
 const OVERLAY_OPTIONS = {
 	anchor: "center" as const,
@@ -21,7 +22,7 @@ const OVERLAY_OPTIONS = {
 
 type Theme = ExtensionContext["ui"]["theme"];
 type SettingsView = "user" | "builtin";
-type FieldKey = "model" | "fallbackModels" | "thinking";
+type FieldKey = "model" | "fallbackModels" | "thinking" | "fastMode";
 
 export interface ModelChoice {
 	value: string | undefined;
@@ -81,6 +82,18 @@ function fallbackLabel(values: string[] | undefined): string {
 	return values?.length ? values.join(", ") : "(none)";
 }
 
+function fastModeSupportLabel(model: string | undefined, availableModels: ModelInfo[] | undefined): FastModeSupport {
+	return model ? fastModeSupportForModel(model, availableModels) : "unknown";
+}
+
+function fastModeLabel(agent: AgentConfig, availableModels: ModelInfo[] | undefined): string {
+	if (!agent.fastMode) return "off";
+	const primary = fastModeSupportLabel(agent.model, availableModels);
+	const fallback = (agent.fallbackModels ?? []).map((model) => fastModeSupportLabel(model, availableModels));
+	const fallbackText = fallback.length > 0 ? `; fallback: ${fallback.join(", ")}` : "";
+	return `on (primary: ${primary}${fallbackText})`;
+}
+
 function registryModelChoices(ctx: ExtensionContext, thinking?: string): ModelChoice[] {
 	const available = ctx.modelRegistry?.getAvailable?.() ?? [];
 	const seen = new Set<string>();
@@ -122,6 +135,7 @@ function cloneAgent(agent: AgentConfig): AgentConfig {
 		tools: agent.tools ? [...agent.tools] : undefined,
 		mcpDirectTools: agent.mcpDirectTools ? [...agent.mcpDirectTools] : undefined,
 		fallbackModels: agent.fallbackModels ? [...agent.fallbackModels] : undefined,
+		fastMode: agent.fastMode,
 		skills: agent.skills ? [...agent.skills] : undefined,
 	};
 }
@@ -129,6 +143,7 @@ function cloneAgent(agent: AgentConfig): AgentConfig {
 function builtinBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 	return agent.override?.base ?? {
 		model: agent.model,
+		fastMode: agent.fastMode,
 		fallbackModels: agent.fallbackModels ? [...agent.fallbackModels] : undefined,
 		thinking: agent.thinking,
 		systemPromptMode: agent.systemPromptMode,
@@ -153,6 +168,9 @@ export function buildSettingsRows(agents: AgentConfig[], availableModels?: Model
 		rows.push({ agent, field: "model", label: "Default model", value: valueLabel(effectiveModel) });
 		rows.push({ agent, field: "fallbackModels", label: "Fallback models", value: fallbackLabel(effectiveFallbacks) });
 		rows.push({ agent, field: "thinking", label: "Thinking level", value: valueLabel(agent.thinking) });
+		// Older callers/tests may construct AgentConfig objects without the field;
+		// discovered definitions always carry the explicit default false.
+		if (agent.fastMode !== undefined) rows.push({ agent, field: "fastMode", label: "Fast mode", value: fastModeLabel(agent, availableModels) });
 	}
 	return rows;
 }
@@ -374,7 +392,10 @@ class SubagentsSettingsOverlay {
 		const row = this.selectedRow();
 		if (!row) return;
 		if (row.field === "thinking") this.cycleThinking(row);
-		else this.openPicker(row);
+		else if (row.field === "fastMode") {
+			row.agent.fastMode = !row.agent.fastMode;
+			this.save(row.agent);
+		} else this.openPicker(row);
 	}
 
 	private save(agent: AgentConfig): void {

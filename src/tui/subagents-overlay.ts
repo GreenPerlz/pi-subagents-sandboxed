@@ -49,6 +49,7 @@ function nestedChildToRun(parent: OverlayRun, child: OverlayNestedChild): Overla
 		currentTool: child.currentTool,
 		model: child.model,
 		thinking: child.thinking,
+		fastMode: child.fastMode,
 		tokens: child.tokens,
 		sessionFile: nestedChildSessionFile(child),
 		logPath: child.logPath,
@@ -187,7 +188,7 @@ function formatTokenTotal(tokens: { total?: number } | undefined): string | unde
 	return `${total} tokens`;
 }
 
-function overviewMeta(input: { currentTool?: string; elapsed?: string; startedAt?: number; model?: string; thinking?: string; tokens?: { total?: number } }, theme: Theme): string {
+function overviewMeta(input: { currentTool?: string; elapsed?: string; startedAt?: number; model?: string; thinking?: string; fastMode?: { requested: boolean; eligible: boolean | "unknown"; active: boolean | "unknown" }; tokens?: { total?: number } }, theme: Theme): string {
 	const parts: string[] = [];
 	if (input.currentTool) parts.push(input.currentTool);
 	if (input.elapsed) parts.push(`ran ${input.elapsed}`);
@@ -195,6 +196,10 @@ function overviewMeta(input: { currentTool?: string; elapsed?: string; startedAt
 	if (start) parts.push(`started ${start}`);
 	const modelThinking = formatModelThinking(input.model, input.thinking);
 	if (modelThinking) parts.push(modelThinking);
+	if (input.fastMode?.requested) {
+		const state = input.fastMode.active === true ? "active" : input.fastMode.eligible === false ? "unsupported" : input.fastMode.active === "unknown" ? "requested" : "not active";
+		parts.push(`fast:${state}`);
+	}
 	const tokenTotal = formatTokenTotal(input.tokens);
 	if (tokenTotal) parts.push(tokenTotal);
 	return parts.length ? theme.fg("dim", ` · ${parts.join(" · ")}`) : "";

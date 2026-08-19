@@ -70,6 +70,31 @@ describe("agent management config parsing", () => {
 		assert.match(readText(got), /Can be changed by agent: acceptance\.\*, sandbox\.provider/);
 	});
 
+	it("round-trips fastMode through agent and chain management create/get/update", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const agentCreated = handleCreate({ config: { name: "worker", description: "Worker", scope: "project", fastMode: true } }, ctx);
+		assert.equal(agentCreated.isError, false);
+		assert.match(fs.readFileSync(path.join(tempDir, ".pi", "agents", "worker.md"), "utf-8"), /^fastMode: true$/m);
+		assert.match(readText(handleManagementAction("get", { agent: "worker" }, ctx)), /Fast mode: true/);
+		const agentUpdated = handleUpdate({ agent: "worker", config: { fastMode: false } }, ctx);
+		assert.equal(agentUpdated.isError, false);
+		assert.doesNotMatch(fs.readFileSync(path.join(tempDir, ".pi", "agents", "worker.md"), "utf-8"), /^fastMode: true$/m);
+
+		const chainCreated = handleCreate({ config: {
+			name: "review-flow",
+			description: "Review flow",
+			scope: "project",
+			steps: [{ agent: "worker", task: "Review", fastMode: true }],
+		} }, ctx);
+		assert.equal(chainCreated.isError, false);
+		const chainPath = path.join(tempDir, ".pi", "chains", "review-flow.chain.md");
+		assert.match(fs.readFileSync(chainPath, "utf-8"), /^fastMode: true$/m);
+		assert.match(readText(handleManagementAction("get", { chainName: "review-flow" }, ctx)), /Fast mode: true/);
+		const chainUpdated = handleUpdate({ chainName: "review-flow", config: { steps: [{ agent: "worker", task: "Review", fastMode: false }] } }, ctx);
+		assert.equal(chainUpdated.isError, false);
+		assert.doesNotMatch(fs.readFileSync(chainPath, "utf-8"), /^fastMode: true$/m);
+	});
+
 	it("rejects override policy typos during agent management", () => {
 		const result = handleCreate(
 			{

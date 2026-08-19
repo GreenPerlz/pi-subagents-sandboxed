@@ -14,6 +14,7 @@ import {
 	type SubagentRunMode,
 	type SubagentState,
 } from "../../shared/types.ts";
+import type { FastModeStatus } from "../../shared/fast-mode.ts";
 import { isSafeNestedPathId, parseNestedPathEnv, sanitizeNestedPath, type NestedPathEntry } from "./nested-path.ts";
 import {
 	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
@@ -190,6 +191,15 @@ function sanitizeState(value: unknown, fallback: NestedRunState): NestedRunState
 		: fallback;
 }
 
+function sanitizeFastMode(value: unknown): FastModeStatus | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const raw = value as Record<string, unknown>;
+	if (raw.requested !== true) return undefined;
+	const eligible = raw.eligible === true || raw.eligible === false || raw.eligible === "unknown" ? raw.eligible : "unknown";
+	const active = raw.active === true || raw.active === false || raw.active === "unknown" ? raw.active : "unknown";
+	return { requested: true, eligible, active, ...(stringValue(raw.model, 128) ? { model: stringValue(raw.model, 128) } : {}) };
+}
+
 function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefined {
 	if (!input || typeof input !== "object") return undefined;
 	const raw = input as Record<string, unknown>;
@@ -210,6 +220,7 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		...(clampNumber(raw.turnCount) !== undefined ? { turnCount: clampNumber(raw.turnCount) } : {}),
 		...(clampNumber(raw.toolCount) !== undefined ? { toolCount: clampNumber(raw.toolCount) } : {}),
 		...(stringValue(raw.model, 128) ? { model: stringValue(raw.model, 128) } : {}),
+		...(sanitizeFastMode(raw.fastMode) ? { fastMode: sanitizeFastMode(raw.fastMode) } : {}),
 		...(stringValue(raw.thinking, 128) ? { thinking: stringValue(raw.thinking, 128) } : {}),
 		...(sanitizeTokenUsage(raw.totalTokens) ? { totalTokens: sanitizeTokenUsage(raw.totalTokens) } : {}),
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
@@ -259,6 +270,7 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.turnCount) !== undefined ? { turnCount: clampNumber(raw.turnCount) } : {}),
 		...(clampNumber(raw.toolCount) !== undefined ? { toolCount: clampNumber(raw.toolCount) } : {}),
 		...(stringValue(raw.model, 128) ? { model: stringValue(raw.model, 128) } : {}),
+		...(sanitizeFastMode(raw.fastMode) ? { fastMode: sanitizeFastMode(raw.fastMode) } : {}),
 		...(stringValue(raw.thinking, 128) ? { thinking: stringValue(raw.thinking, 128) } : {}),
 		...(totalTokens ? { totalTokens } : {}),
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
@@ -834,6 +846,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 			...(step.turnCount !== undefined ? { turnCount: step.turnCount } : {}),
 			...(step.toolCount !== undefined ? { toolCount: step.toolCount } : {}),
 			...(step.model ? { model: step.model } : {}),
+			...(step.fastMode ? { fastMode: step.fastMode } : {}),
 			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.tokens ? { totalTokens: step.tokens } : {}),
 			...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),

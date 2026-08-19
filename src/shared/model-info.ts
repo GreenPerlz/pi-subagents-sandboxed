@@ -7,6 +7,9 @@ export interface ModelInfo {
 	provider: string;
 	id: string;
 	fullId: string;
+	/** Provider origin metadata copied from the runtime registry. */
+	api?: string;
+	baseUrl?: string;
 	reasoning?: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
 }
@@ -14,6 +17,9 @@ export interface ModelInfo {
 interface RegistryModelLike {
 	provider: string;
 	id: string;
+	/** Provider API and endpoint are part of the trust boundary for provider-specific options. */
+	api?: string;
+	baseUrl?: string;
 	reasoning?: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
 }
@@ -23,6 +29,8 @@ export function toModelInfo(model: RegistryModelLike): ModelInfo {
 		provider: model.provider,
 		id: model.id,
 		fullId: `${model.provider}/${model.id}`,
+		...(model.api ? { api: model.api } : {}),
+		...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
 		reasoning: model.reasoning,
 		thinkingLevelMap: model.thinkingLevelMap,
 	};

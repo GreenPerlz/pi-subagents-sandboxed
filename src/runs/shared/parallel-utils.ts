@@ -11,6 +11,9 @@ export interface RunnerSubagentStep {
 	structured?: boolean;
 	cwd?: string;
 	model?: string;
+	/** Requested setting; eligibility is evaluated for each model candidate. */
+	fastMode?: boolean;
+	fastModeCandidates?: Array<import("../../shared/fast-mode.ts").FastModeStatus | undefined>;
 	thinking?: string;
 	modelCandidates?: string[];
 	tools?: string[];

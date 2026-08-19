@@ -207,6 +207,10 @@ function parseStepList(raw: unknown): { steps?: ChainStepConfig[]; error?: strin
 			if (typeof s.model === "string") step.model = s.model;
 			else return { error: `config.steps[${i}].model must be a string.` };
 		}
+		if (hasKey(s, "fastMode")) {
+			if (typeof s.fastMode === "boolean") step.fastMode = s.fastMode;
+			else return { error: `config.steps[${i}].fastMode must be a boolean.` };
+		}
 		if (hasKey(s, "skills")) {
 			if (s.skills === false) step.skills = false;
 			else if (Array.isArray(s.skills)) step.skills = s.skills.filter((v): v is string => typeof v === "string").map((v) => v.trim()).filter(Boolean);
@@ -248,6 +252,10 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		if (cfg.model === false || cfg.model === "") target.model = undefined;
 		else if (typeof cfg.model === "string") target.model = cfg.model.trim() || undefined;
 		else return "config.model must be a string or false when provided.";
+	}
+	if (hasKey(cfg, "fastMode")) {
+		if (typeof cfg.fastMode === "boolean") target.fastMode = cfg.fastMode;
+		else return "config.fastMode must be a boolean when provided.";
 	}
 	if (hasKey(cfg, "fallbackModels")) {
 		if (cfg.fallbackModels === false || cfg.fallbackModels === "") target.fallbackModels = undefined;
@@ -406,6 +414,7 @@ function formatAgentDetail(agent: AgentConfig): string {
 		lines.push(`Package: ${agent.packageName}`);
 	}
 	if (agent.model) lines.push(`Model: ${agent.model}`);
+	if (agent.fastMode) lines.push("Fast mode: true");
 	if (agent.fallbackModels?.length) lines.push(`Fallback models: ${agent.fallbackModels.join(", ")}`);
 	if (tools.length) lines.push(`Tools: ${tools.join(", ")}`);
 	if (agent.skills?.length) lines.push(`Skills: ${agent.skills.join(", ")}`);
@@ -430,7 +439,7 @@ function formatAgentDetail(agent: AgentConfig): string {
 function formatChainStepDetail(step: ChainStepConfig, index: number): string[] {
 	const lines: string[] = [];
 	if (step.expand || step.collect) {
-		const parallel = step.parallel && !Array.isArray(step.parallel) && typeof step.parallel === "object" ? step.parallel as { agent?: unknown; task?: unknown; label?: unknown; outputSchema?: unknown } : undefined;
+		const parallel = step.parallel && !Array.isArray(step.parallel) && typeof step.parallel === "object" ? step.parallel as { agent?: unknown; task?: unknown; label?: unknown; outputSchema?: unknown; fastMode?: unknown } : undefined;
 		const expand = step.expand && typeof step.expand === "object" ? step.expand as { from?: { output?: unknown; path?: unknown }; item?: unknown; key?: unknown; maxItems?: unknown; onEmpty?: unknown } : undefined;
 		const collect = step.collect && typeof step.collect === "object" ? step.collect as { as?: unknown; outputSchema?: unknown } : undefined;
 		lines.push(`${index + 1}. Dynamic fanout${typeof collect?.as === "string" ? ` -> ${collect.as}` : ""}`);
@@ -440,6 +449,7 @@ function formatChainStepDetail(step: ChainStepConfig, index: number): string[] {
 		if (typeof expand?.maxItems === "number") lines.push(`   Max items: ${expand.maxItems}`);
 		if (typeof expand?.onEmpty === "string") lines.push(`   On empty: ${expand.onEmpty}`);
 		if (parallel?.agent) lines.push(`   Agent: ${String(parallel.agent)}`);
+		if (parallel?.fastMode === true) lines.push("   Fast mode: true");
 		if (typeof parallel?.label === "string") lines.push(`   Label: ${parallel.label}`);
 		if (typeof parallel?.task === "string" && parallel.task.trim()) lines.push(`   Task: ${parallel.task}`);
 		if (parallel?.outputSchema) lines.push("   Structured output: true");
@@ -456,6 +466,7 @@ function formatChainStepDetail(step: ChainStepConfig, index: number): string[] {
 	if (step.reads === false) lines.push("   Reads: false");
 	else if (Array.isArray(step.reads) && step.reads.length > 0) lines.push(`   Reads: ${step.reads.join(", ")}`);
 	if (step.model) lines.push(`   Model: ${step.model}`);
+	if (step.fastMode) lines.push("   Fast mode: true");
 	if (step.skills === false) lines.push("   Skills: false");
 	else if (Array.isArray(step.skills) && step.skills.length > 0) lines.push(`   Skills: ${step.skills.join(", ")}`);
 	if (step.progress !== undefined) lines.push(`   Progress: ${step.progress ? "true" : "false"}`);
@@ -572,6 +583,7 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 		systemPromptMode: defaultSystemPromptMode(name),
 		inheritProjectContext: defaultInheritProjectContext(name),
 		inheritSkills: defaultInheritSkills(),
+		fastMode: false,
 		acceptanceSelfReview: DEFAULT_ACCEPTANCE_SELF_REVIEW,
 		acceptanceMaxFinalizationTurns: DEFAULT_ACCEPTANCE_MAX_FINALIZATION_TURNS,
 		canBeChangedByAgent: [],

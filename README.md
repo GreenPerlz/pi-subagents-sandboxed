@@ -358,7 +358,7 @@ Skip this section until you want exact syntax.
 | `/parallel agent1 "task1" -> agent2 "task2"` | Run agents in parallel |
 | `/run-chain <chainName> -- <task>` | Launch a saved `.chain.md` or `.chain.json` workflow |
 | `/subagents-doctor` | Show read-only setup diagnostics |
-| `/subagents-settings` | Open a TUI overlay to configure user-scope agent default model, fallback models, and thinking level |
+| `/subagents-settings` | Open a TUI overlay to configure user-scope agent default model, fallback models, thinking level, and fast mode |
 
 Commands validate agent names locally, support tab completion, and send results back into the conversation.
 
@@ -498,7 +498,7 @@ Example:
 }
 ```
 
-Supported override fields are `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `disabled`, `skills`, `tools`, and `systemPrompt`. Use `defaultContext: false` in builtin overrides to clear an inherited context default. Project overrides beat user overrides, and a dedicated `subagents.json` beats same-scope legacy settings.
+Supported override fields are `model`, `fastMode`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `disabled`, `skills`, `tools`, and `systemPrompt`. Use `defaultContext: false` in builtin overrides to clear an inherited context default. Project overrides beat user overrides, and a dedicated `subagents.json` beats same-scope legacy settings.
 
 Set `disabled: true` to hide a builtin from runtime discovery and agent-facing `subagent({ action: "list" })` output. For bulk control, set `disableBuiltins: true` in dedicated `subagents.json` (or legacy `subagents.disableBuiltins: true` in `settings.json`).
 
@@ -558,6 +558,7 @@ Important fields:
 | `extensions` | Omitted means normal extensions; empty means no extensions; comma-separated values allowlist specific extensions. |
 | `model` | Default model. Bare ids prefer the current provider when possible, then unique registry matches. |
 | `fallbackModels` | Ordered backup models for provider/model failures such as quota, auth, timeout, or unavailable model. Ordinary task failures do not trigger fallback. |
+| `fastMode` | Explicit opt-in service-tier request (`service_tier: "priority"`) for canonical bundled models whose Pi provider adapter supports it. This currently covers canonical `openai` and `openai-codex` models using Pi's Responses adapters, including GPT-5.6 Sol, Terra, and Luna, when registry API and base URL match the bundled provider catalog. It is not a model alias or thinking level; custom replacements and proxies run normally, and active provider selection may remain unknown. Priority pricing can materially increase API charges, and availability varies by account, project, quotas, and current provider support. There is no latency guarantee. Default is off. |
 | `thinking` | Appended as a `:level` suffix at runtime unless a suffix is already present. |
 | `systemPromptMode` | `replace` by default; `append` keeps Pi’s base prompt. |
 | `inheritProjectContext` | Keeps or strips inherited project instruction blocks. |
@@ -1204,7 +1205,7 @@ Self-review finalization never counts as `reviewed`, and it never counts as `ver
 
 ### Per-agent override policy
 
-Every explicit agent-specific run override is checked against the target agent's `canBeChangedByAgent` frontmatter list before any child starts. Guarded paths include `cwd`, `context`, `model`, `skills` (`skill` maps here), `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, each provided `acceptance.<field>`, and each provided `sandbox.<field>`. Use exact entries or segment-aware wildcards such as `*`, `acceptance.*`, and `sandbox.*`; substring matches are not used. Management rejects patterns that cannot match the guarded surface, and malformed manually-authored patterns fail closed rather than being normalized. A shared top-level override—including `worktree: true`—must be allowed by every affected agent. Clarify-TUI edits made by a human are applied after this raw-request preflight and are not treated as agent-generated overrides.
+Every explicit agent-specific run override is checked against the target agent's `canBeChangedByAgent` frontmatter list before any child starts. Guarded paths include `cwd`, `context`, `model`, `fastMode`, `skills` (`skill` maps here), `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, each provided `acceptance.<field>`, and each provided `sandbox.<field>`. Use exact entries or segment-aware wildcards such as `*`, `acceptance.*`, and `sandbox.*`; substring matches are not used. Management rejects patterns that cannot match the guarded surface, and malformed manually-authored patterns fail closed rather than being normalized. A shared top-level override—including `worktree: true`—must be allowed by every affected agent. Clarify-TUI edits made by a human are applied after this raw-request preflight and are not treated as agent-generated overrides.
 
 ## Live progress
 

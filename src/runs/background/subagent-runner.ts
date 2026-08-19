@@ -60,6 +60,7 @@ import { createStructuredOutputRuntime, readStructuredOutput } from "../shared/s
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
 import { hasLiveNestedDescendantsForParent, nestedSummaryFromAsyncStatus, projectNestedEvents, writeNestedEvent } from "../shared/nested-events.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
+import { shouldRequestFastMode, type FastModeStatus } from "../../shared/fast-mode.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
@@ -147,6 +148,7 @@ interface StepResult {
 	intercomTarget?: string;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
@@ -212,6 +214,18 @@ function resetStepLiveDetail(step: RunnerStatusStep): void {
 	step.currentPath = undefined;
 	step.recentTools = [];
 	step.recentOutput = [];
+}
+
+function initialFastModeStatus(step: SubagentStep): FastModeStatus | undefined {
+	return step.fastModeCandidates?.[0]
+		?? (step.fastMode
+			? {
+				requested: true,
+				eligible: "unknown",
+				active: "unknown",
+				...(step.model ? { model: step.model } : {}),
+			}
+			: undefined);
 }
 
 interface ChildEventContext {
@@ -737,6 +751,7 @@ async function runSingleStep(
 	error?: string;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
@@ -819,10 +834,13 @@ async function runSingleStep(
 		};
 	};
 	let finalResult: RunPiStreamingResult | undefined;
+	let finalFastModeStatus: FastModeStatus | undefined;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
+		const fastModeStatus = step.fastModeCandidates?.[index] ?? (step.fastMode ? { requested: true, eligible: "unknown", active: "unknown", ...(candidate ? { model: candidate } : {}) } : undefined);
+		finalFastModeStatus = fastModeStatus;
 		ctx.onAttemptStart?.({ model: candidate, thinking: resolveCandidateLaunchThinking(candidate, step.thinking) });
 		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 		if (effectiveStructuredOutput) {
@@ -839,6 +857,7 @@ async function runSingleStep(
 			sessionDir,
 			sessionFile: step.sessionFile,
 			model: candidate,
+			fastMode: shouldRequestFastMode(fastModeStatus),
 			thinking: resolveCandidateLaunchThinking(candidate, step.thinking),
 			inheritProjectContext: step.inheritProjectContext,
 			inheritSkills: step.inheritSkills,
@@ -907,6 +926,7 @@ async function runSingleStep(
 		const attempt: ModelAttempt = {
 			model: candidate ?? run.model ?? step.model ?? "default",
 			success: effectiveExitCode === 0 && !error,
+			fastMode: fastModeStatus,
 			exitCode: effectiveExitCode,
 			error,
 			usage: run.usage,
@@ -1011,6 +1031,7 @@ async function runSingleStep(
 					sessionEnabled: true,
 					sessionFile,
 					model: finalizationModel,
+					fastMode: shouldRequestFastMode(step.fastModeCandidates?.find((status) => status?.model === finalizationModel)),
 					thinking: resolveCandidateLaunchThinking(finalizationModel, step.thinking),
 					inheritProjectContext: step.inheritProjectContext,
 					inheritSkills: step.inheritSkills,
@@ -1052,6 +1073,7 @@ async function runSingleStep(
 				modelAttempts.push({
 					model: finalizationModel ?? finalizationRun.model ?? "default",
 					success: finalizationRun.exitCode === 0 && !finalizationRun.error,
+					fastMode: step.fastModeCandidates?.find((status) => status?.model === finalizationModel),
 					exitCode: finalizationRun.exitCode,
 					error: finalizationRun.error,
 					usage: finalizationRun.usage,
@@ -1107,6 +1129,7 @@ async function runSingleStep(
 					task,
 					exitCode: effectiveFinalExitCode,
 					model: finalResult?.model,
+					fastMode: finalFastModeStatus,
 					attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 					modelAttempts,
 					skills: step.skills,
@@ -1126,6 +1149,7 @@ async function runSingleStep(
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
 		thinking: resolveCandidateLaunchThinking(finalResult?.model, step.thinking),
+		fastMode: finalFastModeStatus,
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 		modelAttempts,
 		artifactPaths,
@@ -1309,6 +1333,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					skills: task.skills,
 					model: task.model,
 					thinking: task.thinking,
+					fastMode: initialFastModeStatus(task),
 					attemptedModels: task.modelCandidates && task.modelCandidates.length > 0 ? task.modelCandidates : task.model ? [task.model] : undefined,
 					...((task.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((task.sandbox ?? config.sandbox)!) } : {}),
 					recentTools: [],
@@ -1342,6 +1367,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				skills: step.skills,
 				model: step.model,
 				thinking: step.thinking,
+				fastMode: initialFastModeStatus(step),
 				attemptedModels: step.modelCandidates && step.modelCandidates.length > 0 ? step.modelCandidates : step.model ? [step.model] : undefined,
 				...((step.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((step.sandbox ?? config.sandbox)!) } : {}),
 				recentTools: [],
@@ -1910,6 +1936,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					skills: task.skills,
 					model: task.model,
 					thinking: task.thinking,
+					fastMode: initialFastModeStatus(task),
 					attemptedModels: task.modelCandidates && task.modelCandidates.length > 0 ? task.modelCandidates : task.model ? [task.model] : undefined,
 					recentTools: [],
 					recentOutput: [],
@@ -2017,6 +2044,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.steps[fi].exitCode = singleResult.exitCode;
 				statusPayload.steps[fi].model = singleResult.model;
 				statusPayload.steps[fi].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[fi].thinking);
+				statusPayload.steps[fi].fastMode = singleResult.fastMode;
 				statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
 				statusPayload.steps[fi].modelAttempts = singleResult.modelAttempts;
 				statusPayload.steps[fi].error = singleResult.error;
@@ -2049,6 +2077,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					intercomTarget: pr.intercomTarget,
 					model: pr.model,
 					thinking: pr.thinking,
+					fastMode: pr.fastMode,
 					attemptedModels: pr.attemptedModels,
 					modelAttempts: pr.modelAttempts,
 					artifactPaths: pr.artifactPaths,
@@ -2280,6 +2309,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].exitCode = singleResult.exitCode;
 						statusPayload.steps[fi].model = singleResult.model;
 						statusPayload.steps[fi].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[fi].thinking);
+						statusPayload.steps[fi].fastMode = singleResult.fastMode;
 						statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
 						statusPayload.steps[fi].modelAttempts = singleResult.modelAttempts;
 						statusPayload.steps[fi].error = singleResult.error;
@@ -2359,6 +2389,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						intercomTarget: pr.intercomTarget,
 						model: pr.model,
 						thinking: pr.thinking,
+						fastMode: pr.fastMode,
 						attemptedModels: pr.attemptedModels,
 						modelAttempts: pr.modelAttempts,
 						artifactPaths: pr.artifactPaths,
@@ -2541,6 +2572,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				intercomTarget: singleResult.intercomTarget,
 				model: singleResult.model,
 				thinking: singleResult.thinking,
+				fastMode: singleResult.fastMode,
 				attemptedModels: singleResult.attemptedModels,
 				modelAttempts: singleResult.modelAttempts,
 				artifactPaths: singleResult.artifactPaths,
@@ -2591,6 +2623,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.steps[flatIndex].exitCode = singleResult.exitCode;
 			statusPayload.steps[flatIndex].model = singleResult.model;
 			statusPayload.steps[flatIndex].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[flatIndex].thinking);
+			statusPayload.steps[flatIndex].fastMode = singleResult.fastMode;
 			statusPayload.steps[flatIndex].attemptedModels = singleResult.attemptedModels;
 			statusPayload.steps[flatIndex].modelAttempts = singleResult.modelAttempts;
 			statusPayload.steps[flatIndex].error = singleResult.error;
@@ -2755,6 +2788,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				intercomTarget: r.intercomTarget,
 				model: r.model,
 				thinking: r.thinking,
+				fastMode: r.fastMode,
 				attemptedModels: r.attemptedModels,
 				modelAttempts: r.modelAttempts,
 				artifactPaths: r.artifactPaths,

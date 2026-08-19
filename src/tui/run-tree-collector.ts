@@ -23,6 +23,7 @@ import {
 	type SubagentState,
 	type TokenUsage,
 } from "../shared/types.ts";
+import type { FastModeStatus } from "../shared/fast-mode.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -40,6 +41,7 @@ export interface OverlayNestedChild {
 	startedAt?: number;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	tokens?: TokenUsage;
 	sessionFile?: string;
 	logPath?: string;
@@ -57,6 +59,7 @@ export interface OverlayStep {
 	startedAt?: number;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	tokens?: TokenUsage;
 	sessionFile?: string;
 	logPath?: string;
@@ -78,6 +81,7 @@ export interface OverlayRun {
 	currentTool?: string;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	tokens?: TokenUsage;
 	sessionFile?: string;
 	logPath?: string;
@@ -109,6 +113,7 @@ interface PersistedResultChild {
 	artifactPath?: string;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 }
 
 interface PersistedResultRecord {
@@ -215,6 +220,7 @@ function mapNestedRunWithStaleState(run: NestedRunSummary, fallbackState?: Overl
 			startedAt: step.startedAt,
 			model: step.model,
 			thinking: step.thinking,
+			fastMode: step.fastMode,
 			tokens: step.totalTokens,
 			sessionFile: step.sessionFile,
 			children: mapNestedStepChildrenWithStaleState(step.children, fallbackState, freezeAt),
@@ -232,6 +238,7 @@ function mapNestedRunWithStaleState(run: NestedRunSummary, fallbackState?: Overl
 		startedAt: run.startedAt,
 		model: run.model,
 		thinking: run.thinking,
+		fastMode: run.fastMode,
 		tokens: run.totalTokens,
 		sessionFile: inferNestedSessionFile(run, steps, directChildren),
 		asyncDir: run.asyncDir,
@@ -288,6 +295,15 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
+function fastModeValue(value: unknown): FastModeStatus | undefined {
+	const raw = objectValue(value);
+	if (!raw || raw.requested !== true) return undefined;
+	const eligible = raw.eligible === true || raw.eligible === false || raw.eligible === "unknown" ? raw.eligible : "unknown";
+	const active = raw.active === true || raw.active === false || raw.active === "unknown" ? raw.active : "unknown";
+	const model = stringValue(raw.model);
+	return { requested: true, eligible, active, ...(model ? { model } : {}) };
+}
+
 function modeValue(value: unknown, childCount: number): SubagentRunMode {
 	return value === "single" || value === "parallel" || value === "chain"
 		? value
@@ -333,6 +349,7 @@ function readPersistedResultRecord(resultPath: string): PersistedResultRecord | 
 				artifactPath: stringValue(artifactPaths?.outputPath),
 				model: stringValue(child.model),
 				thinking: stringValue(child.thinking),
+				fastMode: fastModeValue(child.fastMode),
 			};
 		});
 		const id = stringValue(raw.runId) ?? stringValue(raw.id) ?? path.basename(resultPath, ".json");
@@ -416,6 +433,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 			startedAt: step.startedAt,
 			model: step.model,
 			thinking: step.thinking,
+			fastMode: step.fastMode,
 			tokens: step.tokens,
 			sessionFile: step.sessionFile ?? resultChild?.sessionFile,
 			logPath: logPathForStep(run.asyncDir, step.index),
@@ -456,10 +474,12 @@ function overlayRunFromPersistedResult(result: PersistedResultRecord): OverlayRu
 		artifactPath: child.artifactPath,
 		model: child.model,
 		thinking: child.thinking,
+		fastMode: child.fastMode,
 		children: [],
 	}));
 	const agents = agentsLabel(steps.map((step) => step.agent));
 	const { model: runModel, thinking: runThinking } = deriveRunModelThinking(steps);
+	const runFastMode = result.mode === "single" ? steps[0]?.fastMode : undefined;
 	return {
 		id: result.id,
 		label: `${modeLabel(result.mode)}: ${agents.join(", ")}`,
@@ -470,6 +490,7 @@ function overlayRunFromPersistedResult(result: PersistedResultRecord): OverlayRu
 		updatedAt: result.updatedAt,
 		model: runModel,
 		thinking: runThinking,
+		fastMode: runFastMode,
 		sessionFile: result.sessionFile ?? sessionFileFromResult(result),
 		logPath: logPathForRun(result.asyncDir),
 		artifactPath: artifactPathFromResult(result),
@@ -511,6 +532,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 				startedAt: ctrl.startedAt,
 				model: ctrl.currentIndex === index ? ctrl.currentModel ?? child.model : child.model,
 				thinking: ctrl.currentIndex === index ? (ctrl.currentThinking ?? child.thinking) : child.thinking,
+				fastMode: ctrl.currentIndex === index ? (ctrl.currentFastMode ?? child.fastMode) : child.fastMode,
 				tokens: ctrl.currentIndex === index ? approximateTokenUsage(ctrl.tokens) ?? child.totalTokens : child.totalTokens,
 				sessionFile: child.sessionFile,
 				artifactPath: child.artifactPath,
@@ -531,6 +553,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 				startedAt: ctrl.startedAt,
 				model: ctrl.currentModel,
 				thinking: ctrl.currentThinking,
+				fastMode: ctrl.currentFastMode,
 				tokens: approximateTokenUsage(ctrl.tokens),
 				sessionFile: ctrl.sessionFile,
 				children: currentStepNested.map(mapNestedRun),
@@ -543,6 +566,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 		const displayedSourceChild = ctrl.currentModel !== undefined ? currentChild : childInfo.find((child) => child.model);
 		const runModel = ctrl.currentModel ?? displayedSourceChild?.model;
 		const runThinking = ctrl.currentModel !== undefined ? (ctrl.currentThinking ?? displayedSourceChild?.thinking) : displayedSourceChild?.thinking;
+		const runFastMode = ctrl.mode === "single" && steps.length === 1 ? (steps[0]?.fastMode ?? ctrl.currentFastMode) : undefined;
 
 		const runState = deriveRunState(rememberedState ?? "running", steps, (ctrl.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, finalizedNestedState, finalizedNestedFreezeAt)));
 
@@ -559,6 +583,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			currentTool: runState === "running" ? ctrl.currentTool : undefined,
 			model: runModel,
 			thinking: runThinking,
+			fastMode: runFastMode,
 			tokens: approximateTokenUsage(ctrl.tokens) ?? sumTokenUsage(childInfo.map((child) => child.totalTokens)),
 			sessionFile: childInfo.find((child) => child.sessionFile)?.sessionFile ?? ctrl.sessionFile ?? nestedSessionFile,
 			artifactPath: childInfo.find((child) => child.artifactPath)?.artifactPath,
@@ -598,11 +623,13 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 		const sourceChild = run.children.find((child) => child.model);
 		const runModel = sourceChild?.model;
 		const runThinking = sourceChild?.thinking;
+		const runFastMode = run.mode === "single" && run.children.length === 1 ? run.children[0]?.fastMode : undefined;
 		const steps: OverlayStep[] = run.children.map((child, index) => ({
 			agent: child.agent,
 			state: mapState(child.status),
 			model: child.model,
 			thinking: child.thinking,
+			fastMode: child.fastMode,
 			tokens: child.totalTokens,
 			sessionFile: child.sessionFile,
 			artifactPath: child.artifactPath,
@@ -624,6 +651,7 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 			updatedAt: run.updatedAt,
 			model: runModel,
 			thinking: runThinking,
+			fastMode: runFastMode,
 			tokens: sumTokenUsage(run.children.map((child) => child.totalTokens)),
 			sessionFile: run.children.find((c) => c.sessionFile)?.sessionFile,
 			artifactPath: run.children.find((c) => c.artifactPath)?.artifactPath,
@@ -639,7 +667,7 @@ function staleForegroundState(state: OverlayRunState): OverlayRunState {
 
 function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, now: number): OverlayRun {
 	const staleState = staleForegroundState(mapState(status.state));
-	const children = status.children.length
+	const children: PersistedForegroundStatus["children"] = status.children.length
 		? status.children
 		: status.currentAgent
 			? [{ agent: status.currentAgent, index: status.currentIndex ?? 0, status: status.state, sessionFile: status.sessionFile }]
@@ -648,11 +676,13 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 	const sourceChild = children.find((child) => child.model);
 	const runModel = sourceChild?.model;
 	const runThinking = sourceChild?.thinking;
+	const runFastMode = status.mode === "single" && children.length === 1 ? children[0]?.fastMode : undefined;
 	const steps: OverlayStep[] = children.map((child, index) => ({
 		agent: child.agent,
 		state: staleForegroundState(mapState(child.status)),
 		model: child.model,
 		thinking: child.thinking,
+		fastMode: child.fastMode,
 		tokens: child.totalTokens,
 		sessionFile: child.sessionFile,
 		artifactPath: child.artifactPath,
@@ -676,6 +706,7 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		currentTool: staleState === "running" ? status.currentTool : undefined,
 		model: runModel,
 		thinking: runThinking,
+		fastMode: runFastMode,
 		tokens: sumTokenUsage(children.map((child) => child.totalTokens)),
 		sessionFile: status.sessionFile ?? children.find((child) => child.sessionFile)?.sessionFile,
 		artifactPath: children.find((child) => child.artifactPath)?.artifactPath,
@@ -724,6 +755,7 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 				startedAt: step.startedAt,
 				model: step.model,
 				thinking: step.thinking,
+				fastMode: step.fastMode,
 				tokens: step.tokens,
 				sessionFile: step.sessionFile,
 				logPath: logPathForStep(job.asyncDir, step.index),

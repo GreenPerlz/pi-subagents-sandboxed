@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import type { ForegroundResumeChild, NestedRunSummary, SubagentRunMode } from "../../shared/types.ts";
+import type { FastModeStatus } from "../../shared/fast-mode.ts";
 
 export type PersistedForegroundState = "queued" | "running" | "complete" | "failed" | "paused";
 
@@ -13,6 +14,7 @@ export interface PersistedForegroundStep {
 	artifactPath?: string;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	totalTokens?: ForegroundResumeChild["totalTokens"];
 }
 

@@ -31,7 +31,7 @@ This page is the compact reference for persistent extension settings, agent Mark
 ### Builtin agents
 
 - **`disableBuiltins`** — Hides all packaged builtin agents from discovery. User and project agents remain available.
-- **`agentOverrides`** — Applies small changes to packaged agents without editing their Markdown files. Supported fields are `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `disabled`, `skills`, `tools`, and `systemPrompt`.
+- **`agentOverrides`** — Applies small changes to packaged agents without editing their Markdown files. Supported fields are `model`, `fastMode`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `disabled`, `skills`, `tools`, and `systemPrompt`.
 - **`agentOverrides.<name>.disabled`** — Hides one packaged agent. Set it to `false` or remove the override to make that agent available again.
 
 ### Control and notifications
@@ -87,6 +87,7 @@ This page is the compact reference for persistent extension settings, agent Mark
 - **`model`** — Sets the agent's default model. If omitted, the child inherits the current/default model selection.
 - **`fallbackModels`** — Lists ordered backup models used for retryable provider failures such as auth, quota, timeout, or unavailability. Ordinary task failures do not trigger these fallbacks.
 - **`thinking`** — Sets the model thinking level, such as `high`, when supported. It is applied as a model suffix unless one is already present.
+- **`fastMode`** — Requests the provider priority service tier for this agent; it is persisted in agent frontmatter and management/builtin overrides, and defaults to off. It is injected for canonical bundled models whose Pi adapter supports priority, currently `openai` and `openai-codex` models using Pi's Responses adapters, including GPT-5.6 Sol, Terra, and Luna. Registry API and base URL must match the bundled catalog, so custom replacements and proxies remain unsupported.
 - **`tools`** — Sets the builtin tool allowlist; omitting it gives the child Pi's normal builtin tools. Entries prefixed with `mcp:` select direct MCP tools, and `subagent` explicitly permits bounded nested fanout.
 - **`extensions`** — Omitted loads normal extensions, an empty value loads none, and a comma-separated value allowlists extensions. Use explicit extension paths for a closed child runtime.
 - **`skill` / `skills`** — Injects one or more named skills into the child. `skills` is the canonical guarded override path used by `canBeChangedByAgent`.
@@ -110,7 +111,7 @@ Session logs, async status, and debug artifacts remain runtime/session data; the
 
 `canBeChangedByAgent` accepts exact paths and segment wildcards such as `model`, `acceptance.*`, `sandbox.*`, or the global `*`. Malformed or unsupported patterns fail closed, and management-created definitions reject patterns that cannot match a guarded setting.
 
-Guarded paths are `cwd`, `context`, `model`, `skills`, `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, every `acceptance.<field>`, and every `sandbox.<field>`. A shared override in a multi-agent launch must be allowed by every affected agent; this includes a shared `worktree: true` request. The packaged `orchestrator` explicitly opts into `worktree`; other agents remain deny-by-default unless their definition opts in.
+Guarded paths are `cwd`, `context`, `model`, `fastMode`, `skills`, `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, every `acceptance.<field>`, and every `sandbox.<field>`. A shared override in a multi-agent launch must be allowed by every affected agent; this includes a shared `worktree: true` request. The packaged `orchestrator` explicitly opts into `worktree`; other agents remain deny-by-default unless their definition opts in.
 
 ### Agent sandbox
 
@@ -124,6 +125,8 @@ Guarded paths are `cwd`, `context`, `model`, `skills`, `output`, `outputMode`, `
 - **`sandboxExtraReadOnlyMounts`** — Adds comma-separated read-only mounts for this agent. Use the narrowest paths containing required tools or inputs.
 - **`sandboxExtraWritableMounts`** — Adds comma-separated writable mounts for this agent. Restrict them to required caches, outputs, or work directories.
 - **`sandboxPackageDiscovery`** — Selects `closed`, `project-local`, or `ambient` package discovery. Prefer `closed`; `ambient` is unsafe legacy behavior.
+
+Fast mode is compatible with closed sandboxes: the child runtime's explicit prompt extension is mounted and loaded alongside the sandbox intercom extension, so the request transformation does not require ambient package discovery. Priority service tiers can change price and availability; `fastMode` does not claim provider activation when Pi does not expose an authoritative response flag.
 
 ## Acceptance contract settings
 
@@ -157,6 +160,7 @@ Guarded paths are `cwd`, `context`, `model`, `skills`, `output`, `outputMode`, `
 - **`cwd`** — Sets the working directory shared by affected children. Every affected agent must permit `cwd` when it is explicitly provided.
 - **`context`** — Uses `fresh` or `fork` context for the launch. Every affected agent must permit an explicit context change.
 - **`model`** — Overrides the target model for a single/task run. The target agent must permit `model`.
+- **`fastMode`** — Requests priority for one launch, task, or chain step; it is a guarded override and the target agent must permit `fastMode`. Unsupported candidates still run normally and report `unsupported`; unavailable model metadata reports `requested` without injecting priority, and fallback candidates are evaluated independently.
 - **`skill`** — Adds, replaces, or disables skills for the relevant child or chain. It maps to the guarded `skills` path.
 - **`output`** — Sets an output path or `false` to disable saved output. The target agent must permit `output`.
 - **`outputMode`** — Uses `inline` or `file-only` result delivery. `file-only` is an intentional persistence request and may use an automatically generated runtime path when no explicit output path is supplied.

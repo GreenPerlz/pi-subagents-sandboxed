@@ -66,6 +66,7 @@ import {
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { resolveModelCandidate } from "../shared/model-fallback.ts";
+import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { injectSingleOutputInstruction, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
@@ -269,6 +270,12 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				input.foregroundControl.currentActivityState = undefined;
 				input.foregroundControl.currentModel = effectiveModel;
 				input.foregroundControl.currentThinking = undefined;
+				input.foregroundControl.currentFastMode = resolveFastModeStatus(
+					behavior.fastMode,
+					effectiveModel,
+					input.availableModels,
+					input.ctx.model?.provider,
+				);
 				input.foregroundControl.updatedAt = Date.now();
 				if (input.sessionFileForIndex) {
 					input.foregroundControl.sessionFile = input.sessionFileForIndex(input.globalTaskIndex + taskIndex);
@@ -308,6 +315,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				orchestratorIntercomTarget: input.orchestratorIntercomTarget,
 				nestedRoute: input.nestedRoute,
 				modelOverride: effectiveModel,
+				fastMode: behavior.fastMode,
 				availableModels: input.availableModels,
 				preferredModelProvider: input.ctx.model?.provider,
 				skills: behavior.skills === false ? [] : behavior.skills,
@@ -571,6 +579,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			progress: step.progress,
 			skills: normalizeSkillInput(step.skill),
 			model: step.model,
+			fastMode: step.fastMode,
 		}));
 
 		const resolvedBehaviors = agentConfigs.map((config, i) =>
@@ -1103,6 +1112,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				outputMode: seqStep.outputMode,
 				reads: tuiOverride?.reads !== undefined ? tuiOverride.reads : seqStep.reads,
 				progress: tuiOverride?.progress !== undefined ? tuiOverride.progress : seqStep.progress,
+				fastMode: tuiOverride?.fastMode !== undefined ? tuiOverride.fastMode : seqStep.fastMode,
 				skills:
 					tuiOverride?.skills !== undefined
 						? tuiOverride.skills
@@ -1161,6 +1171,12 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				foregroundControl.currentActivityState = undefined;
 				foregroundControl.currentModel = effectiveModel;
 				foregroundControl.currentThinking = undefined;
+				foregroundControl.currentFastMode = resolveFastModeStatus(
+					behavior.fastMode,
+					effectiveModel,
+					availableModels,
+					ctx.model?.provider,
+				);
 				foregroundControl.updatedAt = Date.now();
 				if (params.sessionFileForIndex) {
 					foregroundControl.sessionFile = params.sessionFileForIndex(globalTaskIndex);
@@ -1200,6 +1216,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				orchestratorIntercomTarget,
 				nestedRoute: params.nestedRoute,
 				modelOverride: effectiveModel,
+				fastMode: behavior.fastMode,
 				availableModels,
 				preferredModelProvider: ctx.model?.provider,
 				skills: behavior.skills === false ? [] : behavior.skills,
@@ -1220,6 +1237,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 							foregroundControl.currentActivityState = current?.activityState;
 							foregroundControl.currentModel = stepResults[0]?.model ?? effectiveModel;
 							foregroundControl.currentThinking = stepResults[0]?.thinking;
+							foregroundControl.currentFastMode = stepResults[0]?.fastMode ?? foregroundControl.currentFastMode;
 							foregroundControl.lastActivityAt = current?.lastActivityAt;
 							foregroundControl.currentTool = current?.currentTool;
 							foregroundControl.currentToolStartedAt = current?.currentToolStartedAt;
@@ -1262,6 +1280,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				foregroundControl.interrupt = undefined;
 				foregroundControl.currentModel = r.model ?? effectiveModel;
 				foregroundControl.currentThinking = r.thinking;
+				foregroundControl.currentFastMode = r.fastMode ?? foregroundControl.currentFastMode;
 				foregroundControl.updatedAt = Date.now();
 			}
 			recordRun(seqStep.agent, cleanTask, r.exitCode, r.progressSummary?.durationMs ?? 0);

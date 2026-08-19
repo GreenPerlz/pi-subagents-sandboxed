@@ -243,6 +243,7 @@ describe("subagents overlay rendering", () => {
 				agents: ["worker"],
 				currentTool: "read",
 				elapsed: "5.2s",
+				fastMode: { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" },
 				steps: [
 					{
 						agent: "worker",
@@ -254,13 +255,14 @@ describe("subagents overlay rendering", () => {
 				],
 			},
 		];
-		const lines = renderOverlay(runs, theme as never, WIDTH);
+		const lines = renderOverlay(runs, theme as never, 120);
 		const text = lines.join("\n");
 		// The worker agent name should appear exactly once (in the run header)
 		const workerMatches = text.match(/\bworker\b/g);
 		assert.strictEqual(workerMatches?.length, 1, "worker should appear exactly once in rendered output");
 		// The run header should include the currentTool
 		assert.ok(text.includes("read"), "run header should include currentTool");
+		assert.ok(text.includes("fast:requested"), "run header should include fast-mode status");
 		// There should be no indented step line
 		const stepLine = lines.find((l) => l.includes("worker") && l.includes("running") && l.replace(/^.*?│/, "").startsWith("  "));
 		assert.strictEqual(stepLine, undefined, "should not render a redundant step line");

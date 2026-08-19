@@ -5,6 +5,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
+import type { FastModeStatus } from "./fast-mode.ts";
 import type { ResolvedSandboxConfig, SandboxResultDetails } from "../sandbox/types.ts";
 import type { FSWatcher } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -148,14 +149,14 @@ export type SubagentRunMode = "single" | "parallel" | "chain";
 
 export type PublicNestedStepSummary = Pick<
 	NestedStepSummary,
-	"agent" | "status" | "sessionFile" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "startedAt" | "endedAt" | "error"
+	"agent" | "status" | "sessionFile" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "startedAt" | "endedAt" | "error" | "fastMode"
 > & {
 	children?: PublicNestedRunSummary[];
 };
 
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "model" | "totalTokens" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "summary"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "model" | "fastMode" | "totalTokens" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "summary"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -165,6 +166,7 @@ export interface SubagentResultIntercomChild {
 	agent: string;
 	status: SubagentResultStatus;
 	summary: string;
+	fastMode?: FastModeStatus;
 	index?: number;
 	artifactPath?: string;
 	sessionPath?: string;
@@ -237,6 +239,7 @@ interface ProgressSummary {
 export interface ModelAttempt {
 	model: string;
 	success: boolean;
+	fastMode?: FastModeStatus;
 	exitCode?: number | null;
 	error?: string;
 	usage?: Usage;
@@ -424,6 +427,7 @@ export interface SingleResult {
 	usage: Usage;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	controlEvents?: ControlEvent[];
@@ -532,6 +536,7 @@ export interface NestedStepSummary {
 	toolCount?: number;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	totalTokens?: TokenUsage;
 	startedAt?: number;
 	endedAt?: number;
@@ -556,6 +561,7 @@ export interface NestedRunSummary extends NestedRunAddress {
 	agents?: string[];
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	currentStep?: number;
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
@@ -650,6 +656,7 @@ export interface AsyncStatus {
 		skills?: string[];
 		model?: string;
 		thinking?: string;
+		fastMode?: FastModeStatus;
 		attemptedModels?: string[];
 		modelAttempts?: ModelAttempt[];
 		error?: string;
@@ -713,6 +720,7 @@ export interface ForegroundResumeChild {
 	status: SubagentResultStatus;
 	model?: string;
 	thinking?: string;
+	fastMode?: FastModeStatus;
 	totalTokens?: TokenUsage;
 }
 
@@ -748,6 +756,7 @@ export interface SubagentState {
 		toolCount?: number;
 		currentModel?: string;
 		currentThinking?: string;
+		currentFastMode?: FastModeStatus;
 		sessionFile?: string;
 		nestedRoute?: NestedRouteInfo;
 		nestedChildren?: NestedRunSummary[];
@@ -836,8 +845,10 @@ export interface RunSyncOptions {
 	nestedRoute?: NestedRouteInfo;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
-	/** Registry models available for heuristic bare-model resolution */
-	availableModels?: Array<{ provider: string; id: string; fullId: string }>;
+	/** Request the provider priority service tier; eligibility is evaluated per candidate. */
+	fastMode?: boolean;
+	/** Registry models available for heuristic bare-model resolution and provider trust checks. */
+	availableModels?: Array<{ provider: string; id: string; fullId: string; api?: string; baseUrl?: string }>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
 	preferredModelProvider?: string;
 	/** Skills to inject (overrides agent default if provided) */

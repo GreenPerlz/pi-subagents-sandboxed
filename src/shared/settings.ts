@@ -21,6 +21,7 @@ export interface ResolvedStepBehavior {
 	progress: boolean;
 	skills: string[] | false;
 	model?: string;
+	fastMode?: boolean;
 }
 
 export interface StepOverrides {
@@ -30,6 +31,7 @@ export interface StepOverrides {
 	progress?: boolean;
 	skills?: string[] | false;
 	model?: string;
+	fastMode?: boolean;
 }
 
 function normalizeOutputOverride(output: string | false | undefined): string | false | undefined {
@@ -55,6 +57,7 @@ export interface SequentialStep {
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	fastMode?: boolean;
 	acceptance?: AcceptanceInput;
 }
 
@@ -74,6 +77,7 @@ export interface ParallelTaskItem {
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	fastMode?: boolean;
 	acceptance?: AcceptanceInput;
 }
 
@@ -266,7 +270,8 @@ export function resolveStepBehavior(
 
 	const outputMode = stepOverrides.outputMode ?? "inline";
 	const model = stepOverrides.model ?? agentConfig.model;
-	return { output, outputMode, reads, progress, skills, model };
+	const fastMode = stepOverrides.fastMode ?? agentConfig.fastMode ?? false;
+	return { output, outputMode, reads, progress, skills, model, ...(fastMode ? { fastMode: true } : {}) };
 }
 
 export function resolveTaskTextForFileUpdatePolicy(task: string | undefined, originalTask?: string): string | undefined {
@@ -420,7 +425,8 @@ export function resolveParallelBehaviors(
 
 		const outputMode = task.outputMode ?? "inline";
 		const model = task.model ?? config.model;
-		return { output, outputMode, reads, progress, skills, model };
+		const fastMode = task.fastMode ?? config.fastMode ?? false;
+		return { output, outputMode, reads, progress, skills, model, ...(fastMode ? { fastMode: true } : {}) };
 	});
 }
 

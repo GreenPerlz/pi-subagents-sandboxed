@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SUBAGENT_FANOUT_CHILD_ENV } from "./pi-args.ts";
+import { SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_FAST_MODE_ENV } from "./pi-args.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
 import type { JsonSchemaObject } from "../../shared/types.ts";
 
@@ -193,6 +193,16 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	}
 
 	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown) => unknown) => void;
+	// This extension is explicitly loaded for every child, including closed
+	// sandboxes. The parent sets this env only for a registry-resolved model
+	// whose provider request semantics are known.
+	if (process.env[SUBAGENT_FAST_MODE_ENV] === "1") {
+		onRuntimeEvent("before_provider_request", (rawEvent: unknown) => {
+			const event = rawEvent as { payload?: unknown };
+			if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return undefined;
+			return { ...(event.payload as Record<string, unknown>), service_tier: "priority" };
+		});
+	}
 	let cleanedInitialContext = false;
 	onRuntimeEvent("context", (event: { messages: unknown[] }) => {
 		if (cleanedInitialContext) return undefined;

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { detectGitWorktreePointerGitdir } from "./preflight.ts";
@@ -147,17 +147,23 @@ function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Map<strin
 	}
 }
 
-function addSandboxSpawnCommandMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, command: string | undefined): void {
-	if (!command || !path.isAbsolute(command)) return;
+function addNodeRuntimeMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, command: string): void {
 	const commandDir = path.dirname(command);
 	const installRoot = path.basename(command) === "node" && path.basename(commandDir) === "bin"
 		? path.dirname(commandDir)
 		: undefined;
-	if (installRoot && existsSync(installRoot)) {
-		addSandboxMount(mounts, seen, installRoot, "ro");
-		return;
+	addSandboxMount(mounts, seen, installRoot && existsSync(installRoot) ? installRoot : command, "ro");
+}
+
+function addSandboxSpawnCommandMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, command: string | undefined): void {
+	if (!command || !path.isAbsolute(command)) return;
+	addNodeRuntimeMount(mounts, seen, command);
+	try {
+		const realCommand = realpathSync(command);
+		if (realCommand !== path.resolve(command)) addNodeRuntimeMount(mounts, seen, realCommand);
+	} catch {
+		// The ordinary mount path handles missing or unresolvable commands.
 	}
-	addSandboxMount(mounts, seen, command, "ro");
 }
 
 function addSandboxSpawnMounts(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, command: string | undefined, args: string[] | undefined): void {

@@ -306,6 +306,21 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, nodeModulesRoot), "ro");
 	});
 
+	it("mounts the real Node installation when the foreground runtime is a symlink", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const nodeInstallRoot = mkdirp(path.join(root, ".hermes", "node"));
+		const realNodePath = writeFile(path.join(nodeInstallRoot, "bin", "node"));
+		const linkedNodePath = path.join(root, ".local", "bin", "node");
+		mkdirp(path.dirname(linkedNodePath));
+		fs.symlinkSync(realNodePath, linkedNodePath);
+
+		const mounts = buildSubagentSandboxMounts({ cwd, spawnCommand: linkedNodePath });
+
+		assert.equal(mountMode(mounts, path.join(root, ".local")), "ro", "the symlink path must remain visible");
+		assert.equal(mountMode(mounts, nodeInstallRoot), "ro", "the symlink target must be executable inside bwrap");
+	});
+
 	it("mounts explicit extra read-only and writable sandbox paths with least privilege", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));

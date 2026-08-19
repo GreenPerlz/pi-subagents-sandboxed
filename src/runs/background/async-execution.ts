@@ -94,6 +94,41 @@ function resolveJitiCliPath(): string | undefined {
 
 const jitiCliPath = resolveJitiCliPath();
 
+function isGenericJavaScriptRuntime(command: string): boolean {
+	return /^(?:node|bun)(?:\.exe)?$/i.test(path.basename(command));
+}
+
+function findNodeOnPath(): string | undefined {
+	const pathValue = process.env.PATH;
+	if (!pathValue) return undefined;
+	const extensions = process.platform === "win32"
+		? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+		: [""];
+	for (const directory of pathValue.split(path.delimiter)) {
+		if (!directory) continue;
+		for (const extension of extensions) {
+			const candidate = path.join(directory, `node${extension.toLowerCase()}`);
+			try {
+				fs.accessSync(candidate, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
+				return candidate;
+			} catch {
+				// Continue searching PATH.
+			}
+		}
+	}
+	return undefined;
+}
+
+function resolveAsyncRunnerRuntime(): string | undefined {
+	// npm-installed Pi normally runs under Node/Bun, but standalone Pi releases
+	// expose the Pi executable itself as process.execPath. That executable can
+	// launch Pi commands, not arbitrary Jiti scripts, so use an external Node in
+	// that case.
+	if (!fs.existsSync(process.execPath)) return undefined;
+	if (isGenericJavaScriptRuntime(process.execPath)) return process.execPath;
+	return findNodeOnPath();
+}
+
 interface AsyncExecutionContext {
 	pi: ExtensionAPI;
 	cwd: string;
@@ -182,7 +217,7 @@ export function formatAsyncStartedMessage(headline: string): string {
  * Check if jiti is available for async execution
  */
 export function isAsyncAvailable(): boolean {
-	return jitiCliPath !== undefined;
+	return jitiCliPath !== undefined && resolveAsyncRunnerRuntime() !== undefined;
 }
 
 /**
@@ -191,6 +226,10 @@ export function isAsyncAvailable(): boolean {
 function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; error?: string } {
 	if (!jitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
+	}
+	const runtimePath = resolveAsyncRunnerRuntime();
+	if (!runtimePath) {
+		return { error: "a Node runtime for detached TypeScript execution could not be found; install Node or add it to PATH" };
 	}
 
 	try {
@@ -207,7 +246,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 	fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 
-	const proc = spawn(process.execPath, [jitiCliPath, runner, cfgPath], {
+	const proc = spawn(runtimePath, [jitiCliPath, runner, cfgPath], {
 		cwd,
 		detached: true,
 		stdio: "ignore",

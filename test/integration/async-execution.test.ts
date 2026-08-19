@@ -2261,7 +2261,50 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(chainResult.content[0]?.text ?? "", /cwd does not exist/);
 	});
 
-	it("returns a tool error when the async runner process cannot spawn", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+	it("uses an external JavaScript runtime when Pi is a standalone executable", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const standalonePiPath = path.join(tempDir, "pi");
+		const standaloneMarkerPath = path.join(tempDir, "standalone-pi-invoked");
+		fs.writeFileSync(
+			standalonePiPath,
+			`#!/bin/sh\nprintf invoked > "${standaloneMarkerPath}"\nexit 88\n`,
+			"utf-8",
+		);
+		fs.chmodSync(standalonePiPath, 0o755);
+
+		const originalExecPath = process.execPath;
+		process.execPath = standalonePiPath;
+		try {
+			mockPi.onCall({ output: "standalone host async done" });
+			const id = `async-standalone-host-${Date.now().toString(36)}`;
+			const result = executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Do work",
+				agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+			});
+
+			assert.equal(result.isError, undefined);
+			const resultPath = await waitForAsyncResultFile(id, 2_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true);
+			assert.equal(fs.existsSync(standaloneMarkerPath), false, "standalone Pi executable must not host the Jiti runner");
+		} finally {
+			process.execPath = originalExecPath;
+		}
+	});
+
+	it("returns a tool error when the async runner runtime is unavailable", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
 		const originalExecPath = process.execPath;
 		process.execPath = path.join(tempDir, "missing-node");
 		try {
@@ -2286,7 +2329,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 			assert.equal(result.isError, true);
 			assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
-			assert.match(result.content[0]?.text ?? "", /async runner did not produce a pid/);
+			assert.match(result.content[0]?.text ?? "", /Node runtime for detached TypeScript execution could not be found/);
 		} finally {
 			process.execPath = originalExecPath;
 		}

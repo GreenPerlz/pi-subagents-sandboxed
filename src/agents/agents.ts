@@ -242,6 +242,7 @@ function frontmatterStringList(value: string | undefined): string[] | undefined 
 function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSandboxConfig | undefined {
 	const sandbox: AgentSandboxConfig = {};
 	const provider = frontmatterString(frontmatter.sandboxProvider);
+	const gitMode = frontmatterString(frontmatter.sandboxGitMode);
 	const profile = frontmatterString(frontmatter.sandboxProfile);
 	const network = frontmatterString(frontmatter.sandboxNetwork);
 	const trustProject = frontmatterBoolean(frontmatter.sandboxTrustProject);
@@ -252,6 +253,7 @@ function buildAgentSandboxConfig(frontmatter: Record<string, string>): AgentSand
 	const extraWritableMounts = frontmatterStringList(frontmatter.sandboxExtraWritableMounts);
 	const packageDiscovery = frontmatterString(frontmatter.sandboxPackageDiscovery);
 	if (provider !== undefined) sandbox.provider = provider;
+	if (gitMode !== undefined) sandbox.gitMode = gitMode;
 	if (profile !== undefined) sandbox.profile = profile;
 	if (network !== undefined) sandbox.network = network;
 	if (trustProject !== undefined) sandbox.trustProject = trustProject;
@@ -459,6 +461,7 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	const input = value as Record<string, unknown>;
 	const sandbox: SandboxSettingsDefaults = {};
 	const defaultProvider = parseOptionalStringField(input.defaultProvider, { filePath, field: "sandbox.defaultProvider" });
+	const gitMode = parseOptionalStringField(input.gitMode, { filePath, field: "sandbox.gitMode" });
 	const defaultProfile = parseOptionalStringField(input.defaultProfile, { filePath, field: "sandbox.defaultProfile" });
 	const network = parseOptionalStringField(input.network, { filePath, field: "sandbox.network" });
 	const auth = parseOptionalStringField(input.auth, { filePath, field: "sandbox.auth" });
@@ -468,6 +471,7 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	const extraWritableMounts = parseOptionalStringArrayField(input.extraWritableMounts, { filePath, field: "sandbox.extraWritableMounts" });
 	const packageDiscovery = parseOptionalStringField(input.packageDiscovery, { filePath, field: "sandbox.packageDiscovery" });
 	if (defaultProvider !== undefined) sandbox.defaultProvider = defaultProvider;
+	if (gitMode !== undefined) sandbox.gitMode = gitMode;
 	if (defaultProfile !== undefined) sandbox.defaultProfile = defaultProfile;
 	if (network !== undefined) sandbox.network = network;
 	if (auth !== undefined) sandbox.auth = auth;

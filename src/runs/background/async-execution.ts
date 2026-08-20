@@ -12,7 +12,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { resolveSandboxConfig } from "../../sandbox/config.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
-import { hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
@@ -322,12 +322,23 @@ export function executeAsyncChain(
 				};
 			}
 		}
-		if (isParallelStep(s) && !s.worktree) {
+		if (isParallelStep(s)) {
 			const stepAgentConfigs = s.parallel
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
-			const sandboxWriteInputs = stepAgentConfigs.map((agent) => ({ agentName: agent.name, tools: agent.tools, sandbox: resolveStepSandbox(agent) }));
-			if (hasSandboxWritableAgent({ agents: sandboxWriteInputs })) {
+			const stepSandboxes = stepAgentConfigs.map((agent) => resolveStepSandbox(agent));
+			const isolatedGitRequested = stepSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
+			if (isolatedGitRequested && s.worktree) {
+				return formatAsyncStartError(resultMode, `isolated Git cannot be combined with parent-managed worktree mode on chain step ${stepIndex + 1}`);
+			}
+			if (isolatedGitRequested && stepAgentConfigs.some((agent, index) =>
+				stepSandboxes[index]?.gitMode !== "isolated"
+					&& inferSandboxCwdWritable({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] }),
+			)) {
+				return formatAsyncStartError(resultMode, `isolated Git parallel step ${stepIndex + 1} cannot include a non-isolated write-capable task`);
+			}
+			const sandboxWriteInputs = stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] }));
+			if (!s.worktree && !isolatedGitRequested && hasSandboxWritableAgent({ agents: sandboxWriteInputs })) {
 				return formatAsyncStartError(resultMode, sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`));
 			}
 		}

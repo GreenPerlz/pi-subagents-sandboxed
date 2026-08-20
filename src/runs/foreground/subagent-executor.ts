@@ -4,8 +4,9 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
-import { resolveSandboxConfig } from "../../sandbox/config.ts";
-import { hasSandboxWritableAgent, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { hasExplicitSandboxOptOut, resolveSandboxConfig } from "../../sandbox/config.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, cleanupIsolatedGitRuntime, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
+import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
@@ -990,6 +991,7 @@ async function emitForegroundResultIntercom(input: {
 		...(result.fastMode ? { fastMode: result.fastMode } : {}),
 		index,
 		artifactPath: result.artifactPaths?.outputPath,
+		...(result.gitBundle ? { gitBundle: result.gitBundle } : {}),
 		sessionPath: result.sessionFile,
 		intercomTarget: resolveSubagentIntercomTarget(input.runId, result.agent, index),
 	}]);
@@ -1772,6 +1774,7 @@ interface ForegroundParallelRunInput {
 	liveProgress: (AgentProgress | undefined)[];
 	onUpdate?: (r: AgentToolResult<Details>) => void;
 	worktreeSetup?: WorktreeSetup;
+	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[];
 	sandbox?: ResolvedSandboxConfig;
 	sandboxes?: (ResolvedSandboxConfig | undefined)[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
@@ -1837,7 +1840,13 @@ function resolveParallelTaskCwd(
 	paramsCwd: string,
 	worktreeSetup: WorktreeSetup | undefined,
 	index: number,
+	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[],
 ): string {
+	// Isolated Git mapping happens inside runSingleAttempt, where the exact
+	// requested parent repository cwd is still available. Returning the private
+	// path here would make that mapping reject its own worktree as outside the
+	// assigned repository and would also discard task cwd subdirectories.
+	if (isolatedGitWorktrees?.[index]) return resolveChildCwd(paramsCwd, task.cwd);
 	if (worktreeSetup) return worktreeSetup.worktrees[index]!.agentCwd;
 	return resolveChildCwd(paramsCwd, task.cwd);
 }
@@ -1859,13 +1868,14 @@ function findDuplicateParallelOutputPath(input: {
 	paramsCwd: string;
 	ctxCwd: string;
 	worktreeSetup?: WorktreeSetup;
+	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[];
 }): string | undefined {
 	const seen = new Map<string, { index: number; agent: string }>();
 	for (let index = 0; index < input.tasks.length; index++) {
 		const behavior = input.behaviors[index];
 		if (!behavior?.output) continue;
 		const task = input.tasks[index]!;
-		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index);
+		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees);
 		const outputPath = resolveSingleOutputPath(behavior.output, input.ctxCwd, taskCwd);
 		if (!outputPath) continue;
 		const previous = seen.get(outputPath);
@@ -1881,7 +1891,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 	return mapConcurrent(input.tasks, input.concurrencyLimit, async (task, index) => {
 		const behavior = input.behaviors[index];
 		const effectiveSkills = behavior?.skills;
-		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index);
+		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees);
 		const readInstructions = behavior
 			? buildChainInstructions({ ...behavior, output: false, progress: false }, taskCwd, false)
 			: { prefix: "", suffix: "" };
@@ -1956,6 +1966,8 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			acceptance: task.acceptance,
 			acceptanceContext: { mode: "parallel" },
 			sandbox: input.sandboxes?.[index] ?? input.sandbox,
+			isolatedGit: input.isolatedGitWorktrees?.[index],
+			isolatedGitBundleDir: input.artifactsDir,
 			sandboxIntercomBridge: input.sandboxIntercomBridge,
 			progressPaths: behavior?.progress ? input.progressPaths : undefined,
 			onUpdate: input.onUpdate
@@ -2062,7 +2074,17 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	});
 	const sandboxIntercomBridge = resolveSandboxIntercomBridge(data.intercomBridge);
 	const taskSandboxes = agentConfigs.map((agent) => resolveChildSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox }));
-	if (!params.worktree && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
+	const isolatedGitRequested = taskSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
+	if (isolatedGitRequested && params.worktree) {
+		return buildParallelModeError("isolated Git cannot be combined with parent-managed worktree mode; use isolated Git alone");
+	}
+	if (isolatedGitRequested && agentConfigs.some((agent, index) =>
+		taskSandboxes[index]?.gitMode !== "isolated"
+			&& inferSandboxCwdWritable({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] }),
+	)) {
+		return buildParallelModeError("isolated Git parallel runs cannot include a non-isolated write-capable task");
+	}
+	if (!params.worktree && !isolatedGitRequested && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
 		return buildParallelModeError(sandboxParallelWorktreeRequiredMessage());
 	}
 
@@ -2210,6 +2232,36 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	);
 	if (errorResult) return errorResult;
 
+	let isolatedRuntime: IsolatedGitRuntime | undefined;
+	let isolatedGitWorktrees: (IsolatedGitWorktree | undefined)[] | undefined;
+	if (isolatedGitRequested) {
+		try {
+			const isolatedConfigs = taskSandboxes.filter((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
+			const isolatedProvider = isolatedConfigs[0]?.provider;
+			if (isolatedConfigs.some((sandboxConfig) => sandboxConfig?.provider !== "bubblewrap")) throw new Error("isolated Git requires the Bubblewrap sandbox provider; refusing to downgrade");
+			isolatedRuntime = createIsolatedGitRuntime({
+				cwd: effectiveCwd,
+				runId,
+				provider: isolatedProvider,
+				network: isolatedConfigs[0]?.network,
+				profile: isolatedConfigs[0]?.profile,
+				fallback: isolatedConfigs[0]?.fallback,
+				extraReadOnlyMounts: [...new Set(isolatedConfigs.flatMap((sandboxConfig) => sandboxConfig?.extraReadOnlyMounts ?? []))],
+				extraWritableMounts: [...new Set(isolatedConfigs.flatMap((sandboxConfig) => sandboxConfig?.extraWritableMounts ?? []))],
+			});
+			isolatedGitWorktrees = new Array(tasks.length).fill(undefined);
+			for (let index = 0; index < tasks.length; index++) {
+				if (taskSandboxes[index]?.gitMode === "isolated") {
+					isolatedGitWorktrees[index] = createIsolatedGitWorktree(isolatedRuntime, { index });
+				}
+			}
+		} catch (error) {
+			if (isolatedRuntime) cleanupIsolatedGitRuntime(isolatedRuntime);
+			if (worktreeSetup) cleanupWorktrees(worktreeSetup);
+			return buildParallelModeError(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	let preserveWorktree = false;
 	try {
 		const duplicateOutputError = findDuplicateParallelOutputPath({
@@ -2218,6 +2270,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			paramsCwd: effectiveCwd,
 			ctxCwd: ctx.cwd,
 			worktreeSetup,
+			isolatedGitWorktrees,
 		});
 		if (duplicateOutputError) return buildParallelModeError(duplicateOutputError);
 		for (let index = 0; index < tasks.length; index++) {
@@ -2274,6 +2327,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			liveProgress,
 			onUpdate,
 			worktreeSetup,
+			isolatedGitWorktrees,
 			sandbox,
 			sandboxes: taskSandboxes,
 			sandboxIntercomBridge,
@@ -2409,6 +2463,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		};
 	} finally {
 		if (worktreeSetup) cleanupWorktrees(worktreeSetup, { preserve: preserveWorktree });
+		if (isolatedRuntime) cleanupIsolatedGitRuntime(isolatedRuntime);
 	}
 }
 
@@ -2623,7 +2678,34 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		agent: agentConfig,
 		run: params.sandbox,
 	});
+	let isolatedRuntime: IsolatedGitRuntime | undefined;
+	let isolatedWorktree: IsolatedGitWorktree | undefined;
+	if (sandbox?.gitMode === "isolated") {
+		try {
+			isolatedRuntime = createIsolatedGitRuntime({
+				cwd: effectiveCwd,
+				runId,
+				provider: sandbox.provider,
+				network: sandbox.network,
+				profile: sandbox.profile,
+				fallback: sandbox.fallback,
+				extraReadOnlyMounts: sandbox.extraReadOnlyMounts,
+				extraWritableMounts: sandbox.extraWritableMounts,
+			});
+			isolatedWorktree = createIsolatedGitWorktree(isolatedRuntime, { index: 0 });
+		} catch (error) {
+			if (isolatedRuntime) cleanupIsolatedGitRuntime(isolatedRuntime);
+			return {
+				content: [{ type: "text", text: `Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}` }],
+				isError: true,
+				details: { mode: "single", results: [] },
+			};
+		}
+	}
+	try {
 	const r = await runSync(ctx.cwd, agents, params.agent!, task, {
+		// Pass the requested parent cwd through; runSingleAttempt maps it to the
+		// runtime-managed private worktree while preserving subdirectory intent.
 		cwd: effectiveCwd,
 		signal,
 		interruptSignal: interruptController.signal,
@@ -2655,6 +2737,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		acceptance: params.acceptance,
 		acceptanceContext: { mode: "single" },
 		sandbox,
+		isolatedGit: isolatedWorktree,
+		isolatedGitBundleDir: artifactsDir,
 		sandboxIntercomBridge: resolveSandboxIntercomBridge(data.intercomBridge),
 	});
 	if (foregroundControl?.currentIndex === 0) {
@@ -2751,6 +2835,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		content: [{ type: "text", text: finalizedOutput.displayOutput || "(no output)" }],
 		details,
 	};
+	} finally {
+		if (isolatedRuntime) cleanupIsolatedGitRuntime(isolatedRuntime);
+	}
 }
 
 export function createSubagentExecutor(deps: ExecutorDeps): {
@@ -2991,27 +3078,32 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(effectiveParams.agentScope));
 			const ralphWorkerTargetAgentName = collectRalphNestedLaunchAgentTargets(effectiveParams).find(isRalphNestedWorkerAgentName);
 			const ralphWorkerTargetAgent = ralphWorkerTargetAgentName ? discoveredAgents.find((a) => a.name === ralphWorkerTargetAgentName) : undefined;
-			const sandboxConfig = resolveSandboxConfig({ settings: sandboxSettings, agent: ralphWorkerTargetAgent, run: effectiveParams.sandbox });
-			const sandboxRoot = effectiveCwd;
-			const extraMountRoots = [
-				...(sandboxConfig?.extraReadOnlyMounts ?? []),
-				...(sandboxConfig?.extraWritableMounts ?? []),
-			];
-			const preflight = runSandboxPreflight({
-				cwd: effectiveCwd,
-				sandboxRoot,
-				extraMountRoots: extraMountRoots.length > 0 ? extraMountRoots : undefined,
-				requireGitWorktree: true,
-			});
-			if (!preflight.passed) {
-				console.warn(preflight.summary);
-				return validationErrorResult(
-					getRequestedModeLabel(effectiveParams),
-					`Ralph orchestrator sandbox preflight failed:\n${preflight.summary}`,
-				);
+			const sandboxInput = { settings: sandboxSettings, agent: ralphWorkerTargetAgent, run: effectiveParams.sandbox };
+			const sandboxConfig = resolveSandboxConfig(sandboxInput);
+			// Explicit provider `none` is the documented opt-out from Bubblewrap;
+			// it must also opt out of sandbox-only Git/preflight requirements.
+			if (!hasExplicitSandboxOptOut(sandboxInput) && sandboxConfig?.provider !== "none") {
+				const sandboxRoot = effectiveCwd;
+				const extraMountRoots = [
+					...(sandboxConfig?.extraReadOnlyMounts ?? []),
+					...(sandboxConfig?.extraWritableMounts ?? []),
+				];
+				const preflight = runSandboxPreflight({
+					cwd: effectiveCwd,
+					sandboxRoot,
+					extraMountRoots: extraMountRoots.length > 0 ? extraMountRoots : undefined,
+					requireGitWorktree: true,
+				});
+				if (!preflight.passed) {
+					console.warn(preflight.summary);
+					return validationErrorResult(
+						getRequestedModeLabel(effectiveParams),
+						`Ralph orchestrator sandbox preflight failed:\n${preflight.summary}`,
+					);
+				}
+				console.log(preflight.summary);
+				preflightSummaryForResult = preflight.summary;
 			}
-			console.log(preflight.summary);
-			preflightSummaryForResult = preflight.summary;
 		}
 
 		const validationError = validateExecutionInput(

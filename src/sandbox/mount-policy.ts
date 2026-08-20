@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { detectGitWorktreePointerGitdir } from "./preflight.ts";
-import type { SandboxMount, SandboxMountMode } from "./types.ts";
+import type { SandboxMount, SandboxMountMode, GitMode } from "./types.ts";
+import { resolveGitMode } from "./config.ts";
 
 export interface StructuredOutputMountInput {
 	schemaPath?: string;
@@ -37,6 +38,10 @@ export interface SubagentSandboxMountInput {
 	/** Project-local Pi package roots resolved by the parent and mounted read-only. */
 	packageRoots?: string[];
 	cwdMode?: SandboxMountMode;
+	/** Skip cwd/.git mounts when a runtime-managed isolated Git layer supplies them. */
+	includeCwd?: boolean;
+	/** Explicit Git access policy; read-only also protects an in-tree .git directory. */
+	gitMode?: GitMode | string;
 	/** Explicit user-requested read-only paths for installed toolchains/read-only inputs. */
 	extraReadOnlyMounts?: string[];
 	/** Explicit user-requested writable paths for caches, outputs, or work directories. */
@@ -45,11 +50,28 @@ export interface SubagentSandboxMountInput {
 	intercomStateDir?: string;
 	/** Nested subagent event route. Mounted writable so sandboxed children can launch/report nested descendants. */
 	nestedRoute?: NestedRouteMountInput;
+	/** Parent Git metadata that must be protected even when cwd is supplied by a runtime-managed layer. */
+	protectedGitPaths?: readonly string[];
 }
 
-function addSandboxMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, source: string | undefined, mode: SandboxMount["mode"]): void {
+function validateWritableGitMount(protectedGitPaths: readonly string[] | undefined, source: string): void {
+	if (!protectedGitPaths) return;
+	for (const protectedPath of protectedGitPaths) {
+		if (!pathsOverlap(protectedPath, source)) continue;
+		throw new Error(`Writable sandbox mount '${path.resolve(source)}' overlaps protected Git metadata '${path.resolve(protectedPath)}'`);
+	}
+}
+
+function addSandboxMount(
+	mounts: SandboxMount[],
+	seen: Map<string, SandboxMount["mode"]>,
+	source: string | undefined,
+	mode: SandboxMount["mode"],
+	protectedGitPaths?: readonly string[],
+): void {
 	if (!source) return;
 	const resolved = path.resolve(source);
+	if (mode === "rw") validateWritableGitMount(protectedGitPaths, resolved);
 	const existingMode = seen.get(resolved);
 	if (existingMode) {
 		if (existingMode === "ro" && mode === "rw") {
@@ -64,29 +86,77 @@ function addSandboxMount(mounts: SandboxMount[], seen: Map<string, SandboxMount[
 	mounts.push({ source: resolved, mode });
 }
 
-function addSandboxMountParent(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, filePath: string | undefined, mode: SandboxMount["mode"]): void {
+function addSandboxMountParent(
+	mounts: SandboxMount[],
+	seen: Map<string, SandboxMount["mode"]>,
+	filePath: string | undefined,
+	mode: SandboxMount["mode"],
+	protectedGitPaths?: readonly string[],
+): void {
 	if (!filePath) return;
 	const parent = path.dirname(filePath);
+	// addSandboxMount validates before this mkdir. A nonexistent suffix must not
+	// be created under protected metadata merely to discover the overlap.
+	if (mode === "rw") validateWritableGitMount(protectedGitPaths, parent);
 	if (mode === "rw") mkdirSync(parent, { recursive: true });
-	addSandboxMount(mounts, seen, parent, mode);
+	addSandboxMount(mounts, seen, parent, mode, protectedGitPaths);
 }
 
-function addSandboxSessionFileMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, sessionFile: string | undefined): void {
+function addSandboxSessionFileMount(
+	mounts: SandboxMount[],
+	seen: Map<string, SandboxMount["mode"]>,
+	sessionFile: string | undefined,
+	protectedGitPaths?: readonly string[],
+): void {
 	if (!sessionFile) return;
 	const resolved = path.resolve(sessionFile);
 	if (existsSync(resolved)) {
-		addSandboxMount(mounts, seen, resolved, "rw");
+		addSandboxMount(mounts, seen, resolved, "rw", protectedGitPaths);
 		return;
 	}
-	addSandboxMountParent(mounts, seen, resolved, "rw");
+	addSandboxMountParent(mounts, seen, resolved, "rw", protectedGitPaths);
 }
 
-function addNestedRouteMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, route: NestedRouteMountInput | undefined): void {
+function addNestedRouteMount(
+	mounts: SandboxMount[],
+	seen: Map<string, SandboxMount["mode"]>,
+	route: NestedRouteMountInput | undefined,
+	protectedGitPaths?: readonly string[],
+): void {
 	if (!route) return;
 	const eventRoot = path.dirname(path.resolve(route.eventSink));
 	const controlRoot = path.dirname(path.resolve(route.controlInbox));
 	if (eventRoot !== controlRoot) return;
-	addSandboxMount(mounts, seen, eventRoot, "rw");
+	addSandboxMount(mounts, seen, eventRoot, "rw", protectedGitPaths);
+}
+
+function writableMountCandidates(input: SubagentSandboxMountInput): string[] {
+	const candidates: string[] = [];
+	const add = (candidate: string | undefined): void => {
+		if (candidate) candidates.push(path.resolve(candidate));
+	};
+	add(input.sessionDir);
+	if (input.sessionFile) {
+		const resolved = path.resolve(input.sessionFile);
+		add(existsSync(resolved) ? resolved : path.dirname(resolved));
+	}
+	add(input.artifactsDir);
+	for (const filePath of [input.jsonlPath, input.outputPath, ...(input.progressPaths ?? []), ...(input.statusPaths ?? [])]) {
+		if (filePath) add(path.dirname(filePath));
+	}
+	if (input.structuredOutput?.outputPath) add(path.dirname(input.structuredOutput.outputPath));
+	for (const configuredPath of input.extraWritableMounts ?? []) add(expandTilde(configuredPath));
+	add(input.intercomStateDir);
+	if (input.nestedRoute) {
+		const eventRoot = path.dirname(path.resolve(input.nestedRoute.eventSink));
+		const controlRoot = path.dirname(path.resolve(input.nestedRoute.controlInbox));
+		if (eventRoot === controlRoot) add(eventRoot);
+	}
+	return candidates;
+}
+
+function validateWritableMountCandidates(protectedGitPaths: readonly string[], input: SubagentSandboxMountInput): void {
+	for (const candidate of writableMountCandidates(input)) validateWritableGitMount(protectedGitPaths, candidate);
 }
 
 function nearestPackageRoot(filePath: string): string | undefined {
@@ -204,63 +274,113 @@ function addSandboxAuthMounts(mounts: SandboxMount[], seen: Map<string, SandboxM
 	// fails when npm is not available under Bubblewrap.
 }
 
-function addExplicitMounts(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, paths: string[] | undefined, mode: SandboxMount["mode"]): void {
+function addExplicitMounts(
+	mounts: SandboxMount[],
+	seen: Map<string, SandboxMount["mode"]>,
+	paths: string[] | undefined,
+	mode: SandboxMount["mode"],
+	protectedGitPaths?: readonly string[],
+): void {
 	for (const configuredPath of paths ?? []) {
 		const resolved = path.resolve(expandTilde(configuredPath));
+		if (mode === "rw") validateWritableGitMount(protectedGitPaths, resolved);
 		if (mode === "rw") mkdirSync(resolved, { recursive: true });
-		addSandboxMount(mounts, seen, resolved, mode);
+		addSandboxMount(mounts, seen, resolved, mode, protectedGitPaths);
 	}
 }
 
-function addGitWorktreePointerMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, cwd: string): void {
+function canonicalPath(candidate: string): string {
+	let current = path.resolve(candidate);
+	const suffix: string[] = [];
+	while (!existsSync(current)) {
+		const parent = path.dirname(current);
+		if (parent === current) return path.resolve(candidate);
+		suffix.unshift(path.basename(current));
+		current = parent;
+	}
+	try {
+		return path.join(realpathSync.native(current), ...suffix);
+	} catch {
+		return path.join(path.resolve(current), ...suffix);
+	}
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+	const leftPath = canonicalPath(left);
+	const rightPath = canonicalPath(right);
+	const leftRelative = path.relative(leftPath, rightPath);
+	const rightRelative = path.relative(rightPath, leftPath);
+	return leftRelative === "" || rightRelative === ""
+		|| (!leftRelative.startsWith(".." + path.sep) && !path.isAbsolute(leftRelative))
+		|| (!rightRelative.startsWith(".." + path.sep) && !path.isAbsolute(rightRelative));
+}
+
+function addGitWorktreePointerMount(
+	mounts: SandboxMount[],
+	seen: Map<string, SandboxMount["mode"]>,
+	cwd: string,
+	gitMode: GitMode | string | undefined,
+	protectedGitPaths: string[],
+): void {
 	const detection = detectGitWorktreePointerGitdir(cwd);
 	if (!detection.ok) {
 		throw new Error(detection.error ?? `Invalid Git worktree .git pointer in ${path.resolve(cwd)}`);
 	}
-	if (!detection.pointerGitdir) return;
 	const resolvedCwd = path.resolve(cwd);
-	if (!isWithinAnyRoot(detection.pointerGitdir, [resolvedCwd])) {
-		addSandboxMount(mounts, seen, detection.pointerGitdir, "ro");
+	const gitEntry = path.join(resolvedCwd, ".git");
+	const effectiveGitMode = resolveGitMode({ gitMode });
+	if (existsSync(gitEntry)) protectedGitPaths.push(gitEntry);
+	// Always overlay the checkout's .git entry read-only. This covers both
+	// ordinary directory repositories (which have no pointerGitdir) and the
+	// pointer file itself for linked worktrees.
+	if (effectiveGitMode === "read-only") {
+		addSandboxMount(mounts, seen, gitEntry, "ro");
 	}
-	if (detection.commonGitdir && !isWithinAnyRoot(detection.commonGitdir, [resolvedCwd])) {
+	if (!detection.pointerGitdir) return;
+	protectedGitPaths.push(detection.pointerGitdir);
+	// Mount even in-tree metadata explicitly: cwd may be writable, and the
+	// nested read-only bind is what prevents an ordinary checkout from
+	// modifying linked-worktree state.
+	addSandboxMount(mounts, seen, detection.pointerGitdir, "ro");
+	if (detection.commonGitdir) {
+		protectedGitPaths.push(detection.commonGitdir);
 		addSandboxMount(mounts, seen, detection.commonGitdir, "ro");
 	}
-}
-
-function isWithinAnyRoot(candidate: string, roots: string[]): boolean {
-	for (const root of roots) {
-		const relative = path.relative(root, candidate);
-		if (!relative.startsWith("..") && !path.isAbsolute(relative)) return true;
-	}
-	return false;
 }
 
 export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): SandboxMount[] {
 	const mounts: SandboxMount[] = [];
 	const seen = new Map<string, SandboxMount["mode"]>();
-	addSandboxMount(mounts, seen, input.cwd, input.cwdMode ?? "rw");
-	addGitWorktreePointerMount(mounts, seen, input.cwd);
+	const protectedGitPaths: string[] = [...(input.protectedGitPaths ?? [])];
+	if (input.includeCwd !== false) {
+		addSandboxMount(mounts, seen, input.cwd, input.cwdMode ?? "rw");
+		addGitWorktreePointerMount(mounts, seen, input.cwd, input.gitMode, protectedGitPaths);
+	}
+	// Validate the complete writable set before any generated parent/resource
+	// directory is created by the mount assembly below.
+	validateWritableMountCandidates(protectedGitPaths, input);
 	addSandboxMount(mounts, seen, input.tempDir, "ro");
-	addSandboxMount(mounts, seen, input.sessionDir, "rw");
-	addSandboxSessionFileMount(mounts, seen, input.sessionFile);
-	addSandboxMount(mounts, seen, input.artifactsDir, "rw");
-	addSandboxMountParent(mounts, seen, input.jsonlPath, "rw");
-	addSandboxMountParent(mounts, seen, input.outputPath, "rw");
-	for (const progressPath of input.progressPaths ?? []) addSandboxMountParent(mounts, seen, progressPath, "rw");
-	for (const statusPath of input.statusPaths ?? []) addSandboxMountParent(mounts, seen, statusPath, "rw");
+	addSandboxMount(mounts, seen, input.sessionDir, "rw", protectedGitPaths);
+	addSandboxSessionFileMount(mounts, seen, input.sessionFile, protectedGitPaths);
+	addSandboxMount(mounts, seen, input.artifactsDir, "rw", protectedGitPaths);
+	addSandboxMountParent(mounts, seen, input.jsonlPath, "rw", protectedGitPaths);
+	addSandboxMountParent(mounts, seen, input.outputPath, "rw", protectedGitPaths);
+	for (const progressPath of input.progressPaths ?? []) addSandboxMountParent(mounts, seen, progressPath, "rw", protectedGitPaths);
+	for (const statusPath of input.statusPaths ?? []) addSandboxMountParent(mounts, seen, statusPath, "rw", protectedGitPaths);
 	addSandboxMountParent(mounts, seen, input.structuredOutput?.schemaPath, "ro");
-	addSandboxMountParent(mounts, seen, input.structuredOutput?.outputPath, "rw");
+	addSandboxMountParent(mounts, seen, input.structuredOutput?.outputPath, "rw", protectedGitPaths);
 	for (const packageRoot of input.packageRoots ?? []) addSandboxMount(mounts, seen, packageRoot, "ro");
 	addSandboxExtensionMountParents(mounts, seen, input.piArgs);
 	addSandboxSpawnMounts(mounts, seen, input.spawnCommand, input.spawnArgs);
 	addSandboxAuthMounts(mounts, seen, input.authMode, input.agentDir);
 	addExplicitMounts(mounts, seen, input.extraReadOnlyMounts, "ro");
-	addExplicitMounts(mounts, seen, input.extraWritableMounts, "rw");
+	addExplicitMounts(mounts, seen, input.extraWritableMounts, "rw", protectedGitPaths);
 	if (input.intercomStateDir) {
 		const resolved = path.resolve(input.intercomStateDir);
+		validateWritableGitMount(protectedGitPaths, resolved);
 		mkdirSync(resolved, { recursive: true });
-		addSandboxMount(mounts, seen, resolved, "rw");
+		addSandboxMount(mounts, seen, resolved, "rw", protectedGitPaths);
 	}
-	addNestedRouteMount(mounts, seen, input.nestedRoute);
+	addNestedRouteMount(mounts, seen, input.nestedRoute, protectedGitPaths);
 	return mounts;
 }

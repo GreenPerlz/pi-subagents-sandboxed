@@ -44,7 +44,7 @@ That installs the extension and the packaged agents. Because those packaged agen
 
 ## Sandboxed subagents
 
-The packaged builtin agents (`explore`, `orchestrator`, `research`, `review`, and `work`) request `bubblewrap` with the `host-toolchain` profile, host networking, `pi-json` auth, fail-closed fallback, and closed package discovery by default. Custom agents or runs with no sandbox provider still use the same child Pi spawn path as upstream `pi-subagents`. A per-run sandbox override is only runnable when every affected agent explicitly permits the requested `sandbox.*` fields.
+The packaged builtin agents (`explore`, `orchestrator`, `research`, `review`, and `work`) request `bubblewrap` with the `host-toolchain` profile, host networking, `pi-json` auth, fail-closed fallback, and closed package discovery by default. Custom agents with no sandbox frontmatter use the same safe Bubblewrap/read-only-Git default as packaged agents. An explicit per-run `provider: "none"` is the opt-out; a per-run sandbox override is only runnable when every affected agent explicitly permits the requested `sandbox.*` fields.
 
 ### Bubblewrap requirements
 
@@ -121,13 +121,13 @@ Run-level sandbox options override agent frontmatter, which overrides settings d
 
 ### Sandbox modes and diagnostics
 
-- Provider: `bubblewrap` wraps child Pi invocations with `bwrap`; provider `none` or an omitted provider means no sandbox.
+- Provider: `bubblewrap` wraps child Pi invocations with `bwrap`; an omitted provider defaults to Bubblewrap, while explicit provider `none` opts out.
 - Profile: `host-toolchain` is for local developer machines that already have the repo toolchain installed on the host.
 - Network: `host` is the default so child Pi processes can reach model/API providers; `none` passes Bubblewrap `--unshare-net` for offline tasks.
 - Auth: `pi-json` is the default mode and mounts Pi's `auth.json` and `subagents.json` read-only without mounting full `settings.json`; use `env` only when you explicitly want the child process to rely on provider credentials from its environment.
 - Fallback: `fail` is the default and refuses to run when Bubblewrap cannot be applied. Explicit `fallback: "none"` runs the original unsandboxed invocation and records a warning/result marker.
 - Package discovery: `closed` is the default for sandboxed children and starts child Pi with `--no-extensions`, `--no-prompt-templates`, and `--no-themes`, loading only runtime/explicit extension flags. `project-local` keeps those closed-runtime flags, but the parent resolves project-local Pi package declarations before Bubblewrap, passes their `package.json -> pi.extensions` as explicit `--extension` flags, and mounts those package roots read-only. It reads project `.pi/settings.json` package declarations and the nearest cwd package; it intentionally does not load user/global packages or mount user settings/global npm roots. `ambient` is unsafe/legacy and must be requested explicitly; it can re-enable Pi's normal discovery inside the sandbox and may require broader mounts, so it is not recommended for untrusted work.
-- Write inference: agents with `edit` or `write` tools get writable cwd/worktree mounts. `bash` alone stays read-only unless `bashWrite: true` is set. Parallel sandboxed writers require `worktree: true` so each writer gets an isolated writable worktree.
+- Write inference: agents with `edit` or `write` tools get writable cwd/worktree mounts. `bash` alone stays read-only unless `bashWrite: true` is set. Git mode `read-only` is the default and protects checkout metadata; `isolated` gives each writer a private Bubblewrap Git worktree. Parallel sandboxed writers may use parent-managed `worktree: true` or `sandbox.gitMode: "isolated"`; do not combine them because isolated mode rejects parent-managed worktrees.
 - Extra mounts: use `extraReadOnlyMounts` for installed executables/toolchains or read-only inputs. Use `extraWritableMounts` only for caches, outputs, or work directories that the agent must write. Do **not** mount all of `$HOME`; prefer the narrowest directory that contains the missing executable or failed cache/output path.
 
 Returned result details and async status steps include a `sandbox` diagnostic object for sandboxed executions:
@@ -940,7 +940,9 @@ subagent({ action: "doctor" })
 
 ## Worktree isolation
 
-Parallel agents can clobber each other if they edit the same checkout. `worktree: true` gives each parallel child its own git worktree branched from `HEAD`. For issue orchestration, the default is one parent-owned worktree: launch one `orchestrator` task with `worktree: true`, then let its inline explore → same-cwd work → fresh review loop share that worktree.
+Parallel agents can clobber each other if they edit the same checkout. Parent-managed `worktree: true` gives each parallel child its own git worktree branched from `HEAD`; alternatively, `sandbox.gitMode: "isolated"` gives each sandboxed writer a private Bubblewrap Git worktree. These modes cannot be combined. For issue orchestration, the default is one parent-owned worktree: launch one `orchestrator` task with `worktree: true`, then let its inline explore → same-cwd work → fresh review loop share that worktree.
+
+### Parent-managed worktrees
 
 ```ts
 { tasks: [
@@ -948,7 +950,7 @@ Parallel agents can clobber each other if they edit the same checkout. `worktree
 ], worktree: true }
 ```
 
-Generic independent parallel work remains available for agents that explicitly opt into the guarded `worktree` override. Packaged `work` intentionally does not grant that override; define a project agent when independent writer worktrees are desired:
+Generic independent parallel work remains available through either the guarded parent-managed `worktree` override or explicit `sandboxGitMode: isolated`. Packaged `work` intentionally does not grant the parent-managed override; define a project agent when independent writer worktrees are desired:
 
 ```md
 <!-- .pi/agents/parallel-work.md -->
@@ -986,7 +988,7 @@ Then launch the opt-in agent:
 ]}
 ```
 
-Requirements:
+Requirements for parent-managed worktrees:
 
 - run inside a git repo
 - working tree must be clean
@@ -995,6 +997,51 @@ Requirements:
 - configured `worktreeSetupHook` must return valid JSON before timeout
 
 After a worktree parallel step completes, the runtime captures per-agent diff stats and full patch files before any intercom receipt or `finally` cleanup. The captured patch directory is included in the inline result and grouped intercom message, so the parent can apply that patch after the temporary worktrees are removed. Worktrees and temp branches are then cleaned up in `finally` blocks; do not rely on the child cwd still existing.
+
+### Sandbox-isolated Git writers
+
+Use isolated Git mode when each writer should author commits in a runtime-managed Bubblewrap worktree instead of receiving a parent-managed worktree. Do not set `worktree: true` for this mode:
+
+```md
+<!-- .pi/agents/isolated-writer.md -->
+---
+name: isolated-writer
+description: Writer with a private runtime-managed Git worktree
+tools: read, grep, find, ls, bash, edit, write
+sandboxProvider: bubblewrap
+sandboxProfile: host-toolchain
+sandboxNetwork: host
+sandboxAuth: pi-json
+sandboxFallback: fail
+sandboxPackageDiscovery: closed
+sandboxGitMode: isolated
+---
+Implement the assigned change in the runtime-managed checkout. Use `git add` and
+`git commit` to author the change, and leave the checkout clean before finishing.
+```
+
+Launch it without a parent-managed worktree and consume the returned bundle metadata:
+
+```ts
+const result = await subagent({
+  agent: "isolated-writer",
+  task: "Implement the assigned change and commit it in the isolated checkout."
+});
+const bundle = result.details?.results?.[0]?.gitBundle;
+if (bundle) {
+  const { path, checksum, base, head, commitSummary } = bundle;
+  console.log({ path, checksum, base, head, commitSummary });
+}
+```
+
+The bundle is returned for the caller to inspect or verify; isolated mode does not promise parent-checkout integration.
+
+Isolated mode has separate constraints:
+
+- run inside a git repo with `user.name` and `user.email` configured
+- run on Linux with Bubblewrap; isolated mode refuses unsandboxed fallback
+- requested cwd must stay inside the repository; a task or step subdirectory cwd is mapped to the same relative subdirectory in the private worktree
+- omit parent-managed `worktree: true`; isolated mode creates and manages its private worktree
 
 ## Configuration
 

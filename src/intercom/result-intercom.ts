@@ -243,6 +243,12 @@ function formatSubagentResultIntercomMessage(input: {
 		lines.push(`${index + 1}. ${child.agent} — ${child.status}`);
 		if (child.intercomTarget) lines.push(`${input.source === "async" ? "Previous intercom target" : "Run intercom target"}: ${child.intercomTarget}`);
 		if (child.artifactPath) lines.push(`Output artifact: ${child.artifactPath}`);
+		if (child.gitBundle) {
+			lines.push(`Git bundle: ${child.gitBundle.path}`);
+			lines.push(`Git bundle checksum: ${child.gitBundle.checksum}`);
+			lines.push(`Git base/head: ${child.gitBundle.base}..${child.gitBundle.head}`);
+			if (child.gitBundle.commitSummary) lines.push(`Git commits: ${child.gitBundle.commitSummary}`);
+		}
 		if (child.sessionPath) lines.push(`Session: ${child.sessionPath}`);
 		lines.push(...formatNestedResultLines(child.children));
 		lines.push("Summary:");
@@ -359,6 +365,15 @@ export function formatSubagentResultReceipt(input: {
 		`Run: ${input.runId}`,
 		`Children: ${formatStatusCounts(counts)}`,
 	];
+
+	const bundles = input.payload.children.filter((child) => child.gitBundle);
+	if (bundles.length > 0) {
+		lines.push("Git bundles:");
+		for (const child of bundles) {
+			const bundle = child.gitBundle!;
+			lines.push(`- ${child.agent} [${child.status}]: ${bundle.path} (${bundle.checksum}) ${bundle.base}..${bundle.head}`);
+		}
+	}
 
 	const artifacts = input.payload.children.filter((child) => typeof child.artifactPath === "string");
 	if (artifacts.length > 0) {

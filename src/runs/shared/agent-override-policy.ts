@@ -43,6 +43,7 @@ export const GUARDED_AGENT_OVERRIDE_LEAVES = [
 	"acceptance.stopRules",
 	"acceptance.selfReview",
 	"acceptance.maxFinalizationTurns",
+	"sandbox.gitMode",
 	"sandbox.provider",
 	"sandbox.profile",
 	"sandbox.network",

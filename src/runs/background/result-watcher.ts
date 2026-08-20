@@ -42,6 +42,7 @@ type ResultFileChild = {
 	success?: boolean;
 	sessionFile?: string;
 	artifactPaths?: { outputPath?: string };
+	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
 	intercomTarget?: string;
 	children?: unknown;
 };
@@ -170,6 +171,7 @@ export function createResultWatcher(
 					summary,
 					index,
 					artifactPath: result.artifactPaths?.outputPath,
+					...(result.gitBundle ? { gitBundle: result.gitBundle } : {}),
 					...(typeof sessionPath === "string" && fsApi.existsSync(sessionPath) ? { sessionPath } : {}),
 					...(result.intercomTarget ? { intercomTarget: result.intercomTarget } : {}),
 					...(childNestedChildren ? { children: childNestedChildren } : {}),
@@ -218,6 +220,7 @@ export function createResultWatcher(
 							summary: child.summary,
 							index: child.index,
 							artifactPath: child.artifactPath,
+							...(child.gitBundle ? { gitBundle: child.gitBundle } : {}),
 							sessionPath: child.sessionPath,
 							children: child.children,
 						}))

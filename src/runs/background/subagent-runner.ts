@@ -8,6 +8,8 @@ import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { resolveProjectLocalPiPackageResources } from "../../agents/pi-packages.ts";
 import { PI_CHILD_RUNTIME_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
+import { resolveGitMode } from "../../sandbox/config.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, mapIsolatedGitCwd, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
@@ -162,6 +164,7 @@ interface StepResult {
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
 	sandbox?: SandboxResultDetails;
+	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
 }
 
 const ASYNC_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
@@ -273,6 +276,7 @@ interface RunPiStreamingResult {
 
 interface RunPiStreamingSandboxInput extends SubagentSandboxMountInput {
 	config: ResolvedSandboxConfig;
+	isolatedGit?: IsolatedGitWorktree;
 }
 
 function runPiStreaming(
@@ -300,19 +304,35 @@ function runPiStreaming(
 		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;
 		let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
 		try {
+			if (sandbox?.config && resolveGitMode(sandbox.config) === "isolated" && !sandbox.isolatedGit) {
+				throw new Error("isolated Git requires a runtime-managed isolated worktree handle; refusing ordinary checkout execution");
+			}
 			if (sandbox) {
-				effectiveSandboxMounts = buildSubagentSandboxMounts({
+				effectiveSandboxMounts = sandbox.isolatedGit
+					? buildSubagentSandboxMounts({
+						...sandbox,
+						includeCwd: false,
+						cwd,
+						protectedGitPaths: sandbox.isolatedGit.runtime.parentGitPaths,
+						extraReadOnlyMounts: sandbox.config.extraReadOnlyMounts,
+						extraWritableMounts: sandbox.config.extraWritableMounts,
+						spawnCommand: piSpawnSpec.command,
+						spawnArgs: piSpawnSpec.args,
+					})
+					: buildSubagentSandboxMounts({
 					...sandbox,
 					extraReadOnlyMounts: sandbox.config.extraReadOnlyMounts,
 					extraWritableMounts: sandbox.config.extraWritableMounts,
 					spawnCommand: piSpawnSpec.command,
 					spawnArgs: piSpawnSpec.args,
-				});
-				const wrapped = createSandboxProvider(sandbox.config).wrapInvocation({
-					config: sandbox.config,
-					invocation: { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd },
-					mounts: effectiveSandboxMounts,
-				});
+					});
+				const wrapped = sandbox.isolatedGit
+					? { invocation: sandbox.isolatedGit.runtime.wrapInvocation(sandbox.isolatedGit, { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd }, effectiveSandboxMounts, sandbox.config), diagnostics: [] }
+					: createSandboxProvider(sandbox.config).wrapInvocation({
+						config: sandbox.config,
+						invocation: { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd },
+						mounts: effectiveSandboxMounts,
+					});
 				if (wrapped.mounts?.length) {
 					const seenDiagnosticMounts = new Set(effectiveSandboxMounts.map((mount) => `${mount.mode}:${mount.source}`));
 					for (const mount of wrapped.mounts) {
@@ -734,6 +754,7 @@ interface SingleStepContext {
 	orchestratorIntercomTarget?: string;
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
+	isolatedGit?: IsolatedGitWorktree;
 	progressPaths?: string[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	onAttemptStart?: (attempt: { model?: string; thinking?: string }) => void;
@@ -766,6 +787,7 @@ async function runSingleStep(
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
+	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
 }> {
 	const effectiveStructuredOutput = step.structuredOutput ?? (step.structuredOutputSchema
 		? createStructuredOutputRuntime(step.structuredOutputSchema, path.join(path.dirname(ctx.outputFile), "structured-output"))
@@ -801,6 +823,7 @@ async function runSingleStep(
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	const effectiveSandbox = step.sandbox ?? ctx.sandbox;
 	const stepCwd = step.cwd ?? ctx.cwd;
+	const executionCwd = ctx.isolatedGit ? mapIsolatedGitCwd(ctx.isolatedGit, stepCwd) : stepCwd;
 	const projectLocalPackageResources = effectiveSandbox?.packageDiscovery === "project-local"
 		? resolveProjectLocalPiPackageResources(stepCwd)
 		: undefined;
@@ -815,8 +838,10 @@ async function runSingleStep(
 		if (!sandbox) return undefined;
 		return {
 			config: sandbox,
-			cwd: stepCwd,
+			isolatedGit: ctx.isolatedGit,
+			cwd: executionCwd,
 			cwdMode: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }) ? "rw" : "ro",
+			gitMode: sandbox.gitMode,
 			tempDir: input.tempDir,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
@@ -867,7 +892,7 @@ async function runSingleStep(
 			systemPrompt: effectiveSystemPrompt,
 			systemPromptMode: step.systemPromptMode,
 			mcpDirectTools: step.mcpDirectTools,
-			cwd: stepCwd,
+			cwd: executionCwd,
 			promptFileStem: step.agent,
 			intercomSessionName: ctx.childIntercomTarget,
 			orchestratorIntercomTarget: ctx.orchestratorIntercomTarget,
@@ -885,7 +910,7 @@ async function runSingleStep(
 		});
 		const run = await runPiStreaming(
 			args,
-			stepCwd,
+			executionCwd,
 			ctx.outputFile,
 			env,
 			ctx.piPackageRoot,
@@ -995,7 +1020,7 @@ async function runSingleStep(
 		? await evaluateAcceptance({
 			acceptance: acceptanceForInitialReport,
 			output: outputForAcceptance,
-			cwd: step.cwd ?? ctx.cwd,
+			cwd: executionCwd,
 		})
 		: undefined;
 	if (acceptance && step.effectiveAcceptance && shouldRunAcceptanceFinalization(step.effectiveAcceptance) && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted) {
@@ -1041,7 +1066,7 @@ async function runSingleStep(
 					systemPrompt: effectiveSystemPrompt,
 					systemPromptMode: step.systemPromptMode,
 					mcpDirectTools: step.mcpDirectTools,
-					cwd: stepCwd,
+					cwd: executionCwd,
 					promptFileStem: `${step.agent}-acceptance-finalization`,
 					intercomSessionName: ctx.childIntercomTarget,
 					orchestratorIntercomTarget: ctx.orchestratorIntercomTarget,
@@ -1058,7 +1083,7 @@ async function runSingleStep(
 				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;
 				const finalizationRun = await runPiStreaming(
 					args,
-					stepCwd,
+					executionCwd,
 					finalizationOutputFile,
 					env,
 					ctx.piPackageRoot,
@@ -1088,7 +1113,7 @@ async function runSingleStep(
 				const selfReviewLedger = await evaluateAcceptance({
 					acceptance: selfReviewAcceptance,
 					output: finalizationOutput,
-					cwd: stepCwd,
+					cwd: executionCwd,
 				});
 				authoritativeLedger = selfReviewLedger;
 				turns.push(createFinalizationTurn({ turn, prompt, rawOutput: finalizationOutput, ledger: selfReviewLedger }));
@@ -1099,7 +1124,7 @@ async function runSingleStep(
 						: await evaluateAcceptance({
 							acceptance: step.effectiveAcceptance,
 							output: finalizationOutput,
-							cwd: step.cwd ?? ctx.cwd,
+							cwd: executionCwd,
 						});
 					acceptance = attachFinalizationToLedger({ initialLedger: acceptance, authoritativeLedger, turns, status: "completed", maxTurns });
 					break;
@@ -1111,6 +1136,31 @@ async function runSingleStep(
 	}
 	const acceptanceFailure = acceptance ? acceptanceFailureMessage(acceptance) : undefined;
 	const acceptanceCanFailRun = acceptanceFailure && acceptance?.explicit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted;
+	let gitBundle: { path: string; checksum: string; base: string; head: string; commitSummary: string } | undefined;
+	if (ctx.isolatedGit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.error && !finalResult?.interrupted && !acceptanceCanFailRun) {
+		try {
+			const bundle = exportIsolatedGitBundle(ctx.isolatedGit.runtime, {
+				outputDir: ctx.artifactsDir ?? path.join(path.dirname(ctx.outputFile), "isolated-git-bundles"),
+				worktree: ctx.isolatedGit,
+			});
+			gitBundle = {
+				path: bundle.path,
+				checksum: bundle.checksum,
+				base: bundle.base,
+				head: bundle.head,
+				commitSummary: bundle.commitSummary,
+			};
+		} catch (error) {
+			return {
+				agent: step.agent,
+				output: outputForSummary,
+				exitCode: 1,
+				error: `Isolated Git bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+				model: finalResult?.model,
+				acceptance,
+			};
+		}
+	}
 	const effectiveFinalExitCode = acceptanceCanFailRun ? 1 : finalResult?.exitCode ?? 1;
 	const effectiveFinalError = acceptanceCanFailRun
 		? (finalResult?.error ? `${finalResult.error}\n${acceptanceFailure}` : acceptanceFailure)
@@ -1164,6 +1214,7 @@ async function runSingleStep(
 		structuredOutputSchemaPath: effectiveStructuredOutput?.schemaPath,
 		acceptance,
 		sandbox: finalResult?.sandbox,
+		gitBundle,
 	};
 }
 
@@ -1377,6 +1428,39 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 	const flatSteps = flattenSteps(steps);
+	let isolatedGitRuntime: IsolatedGitRuntime | undefined;
+	const isolatedGitWorktrees = new Map<number, IsolatedGitWorktree>();
+	const isolatedSandboxConfigs = [
+		...(config.sandbox?.gitMode === "isolated" ? [config.sandbox] : []),
+		...flatSteps.map((step) => step.sandbox).filter((sandbox): sandbox is ResolvedSandboxConfig => sandbox?.gitMode === "isolated"),
+	];
+	const hasIsolatedGit = isolatedSandboxConfigs.length > 0;
+	try {
+	if (hasIsolatedGit) {
+		if (isolatedSandboxConfigs.some((sandbox) => sandbox.provider !== "bubblewrap")) {
+			throw new Error("isolated Git requires the Bubblewrap sandbox provider; refusing to downgrade");
+		}
+		isolatedGitRuntime = createIsolatedGitRuntime({
+			cwd,
+			runId: id,
+			provider: isolatedSandboxConfigs[0]?.provider,
+			network: isolatedSandboxConfigs[0]?.network,
+			profile: isolatedSandboxConfigs[0]?.profile,
+			fallback: isolatedSandboxConfigs[0]?.fallback,
+			extraReadOnlyMounts: [...new Set(isolatedSandboxConfigs.flatMap((sandbox) => sandbox.extraReadOnlyMounts ?? []))],
+			extraWritableMounts: [...new Set(isolatedSandboxConfigs.flatMap((sandbox) => sandbox.extraWritableMounts ?? []))],
+		});
+	}
+	const resolveIsolatedGitWorktree = (step: SubagentStep, flatIndex: number): IsolatedGitWorktree | undefined => {
+		const sandbox = step.sandbox ?? config.sandbox;
+		if (sandbox?.gitMode !== "isolated") return undefined;
+		const existing = isolatedGitWorktrees.get(flatIndex);
+		if (existing) return existing;
+		if (!isolatedGitRuntime) throw new Error("isolated Git runtime was not created");
+		const worktree = createIsolatedGitWorktree(isolatedGitRuntime, { index: flatIndex });
+		isolatedGitWorktrees.set(flatIndex, worktree);
+		return worktree;
+	};
 	const sessionEnabled = Boolean(config.sessionDir)
 		|| shareEnabled
 		|| flatSteps.some((step) => Boolean(step.sessionFile));
@@ -2029,6 +2113,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					orchestratorIntercomTarget: config.controlIntercomTarget,
 					nestedRoute: config.nestedRoute,
 					sandbox: config.sandbox,
+					isolatedGit: resolveIsolatedGitWorktree(task, fi),
 					progressPaths: config.progressPaths,
 					sandboxIntercomBridge: config.sandboxIntercomBridge,
 					registerInterrupt: (interrupt) => {
@@ -2053,6 +2138,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 				statusPayload.steps[fi].acceptance = singleResult.acceptance;
 				statusPayload.steps[fi].sandbox = singleResult.sandbox;
+				statusPayload.steps[fi].gitBundle = singleResult.gitBundle;
 				statusPayload.lastUpdate = taskEndTime;
 				writeStatusPayload();
 				appendJsonl(eventsPath, JSON.stringify({
@@ -2090,6 +2176,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
 					acceptance: pr.acceptance,
 					sandbox: pr.sandbox,
+					gitBundle: pr.gitBundle,
 				});
 			}
 			const collection = collectDynamicResults(step as Parameters<typeof collectDynamicResults>[0], materialized.items, parallelResults);
@@ -2273,7 +2360,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						const taskSessionDir = config.sessionDir
 							? path.join(config.sessionDir, `parallel-${taskIdx}`)
 							: undefined;
-						const { taskForRun, taskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
+						const { taskForRun, taskCwd: preparedTaskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
+						const isolatedGit = resolveIsolatedGitWorktree(taskForRun, fi);
+						// Keep the requested parent cwd in the step context; runSingleStep
+						// maps it to the private worktree and preserves subdirectories.
+						const taskCwd = preparedTaskCwd;
 
 						const singleResult = await runSingleStep(taskForRun, {
 							previousOutput, placeholder, cwd: taskCwd, sessionEnabled,
@@ -2288,6 +2379,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							orchestratorIntercomTarget: config.controlIntercomTarget,
 							nestedRoute: config.nestedRoute,
 							sandbox: config.sandbox,
+							isolatedGit,
 							progressPaths: config.progressPaths,
 							sandboxIntercomBridge: config.sandboxIntercomBridge,
 							registerInterrupt: (interrupt) => {
@@ -2318,6 +2410,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 						statusPayload.steps[fi].acceptance = singleResult.acceptance;
 						statusPayload.steps[fi].sandbox = singleResult.sandbox;
+						statusPayload.steps[fi].gitBundle = singleResult.gitBundle;
 						statusPayload.lastUpdate = taskEndTime;
 						writeStatusPayload();
 
@@ -2398,6 +2491,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
 						acceptance: pr.acceptance,
 						sandbox: pr.sandbox,
+						gitBundle: pr.gitBundle,
 					});
 				}
 
@@ -2549,6 +2643,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				orchestratorIntercomTarget: config.controlIntercomTarget,
 				nestedRoute: config.nestedRoute,
 				sandbox: config.sandbox,
+				isolatedGit: resolveIsolatedGitWorktree(seqStep, flatIndex),
 				progressPaths: config.progressPaths,
 				sandboxIntercomBridge: config.sandboxIntercomBridge,
 				registerInterrupt: (interrupt) => {
@@ -2585,6 +2680,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				structuredOutputSchemaPath: singleResult.structuredOutputSchemaPath,
 				acceptance: singleResult.acceptance,
 				sandbox: singleResult.sandbox,
+				gitBundle: singleResult.gitBundle,
 			});
 			if (seqStep.outputName) {
 				outputs[seqStep.outputName] = outputEntryFromAsyncResult({
@@ -2632,6 +2728,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.steps[flatIndex].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 			statusPayload.steps[flatIndex].acceptance = singleResult.acceptance;
 			statusPayload.steps[flatIndex].sandbox = singleResult.sandbox;
+			statusPayload.steps[flatIndex].gitBundle = singleResult.gitBundle;
 			if (stepTokens) {
 				statusPayload.steps[flatIndex].tokens = stepTokens;
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
@@ -2802,6 +2899,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				structuredOutputSchemaPath: r.structuredOutputSchemaPath,
 				acceptance: r.acceptance,
 				sandbox: r.sandbox,
+				gitBundle: r.gitBundle,
 			})),
 			outputs,
 			workflowGraph: statusPayload.workflowGraph,
@@ -2826,6 +2924,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		});
 	} catch (err) {
 		console.error(`Failed to write result file ${resultPath}:`, err);
+	}
+	} finally {
+		if (isolatedGitRuntime) cleanupIsolatedGitRuntime(isolatedGitRuntime);
 	}
 }
 

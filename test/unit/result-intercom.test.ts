@@ -201,7 +201,7 @@ describe("result intercom formatter", () => {
 			mode: "parallel",
 			source: "foreground",
 			children: [
-				{ agent: "a", status: "completed", summary: "done", artifactPath: "/tmp/a.md", intercomTarget: "subagent-a-run-abc-1" },
+				{ agent: "a", status: "completed", summary: "done", artifactPath: "/tmp/a.md", gitBundle: { path: "/tmp/a.bundle", checksum: "abc123", base: "base", head: "head", commitSummary: "head\tAuthor\tcommit" }, intercomTarget: "subagent-a-run-abc-1" },
 				{ agent: "b", status: "failed", summary: "failed", sessionPath: "/tmp/b.jsonl" },
 			],
 		});
@@ -213,6 +213,7 @@ describe("result intercom formatter", () => {
 
 		assert.match(receipt, /Delivered parallel subagent results via intercom\./);
 		assert.match(receipt, /Children: 1 completed, 1 failed/);
+		assert.match(receipt, /Git bundles:\n- a \[completed\]: \/tmp\/a\.bundle \(abc123\) base\.\.head/);
 		assert.match(receipt, /Artifacts:\n- a \[completed\]: \/tmp\/a\.md/);
 		assert.match(receipt, /Run intercom targets \(may be inactive after completion\):\n- a \[completed\]: subagent-a-run-abc-1/);
 		assert.match(receipt, /Sessions:\n- b \[failed\]: \/tmp\/b\.jsonl/);

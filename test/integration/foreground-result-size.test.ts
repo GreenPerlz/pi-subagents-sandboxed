@@ -73,7 +73,7 @@ function makeExecutor(cwd: string) {
 		getSubagentSessionRoot: () => cwd,
 		expandTilde: (value: string) => value,
 		discoverAgents: () => ({
-			agents: [{ name: "tester", description: "Tool-heavy test agent" }],
+			agents: [{ name: "tester", description: "Tool-heavy test agent", canBeChangedByAgent: ["sandbox.provider"] }],
 		}),
 	});
 }
@@ -161,7 +161,7 @@ describe("foreground result payload compaction", { skip: !available ? "subagent 
 		const executor = makeExecutor(tempDir);
 		const result = await executor.execute(
 			"id",
-			{ agent: "tester", task: "Run the full noisy test sweep", includeProgress: false },
+			{ agent: "tester", task: "Run the full noisy test sweep", includeProgress: false, sandbox: { provider: "none" } },
 			new AbortController().signal,
 			undefined,
 			makeCtx(tempDir),

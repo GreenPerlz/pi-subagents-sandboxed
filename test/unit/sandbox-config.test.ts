@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { discoverAgents, readSandboxSettings } from "../../src/agents/agents.ts";
-import { resolveSandboxConfig } from "../../src/sandbox/config.ts";
+import { hasExplicitSandboxOptOut, resolveSandboxConfig } from "../../src/sandbox/config.ts";
+import { buildSubagentSandboxMounts } from "../../src/sandbox/mount-policy.ts";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -49,6 +50,7 @@ describe("sandbox configuration resolution", () => {
 			subagents: {
 				sandbox: {
 					defaultProvider: "settings-provider",
+					gitMode: "read-only",
 					defaultProfile: "settings-profile",
 					network: "settings-network",
 					auth: "settings-auth",
@@ -62,6 +64,7 @@ describe("sandbox configuration resolution", () => {
 		});
 		writeAgent(project, [
 			"sandboxProvider: agent-provider",
+			"sandboxGitMode: isolated",
 			"sandboxProfile: agent-profile",
 			"sandboxNetwork: agent-network",
 			"sandboxTrustProject: true",
@@ -78,6 +81,7 @@ describe("sandbox configuration resolution", () => {
 		assert.ok(agent, "worker should be discovered");
 		assert.deepEqual(agent.sandbox, {
 			provider: "agent-provider",
+			gitMode: "isolated",
 			profile: "agent-profile",
 			network: "agent-network",
 			trustProject: true,
@@ -92,6 +96,7 @@ describe("sandbox configuration resolution", () => {
 
 		assert.deepEqual(resolveSandboxConfig({ settings }), {
 			provider: "settings-provider",
+			gitMode: "read-only",
 			profile: "settings-profile",
 			network: "settings-network",
 			trustProject: false,
@@ -103,6 +108,7 @@ describe("sandbox configuration resolution", () => {
 		});
 		assert.deepEqual(resolveSandboxConfig({ settings, agent }), {
 			provider: "agent-provider",
+			gitMode: "isolated",
 			profile: "agent-profile",
 			network: "agent-network",
 			trustProject: true,
@@ -118,6 +124,7 @@ describe("sandbox configuration resolution", () => {
 			agent,
 			run: {
 				provider: "run-provider",
+				gitMode: "read-only",
 				profile: "run-profile",
 				network: "run-network",
 				trustProject: false,
@@ -130,6 +137,7 @@ describe("sandbox configuration resolution", () => {
 			},
 		}), {
 			provider: "run-provider",
+			gitMode: "read-only",
 			profile: "run-profile",
 			network: "run-network",
 			trustProject: false,
@@ -142,8 +150,8 @@ describe("sandbox configuration resolution", () => {
 		});
 	});
 
-	it("resolves to no sandbox when provider is omitted everywhere", () => {
-		assert.equal(resolveSandboxConfig({
+	it("defaults unconfigured agents to read-only Bubblewrap Git protection", () => {
+		assert.deepEqual(resolveSandboxConfig({
 			settings: {
 				defaultProfile: "host-toolchain",
 				network: "host",
@@ -151,7 +159,89 @@ describe("sandbox configuration resolution", () => {
 				trustProject: true,
 				fallback: "fail",
 			},
-		}), undefined);
+		}), {
+			provider: "bubblewrap",
+			gitMode: "read-only",
+			profile: "host-toolchain",
+			network: "host",
+			trustProject: true,
+			auth: "env",
+			fallback: "fail",
+		});
+	});
+
+	it("defaults a custom agent with no settings, frontmatter, or run override to read-only Bubblewrap", () => {
+		const { project } = makeProject();
+		writeAgent(project, "");
+		const agent = discoverAgents(project, "project").agents.find((candidate) => candidate.name === "worker");
+		assert.ok(agent, "custom worker should be discovered");
+		assert.equal(agent.sandbox, undefined);
+		assert.deepEqual(resolveSandboxConfig({ agent }), {
+			provider: "bubblewrap",
+			gitMode: "read-only",
+			auth: "pi-json",
+		});
+	});
+
+	it("keeps an explicit provider none opt-out unsandboxed", () => {
+		assert.equal(resolveSandboxConfig({ run: { provider: "none" } }), undefined);
+		assert.equal(hasExplicitSandboxOptOut({ run: { provider: "none" } }), true);
+		assert.equal(hasExplicitSandboxOptOut({ settings: { defaultProvider: "none" }, agent: { sandbox: { provider: "bubblewrap" } } }), false);
+	});
+
+	it("resolves the winning sandbox provider and Git mode across settings, agent, and run precedence", () => {
+		const isolatedWins = [
+			{
+				name: "agent isolated mode overrides settings provider none",
+				input: { settings: { defaultProvider: "none" }, agent: { sandbox: { gitMode: "isolated" } } },
+			},
+			{
+				name: "run isolated mode overrides settings provider none",
+				input: { settings: { defaultProvider: "none" }, run: { gitMode: "isolated" } },
+			},
+			{
+				name: "run isolated mode overrides agent provider none",
+				input: { agent: { sandbox: { provider: "none" } }, run: { gitMode: "isolated" } },
+			},
+		] as const;
+		for (const { name, input } of isolatedWins) {
+			assert.deepEqual(resolveSandboxConfig(input), {
+				provider: "bubblewrap",
+				gitMode: "isolated",
+				auth: "pi-json",
+			}, name);
+		}
+
+		const optOutWins = [
+			{
+				name: "agent provider none overrides settings isolated mode",
+				input: { settings: { gitMode: "isolated" }, agent: { sandbox: { provider: "none" } } },
+			},
+			{
+				name: "run provider none overrides settings isolated mode",
+				input: { settings: { gitMode: "isolated" }, run: { provider: "none" } },
+			},
+			{
+				name: "run provider none overrides agent isolated mode",
+				input: { agent: { sandbox: { gitMode: "isolated" } }, run: { provider: "none" } },
+			},
+		] as const;
+		for (const { name, input } of optOutWins) {
+			assert.equal(resolveSandboxConfig(input), undefined, name);
+		}
+
+		const sameLayerContradictions = [
+			{ name: "settings", input: { settings: { defaultProvider: "none", gitMode: "isolated" } } },
+			{ name: "agent", input: { agent: { sandbox: { provider: "none", gitMode: "isolated" } } } },
+			{ name: "run", input: { run: { provider: "none", gitMode: "isolated" } } },
+		] as const;
+		for (const { name, input } of sameLayerContradictions) {
+			assert.throws(
+				() => resolveSandboxConfig(input),
+				/explicit provider 'none'.*isolated Git|cannot combine.*provider.*none.*isolated/i,
+				name,
+			);
+		}
 	});
 
 	it("defaults sandbox auth to pi-json when provider is configured", () => {
@@ -159,8 +249,21 @@ describe("sandbox configuration resolution", () => {
 			run: { provider: "bubblewrap" },
 		}), {
 			provider: "bubblewrap",
+			gitMode: "read-only",
 			auth: "pi-json",
 		});
+	});
+
+	it("resolves omitted Git mode to read-only and mounts ordinary .git metadata read-only", () => {
+		const { project } = makeProject();
+		fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+		for (const gitMode of [undefined, "read-only"] as const) {
+			const mounts = buildSubagentSandboxMounts({ cwd: project, cwdMode: "rw", gitMode });
+			assert.deepEqual(mounts.find((mount) => mount.source === path.join(project, ".git")), {
+				source: path.join(project, ".git"),
+				mode: "ro",
+			});
+		}
 	});
 
 	it("lets a per-run provider none opt out of an agent sandbox default", () => {
@@ -168,5 +271,14 @@ describe("sandbox configuration resolution", () => {
 			agent: { sandbox: { provider: "bubblewrap", profile: "host-toolchain" } },
 			run: { provider: "none" },
 		}), undefined);
+		assert.equal(resolveSandboxConfig({
+			settings: { gitMode: "isolated" },
+			run: { provider: "none" },
+		}), undefined, "an explicit run provider none must also clear inherited isolated Git mode");
+		assert.throws(
+			() => resolveSandboxConfig({ run: { provider: "none", gitMode: "isolated" } }),
+			/explicit provider 'none'.*isolated Git|cannot combine.*provider.*none.*isolated/i,
+			"the same request must not combine provider none with isolated Git",
+		);
 	});
 });

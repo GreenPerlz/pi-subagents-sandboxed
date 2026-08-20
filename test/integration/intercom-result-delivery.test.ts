@@ -159,7 +159,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				clear: () => {},
 			},
 		};
-		const executor = createSubagentExecutor!({
+		const baseExecutor = createSubagentExecutor!({
 			pi: {
 				events,
 				getSessionName: () => options.sessionName === null ? undefined : options.sessionName ?? "orchestrator",
@@ -175,6 +175,14 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			expandTilde: (value: string) => value,
 			discoverAgents: () => ({ agents: options.agents ?? [makeAgent("worker")] }),
 		});
+		const executor = {
+			...baseExecutor,
+			execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: ((r: unknown) => void) | undefined, ctx: unknown) =>
+				baseExecutor.execute(id, {
+					...params,
+					...(!params.sandbox && !(options.agents ?? []).some((agent) => agent.sandbox) ? { sandbox: { provider: "none" } } : {}),
+				}, signal, onUpdate as never, ctx as never),
+		};
 		return { executor, events, state };
 	}
 
@@ -284,6 +292,42 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		assert.match(String(payload.message ?? ""), /2\. b — completed/);
 		assert.match(result.content[0]?.text ?? "", /Delivered parallel subagent results via intercom\./);
 		assert.equal(result.details?.results?.every((entry) => entry.finalOutput === undefined), true);
+	});
+
+	it("delivers a live foreground isolated Git bundle through grouped intercom", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf-8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "isolated-intercom-repo");
+		initGitRepo(repoDir);
+		const before = spawnSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf-8" }).stdout.trim();
+		mockPi.onCall({
+			output: "Isolated commit output",
+			commands: ["printf 'isolated\\n' > isolated.txt && git add isolated.txt && git commit -m 'isolated intercom commit'"],
+		});
+		const { executor, events } = makeExecutor();
+		const result = await executor.execute(
+			"isolated-foreground-intercom",
+			{
+				tasks: [{ agent: "worker", task: "Commit in the isolated worktree" }],
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(repoDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		const payload = events.emitted.find((entry) => entry.channel === "subagent:result-intercom")?.payload as {
+			children?: Array<{ gitBundle?: { path?: string; base?: string; head?: string } }>;
+			message?: string;
+		} | undefined;
+		const bundle = payload?.children?.[0]?.gitBundle;
+		assert.ok(bundle?.path && fs.existsSync(bundle.path), "grouped foreground delivery must carry the live isolated bundle");
+		assert.equal(bundle.base, before);
+		assert.notEqual(bundle.head, before);
+		assert.match(payload?.message ?? "", /Git bundle:/);
+		assert.equal(spawnSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf-8" }).stdout.trim(), before);
+		assert.equal(fs.existsSync(path.join(repoDir, "isolated.txt")), false);
+		const verified = spawnSync("git", ["bundle", "verify", bundle.path], { cwd: repoDir, encoding: "utf-8" });
+		assert.equal(verified.status, 0, verified.stderr || verified.stdout);
 	});
 
 	it("captures a foreground worktree patch before intercom receipt and leaves it integratable after cleanup", async () => {

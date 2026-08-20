@@ -16,6 +16,7 @@ import * as path from "node:path";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
 import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
 import type { MockPi } from "../support/helpers.ts";
 
@@ -43,7 +44,7 @@ interface AsyncResultPayload {
 	mode?: string;
 	summary?: string;
 	worktreeExecutionError?: string;
-	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; fastMode?: { requested?: boolean; eligible?: boolean | "unknown"; active?: boolean | "unknown"; model?: string }; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown }; sandbox?: SandboxDiagnosticsPayload }>;
+	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; fastMode?: { requested?: boolean; eligible?: boolean | "unknown"; active?: boolean | "unknown"; model?: string }; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown; finalization?: { status?: string } }; sandbox?: SandboxDiagnosticsPayload; gitBundle?: { path?: string; checksum?: string; base?: string; head?: string; commitSummary?: string } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; error?: string }> }> };
 }
@@ -627,6 +628,112 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("rejects an isolated async generated mount before creating a parent Git path", {
+		skip: !isAsyncAvailable() || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap and detached runtime are required" : undefined,
+	}, async () => {
+		const repo = createRepo("pi-isolated-async-mount-repo-");
+		const id = `async-isolated-unsafe-mount-${Date.now().toString(36)}`;
+		const unsafeParent = path.join(repo, ".git", "generated-async");
+		const unsafeOutput = path.join(unsafeParent, "output.md");
+		mockPi.onCall({ output: "must not launch" });
+		const started = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Write an output",
+			agentConfig: makeAgent("worker", { tools: ["read", "bash"] }),
+			ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-isolated-unsafe-mount" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			output: unsafeOutput,
+			sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", extraWritableMounts: [mockPi.dir] },
+		});
+		assert.equal(started.isError, undefined, started.content[0]?.text);
+		const resultPath = await waitForAsyncResultFile(id, 15_000);
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(result.success, false);
+		assert.match(result.results[0]?.error ?? "", /protected Git metadata|parent common Git metadata|isolated Git/i);
+		assert.equal(fs.existsSync(unsafeParent), false, "an unsafe generated output parent must not be created");
+	});
+
+	it("runs an isolated async child through result persistence and the live result watcher", {
+		skip: !isAsyncAvailable() || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap and detached runtime are required" : undefined,
+	}, async () => {
+		const repo = createRepo("pi-isolated-async-repo-");
+		const base = git(repo, ["rev-parse", "HEAD"]);
+		const artifactsDir = path.join(tempDir, "isolated-async-artifacts");
+		const sessionRoot = path.join(tempDir, "isolated-async-sessions");
+		const id = `async-isolated-watcher-${Date.now().toString(36)}`;
+		const runtimePrefix = `pi-isolated-git-${id}-`;
+		const runtimeRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix)));
+		const eventBus = createEventBus();
+		const state = createWatcherState("session-isolated-async", repo);
+		let completion: AsyncResultPayload | undefined;
+		let intercomPayload: { mode?: string; children?: Array<{ agent?: string; status?: string; gitBundle?: { path?: string; checksum?: string; base?: string; head?: string } }> } | undefined;
+		eventBus.on("subagent:async-complete", (payload) => {
+			if ((payload as { runId?: string }).runId === id) completion = payload as AsyncResultPayload;
+		});
+		eventBus.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => {
+			const data = payload as typeof intercomPayload & { requestId?: string };
+			intercomPayload = data;
+			eventBus.emit(SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, { requestId: data.requestId, delivered: true });
+		});
+		const watcher = createResultWatcher({ events: eventBus }, state, RESULTS_DIR, 60_000);
+		watcher.startResultWatcher();
+		try {
+			mockPi.onCall({
+				output: "isolated async A committed",
+				commands: ["printf 'isolated async A\\n' > async-a.txt && git add async-a.txt && git commit -m 'isolated async A'"],
+			});
+			mockPi.onCall({
+				output: "isolated async B committed",
+				commands: ["printf 'isolated async B\\n' > async-b.txt && git add async-b.txt && git commit -m 'isolated async B'"],
+			});
+			const started = executeAsyncChain(id, {
+				chain: [{ parallel: [{ agent: "worker", task: "Commit isolated A" }, { agent: "worker", task: "Commit isolated B" }] }],
+				resultMode: "parallel",
+				agents: [makeAgent("worker", { tools: ["read", "bash"] })],
+				ctx: { pi: { events: eventBus }, cwd: repo, currentSessionId: "session-isolated-async" },
+				artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: true, includeMetadata: true, cleanupDays: 7 },
+				artifactsDir,
+				shareEnabled: false,
+				sessionRoot,
+				maxSubagentDepth: 2,
+				controlIntercomTarget: "orchestrator",
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", extraWritableMounts: [mockPi.dir] },
+			});
+			assert.equal(started.isError, undefined, started.content[0]?.text);
+			const deadline = Date.now() + 15_000;
+			while (!completion && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.ok(completion, "result watcher should receive the persisted isolated result");
+			assert.equal(completion?.success, true, JSON.stringify(completion));
+			assert.equal(completion?.state, "complete");
+			assert.equal(completion?.results.length, 2);
+			assert.equal(completion?.results.every((result) => result.success), true);
+			assert.match(completion?.results[0]?.output ?? "", /isolated async A committed/);
+			assert.match(completion?.results[1]?.output ?? "", /isolated async B committed/);
+			for (const result of completion?.results ?? []) {
+				assert.equal(result.gitBundle?.base, base);
+				assert.match(result.gitBundle?.path ?? "", /isolated-success-/);
+				assert.ok(result.gitBundle?.checksum);
+				assert.ok(result.gitBundle?.head);
+				assert.ok(result.gitBundle?.commitSummary);
+			}
+			assert.equal(intercomPayload?.mode, "parallel");
+			assert.equal(intercomPayload?.children?.length, 2);
+			assert.equal(intercomPayload?.children?.every((child) => child.status === "completed" && child.gitBundle?.checksum), true);
+			assert.equal(fs.existsSync(path.join(repo, "async-a.txt")), false, "isolated child must not edit the parent checkout");
+			assert.equal(fs.existsSync(path.join(repo, "async-b.txt")), false, "isolated child must not edit the parent checkout");
+			const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+			const cleanupDeadline = Date.now() + 5_000;
+			while (fs.existsSync(resultPath) && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(fs.existsSync(resultPath), false, "result watcher should consume the persisted result");
+			const leakedRuntimeRoots = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix) && !runtimeRootsBefore.has(entry));
+			assert.deepEqual(leakedRuntimeRoots, [], "background isolated Git runtime must be cleaned before result delivery");
+		} finally {
+			watcher.stopResultWatcher();
+		}
+	});
+
 	it("sandboxed async parallel and chain children preserve detached status and mounted paths", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const fakeBwrap = installFakeBwrap(tempDir);
 		try {
@@ -797,6 +904,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				tasks: [{ agent: "worker", task: "Do async work", output: "async-top-output.md", reads: ["input.md"], progress: true }],
 				async: true,
 				clarify: false,
+				sandbox: { provider: "none" },
 			},
 			new AbortController().signal,
 			undefined,
@@ -835,6 +943,65 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(taskArg.includes(`Update progress at: ${path.join(tempDir, "progress.md")}`));
 		assert.equal(taskArg.includes("[Saved output:"), false);
 		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
+	});
+
+	it("isolated async acceptance finalization preserves a requested subdirectory and exports its bundle", {
+		skip: !isAsyncAvailable() || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap and detached runtime are required" : undefined,
+	}, async () => {
+		const repo = createRepo("pi-isolated-async-acceptance-repo-");
+		const subdirectory = path.join(repo, "packages", "app");
+		fs.mkdirSync(subdirectory, { recursive: true });
+		fs.writeFileSync(path.join(subdirectory, ".keep"), "\n", "utf-8");
+		git(repo, ["add", "packages/app/.keep"]);
+		git(repo, ["commit", "-m", "add acceptance subdirectory"]);
+		const parentBefore = {
+			head: git(repo, ["rev-parse", "HEAD"]),
+			status: git(repo, ["status", "--porcelain=v1"]),
+			refs: git(repo, ["for-each-ref", "--format=%(refname)=%(objectname)"]),
+		};
+		const report = [
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "subdirectory commit created" }],
+				changedFiles: ["packages/app/async-acceptance.txt"],
+				commandsRun: [{ command: "git status", result: "passed", summary: "passed" }],
+				residualRisks: [],
+			}),
+			"```",
+		].join("\n");
+		mockPi.onCall({
+			output: report,
+			commands: ["printf 'isolated acceptance\\n' > async-acceptance.txt && git add async-acceptance.txt && git commit -m 'isolated acceptance'"],
+		});
+		mockPi.onCall({ output: report });
+		const id = `async-isolated-acceptance-${Date.now().toString(36)}`;
+		const artifactsDir = path.join(tempDir, "isolated-acceptance-artifacts");
+		const started = executeAsyncChain(id, {
+			chain: [{ agent: "worker", task: "Create the acceptance file", cwd: "packages/app", acceptance: { criteria: ["Create the acceptance file"], selfReview: true, maxFinalizationTurns: 1 } }],
+			agents: [makeAgent("worker", { tools: ["read", "bash"] })],
+			ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-isolated-acceptance" },
+			cwd: repo,
+			artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: true, includeMetadata: true, cleanupDays: 7 },
+			artifactsDir,
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "isolated-acceptance-sessions"),
+			sessionFilesByFlatIndex: [path.join(tempDir, "isolated-acceptance-session.jsonl")],
+			maxSubagentDepth: 2,
+			sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", extraWritableMounts: [mockPi.dir] },
+		});
+		assert.equal(started.isError, undefined, started.content[0]?.text);
+		const resultPath = await waitForAsyncResultFile(id, 15_000);
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(result.success, true, JSON.stringify(result));
+		assert.equal(result.results[0]?.acceptance?.finalization?.status, "completed");
+		assert.match(result.results[0]?.gitBundle?.path ?? "", /isolated-success-/);
+		assert.ok(result.results[0]?.gitBundle?.checksum);
+		assert.equal(fs.existsSync(path.join(repo, "packages", "app", "async-acceptance.txt")), false, "isolated acceptance must not edit the parent checkout");
+		assert.deepEqual({
+			head: git(repo, ["rev-parse", "HEAD"]),
+			status: git(repo, ["status", "--porcelain=v1"]),
+			refs: git(repo, ["for-each-ref", "--format=%(refname)=%(objectname)"]),
+		}, parentBefore);
 	});
 
 	it("async single lets explicit acceptance own completion for report-only output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1069,7 +1236,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			tempArtifactsDir: tempDir,
 			getSubagentSessionRoot: () => tempDir,
 			expandTilde: (p: string) => p,
-			discoverAgents: () => ({ agents: [makeAgent("worker", { canBeChangedByAgent: ["maxSubagentDepth"] })] }),
+			discoverAgents: () => ({ agents: [makeAgent("worker", { canBeChangedByAgent: ["maxSubagentDepth", "sandbox.provider"] })] }),
 		});
 		const previousDepth = process.env.PI_SUBAGENT_DEPTH;
 		const previousMaxDepth = process.env.PI_SUBAGENT_MAX_DEPTH;
@@ -1079,7 +1246,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		try {
 			const response = await executor.execute(
 				"async-nested-depth-override",
-				{ agent: "worker", task: "Report depth", maxSubagentDepth: 2, async: true },
+				{ agent: "worker", task: "Report depth", maxSubagentDepth: 2, async: true, sandbox: { provider: "none" } },
 				new AbortController().signal,
 				undefined,
 				makeMinimalCtx(tempDir),
@@ -1120,6 +1287,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				task: "Review-only. Do not edit files. Return findings.",
 				async: true,
 				clarify: false,
+				sandbox: { provider: "none" },
 			},
 			new AbortController().signal,
 			undefined,
@@ -1414,6 +1582,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 					tasks: [{ agent: "worker", task: "Do worktree work", output: "report.md", reads: ["input.md"] }],
 					async: true,
 					clarify: false,
+					sandbox: { provider: "none" },
 					worktree: true,
 				},
 				new AbortController().signal,

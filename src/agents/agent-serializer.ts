@@ -26,6 +26,7 @@ export const KNOWN_FIELDS = new Set([
 	"acceptanceMaxFinalizationTurns",
 	"canBeChangedByAgent",
 	"sandboxProvider",
+	"sandboxGitMode",
 	"sandboxProfile",
 	"sandboxNetwork",
 	"sandboxTrustProject",
@@ -96,6 +97,7 @@ export function serializeAgent(config: AgentConfig): string {
 	const canBeChangedByAgent = joinComma(config.canBeChangedByAgent);
 	if (canBeChangedByAgent) lines.push(`canBeChangedByAgent: ${canBeChangedByAgent}`);
 	if (config.sandbox?.provider) lines.push(`sandboxProvider: ${config.sandbox.provider}`);
+	if (config.sandbox?.gitMode) lines.push(`sandboxGitMode: ${config.sandbox.gitMode}`);
 	if (config.sandbox?.profile) lines.push(`sandboxProfile: ${config.sandbox.profile}`);
 	if (config.sandbox?.network) lines.push(`sandboxNetwork: ${config.sandbox.network}`);
 	if (config.sandbox?.trustProject !== undefined) lines.push(`sandboxTrustProject: ${config.sandbox.trustProject ? "true" : "false"}`);

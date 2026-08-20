@@ -13,6 +13,8 @@ export interface BubblewrapProviderDeps {
 	pathExists?: (candidate: string) => boolean;
 	realPath?: (filePath: string) => string;
 	env?: Record<string, string | undefined>;
+	/** Isolate the child PID namespace so host processes and their roots are not inspectable. */
+	unsharePid?: boolean;
 }
 
 function isExecutable(filePath: string): boolean {
@@ -35,15 +37,16 @@ function commandExists(command: string, env: Record<string, string | undefined> 
 }
 
 function addMount(args: string[], mount: SandboxMount, seen?: Set<string>, diagnosticMounts?: SandboxMount[]): void {
-	const key = `${mount.mode}:${mount.source}`;
+	const target = mount.target ?? mount.source;
+	const key = `${mount.mode}:${mount.source}:${target}`;
 	if (seen?.has(key)) return;
 	seen?.add(key);
-	diagnosticMounts?.push({ source: mount.source, mode: mount.mode });
+	diagnosticMounts?.push({ source: mount.source, mode: mount.mode, ...(mount.target ? { target: mount.target } : {}) });
 	if (mount.mode === "ro") {
-		args.push("--ro-bind", mount.source, mount.source);
+		args.push("--ro-bind", mount.source, target);
 		return;
 	}
-	args.push("--bind", mount.source, mount.source);
+	args.push("--bind", mount.source, target);
 }
 
 function nodeInstallRoot(command: string): string | undefined {
@@ -54,9 +57,20 @@ function nodeInstallRoot(command: string): string | undefined {
 }
 
 function addEnvironment(args: string[], env: SpawnableInvocation["env"]): void {
-	if (!env) return;
+	// Git redirection variables are ambient authority: without stripping them,
+	// GIT_DIR/GIT_INDEX_FILE/GIT_OBJECT_DIRECTORY can bypass the protected
+	// checkout metadata mounts. When no explicit environment was supplied,
+	// preserve the provider's historical inherited environment and remove only
+	// those Git keys; explicit environments are rebuilt from non-Git entries.
+	if (!env) {
+		for (const key of Object.keys(process.env)) {
+			if (key.startsWith("GIT_")) args.push("--unsetenv", key);
+		}
+		return;
+	}
 	args.push("--clearenv");
 	for (const [key, value] of Object.entries(env)) {
+		if (key.startsWith("GIT_")) continue;
 		if (value === undefined) continue;
 		args.push("--setenv", key, value);
 	}
@@ -80,12 +94,14 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 	private readonly isBubblewrapAvailable: () => boolean;
 	private readonly pathExists: (candidate: string) => boolean;
 	private readonly realPath: (filePath: string) => string;
+	private readonly unsharePid: boolean;
 
 	constructor(deps: BubblewrapProviderDeps = {}) {
 		this.bwrapCommand = deps.bwrapCommand ?? DEFAULT_BWRAP_COMMAND;
 		this.isBubblewrapAvailable = deps.isBubblewrapAvailable ?? (() => commandExists(this.bwrapCommand, deps.env));
 		this.pathExists = deps.pathExists ?? fs.existsSync;
 		this.realPath = deps.realPath ?? ((p) => fs.realpathSync(p));
+		this.unsharePid = deps.unsharePid ?? false;
 	}
 
 	wrapInvocation(input: SandboxWrapInput): SandboxWrapResult {
@@ -120,6 +136,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		for (const source of HOST_TOOLCHAIN_READONLY_PATHS) {
 			if (this.pathExists(source)) addMount(args, { source, mode: "ro" }, seenMounts, diagnosticMounts);
 		}
+		if (this.unsharePid) args.push("--unshare-pid");
 		args.push("--proc", "/proc");
 		args.push("--dev", "/dev");
 		if (network === "host") {

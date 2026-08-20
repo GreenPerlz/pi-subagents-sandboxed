@@ -36,7 +36,8 @@ const ReadsOverride = Type.Unsafe({
 });
 
 const SandboxOverride = Type.Object({
-	provider: Type.Optional(Type.String({ description: "Sandbox provider, e.g. 'bubblewrap'. Omit for no sandbox unless configured by settings or agent defaults." })),
+	gitMode: Type.Optional(Type.String({ enum: ["read-only", "isolated"], description: "Git access mode. Omit for the read-only default; isolated requires a runtime-managed worktree and Linux Bubblewrap." })),
+	provider: Type.Optional(Type.String({ description: "Sandbox provider, e.g. 'bubblewrap'. Omit for the Bubblewrap/read-only default, including unconfigured custom agents; use explicit 'none' to opt out." })),
 	profile: Type.Optional(Type.String({ description: "Sandbox profile, e.g. 'host-toolchain'." })),
 	network: Type.Optional(Type.String({ description: "Sandbox network policy, e.g. 'host' or 'none'." })),
 	trustProject: Type.Optional(Type.Boolean({ description: "Allow sandbox policy to trust project-local files/config." })),

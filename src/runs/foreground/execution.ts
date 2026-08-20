@@ -49,6 +49,8 @@ import {
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { getPiSpawnCommand, getPiSpawnEntrypointOverrideForTests } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
+import { exportIsolatedGitBundle, mapIsolatedGitCwd } from "../../sandbox/isolated-git.ts";
+import { resolveGitMode } from "../../sandbox/config.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
 import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
@@ -184,9 +186,13 @@ async function runSingleAttempt(
 	// Model candidates already carry a thinking suffix only when that specific
 	// model supports it. Keep the candidate authoritative across fallbacks.
 	const modelArg = model;
-	const childCwd = options.cwd ?? runtimeCwd;
+	const requestedCwd = options.cwd ?? runtimeCwd;
+	const childCwd = options.isolatedGit ? mapIsolatedGitCwd(options.isolatedGit, requestedCwd) : requestedCwd;
 	const projectLocalPackageResources = options.sandbox?.packageDiscovery === "project-local"
-		? resolveProjectLocalPiPackageResources(childCwd)
+		// Package discovery belongs to the requested parent repository context;
+		// the private worktree contains only assigned Git content and may not carry
+		// the parent's package installation.
+		? resolveProjectLocalPiPackageResources(requestedCwd)
 		: undefined;
 	const closedSandboxRuntime = Boolean(options.sandbox && options.sandbox.packageDiscovery !== "ambient");
 	const effectiveSavedOutputPath = options.savedOutputPath
@@ -215,7 +221,7 @@ async function runSingleAttempt(
 		packageExtensions: projectLocalPackageResources?.extensions,
 		systemPrompt: effectiveSystemPrompt,
 		mcpDirectTools: agent.mcpDirectTools,
-		cwd: options.cwd ?? runtimeCwd,
+		cwd: childCwd,
 		promptFileStem: agent.name,
 		intercomSessionName: options.intercomSessionName,
 		orchestratorIntercomTarget: options.orchestratorIntercomTarget,
@@ -295,7 +301,44 @@ async function runSingleAttempt(
 			cwd: childCwd,
 			env: spawnEnv,
 		};
-		if (options.sandbox) {
+		if (options.sandbox && resolveGitMode(options.sandbox) === "isolated" && !options.isolatedGit) {
+			throw new Error("isolated Git requires a runtime-managed isolated worktree handle; refusing ordinary checkout execution");
+		}
+		if (options.isolatedGit) {
+			if (!options.sandbox || options.sandbox.provider !== "bubblewrap" || resolveGitMode(options.sandbox) !== "isolated") {
+				throw new Error("isolated Git requires the Bubblewrap sandbox and an explicit isolated Git mode");
+			}
+			result.sandbox = sandboxResultDetails(options.sandbox);
+			effectiveSandboxMounts = buildSubagentSandboxMounts({
+				cwd: childCwd,
+				includeCwd: false,
+				tempDir,
+				sessionDir: options.sessionDir,
+				sessionFile: options.sessionFile,
+				artifactsDir: options.artifactsDir,
+				jsonlPath: shared.jsonlPath,
+				outputPath: options.outputPath,
+				progressPaths: options.progressPaths,
+				structuredOutput: options.structuredOutput,
+				piArgs: args,
+				spawnCommand: piSpawnSpec.command,
+				spawnArgs: piSpawnSpec.args,
+				authMode: options.sandbox.auth,
+				packageRoots: projectLocalPackageResources?.packageRoots,
+				extraReadOnlyMounts: options.sandbox.extraReadOnlyMounts,
+				extraWritableMounts: options.sandbox.extraWritableMounts,
+				protectedGitPaths: options.isolatedGit.runtime.parentGitPaths,
+				intercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
+				nestedRoute: options.nestedRoute,
+			});
+			const wrapped = options.isolatedGit.runtime.wrapInvocation(options.isolatedGit, piInvocation, effectiveSandboxMounts, options.sandbox);
+			spawnSpec = {
+				command: wrapped.command,
+				args: wrapped.args,
+				cwd: wrapped.cwd ?? childCwd,
+				env: wrapped.env ?? spawnEnv,
+			};
+		} else if (options.sandbox) {
 			result.sandbox = sandboxResultDetails(options.sandbox);
 			const provider = createSandboxProvider(options.sandbox);
 			const cwdMode = inferSandboxCwdWritable({ agentName: agent.name, tools: agent.tools, sandbox: options.sandbox }) ? "rw" : "ro";
@@ -307,6 +350,7 @@ async function runSingleAttempt(
 			effectiveSandboxMounts = buildSubagentSandboxMounts({
 				cwd: childCwd,
 				cwdMode,
+				gitMode: options.sandbox.gitMode,
 				tempDir,
 				sessionDir: options.sessionDir,
 				sessionFile: options.sessionFile,
@@ -1313,6 +1357,29 @@ export async function runSync(
 		if (result.progress) {
 			result.progress.status = "failed";
 			result.progress.error = result.error;
+		}
+	}
+
+	if (options.isolatedGit && result.exitCode === 0 && !result.error && !result.detached && !result.interrupted) {
+		try {
+			const bundle = exportIsolatedGitBundle(options.isolatedGit.runtime, {
+				outputDir: options.isolatedGitBundleDir ?? path.join(options.artifactsDir ?? os.tmpdir(), "isolated-git-bundles"),
+				worktree: options.isolatedGit,
+			});
+			result.gitBundle = {
+				path: bundle.path,
+				checksum: bundle.checksum,
+				base: bundle.base,
+				head: bundle.head,
+				commitSummary: bundle.commitSummary,
+			};
+		} catch (error) {
+			result.exitCode = 1;
+			result.error = `Isolated Git bundle export failed: ${error instanceof Error ? error.message : String(error)}`;
+			if (result.progress) {
+				result.progress.status = "failed";
+				result.progress.error = result.error;
+			}
 		}
 	}
 

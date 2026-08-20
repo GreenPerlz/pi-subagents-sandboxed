@@ -17,6 +17,8 @@ interface MockPiResponse {
 		jsonl?: unknown[];
 		stderr?: string;
 	}>;
+	/** Test-only shell commands executed in the child cwd before output. */
+	commands?: string[];
 	echoEnv?: string[];
 	blockArtifactOutput?: boolean;
 	blockRunnerEventsAfterChild?: boolean;

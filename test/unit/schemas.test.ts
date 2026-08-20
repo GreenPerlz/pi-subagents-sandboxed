@@ -162,12 +162,14 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			"extraReadOnlyMounts",
 			"extraWritableMounts",
 			"fallback",
+			"gitMode",
 			"network",
 			"packageDiscovery",
 			"profile",
 			"provider",
 			"trustProject",
 		]);
+		assert.equal(sandboxSchema.properties?.gitMode?.type, "string");
 		assert.equal(sandboxSchema.properties?.provider?.type, "string");
 		assert.equal(sandboxSchema.properties?.profile?.type, "string");
 		assert.equal(sandboxSchema.properties?.network?.type, "string");

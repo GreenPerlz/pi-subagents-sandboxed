@@ -169,6 +169,7 @@ export interface SubagentResultIntercomChild {
 	fastMode?: FastModeStatus;
 	index?: number;
 	artifactPath?: string;
+	gitBundle?: GitBundleResult;
 	sessionPath?: string;
 	intercomTarget?: string;
 	children?: PublicNestedRunSummary[];
@@ -416,6 +417,14 @@ export interface AcceptanceLedger {
 	};
 }
 
+export interface GitBundleResult {
+	path: string;
+	checksum: string;
+	base: string;
+	head: string;
+	commitSummary: string;
+}
+
 export interface SingleResult {
 	agent: string;
 	task: string;
@@ -451,6 +460,7 @@ export interface SingleResult {
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
 	sandbox?: SandboxResultDetails;
+	gitBundle?: GitBundleResult;
 }
 
 export interface Details {
@@ -665,6 +675,7 @@ export interface AsyncStatus {
 		structuredOutputSchemaPath?: string;
 		acceptance?: AcceptanceLedger;
 		sandbox?: SandboxResultDetails;
+		gitBundle?: GitBundleResult;
 	}>;
 	sessionDir?: string;
 	outputFile?: string;
@@ -847,6 +858,12 @@ export interface RunSyncOptions {
 	modelOverride?: string;
 	/** Request the provider priority service tier; eligibility is evaluated per candidate. */
 	fastMode?: boolean;
+	/** Runtime-managed isolated Git worktree. Isolated mode never infers this from a path. */
+	isolatedGit?: import("../sandbox/isolated-git.ts").IsolatedGitWorktree;
+	/** Destination for the single successful-run isolated Git bundle. */
+	isolatedGitBundleDir?: string;
+	/** Internal continuation guard: finalization turns must not export twice. */
+	exportIsolatedGitBundle?: boolean;
 	/** Registry models available for heuristic bare-model resolution and provider trust checks. */
 	availableModels?: Array<{ provider: string; id: string; fullId: string; api?: string; baseUrl?: string }>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */

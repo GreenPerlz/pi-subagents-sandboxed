@@ -9,7 +9,7 @@ Sandboxing happens in three stages:
 1. **Resolve config** in `src/sandbox/config.ts`
    - precedence: **run options > agent frontmatter > settings defaults**
    - `extraReadOnlyMounts` and `extraWritableMounts` are **additive** across those layers
-   - if `provider` is omitted or set to `none`, the run is **not sandboxed**
+   - if `provider` is omitted, Bubblewrap is the safe default; only explicit `none` opts out
    - default auth becomes `pi-json` whenever a provider is configured
 
 2. **Build mounts** in `src/sandbox/mount-policy.ts`
@@ -90,10 +90,16 @@ sandboxPackageDiscovery: closed
 
 ## Supported modes today
 
+### Git mode
+
+- Omitted and `read-only` are the safe default. In a Bubblewrap run, read-only mode protects the visible `.git` metadata from writes.
+- `isolated` is opt-in only. It requires Linux, `bubblewrap`, a runtime-created worktree handle, and both parent `user.name` and `user.email`. The runtime builds a sanitized exact-base object history, never mounts the parent common `.git`, disables remotes/credentials/hooks/signing/editors, and exports one compact successful-run bundle containing portable metadata. Ordinary checkouts, unsupported providers/platforms, inherited `GIT_*` redirection, and writable mounts overlapping parent `.git` fail closed.
+- Configure `sandboxGitMode: isolated` in agent frontmatter, `sandbox.gitMode` in settings/run configuration, or use the guarded `sandbox.gitMode` run override. An omitted/custom agent remains read-only unless it explicitly opts in.
+
 ### Provider
 
 - `bubblewrap`: wraps the child with `bwrap`
-- `none` or omitted: no sandbox
+- `none`: explicit opt-out with no sandbox; an omitted provider defaults to `bubblewrap`
 
 ### Profile
 

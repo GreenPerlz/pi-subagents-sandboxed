@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -260,6 +260,11 @@ async function main() {
 	const response = claimNextResponse(queueDir) ?? defaultResponse();
 	writeSessionFile(args);
 	writeResponseFiles(response);
+	for (const command of Array.isArray(response.commands) ? response.commands : []) {
+		const commandResult = spawnSync("sh", ["-c", command], { stdio: "inherit", cwd: process.cwd(), env: process.env });
+		if (commandResult.error) fail(commandResult.error.message);
+		if ((commandResult.status ?? 1) !== 0) fail(`mock command failed (${commandResult.status}): ${command}`);
+	}
 	blockArtifactOutput(response);
 	blockRunnerEventsAfterChild(response);
 	fs.writeFileSync(

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -298,7 +299,7 @@ describe("worktree", () => {
 		const repoDir = createRepo("pi-worktree-cleanup-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "cleanup", 2);
+			setup = createWorktrees(repoDir, `cleanup-${randomUUID()}`, 2);
 			const worktreePaths = setup.worktrees.map((worktree) => worktree.path);
 			const branches = setup.worktrees.map((worktree) => worktree.branch);
 			cleanupWorktrees(setup);

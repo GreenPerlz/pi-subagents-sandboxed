@@ -116,7 +116,7 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, cwd), "ro");
 	});
 
-	it("does not add an extra gitdir mount for a normal repo with a .git directory", () => {
+	it("mounts normal repo .git metadata read-only even when cwd is writable", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));
 		const gitDir = mkdirp(path.join(cwd, ".git"));
@@ -124,7 +124,7 @@ describe("subagent sandbox mount policy", () => {
 		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: "ro" });
 
 		assert.equal(mountMode(mounts, cwd), "ro");
-		assert.equal(mountMode(mounts, gitDir), undefined);
+		assert.equal(mountMode(mounts, gitDir), "ro");
 	});
 
 	it("auto-mounts a linked worktree .git pointer gitdir read-only without changing cwd writability", () => {
@@ -336,6 +336,146 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, toolchain), "ro");
 		assert.equal(mountMode(mounts, writableCache), "rw");
 		assert.equal(fs.existsSync(writableCache), true, "writable explicit mounts should be created before bwrap binds them");
+	});
+
+	it("rejects every generated writable runtime path that overlaps ordinary Git metadata", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "ordinary"));
+		const gitDir = mkdirp(path.join(cwd, ".git"));
+		const candidates: Array<[string, Parameters<typeof buildSubagentSandboxMounts>[0]]> = [
+			["session", { sessionDir: path.join(gitDir, "session") }],
+			["artifacts", { artifactsDir: path.join(gitDir, "artifacts") }],
+			["output", { outputPath: path.join(gitDir, "output.md") }],
+			["jsonl", { jsonlPath: path.join(gitDir, "logs", "child.jsonl") }],
+			["progress", { progressPaths: [path.join(gitDir, "progress.md")] }],
+			["status", { statusPaths: [path.join(gitDir, "status.json")] }],
+			["structured output", { structuredOutput: { outputPath: path.join(gitDir, "structured", "result.json") } }],
+			["ancestor", { sessionDir: cwd }],
+		];
+		for (const [label, extra] of candidates) {
+			assert.throws(
+				() => buildSubagentSandboxMounts({ cwd, cwdMode: "rw", ...extra }),
+				/overlaps protected Git metadata/i,
+				label,
+			);
+		}
+	});
+
+	it("rejects generated writable runtime paths through linked-worktree metadata, ancestors, and symlinks", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "linked"));
+		const common = mkdirp(path.join(root, "repo", ".git"));
+		const gitdir = mkdirp(path.join(common, "worktrees", "linked"));
+		fs.writeFileSync(path.join(gitdir, "commondir"), "../..\n", "utf-8");
+		fs.writeFileSync(path.join(cwd, ".git"), `gitdir: ${path.relative(cwd, gitdir)}\n`, "utf-8");
+		const linkedAlias = path.join(root, "linked-alias");
+		fs.symlinkSync(common, linkedAlias, "dir");
+		const candidates: Array<[string, Parameters<typeof buildSubagentSandboxMounts>[0]]> = [
+			["gitdir descendant", { sessionDir: path.join(gitdir, "generated") }],
+			["common metadata", { artifactsDir: common }],
+			["common ancestor", { outputPath: path.join(root, "repo", "output.md") }],
+			["symlinked metadata suffix", { statusPaths: [path.join(linkedAlias, "new", "status.json")] }],
+			["symlinked metadata ancestor", { progressPaths: [linkedAlias] }],
+		];
+		for (const [label, extra] of candidates) {
+			assert.throws(
+				() => buildSubagentSandboxMounts({ cwd, cwdMode: "rw", ...extra }),
+				/overlaps protected Git metadata/i,
+				label,
+			);
+		}
+	});
+
+	it("rejects generated and resource writable mounts before mutation when isolated Git supplies parent metadata", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "private-worktree"));
+		const parentGitDir = mkdirp(path.join(root, "parent", ".git"));
+		const generated = path.join(parentGitDir, "generated", "out.md");
+		const resource = path.join(parentGitDir, "resources", "cache");
+
+		for (const [label, extra] of [
+			["generated output", { outputPath: generated }],
+			["resource mount", { extraWritableMounts: [resource] }],
+		] as const) {
+			assert.throws(
+				() => buildSubagentSandboxMounts({ cwd, includeCwd: false, protectedGitPaths: [parentGitDir], ...extra }),
+				/overlaps protected Git metadata/i,
+				label,
+			);
+		}
+		assert.equal(fs.existsSync(path.dirname(generated)), false, "rejected generated output must not create a parent directory");
+		assert.equal(fs.existsSync(resource), false, "rejected resource mount must not create a directory");
+	});
+
+	it("validates every writable candidate before creating an earlier benign candidate", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "private-worktree"));
+		const parentGitDir = mkdirp(path.join(root, "parent", ".git"));
+		const protectedGitPaths = [parentGitDir];
+
+		const generatedParent = path.join(root, "generated", "nested");
+		assert.throws(
+			() => buildSubagentSandboxMounts({
+				cwd,
+				includeCwd: false,
+				protectedGitPaths,
+				outputPath: path.join(generatedParent, "out.md"),
+				extraWritableMounts: [path.join(parentGitDir, "unsafe")],
+			}),
+			/overlaps protected Git metadata/i,
+		);
+		assert.equal(fs.existsSync(generatedParent), false, "a later unsafe extra mount must not leave a generated parent behind");
+
+		const sessionParent = path.join(root, "sessions", "nested");
+		assert.throws(
+			() => buildSubagentSandboxMounts({
+				cwd,
+				includeCwd: false,
+				protectedGitPaths,
+				sessionFile: path.join(sessionParent, "session.jsonl"),
+				extraWritableMounts: [path.join(parentGitDir, "unsafe-session")],
+			}),
+			/overlaps protected Git metadata/i,
+		);
+		assert.equal(fs.existsSync(sessionParent), false, "a later unsafe extra mount must not leave a session parent behind");
+
+		const benignResource = path.join(root, "resources", "cache");
+		assert.throws(
+			() => buildSubagentSandboxMounts({
+				cwd,
+				includeCwd: false,
+				protectedGitPaths,
+				extraWritableMounts: [benignResource, path.join(parentGitDir, "unsafe-resource")],
+			}),
+			/overlaps protected Git metadata/i,
+		);
+		assert.equal(fs.existsSync(benignResource), false, "a later unsafe extra mount must not leave an earlier resource behind");
+	});
+
+	it("rejects writable extra mounts that overlap ordinary or linked-worktree Git metadata", () => {
+		const root = tempRoot();
+		const ordinary = mkdirp(path.join(root, "ordinary"));
+		mkdirp(path.join(ordinary, ".git"));
+		assert.throws(
+			() => buildSubagentSandboxMounts({ cwd: ordinary, cwdMode: "rw", extraWritableMounts: [path.join(ordinary, ".git")] }),
+			/overlaps protected Git metadata/i,
+		);
+		assert.throws(
+			() => buildSubagentSandboxMounts({ cwd: ordinary, cwdMode: "rw", extraWritableMounts: [ordinary] }),
+			/overlaps protected Git metadata/i,
+		);
+
+		const linked = mkdirp(path.join(root, "linked"));
+		const common = mkdirp(path.join(root, "repo", ".git"));
+		const gitdir = mkdirp(path.join(common, "worktrees", "linked"));
+		fs.writeFileSync(path.join(gitdir, "commondir"), "../..\n", "utf-8");
+		fs.writeFileSync(path.join(linked, ".git"), `gitdir: ${path.relative(linked, gitdir)}\n`, "utf-8");
+		for (const candidate of [gitdir, common, path.join(common, "objects")]) {
+			assert.throws(
+				() => buildSubagentSandboxMounts({ cwd: linked, cwdMode: "rw", extraWritableMounts: [candidate] }),
+				/overlaps protected Git metadata/i,
+			);
+		}
 	});
 
 	it("mounts Pi auth and subagent JSON read-only but NOT settings JSON when pi-json auth mode is requested", () => {

@@ -583,6 +583,8 @@ describe("sandbox preflight: orchestrator integration", () => {
 		SUBAGENT_PARENT_CHILD_INDEX_ENV,
 		SUBAGENT_CHILD_AGENT_ENV,
 		SUBAGENT_RUN_ID_ENV,
+		"PI_SUBAGENT_DEPTH",
+		"PI_SUBAGENT_MAX_DEPTH",
 	];
 	let savedEnv: Record<string, string | undefined> | undefined;
 
@@ -590,6 +592,7 @@ describe("sandbox preflight: orchestrator integration", () => {
 		savedEnv = {};
 		for (const key of envKeys) {
 			savedEnv[key] = process.env[key];
+			delete process.env[key];
 		}
 	}
 
@@ -686,6 +689,101 @@ describe("sandbox preflight: orchestrator integration", () => {
 			// Then execution proceeds and hits the throwing model registry
 			assert.equal(result.isError, true);
 			assert.match(text(result), /worker reached execution/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("skips Ralph preflight when the run explicitly opts out with provider none", async () => {
+		saveAndClearEnv();
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-none-"));
+		tempDirs.push(root);
+		try {
+			const route = createNestedRoute("root-preflight-none");
+			routeRoots.push(path.dirname(route.eventSink));
+			setRalphOrchestratorNestedEnv(route, "ralph-preflight-none-run");
+			const throwingCtx = {
+				...testCtx(root),
+				modelRegistry: { getAvailable() { throw new Error("worker reached execution"); } },
+			};
+			const executor = createTestExecutor(undefined, [{
+				name: "worker",
+				description: "Worker",
+				prompt: "Do work",
+				canBeChangedByAgent: ["sandbox.provider"],
+			}]);
+
+			const result = await executor.execute(
+				"run",
+				{ agent: "worker", task: "go", sandbox: { provider: "none" } },
+				new AbortController().signal,
+				undefined,
+				throwingCtx,
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), /worker reached execution/);
+			assert.doesNotMatch(text(result), /Ralph orchestrator sandbox preflight failed/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed for provider none plus isolated Git while preserving inherited opt-out", async () => {
+		saveAndClearEnv();
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-contradictory-sandbox-"));
+		tempDirs.push(root);
+		git(root, ["init"]);
+		git(root, ["config", "user.email", "tests@example.com"]);
+		git(root, ["config", "user.name", "Preflight Tests"]);
+		fs.writeFileSync(path.join(root, "README.md"), "initial\n", "utf-8");
+		git(root, ["add", "-A"]);
+		git(root, ["commit", "-m", "init"]);
+		fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(root, ".pi", "settings.json"), JSON.stringify({ subagents: { sandbox: { defaultProvider: "bubblewrap", gitMode: "isolated" } } }), "utf-8");
+		try {
+			const inheritedRoute = createNestedRoute("root-preflight-inherited-none");
+			routeRoots.push(path.dirname(inheritedRoute.eventSink));
+			setRalphOrchestratorNestedEnv(inheritedRoute, "ralph-preflight-inherited-none-run");
+			const inheritedExecutor = createTestExecutor(undefined, [{
+				name: "worker",
+				description: "Worker",
+				prompt: "Do work",
+				canBeChangedByAgent: ["sandbox.provider", "sandbox.gitMode"],
+			}]);
+			const inheritedResult = await inheritedExecutor.execute(
+				"run",
+				{ agent: "worker", task: "go", sandbox: { provider: "none" } },
+				new AbortController().signal,
+				undefined,
+				{
+					...testCtx(root),
+					modelRegistry: { getAvailable() { throw new Error("worker reached execution"); } },
+				},
+			);
+			assert.equal(inheritedResult.isError, true);
+			assert.match(text(inheritedResult), /worker reached execution/);
+			assert.doesNotMatch(text(inheritedResult), /sandbox preflight failed/i);
+
+			const contradictoryRoute = createNestedRoute("root-preflight-contradictory-none");
+			routeRoots.push(path.dirname(contradictoryRoute.eventSink));
+			setRalphOrchestratorNestedEnv(contradictoryRoute, "ralph-preflight-contradictory-none-run");
+			const contradictoryExecutor = createTestExecutor(undefined, [{
+				name: "worker",
+				description: "Worker",
+				prompt: "Do work",
+				canBeChangedByAgent: ["sandbox.provider", "sandbox.gitMode"],
+			}]);
+			await assert.rejects(
+				() => contradictoryExecutor.execute(
+					"run",
+					{ agent: "worker", task: "go", sandbox: { provider: "none", gitMode: "isolated" } },
+					new AbortController().signal,
+					undefined,
+					testCtx(root),
+				),
+				/Explicit provider 'none'.*isolated Git/i,
+			);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

@@ -1,7 +1,10 @@
 export type SandboxPackageDiscoveryMode = "closed" | "project-local" | "ambient";
+export type GitMode = "read-only" | "isolated";
 
 export interface SandboxRunConfig {
 	provider?: string;
+	/** Git access policy for this child; omitted preserves the read-only default. */
+	gitMode?: GitMode | string;
 	profile?: string;
 	network?: string;
 	trustProject?: boolean;
@@ -17,6 +20,8 @@ export interface AgentSandboxConfig extends SandboxRunConfig {}
 
 export interface SandboxSettingsDefaults {
 	defaultProvider?: string;
+	/** Default Git access policy. Unconfigured agents remain read-only. */
+	gitMode?: GitMode | string;
 	defaultProfile?: string;
 	network?: string;
 	auth?: string;
@@ -29,6 +34,7 @@ export interface SandboxSettingsDefaults {
 
 export interface ResolvedSandboxConfig {
 	provider: string;
+	gitMode?: GitMode | string;
 	profile?: string;
 	network?: string;
 	trustProject?: boolean;
@@ -52,6 +58,8 @@ export type SandboxMountMode = "ro" | "rw";
 export interface SandboxMount {
 	source: string;
 	mode: SandboxMountMode;
+	/** Optional sandbox destination for policy overlays (defaults to source). */
+	target?: string;
 }
 
 export type SandboxDiagnosticLevel = "info" | "warning" | "error";
@@ -81,6 +89,7 @@ export interface SandboxWrapResult {
 
 export interface SandboxResultDetails {
 	provider: string;
+	gitMode?: GitMode | string;
 	profile: string;
 	network: string;
 	auth: string;

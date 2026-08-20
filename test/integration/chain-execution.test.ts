@@ -12,6 +12,7 @@ import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
 import {
@@ -93,6 +94,7 @@ interface ChainResultItem {
 	skills?: string[];
 	acceptance?: { status?: string; verifyRuns?: Array<{ status?: string }>; childReport?: unknown; runtimeChecks?: Array<{ status?: string; id?: string }> };
 	savedOutputPath?: string;
+	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
 }
 
 interface ChainExecutionResult {
@@ -156,6 +158,7 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 			sessionDirForIndex: () => undefined,
 			artifactsDir,
 			artifactConfig: { enabled: false },
+			sandbox: { provider: "none" },
 			clarify: false,
 			...overrides,
 		};
@@ -1255,6 +1258,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 			sessionDirForIndex: () => undefined,
 			artifactsDir: path.join(tempDir, "artifacts"),
 			artifactConfig: { enabled: false },
+			sandbox: { provider: "none" },
 			clarify: false,
 			...overrides,
 		};
@@ -1289,6 +1293,50 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 
 		assert.ok(!result.isError, `should succeed: ${JSON.stringify(result.content)}`);
 		assert.equal(result.details.results.length, 2);
+	});
+
+	it("shares one isolated Git base across a real foreground chain and cleans every writable layer", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf-8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "isolated-chain-repo");
+		fs.mkdirSync(repoDir, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.email", "chain@example.invalid"], ["config", "user.name", "Chain Parent"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repoDir, "base.txt"), "base\n", "utf-8");
+		fs.mkdirSync(path.join(repoDir, "packages", "app"), { recursive: true });
+		fs.writeFileSync(path.join(repoDir, "packages", "app", "seed.txt"), "seed\n", "utf-8");
+		for (const args of [["add", "base.txt", "packages/app/seed.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const base = spawnSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf-8" }).stdout.trim();
+		const runId = "isolated-chain-cleanup";
+		const runtimePrefix = `pi-isolated-git-${runId}-isolated-`;
+		const runtimeRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix)));
+		const agents = [makeAgent("isolated-a", { tools: ["read", "bash"] }), makeAgent("isolated-b", { tools: ["read", "bash"] })];
+		const commitCommand = "printf 'child\\n' > child.txt && git add child.txt && git commit -m 'isolated chain child'";
+		mockPi.onCall({ output: "isolated chain A", commands: [commitCommand] });
+		mockPi.onCall({ output: "isolated chain B", commands: [commitCommand] });
+		const result = await executeChain(
+			makeChainParams(
+				[{ parallel: [{ agent: "isolated-a", task: "Commit A", cwd: "packages/app" }, { agent: "isolated-b", task: "Commit B", cwd: "packages/app" }] }],
+				agents,
+				{
+					cwd: repoDir,
+					ctx: makeMinimalCtx(repoDir),
+					runId,
+					sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+				},
+			),
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.equal(result.details.results.length, 2);
+		const bundles = result.details.results.map((child) => child.gitBundle);
+		assert.equal(bundles.every((bundle) => bundle?.base === base && fs.existsSync(bundle.path)), true);
+		assert.notEqual(bundles[0]?.path, bundles[1]?.path);
+		assert.equal(spawnSync("git", ["-C", repoDir, "status", "--porcelain=v1"], { encoding: "utf-8" }).stdout, "");
+		const leakedRuntimeRoots = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix) && !runtimeRootsBefore.has(entry));
+		assert.deepEqual(leakedRuntimeRoots, [], "foreground chain must remove its private isolated Git runtime root");
 	});
 
 	it("preserves chain worktrees after a post-child artifact rejection", async () => {

@@ -116,7 +116,7 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 	});
 
 	function makeExecutor(agents = [makeAgent("echo")], artifactsDir = tempDir) {
-		return createSubagentExecutor({
+		const baseExecutor = createSubagentExecutor({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
 			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
 			config: {},
@@ -126,6 +126,14 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 			expandTilde: (value: string) => value,
 			discoverAgents: () => ({ agents }),
 		});
+		return {
+			...baseExecutor,
+			execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: ((r: unknown) => void) | undefined, ctx: unknown) =>
+				baseExecutor.execute(id, {
+					...params,
+					...(!params.sandbox && !agents.some((agent) => agent.sandbox) ? { sandbox: { provider: "none" } } : {}),
+				}, signal, onUpdate as never, ctx as never),
+		};
 	}
 
 	function readLastCallArgs(): string[] {
@@ -304,7 +312,7 @@ process.exit(child.status ?? 0);
 		const liveModels: (string | undefined)[] = [];
 		const executePromise = executor.execute(
 			"parallel-runtime-model",
-			{ tasks: [{ agent: "echo", task: "Task" }] },
+			{ tasks: [{ agent: "echo", task: "Task" }], sandbox: { provider: "none" } },
 			new AbortController().signal,
 			() => {
 				liveModels.push(currentControl()?.currentModel);
@@ -591,6 +599,24 @@ Inspect`));
 		} finally {
 			fakeBwrap.restore();
 		}
+	});
+
+	it("rejects mixed isolated and non-isolated parallel writers before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const isolated = makeAgent("isolated", { tools: ["read", "bash"], sandbox: { provider: "bubblewrap", gitMode: "isolated" } });
+		const writer = makeAgent("writer", { tools: ["read", "write"] });
+		const executor = makeExecutor([isolated, writer]);
+
+		const result = await executor.execute(
+			"parallel-mixed-isolated-writers",
+			{ tasks: [{ agent: "isolated", task: "Commit A" }, { agent: "writer", task: "Commit B" }] },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /non-isolated write-capable task/i);
+		assert.equal(mockPi.callCount(), 0);
 	});
 
 	it("rejects sandboxed parallel agents with omitted tools unless worktree isolation is enabled", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

@@ -11,6 +11,7 @@
 
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -87,6 +88,7 @@ interface RunSyncResult {
 	outputReference?: { path: string; bytes: number; lines: number; message: string };
 	outputSaveError?: string;
 	sessionFile?: string;
+	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
 	sandbox?: {
 		provider?: string;
 		profile?: string;
@@ -397,7 +399,7 @@ process.exit(${exitCode});
 			events?: ReturnType<typeof createEventBus>;
 		} = {},
 	) {
-		return createSubagentExecutor!({
+		const baseExecutor = createSubagentExecutor!({
 			pi: { events: overrides.events ?? createEventBus(), getSessionName: overrides.getSessionName ?? (() => undefined) },
 			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
 			config: overrides.config ?? {},
@@ -407,6 +409,15 @@ process.exit(${exitCode});
 			expandTilde: (value: string) => value,
 			discoverAgents: () => ({ agents }),
 		});
+		return {
+			...baseExecutor,
+			execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: ((r: unknown) => void) | undefined, ctx: unknown) =>
+				baseExecutor.execute(id, {
+					...params,
+					...(!params.sandbox && !agents.some((agent) => agent.sandbox) && agents.every((agent) => !agent.canBeChangedByAgent || agent.canBeChangedByAgent.includes("*") || agent.canBeChangedByAgent.includes("sandbox.provider"))
+						? { sandbox: { provider: "none" } } : {}),
+				}, signal, onUpdate as never, ctx as never),
+		};
 	}
 
 	function canonicalFastModeCtx() {
@@ -708,7 +719,7 @@ process.exit(${exitCode});
 	it("rejects denied parallel, chain, dynamic, and async overrides before spawning", async () => {
 		const executor = makeExecutor([
 			makeAgent("one", { canBeChangedByAgent: ["outputSchema"] }),
-			makeAgent("two", { canBeChangedByAgent: [] }),
+			makeAgent("two", { canBeChangedByAgent: ["sandbox.provider"] }),
 		]);
 		const cases = [
 			{
@@ -1443,7 +1454,7 @@ process.exit(${exitCode});
 		const liveModels: (string | undefined)[] = [];
 		const executePromise = executor.execute(
 			"single-runtime-model",
-			{ agent: "echo", task: "Task" },
+			{ agent: "echo", task: "Task", sandbox: { provider: "none" } },
 			new AbortController().signal,
 			() => {
 				liveModels.push(currentControl()?.currentModel);
@@ -2141,6 +2152,73 @@ process.exit(${exitCode});
 		}
 	});
 
+	it("runs a positive foreground isolated Git execution through the executor and preserves the parent", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = path.join(tempDir, "isolated-executor-repo");
+		fs.mkdirSync(repo, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.name", "Executor Parent"], ["config", "user.email", "executor@example.invalid"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const before = spawnSync("git", ["-C", repo, "status", "--porcelain=v1"], { encoding: "utf8" }).stdout;
+		mockPi.onCall({
+			output: "isolated executor complete",
+			commands: ["printf 'child\\n' > child.txt && git add child.txt && git commit -m 'isolated executor commit'"],
+		});
+		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
+		const result = await executor.execute(
+			"isolated-foreground-executor",
+			{ agent: "worker", task: "Commit the isolated child change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(repo),
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.match(result.content[0]?.text ?? "", /isolated executor complete/);
+		const child = result.details.results[0];
+		assert.equal(child?.gitBundle?.base, spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim());
+		assert.ok(child?.gitBundle?.path && fs.existsSync(child.gitBundle.path));
+		assert.equal(spawnSync("git", ["-C", repo, "status", "--porcelain=v1"], { encoding: "utf8" }).stdout, before);
+	});
+
+	it("defaults an unconfigured writer to read-only Git metadata through the executor", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = path.join(tempDir, "default-read-only-repo");
+		fs.mkdirSync(repo, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.name", "Executor Parent"], ["config", "user.email", "executor@example.invalid"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		mockPi.onCall({ commands: ["git config --local sandbox.mutation blocked"] });
+		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
+		const result = await executor.execute(
+			"default-read-only-git",
+			{ agent: "worker", task: "Attempt a Git metadata change", sandbox: { extraWritableMounts: [mockPi.dir] } },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(repo),
+		);
+		assert.equal(result.isError, true);
+		assert.equal(spawnSync("git", ["-C", repo, "config", "--local", "--get", "sandbox.mutation"], { encoding: "utf8" }).status, 1);
+	});
+
+	it("fails closed when isolated Git is configured without a runtime-managed worktree handle", async () => {
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Need isolated Git", {
+			sandbox: { provider: "bubblewrap", gitMode: "isolated" },
+		});
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /runtime-managed isolated worktree handle/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
 	it("reports sandbox setup failures as foreground subagent errors", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const previousPath = process.env.PATH;
 		process.env.PATH = path.join(path.dirname(mockPi.dir), "bin");
@@ -2384,7 +2462,7 @@ process.exit(${exitCode});
 
 	it("executor run override tightens an inherited nested max depth", async () => {
 		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"] });
-		const executor = makeExecutor([makeAgent("echo", { canBeChangedByAgent: ["maxSubagentDepth"] })]);
+		const executor = makeExecutor([makeAgent("echo", { canBeChangedByAgent: ["maxSubagentDepth", "sandbox.provider"] })]);
 		const prevDepth = process.env.PI_SUBAGENT_DEPTH;
 		const prevMaxDepth = process.env.PI_SUBAGENT_MAX_DEPTH;
 		process.env.PI_SUBAGENT_DEPTH = "1";

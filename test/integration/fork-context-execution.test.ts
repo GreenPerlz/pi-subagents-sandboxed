@@ -144,7 +144,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 				})),
 			};
 		};
-		return Object.assign(createSubagentExecutor({
+		const baseExecutor = createSubagentExecutor({
 			pi: {
 				events: eventsApi,
 				getSessionName: () => sessionName,
@@ -160,7 +160,16 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			getSubagentSessionRoot: () => tempDir,
 			expandTilde: (p: string) => p,
 			discoverAgents: discoverForTest,
-		}), { eventsApi });
+		});
+		const executor = {
+			...baseExecutor,
+			execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: ((r: unknown) => void) | undefined, ctx: unknown) =>
+				baseExecutor.execute(id, {
+					...params,
+					...(!params.sandbox && !params.worktree ? { sandbox: { provider: "none" } } : {}),
+				}, signal, onUpdate as never, ctx as never),
+		};
+		return Object.assign(executor, { eventsApi });
 	}
 
 	function readCallArgs(): string[] {

@@ -38,6 +38,7 @@ export function sandboxResultDetails(config: ResolvedSandboxConfig, wrapResult?:
 	const mounts = redactMounts(wrapResult?.mounts);
 	return {
 		provider: config.provider,
+		...(config.gitMode !== undefined ? { gitMode: config.gitMode } : {}),
 		profile: config.profile ?? "host-toolchain",
 		network: config.network ?? "host",
 		auth: config.auth ?? "pi-json",

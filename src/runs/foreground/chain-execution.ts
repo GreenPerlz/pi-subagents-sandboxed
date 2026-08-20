@@ -7,7 +7,8 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
-import { resolveSandboxConfig } from "../../sandbox/config.ts";
+import { resolveSandboxConfig, resolveGitMode } from "../../sandbox/config.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, cleanupIsolatedGitRuntime, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import {
@@ -64,7 +65,7 @@ import {
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
-import { hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { resolveModelCandidate } from "../shared/model-fallback.ts";
 import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { injectSingleOutputInstruction, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -143,6 +144,7 @@ interface ParallelChainRunInput {
 	dynamicChildren?: ChainExecutionDetailsInput["dynamicChildren"];
 	dynamicGroupStatuses?: ChainExecutionDetailsInput["dynamicGroupStatuses"];
 	worktreeSetup?: WorktreeSetup;
+	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[];
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
@@ -247,9 +249,14 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				?? resolveModelCandidate(taskAgentConfig?.model, input.availableModels, input.ctx.model?.provider);
 			const maxSubagentDepth = resolveChildMaxSubagentDepth(input.maxSubagentDepth, taskAgentConfig?.maxSubagentDepth);
 
-			const taskCwd = input.worktreeSetup
-				? input.worktreeSetup.worktrees[taskIndex]!.agentCwd
-				: resolveChildCwd(input.cwd ?? input.ctx.cwd, task.cwd);
+			const isolatedGit = input.isolatedGitWorktrees?.[taskIndex];
+			// Keep the requested parent cwd until runSingleAttempt maps it into the
+			// private worktree. This preserves task subdirectories for isolated Git.
+			const taskCwd = isolatedGit
+				? resolveChildCwd(input.cwd ?? input.ctx.cwd, task.cwd)
+				: (input.worktreeSetup
+					? input.worktreeSetup.worktrees[taskIndex]!.agentCwd
+					: resolveChildCwd(input.cwd ?? input.ctx.cwd, task.cwd));
 
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(input.chainDir, behavior.output))
@@ -323,6 +330,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
 				sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox,
+				isolatedGit,
+				isolatedGitBundleDir: input.artifactsDir,
 				sandboxIntercomBridge: input.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? input.progressPaths : undefined,
 				onUpdate: input.onUpdate
@@ -488,6 +497,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		chainDir: chainDirBase,
 	} = params;
 	const chainSkills = chainSkillsParam ?? [];
+	const sharedSandbox = params.sandbox?.provider === "none" ? undefined : params.sandbox;
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
 	const resolveStepSandbox = (agent: AgentConfig): ResolvedSandboxConfig | undefined => hasSandboxResolutionInputs
 		? resolveSandboxConfig({ settings: params.sandboxSettings, agent, run: params.sandboxRun })
@@ -555,6 +565,27 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	let tuiBehaviorOverrides: (BehaviorOverride | undefined)[] | undefined;
 	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const availableSkills = discoverAvailableSkills(cwd ?? ctx.cwd);
+	// A foreground chain owns one sanitized Git base for its entire top-level
+	// run. Each isolated child still receives a distinct writable metadata and
+	// worktree layer, while the packed base remains shared read-only.
+	let isolatedGitRuntime: IsolatedGitRuntime | undefined;
+	const ensureIsolatedGitRuntime = (sandbox: ResolvedSandboxConfig): IsolatedGitRuntime => {
+		if (resolveGitMode(sandbox) !== "isolated") throw new Error("isolated Git runtime requested for a non-isolated sandbox");
+		if (sandbox.provider !== "bubblewrap") throw new Error("isolated Git requires the Bubblewrap sandbox provider; refusing to downgrade");
+		if (!isolatedGitRuntime) {
+			isolatedGitRuntime = createIsolatedGitRuntime({
+				cwd: path.resolve(cwd ?? ctx.cwd),
+				runId: `${runId}-isolated`,
+				provider: sandbox.provider,
+				network: sandbox.network,
+				profile: sandbox.profile,
+				fallback: sandbox.fallback,
+				extraReadOnlyMounts: sandbox.extraReadOnlyMounts,
+				extraWritableMounts: sandbox.extraWritableMounts,
+			});
+		}
+		return isolatedGitRuntime;
+	};
 
 	if (shouldClarify) {
 		const seqSteps = chainSteps as SequentialStep[];
@@ -647,6 +678,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	let globalTaskIndex = 0;
 	let progressCreated = false;
 
+	try {
 	for (let stepIndex = 0; stepIndex < chainSteps.length; stepIndex++) {
 		const step = chainSteps[stepIndex]!;
 		const stepTemplates = templates[stepIndex]!;
@@ -658,13 +690,34 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
 			const stepSandboxes = stepAgentConfigs.map((agent) => resolveStepSandbox(agent));
-			if (!step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
+			const isolatedGitRequested = stepSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
+			if (isolatedGitRequested && step.worktree) {
+				return buildChainExecutionErrorResult("isolated Git cannot be combined with parent-managed worktree mode", makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+			}
+			if (isolatedGitRequested && stepAgentConfigs.some((agent, index) =>
+				stepSandboxes[index]?.gitMode !== "isolated"
+					&& inferSandboxCwdWritable({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] }),
+			)) {
+				return buildChainExecutionErrorResult("isolated Git parallel steps cannot include a non-isolated write-capable task", makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+			}
+			if (!isolatedGitRequested && !step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
 				return buildChainExecutionErrorResult(
 					sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`),
 					makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
 				);
 			}
 			let worktreeSetup: WorktreeSetup | undefined;
+			let isolatedGitWorktrees: (IsolatedGitWorktree | undefined)[] | undefined;
+			if (isolatedGitRequested) {
+				try {
+					const runtime = ensureIsolatedGitRuntime(stepSandboxes.find((sandboxConfig) => resolveGitMode(sandboxConfig) === "isolated")!);
+					isolatedGitWorktrees = step.parallel.map((task, index) => stepSandboxes[index]?.gitMode === "isolated"
+						? createIsolatedGitWorktree(runtime, { index: globalTaskIndex + index })
+						: undefined);
+				} catch (error) {
+					return buildChainExecutionErrorResult(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+				}
+			}
 			if (step.worktree) {
 				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(step.parallel, parallelCwd);
 				if (worktreeTaskCwdConflict) {
@@ -695,9 +748,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					const behavior = parallelBehaviors[taskIndex]!;
 					const task = step.parallel[taskIndex]!;
 					const taskAgentConfig = agents.find((agent) => agent.name === task.agent);
-					const taskCwd = worktreeSetup
-						? worktreeSetup.worktrees[taskIndex]!.agentCwd
-						: resolveChildCwd(cwd ?? ctx.cwd, task.cwd);
+					const taskCwd = isolatedGitWorktrees?.[taskIndex]
+						? resolveChildCwd(cwd ?? ctx.cwd, task.cwd)
+						: (worktreeSetup
+							? worktreeSetup.worktrees[taskIndex]!.agentCwd
+							: resolveChildCwd(cwd ?? ctx.cwd, task.cwd));
 					const outputPath = typeof behavior.output === "string"
 						? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
 						: undefined;
@@ -726,7 +781,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					originalTask,
 					ctx,
 					intercomEvents,
-					cwd,
+					// Preserve the chain step's requested parent cwd for isolated Git
+					// subdirectory mapping.
+					cwd: parallelCwd,
 					runId,
 					globalTaskIndex,
 					sessionDirForIndex,
@@ -751,8 +808,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					foregroundControl,
 					nestedRoute: params.nestedRoute,
 					worktreeSetup,
+					isolatedGitWorktrees,
 					maxSubagentDepth: params.maxSubagentDepth,
-					sandbox: params.sandbox,
+					sandbox: sharedSandbox,
 					sandboxes: stepSandboxes,
 					sandboxIntercomBridge: params.sandboxIntercomBridge,
 					progressPaths: [path.join(chainDir, "progress.md")],
@@ -1013,7 +1071,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				foregroundControl,
 				nestedRoute: params.nestedRoute,
 				maxSubagentDepth: params.maxSubagentDepth,
-				sandbox: params.sandbox,
+				sandbox: sharedSandbox,
 				sandboxes: dynamicParallelStep.parallel.map(() => dynamicSandbox),
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				progressPaths: [path.join(chainDir, "progress.md")],
@@ -1193,8 +1251,17 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const structuredRuntime = seqStep.outputSchema
 				? createStructuredOutputRuntime(seqStep.outputSchema, path.join(chainDir, "structured-output"))
 				: undefined;
+			let isolatedWorktree: IsolatedGitWorktree | undefined;
+			if (stepSandbox && resolveGitMode(stepSandbox) === "isolated") {
+				try {
+					isolatedWorktree = createIsolatedGitWorktree(ensureIsolatedGitRuntime(stepSandbox), { index: globalTaskIndex });
+				} catch (error) {
+					return buildChainExecutionErrorResult(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+				}
+			}
 			const r = await runSync(ctx.cwd, agents, seqStep.agent, stepTask, {
-				cwd: resolveChildCwd(cwd ?? ctx.cwd, seqStep.cwd),
+				// runSingleAttempt maps the exact requested repository/subdirectory cwd.
+				cwd: stepCwd,
 				signal,
 				interruptSignal: interruptController.signal,
 				allowIntercomDetach: agentConfig.systemPrompt?.includes(INTERCOM_BRIDGE_MARKER) === true,
@@ -1224,6 +1291,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				acceptance: seqStep.acceptance,
 				acceptanceContext: { mode: "chain" },
 				sandbox: stepSandbox,
+				isolatedGit: isolatedWorktree,
+				isolatedGitBundleDir: artifactsDir,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? [path.join(chainDir, "progress.md")] : undefined,
 				onUpdate: onUpdate
@@ -1346,4 +1415,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		details: buildChainExecutionDetails(makeDetailsInput()),
 		...(worktreeSummary ? { worktreeSummary } : {}),
 	};
+	} finally {
+		if (isolatedGitRuntime) cleanupIsolatedGitRuntime(isolatedGitRuntime);
+	}
 }

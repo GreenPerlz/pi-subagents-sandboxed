@@ -59,7 +59,7 @@ This page is the compact reference for persistent extension settings, agent Mark
 ### Sandbox defaults
 
 - **`sandbox`** — Groups default sandbox behavior inherited by agents and runs. Agent frontmatter overrides these defaults, and run-level sandbox fields override the agent.
-- **`sandbox.defaultProvider`** — Sets the default sandbox provider, normally `bubblewrap`. Omit it or use provider `none` at run level for no sandbox.
+- **`sandbox.defaultProvider`** — Sets the default sandbox provider, normally `bubblewrap`; omitting it also uses Bubblewrap, while an explicit run-level provider `none` opts out.
 - **`sandbox.defaultProfile`** — Sets the default sandbox profile, normally `host-toolchain`. The profile determines the base mounts and runtime shape.
 - **`sandbox.network`** — Uses `host` for normal network access or `none` for an isolated network namespace. Model/API calls generally require `host`.
 - **`sandbox.auth`** — Uses `pi-json` to mount Pi auth files read-only or `env` to rely on inherited credentials. Prefer `pi-json` when supported.
@@ -115,6 +115,7 @@ Guarded paths are `cwd`, `context`, `model`, `fastMode`, `skills`, `output`, `ou
 
 ### Agent sandbox
 
+- **`sandboxGitMode`** — Uses `read-only` by default. Opt into `isolated` only with `sandboxProvider: bubblewrap`; the runtime creates a private Git metadata/object layer from the exact assigned base, and exports a compact successful-run bundle. Isolated mode fails closed on ordinary checkouts, unsupported platforms/providers, missing Git identity, and unsafe writable mounts. A guarded `sandbox.gitMode` run override follows the same checks.
 - **`sandboxProvider`** — Sets this agent's sandbox provider, normally `bubblewrap`. It overrides the extension default.
 - **`sandboxProfile`** — Sets this agent's sandbox profile, normally `host-toolchain`. It controls the base sandbox environment.
 - **`sandboxNetwork`** — Sets this agent's network mode to values such as `host` or `none`. Offline mode prevents normal model/API access from inside the child process.

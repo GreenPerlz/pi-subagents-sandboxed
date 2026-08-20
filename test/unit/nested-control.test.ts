@@ -73,7 +73,7 @@ function createState(): SubagentState {
 }
 
 function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }, asyncByDefault = false) {
-	return createSubagentExecutor({
+	const baseExecutor = createSubagentExecutor({
 		pi: { events, getSessionName() { return "parent"; } } as any,
 		state,
 		config: { maxSubagentDepth: 2, control: {}, intercomBridge: {} } as any,
@@ -81,9 +81,14 @@ function createExecutor(state = createState(), agents: Array<Record<string, unkn
 		tempArtifactsDir: os.tmpdir(),
 		getSubagentSessionRoot: (parentSessionFile) => parentSessionFile ? path.join(path.dirname(parentSessionFile), path.basename(parentSessionFile, ".jsonl")) : os.tmpdir(),
 		expandTilde: (value) => value,
-		discoverAgents: () => ({ agents: agents as any }),
+		discoverAgents: () => ({ agents: agents.map((agent) => ({ ...agent, canBeChangedByAgent: agent.canBeChangedByAgent ?? ["sandbox.provider"] })) as any }),
 		allowMutatingManagementActions,
 	});
+	return {
+		...baseExecutor,
+		execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: ((r: unknown) => void) | undefined, ctx: unknown) =>
+			baseExecutor.execute(id, { ...params, sandbox: params.sandbox ?? { provider: "none" } }, signal, onUpdate as never, ctx as never),
+	};
 }
 
 function ctx(root: string, sessionFile: string | null = null) {

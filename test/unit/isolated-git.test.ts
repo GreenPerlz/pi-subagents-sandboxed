@@ -18,6 +18,10 @@ function makeRepo(configureIdentity = true): string {
 	if (configureIdentity) {
 		spawnSync("git", ["-C", repo, "config", "user.name", "Test Author"], { encoding: "utf8" });
 		spawnSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"], { encoding: "utf8" });
+	} else {
+		// Empty local values keep this fixture independent of the host's global identity.
+		spawnSync("git", ["-C", repo, "config", "user.name", ""], { encoding: "utf8" });
+		spawnSync("git", ["-C", repo, "config", "user.email", ""], { encoding: "utf8" });
 	}
 	fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
 	spawnSync("git", ["-C", repo, "add", "base.txt"], { encoding: "utf8" });

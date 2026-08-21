@@ -25,7 +25,8 @@ import {
 	tryImport,
 	events,
 } from "../support/helpers.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT } from "../../src/shared/types.ts";
+import { INTERCOM_DETACH_REQUEST_EVENT, SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
+import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 
 interface TestSequentialStep {
 	agent: string;
@@ -95,6 +96,11 @@ interface ChainResultItem {
 	acceptance?: { status?: string; verifyRuns?: Array<{ status?: string }>; childReport?: unknown; runtimeChecks?: Array<{ status?: string; id?: string }> };
 	savedOutputPath?: string;
 	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
+	success?: boolean;
+	exitCode?: number;
+	status?: string;
+	progress?: { status?: string };
+	progressSummary?: { durationMs?: number };
 }
 
 interface ChainExecutionResult {
@@ -116,14 +122,36 @@ interface ChainExecutionModule {
 	executeChain(params: Record<string, unknown>): Promise<ChainExecutionResult>;
 }
 
+interface ExecutorModule {
+	createSubagentExecutor?: (deps: Record<string, unknown>) => {
+		state: { foregroundRuns: Map<string, { children: ChainResultItem[] }> };
+		execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: unknown, ctx: unknown) => Promise<ChainExecutionResult>;
+	};
+}
+
 const chainMod = await tryImport<ChainExecutionModule>("./src/runs/foreground/chain-execution.ts");
+const executorMod = await tryImport<ExecutorModule>("./src/runs/foreground/subagent-executor.ts");
 const available = !!chainMod;
 const executeChain = chainMod?.executeChain;
+const createSubagentExecutor = executorMod?.createSubagentExecutor;
+
+function removeNewIsolatedRoots(before: Set<string>): void {
+	const processes = spawnSync("ps", ["-eo", "args"], { encoding: "utf8" }).stdout.split("\n");
+	for (const entry of fs.readdirSync(os.tmpdir())) {
+		if (!entry.startsWith("pi-isolated-git-") || before.has(entry)) continue;
+		const root = path.join(os.tmpdir(), entry);
+		// Integration files run concurrently in the same host. Never let this
+		// file's broad fallback cleanup remove a sibling test's live runtime.
+		if (processes.some((line) => line.includes(root))) continue;
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
 
 describe("chain execution — sequential", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let artifactsDir: string;
 	let mockPi: MockPi;
+	let isolatedRootsBefore: Set<string>;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -137,11 +165,13 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 	beforeEach(() => {
 		tempDir = createTempDir();
 		artifactsDir = path.join(tempDir, "artifacts");
+		isolatedRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
 		mockPi.reset();
 	});
 
 	afterEach(() => {
 		removeTempDir(tempDir);
+		removeNewIsolatedRoots(isolatedRootsBefore);
 	});
 
 	function makeChainParams(
@@ -828,6 +858,8 @@ process.exit(child.status ?? 0);
 		assert.deepEqual(result.details.outputs?.reviews?.structured, []);
 		assert.equal(result.details.workflowGraph?.nodes[1]?.status, "completed");
 		assert.deepEqual(result.details.workflowGraph?.nodes[1]?.children, []);
+		assert.deepEqual(result.details.groupDiagnostics, [{ groupId: "dynamic-group-1", unindexed: true, agent: "reviewer", status: "complete" }]);
+		assert.equal(result.details.results.some((child) => child.groupId === "dynamic-group-1"), false);
 	});
 
 	it("marks dynamic collect schema failures as failed graph groups", async () => {
@@ -1225,6 +1257,7 @@ process.exit(child.status ?? 0);
 describe("chain execution — parallel steps", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
+	let isolatedRootsBefore: Set<string>;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -1237,11 +1270,13 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 
 	beforeEach(() => {
 		tempDir = createTempDir();
+		isolatedRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
 		mockPi.reset();
 	});
 
 	afterEach(() => {
 		removeTempDir(tempDir);
+		removeNewIsolatedRoots(isolatedRootsBefore);
 	});
 
 	function makeChainParams(
@@ -1337,6 +1372,173 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 		assert.equal(spawnSync("git", ["-C", repoDir, "status", "--porcelain=v1"], { encoding: "utf-8" }).stdout, "");
 		const leakedRuntimeRoots = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix) && !runtimeRootsBefore.has(entry));
 		assert.deepEqual(leakedRuntimeRoots, [], "foreground chain must remove its private isolated Git runtime root");
+	});
+
+	it("fences production isolated chain export until a nested child reaches terminal state", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf-8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "isolated-nested-fence-repo");
+		fs.mkdirSync(repoDir, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.email", "chain@example.invalid"], ["config", "user.name", "Chain Parent"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repoDir, "base.txt"), "base\n", "utf-8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const runId = "isolated-nested-fence";
+		const route = createNestedRoute(runId);
+		const startedAt = Date.now();
+		writeNestedEvent(route, {
+			type: "subagent.nested.started",
+			ts: startedAt,
+			parentRunId: runId,
+			parentStepIndex: 0,
+			child: { id: "nested-child", parentRunId: runId, parentStepIndex: 0, depth: 1, path: [{ runId, stepIndex: 0 }], state: "running", agent: "reviewer", startedAt, lastUpdate: startedAt },
+		});
+		const terminalTimer = setTimeout(() => writeNestedEvent(route, {
+			type: "subagent.nested.completed",
+			ts: Date.now(),
+			parentRunId: runId,
+			parentStepIndex: 0,
+			child: { id: "nested-child", parentRunId: runId, parentStepIndex: 0, depth: 1, path: [{ runId, stepIndex: 0 }], state: "complete", agent: "reviewer", startedAt, lastUpdate: Date.now() },
+		}), 100);
+		try {
+			mockPi.onCall({ output: "isolated nested fence complete", commands: ["printf 'child\\n' > child.txt && git add child.txt && git commit -m 'nested fence child'"] });
+			const started = Date.now();
+			const result = await executeChain(
+				makeChainParams(
+					[{ parallel: [{ agent: "worker", task: "Commit after nested child" }] }],
+					[makeAgent("worker", { tools: ["read", "bash"] })],
+					{ cwd: repoDir, ctx: makeMinimalCtx(repoDir), runId, nestedRoute: route, sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } },
+				),
+			);
+			assert.equal(result.isError, undefined, result.content[0]?.text);
+			assert.ok(result.details.results[0]?.gitBundle?.path);
+			assert.ok(Date.now() - started >= 75, `export should wait for nested terminal proof (started ${Date.now() - started}ms)`);
+		} finally {
+			clearTimeout(terminalTimer);
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("derives isolated parallel commit requirements from resolved read-only task text", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf-8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "isolated-read-only-policy-repo");
+		fs.mkdirSync(repoDir, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.email", "chain@example.invalid"], ["config", "user.name", "Chain Parent"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repoDir, "base.txt"), "base\n", "utf-8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf-8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		mockPi.onCall({ output: "review complete" });
+		const result = await executeChain(
+			makeChainParams(
+				[{ parallel: [{ agent: "reviewer", task: "{task}" }] }],
+				[makeAgent("reviewer", { tools: ["read", "write"] })],
+				{
+					task: "Review-only. Do not edit files. Return findings.",
+					cwd: repoDir,
+					ctx: makeMinimalCtx(repoDir),
+					runId: "isolated-read-only-policy",
+					sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+				},
+			),
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.equal(result.details.results.length, 1);
+		assert.equal(result.details.results[0]?.gitBundle?.incomplete, false);
+		assert.equal(result.details.results[0]?.error, undefined);
+	});
+
+	it("caller-level export failure preserves original error and actionable root", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "chain-export-failure-repo");
+		fs.mkdirSync(repoDir, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.email", "chain@example.invalid"], ["config", "user.name", "Chain Parent"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repoDir, "base.txt"), "base\n", "utf8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const blockedArtifacts = path.join(tempDir, "artifacts-file");
+		fs.writeFileSync(blockedArtifacts, "not a directory", "utf8");
+		mockPi.onCall({ output: "chain execution output", stderr: "original chain execution error", exitCode: 1, commands: ["printf 'chain\n' > chain.txt && git add chain.txt && git commit -m 'chain export failure'" ] });
+		const result = await executeChain!(makeChainParams(
+			[{ agent: "worker", task: "Commit the chain change" }],
+			[makeAgent("worker", { tools: ["read", "bash"] })],
+			{
+				ctx: makeMinimalCtx(repoDir),
+				runId: "chain-export-failure-visible",
+				artifactsDir: blockedArtifacts,
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+			},
+		));
+		assert.equal(result.isError, true, result.content[0]?.text);
+		assert.match(result.content[0]?.text ?? "", /original chain execution error/i);
+		assert.match(result.content[0]?.text ?? "", /bundle export failed/i);
+		assert.match(result.content[0]?.text ?? "", /recover (?:isolated )?worktrees? at/i);
+	});
+
+	it("unexpected chain export failure is visible without intercom", { skip: process.platform !== "linux" || !createSubagentExecutor || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap and public executor are required" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "public-chain-export-failure-repo");
+		fs.mkdirSync(repoDir, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.email", "chain@example.invalid"], ["config", "user.name", "Chain Parent"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repoDir, "base.txt"), "base\n", "utf8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const parentSessionFile = path.join(tempDir, "parent-session.jsonl");
+		mockPi.onCall({ output: "chain execution output", stderr: "original chain execution error", exitCode: 1, commands: ["printf 'chain\\n' > chain.txt && git add chain.txt && git commit -m 'chain export failure'"] });
+		const agents = [makeAgent("worker", { tools: ["read", "bash"] })];
+		const state = { baseCwd: repoDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), foregroundRuns: new Map(), lastForegroundControlId: null };
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: { intercomBridge: { mode: "off" } },
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents }),
+		});
+		const ctx = { ...makeMinimalCtx(repoDir), sessionManager: { getSessionId: () => "session-123", getSessionFile: () => parentSessionFile } };
+		let blockedArtifacts = false;
+		const result = await executor.execute("public-chain-export-failure", {
+			chain: [{ agent: "worker", task: "Commit the chain change" }],
+			cwd: repoDir,
+			clarify: false,
+			sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+		}, new AbortController().signal, (update: any) => {
+			const outputPath = update.details?.results?.[0]?.artifactPaths?.outputPath;
+			if (blockedArtifacts || typeof outputPath !== "string") return;
+			blockedArtifacts = true;
+			const artifactsDir = path.dirname(outputPath);
+			fs.rmSync(artifactsDir, { recursive: true, force: true });
+			fs.writeFileSync(artifactsDir, "not a directory", "utf8");
+		}, ctx);
+		assert.equal(result.isError, true, result.content[0]?.text);
+		assert.match(result.content[0]?.text ?? "", /original chain execution error|Chain execution rejected/i);
+		assert.match(result.content[0]?.text ?? "", /bundle export failed/i);
+		assert.match(result.content[0]?.text ?? "", /recover (?:isolated )?worktrees? at/i);
+		assert.equal(result.details.results.length, 1, "public result must retain the rejected chain child");
+		assert.match(result.details.results[0]?.error ?? "", /bundle export failed|recover/i);
+		assert.equal(result.details.results[0]?.success, false, "recovery refusal must not leave a successful child projection");
+		assert.notEqual(result.details.results[0]?.exitCode, 0, "recovery refusal must be nonzero");
+		const persisted = [...state.foregroundRuns.values()].at(-1);
+		assert.equal(persisted?.children.length, 1);
+		assert.match(persisted?.children[0]?.error ?? "", /bundle export failed|recover/i);
+		assert.equal(persisted?.children[0]?.status, "failed", "durable foreground observer must retain failed status");
+		assert.notEqual(persisted?.children[0]?.exitCode, 0);
 	});
 
 	it("preserves chain worktrees after a post-child artifact rejection", async () => {
@@ -1510,7 +1712,15 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 			makeAgent("b", { systemPrompt: "Intercom orchestration channel:" }),
 		];
 		const intercomEvents = createEventBus();
+		const terminalIntercomPayloads: Array<{ children?: Array<{ agent?: string; status?: string; index?: number; gitBundle?: unknown; children?: unknown[] }> }> = [];
+		intercomEvents.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload: any) => {
+			if (payload?.to !== "orchestrator") return;
+			terminalIntercomPayloads.push(payload);
+			intercomEvents.emit(SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, { requestId: payload.requestId, delivered: true });
+		});
 		let detachEmitted = false;
+		let terminalResolve!: (update: { details?: { results?: ChainResultItem[] } }) => void;
+		const terminalUpdate = new Promise<{ details?: { results?: ChainResultItem[] } }>((resolve) => { terminalResolve = resolve; });
 
 		const result = await executeChain(
 			makeChainParams(
@@ -1524,8 +1734,15 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 				],
 				agents,
 				{
+					runId: "detached-chain-observer",
 					intercomEvents,
-					onUpdate(update: { details?: { progress?: Array<{ currentTool?: string }> } }) {
+					orchestratorIntercomTarget: "orchestrator",
+					foregroundControl: {
+						updatedAt: Date.now(),
+						nestedChildren: [{ id: "nested-observer", parentRunId: "detached-chain-observer", parentStepIndex: 0, depth: 1, path: [{ runId: "detached-chain-observer", stepIndex: 0 }], state: "complete", agent: "nested" }],
+					},
+					onUpdate(update: { details?: { progress?: Array<{ currentTool?: string }>; results?: ChainResultItem[] } }) {
+						if (update.details?.results?.some((entry) => entry.detached !== true && entry.exitCode === 0 && entry.progressSummary?.durationMs !== undefined && entry.finalOutput === "after handoff")) terminalResolve(update);
 						if (detachEmitted) return;
 						if (!update.details?.progress?.some((entry) => entry.currentTool === "intercom")) return;
 						detachEmitted = true;
@@ -1540,6 +1757,18 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 		assert.doesNotMatch(result.content[0]?.text ?? "", /resume/);
 		assert.equal(detachEmitted, true);
 		assert.equal(result.details.results.some((entry) => entry.detached === true && entry.exitCode === 0), true);
+		const terminal = await Promise.race([
+			terminalUpdate,
+			new Promise<{ details?: { results?: ChainResultItem[] } }>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for parallel chain detached terminal projection")), 5_000)),
+		]);
+		assert.equal(terminal.details?.results?.some((entry) => entry.detached !== true && entry.exitCode === 0 && entry.progressSummary?.durationMs !== undefined && entry.finalOutput === "after handoff"), true, JSON.stringify(terminal.details?.results));
+		const fullTerminal = terminalIntercomPayloads.find((payload) => payload.children?.length === 2);
+		assert.ok(fullTerminal, "detached terminal intercom publication should include the sibling");
+		assert.deepEqual(fullTerminal.children?.map((child) => ({ agent: child.agent, index: child.index, status: child.status })), [
+			{ agent: "a", index: 0, status: "completed" },
+			{ agent: "b", index: 1, status: "completed" },
+		]);
+		assert.equal(fullTerminal.children?.[0]?.children?.[0] && (fullTerminal.children[0].children[0] as { id?: string }).id, "nested-observer");
 	});
 
 	it("stops a sequential chain when a child detaches for intercom coordination", async () => {
@@ -1555,6 +1784,8 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 		];
 		const intercomEvents = createEventBus();
 		let detachEmitted = false;
+		let terminalResolve!: (update: { details?: { results?: ChainResultItem[] } }) => void;
+		const terminalUpdate = new Promise<{ details?: { results?: ChainResultItem[] } }>((resolve) => { terminalResolve = resolve; });
 
 		const result = await executeChain(
 			makeChainParams(
@@ -1565,7 +1796,8 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 				agents,
 				{
 					intercomEvents,
-					onUpdate(update: { details?: { progress?: Array<{ currentTool?: string }> } }) {
+					onUpdate(update: { details?: { progress?: Array<{ currentTool?: string }>; results?: ChainResultItem[] } }) {
+						if (update.details?.results?.some((entry) => entry.detached !== true && entry.exitCode === 0 && entry.progressSummary?.durationMs !== undefined && entry.finalOutput === "after reply")) terminalResolve(update);
 						if (detachEmitted) return;
 						if (!update.details?.progress?.some((entry) => entry.currentTool === "contact_supervisor")) return;
 						detachEmitted = true;
@@ -1580,6 +1812,11 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 		assert.doesNotMatch(result.content[0]?.text ?? "", /resume/);
 		assert.equal(detachEmitted, true);
 		assert.equal(mockPi.callCount(), 1);
+		const terminal = await Promise.race([
+			terminalUpdate,
+			new Promise<{ details?: { results?: ChainResultItem[] } }>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for sequential chain detached terminal projection")), 5_000)),
+		]);
+		assert.equal(terminal.details?.results?.some((entry) => entry.detached !== true && entry.exitCode === 0 && entry.progressSummary?.durationMs !== undefined && entry.finalOutput === "after reply"), true, JSON.stringify(terminal.details?.results));
 	});
 
 	it("fails chain on parallel step failure", async () => {

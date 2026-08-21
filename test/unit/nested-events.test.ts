@@ -15,6 +15,7 @@ import {
 	resolveNestedRouteFromEnv,
 	updateAsyncJobNestedProjection,
 	updateForegroundNestedProjection,
+	waitForNestedDescendantsToStop,
 	writeNestedEvent,
 } from "../../src/runs/shared/nested-events.ts";
 import {
@@ -170,6 +171,9 @@ describe("nested event parsing and projection", () => {
 		};
 		updateForegroundNestedProjection(control);
 		assert.equal(control.nestedChildren?.[0]?.id, "nested-a");
+		// Terminal observers must see the completed child, not the earlier running
+		// projection that was persisted before the detached callback finished.
+		assert.equal(control.nestedChildren?.[0]?.state, "complete");
 	});
 
 	it("attaches root children to visible step slices by original step index", () => {
@@ -440,6 +444,44 @@ describe("nestedSummaryFromAsyncStatus", () => {
 	});
 });
 
+describe("nested teardown-unproven projections (issue #59)", () => {
+	it("preserves per-step teardownUnproven through conversion and merge", () => {
+		const route = trackRoute();
+		const status = {
+			runId: "nested-step-unproven",
+			mode: "single" as const,
+			state: "complete" as const,
+			steps: [{ agent: "leaf", status: "complete" as const, teardownUnproven: true }],
+			lastUpdate: 100,
+		};
+		const converted = nestedSummaryFromAsyncStatus(status, "/tmp/nested-step-unproven", {
+			id: status.runId,
+			parentRunId: route.rootRunId,
+			parentStepIndex: 0,
+			depth: 1,
+			ts: 100,
+		});
+		assert.equal(converted.steps?.[0]?.teardownUnproven, true);
+		writeNestedEvent(route, {
+			type: "subagent.nested.updated",
+			ts: 100,
+			parentRunId: route.rootRunId,
+			parentStepIndex: 0,
+			child: { ...converted, state: "complete" },
+		});
+		writeNestedEvent(route, {
+			type: "subagent.nested.completed",
+			ts: 200,
+			parentRunId: route.rootRunId,
+			parentStepIndex: 0,
+			child: { ...converted, state: "complete", lastUpdate: 200, steps: [{ agent: "leaf", status: "complete" }] },
+		});
+		const projected = projectNestedEvents(route).children;
+		assert.equal(projected[0]?.steps?.[0]?.teardownUnproven, true);
+		assert.equal(hasLiveNestedDescendants(projected), true, "a terminal-looking parent with an unproven step remains live");
+	});
+});
+
 describe("sync-nested-child activity detection (issue #47)", () => {
 	it("reports live descendants when a child is running", () => {
 		const route = trackRoute();
@@ -550,5 +592,57 @@ describe("sync-nested-child activity detection (issue #47)", () => {
 		assert.equal(hasLiveNestedDescendantsForParent(children, "root-run", 1), true);
 		assert.equal(hasLiveNestedDescendantsForParent(children, "nested-parent", 0), true);
 		assert.equal(hasLiveNestedDescendantsForParent(children, "root-run", 2), false);
+	});
+});
+
+describe("nested descendant termination fence", () => {
+	it("does not delay cleanup when no descendant is present", async () => {
+		const route = createNestedRoute("nested-fence-empty");
+		try {
+			const started = Date.now();
+			const result = await waitForNestedDescendantsToStop(route, route.rootRunId, 0, { timeoutMs: 1_000, pollMs: 10 });
+			assert.equal(result.observed, false);
+			assert.equal(result.stopped, true);
+			assert.ok(Date.now() - started < 100, "an empty route should not wait for the timeout");
+		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("refuses export when a descendant never reaches terminal state", async () => {
+		const route = createNestedRoute("nested-fence-timeout");
+		try {
+			writeNestedEvent(route, { type: "subagent.nested.updated", ts: Date.now(), parentRunId: route.rootRunId, parentStepIndex: 0, child: {
+				id: "nested-fence-timeout-child", parentRunId: route.rootRunId, parentStepIndex: 0, depth: 1,
+				path: [{ runId: route.rootRunId, stepIndex: 0 }], state: "running", agent: "worker",
+			} });
+			const result = await waitForNestedDescendantsToStop(route, route.rootRunId, 0, { timeoutMs: 25, pollMs: 5 });
+			assert.equal(result.observed, true);
+			assert.equal(result.stopped, false);
+		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("waits for a terminal descendant event instead of trusting activity snapshots", async () => {
+		const route = createNestedRoute("nested-fence-root");
+		try {
+			writeNestedEvent(route, { type: "subagent.nested.updated", ts: Date.now(), parentRunId: route.rootRunId, parentStepIndex: 0, child: {
+				id: "nested-fence-child", parentRunId: route.rootRunId, parentStepIndex: 0, depth: 1,
+				path: [{ runId: route.rootRunId, stepIndex: 0 }], state: "running", agent: "worker",
+			} });
+			const started = Date.now();
+			const waiting = waitForNestedDescendantsToStop(route, route.rootRunId, 0, { timeoutMs: 1_000, pollMs: 10 });
+			setTimeout(() => writeNestedEvent(route, { type: "subagent.nested.completed", ts: Date.now(), parentRunId: route.rootRunId, parentStepIndex: 0, child: {
+				id: "nested-fence-child", parentRunId: route.rootRunId, parentStepIndex: 0, depth: 1,
+				path: [{ runId: route.rootRunId, stepIndex: 0 }], state: "complete", agent: "worker",
+			} }), 60);
+			const result = await waiting;
+			assert.equal(result.observed, true);
+			assert.equal(result.stopped, true);
+			assert.ok(Date.now() - started >= 50, "fence must wait for descendant terminal state");
+		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
 	});
 });

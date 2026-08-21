@@ -1,11 +1,12 @@
 import { isDynamicParallelStep, isParallelStep, type ChainStep, type SequentialStep } from "../../shared/settings.ts";
 import type { SingleResult, SubagentRunMode, WorkflowGraphNode, WorkflowGraphSnapshot, WorkflowNodeStatus } from "../../shared/types.ts";
+import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 
 export interface WorkflowGraphBuildInput {
 	runId: string;
 	mode?: SubagentRunMode;
 	steps: ChainStep[];
-	results?: Array<Pick<SingleResult, "exitCode" | "detached" | "interrupted" | "error" | "acceptance">>;
+	results?: Array<Pick<SingleResult, "exitCode" | "detached" | "interrupted" | "cancelled" | "error" | "acceptance" | "teardownUnproven">>;
 	currentFlatIndex?: number;
 	currentStepIndex?: number;
 	stepStatuses?: Array<{ status?: string; error?: string }>;
@@ -24,6 +25,8 @@ function normalizeStatus(status: string | undefined): WorkflowNodeStatus | undef
 			return "failed";
 		case "paused":
 			return "paused";
+		case "cancelled":
+			return "cancelled";
 		case "detached":
 			return "detached";
 		case "pending":
@@ -33,9 +36,11 @@ function normalizeStatus(status: string | undefined): WorkflowNodeStatus | undef
 	}
 }
 
-function resultStatus(result: Pick<SingleResult, "exitCode" | "detached" | "interrupted"> | undefined): WorkflowNodeStatus | undefined {
+function resultStatus(result: Pick<SingleResult, "exitCode" | "detached" | "interrupted" | "cancelled"> | undefined): WorkflowNodeStatus | undefined {
 	if (!result) return undefined;
+	if (result.teardownUnproven) return "running";
 	if (result.detached) return "detached";
+	if (result.cancelled) return "cancelled";
 	if (result.interrupted) return "paused";
 	return result.exitCode === 0 ? "completed" : "failed";
 }
@@ -61,12 +66,13 @@ function seqLabel(step: SequentialStep, stepIndex: number): string {
 }
 
 function summarizeParallelStatuses(statuses: WorkflowNodeStatus[]): WorkflowNodeStatus {
-	if (statuses.some((status) => status === "running")) return "running";
-	if (statuses.some((status) => status === "failed")) return "failed";
-	if (statuses.some((status) => status === "paused")) return "paused";
-	if (statuses.some((status) => status === "detached")) return "detached";
-	if (statuses.length > 0 && statuses.every((status) => status === "completed")) return "completed";
-	if (statuses.some((status) => status === "completed")) return "running";
+	if (statuses.includes("completed") && statuses.includes("pending") && !statuses.some((status) => status === "failed" || status === "cancelled" || status === "paused" || status === "detached" || status === "running")) return "running";
+	const state = resolveAggregateState(statuses);
+	if (state === "failed") return "failed";
+	if (state === "cancelled") return "cancelled";
+	if (state === "paused") return "paused";
+	if (state === "completed") return "completed";
+	if (state === "running") return "running";
 	return "pending";
 }
 
@@ -149,7 +155,9 @@ export function buildWorkflowGraphSnapshot(input: WorkflowGraphBuildInput): Work
 				pushPhase(phases, child.phase, childId);
 				if (status === "running" || input.currentFlatIndex === task.flatIndex) currentNodeId = childId;
 			}
-			const groupStatus = groupOverride?.status ?? (children.length > 0 ? summarizeParallelStatuses(childStatuses) : (input.currentStepIndex === stepIndex ? "running" : "pending"));
+			const groupStatus = children.length > 0 || groupOverride
+				? summarizeParallelStatuses(groupOverride ? [groupOverride.status, ...childStatuses] : childStatuses)
+				: (input.currentStepIndex === stepIndex ? "running" : "pending");
 			if (input.currentStepIndex === stepIndex && !currentNodeId) currentNodeId = groupId;
 			nodes.push({
 				id: groupId,

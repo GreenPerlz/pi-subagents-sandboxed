@@ -15,6 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
 import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
+import { isExpectedAsyncRunnerPid } from "../../src/runs/background/pid-identity.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
@@ -51,6 +52,8 @@ interface AsyncResultPayload {
 
 interface AsyncStatusPayload {
 	sessionId?: string;
+	pid?: number;
+	runnerIdentity?: string;
 	activityState?: string;
 	error?: string;
 	worktreeExecutionError?: string;
@@ -660,7 +663,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	}, async () => {
 		const repo = createRepo("pi-isolated-async-repo-");
 		const base = git(repo, ["rev-parse", "HEAD"]);
-		const artifactsDir = path.join(tempDir, "isolated-async-artifacts");
 		const sessionRoot = path.join(tempDir, "isolated-async-sessions");
 		const id = `async-isolated-watcher-${Date.now().toString(36)}`;
 		const runtimePrefix = `pi-isolated-git-${id}-`;
@@ -693,8 +695,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				resultMode: "parallel",
 				agents: [makeAgent("worker", { tools: ["read", "bash"] })],
 				ctx: { pi: { events: eventBus }, cwd: repo, currentSessionId: "session-isolated-async" },
-				artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: true, includeMetadata: true, cleanupDays: 7 },
-				artifactsDir,
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 				shareEnabled: false,
 				sessionRoot,
 				maxSubagentDepth: 2,
@@ -847,6 +848,49 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			}
 		} finally {
 			fakeBwrap.restore();
+		}
+	});
+
+	it("initializes isolated Git worktrees for every dynamic fanout item and projects fallback bundles", { skip: !isAsyncAvailable() || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "async Linux Bubblewrap runtime unavailable" : undefined }, async () => {
+		const repo = createRepo("pi-isolated-dynamic-fanout-");
+		const id = `async-isolated-dynamic-${Date.now().toString(36)}`;
+		const sessionRoot = path.join(tempDir, "isolated-dynamic-sessions");
+		try {
+			mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+			mockPi.onCall({ output: "writer-a" });
+			mockPi.onCall({ output: "writer-b" });
+			const launch = executeAsyncChain(id, {
+				chain: [
+					{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+					{
+						expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 2 },
+						parallel: { agent: "writer", task: "Write {target.path}" },
+						collect: { as: "written" },
+					},
+				],
+				agents: [
+					makeAgent("producer", { tools: ["read"] }),
+					makeAgent("writer", { tools: ["write"], sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", extraWritableMounts: [mockPi.dir] } }),
+				],
+				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-isolated-dynamic" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionRoot,
+				maxSubagentDepth: 2,
+			});
+			assert.equal(launch.isError, undefined, launch.content?.[0]?.text);
+			const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+			const deadline = Date.now() + 20_000;
+			while (!fs.existsSync(resultPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.equal(fs.existsSync(resultPath), true, "dynamic isolated run should publish a result");
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as { results: Array<{ agent: string; gitBundle?: { incomplete?: boolean; terminationState?: string }; error?: string }> };
+			const writers = payload.results.filter((result) => result.agent === "writer");
+			assert.equal(writers.length, 2);
+			assert.ok(writers.every((result) => result.gitBundle?.incomplete === true));
+			assert.ok(writers.every((result) => result.gitBundle?.terminationState === "success" || result.gitBundle?.terminationState === "failure"));
+			assert.ok(writers.every((result) => result.error?.includes("incomplete") || result.error === undefined));
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
 		}
 	});
 
@@ -1461,7 +1505,36 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(status.parallelGroups, [{ start: 1, count: 2, stepIndex: 1 }]);
 		assert.equal(payload.workflowGraph?.nodes?.[1]?.kind, "dynamic-parallel-group");
 		assert.deepEqual(payload.workflowGraph?.nodes?.[1]?.children?.map((child) => child.itemKey), ["src/a.ts", "src/b.ts"]);
-		assert.equal(payload.workflowGraph?.nodes?.[2]?.flatIndex, 3);
+		assert.equal(payload.workflowGraph?.nodes?.[2]?.flatIndex, 2);
+	});
+
+	it("async empty dynamic fanout does not consume the later sequential status slot", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "no targets", structuredOutput: { items: [] } });
+		mockPi.onCall({ output: "consumer ran" });
+		const id = `async-dynamic-empty-${Date.now().toString(36)}`;
+		executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}" },
+					collect: { as: "reviews" },
+				},
+				{ agent: "consumer", task: "Consume empty reviews" },
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer"), makeAgent("consumer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-empty" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.success, true);
+		assert.deepEqual(status.steps?.map((step) => step.agent), ["producer", "consumer"]);
+		assert.equal(payload.results.find((result) => result.agent === "consumer")?.flatIndex, 1);
+		assert.equal(payload.workflowGraph?.nodes?.find((node) => node.agent === "consumer")?.flatIndex, 1);
 	});
 
 	it("async dynamic fanout recomputes later child intercom targets by final flat index", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1655,55 +1728,53 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
-	it("serializes successful async children when outer lifecycle event aggregation rejects", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("broad async sequential rejection is persisted to result/status/watcher/intercom", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const repoDir = createRepo("pi-subagent-async-worktree-lifecycle-");
 		const watcherResultsDir = createTempDir("pi-subagent-async-watcher-");
-		let preservedWorktree: string | undefined;
-		const id = `async-worktree-lifecycle-${Date.now().toString(36)}`;
-		const previousEventsPath = process.env.MOCK_PI_RUNNER_EVENTS_PATH;
-		process.env.MOCK_PI_RUNNER_EVENTS_PATH = path.join(ASYNC_DIR, id, "events.jsonl");
+		const id = `async-sequential-isolated-lifecycle-${Date.now().toString(36)}`;
+		const artifactsDir = createTempDir("pi-subagent-async-sequential-artifacts-");
+		const previousRejectSeam = process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD;
+		process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD = id;
 		try {
 			mockPi.onCall({
 				output: "Async worker completed before lifecycle rejection",
 				keepAliveAfterFinalMessageMs: 100,
 				writeFiles: [{ path: "async-rejected.txt", content: "recover async edit\n" }],
-				blockRunnerEventsAfterChild: true,
 			});
 			const result = executeAsyncChain!(id, {
-				chain: [{ parallel: [{ agent: "worker", task: "Write then reject lifecycle event aggregation" }], worktree: true }],
-				agents: [makeAgent("worker")],
+				chain: [{ agent: "worker", task: "Write then reject lifecycle event aggregation" }],
+				agents: [makeAgent("worker", { tools: ["read", "bash"] })],
 				ctx: { pi: { events: createEventBus() }, cwd: repoDir, currentSessionId: null },
-				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				artifactsDir,
 				shareEnabled: false,
 				controlIntercomTarget: "subagent-chat-main",
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
 				maxSubagentDepth: 2,
 			});
 			assert.ok(!result.isError);
 			const resultPath = await waitForAsyncResultFile(id, 30_000);
+			const childCall = fs.readdirSync(mockPi.dir).find((name) => name.startsWith("call-"));
+			assert.ok(childCall, "the real async child must be invoked before the lifecycle rejection");
 			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			const recoveryBundle = payload.results[0]?.gitBundle?.path;
+			assert.ok(recoveryBundle && fs.existsSync(recoveryBundle), "the real child must edit before the lifecycle rejection");
+			assert.equal(spawnSync("git", ["-C", repoDir, "fetch", recoveryBundle, "refs/isolated/recovery-0:refs/tests/async-rejected"], { encoding: "utf-8" }).status, 0);
+			assert.equal(git(repoDir, ["cat-file", "blob", "refs/tests/async-rejected:async-rejected.txt"]), "recover async edit");
 			const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
 			assert.equal(payload.success, false);
 			assert.equal(payload.state, "failed");
 			assert.equal(payload.exitCode, 1);
 			assert.equal(payload.results.length, 1);
-			assert.equal(payload.results[0]?.success, true, "successful child result must survive the outer lifecycle catch");
-			assert.equal(payload.results[0]?.output, "Async worker completed before lifecycle rejection");
-			assert.ok(payload.worktreeExecutionError);
-			assert.match(payload.worktreeExecutionError, /^Parallel lifecycle failed unexpectedly:/);
-			assert.match(payload.worktreeExecutionError, /Recoverable worktree path/i);
+			assert.equal(payload.results[0]?.success, false, "rejected sequential callback must remain failed");
+			assert.match(payload.results[0]?.error ?? "", /Sequential execution rejected|Async subagent execution rejected|recover isolated worktree/i);
+			assert.ok(payload.results[0]?.gitBundle?.path && fs.existsSync(payload.results[0]!.gitBundle!.path), `rejected isolated step must retain its recovery bundle: ${JSON.stringify(payload)}`);
+			assert.equal(payload.results[0]?.gitBundle?.terminationState, "execution-rejected");
 			assert.equal(status.state, "failed");
-			assert.equal(status.worktreeExecutionError, payload.worktreeExecutionError);
-			assert.match(status.error ?? "", /^Parallel lifecycle failed unexpectedly:/);
+			assert.match(status.error ?? "", /Sequential execution rejected|Async subagent execution rejected|recover isolated worktree/i);
 			assert.equal(status.steps?.[0]?.status, "failed");
-			assert.match(payload.summary ?? "", /Async worker completed before lifecycle rejection/);
-			assert.match(payload.summary ?? "", /Parallel lifecycle failed unexpectedly:/);
-
-			const worktreeList = spawnSync("git", ["-C", repoDir, "worktree", "list", "--porcelain"], { encoding: "utf-8" });
-			preservedWorktree = [...worktreeList.stdout.matchAll(/^worktree (.+)$/gm)]
-				.map((match) => match[1])
-				.find((candidate) => candidate && path.resolve(candidate) !== path.resolve(repoDir));
-			assert.ok(preservedWorktree, "outer lifecycle rejection must preserve the edited worktree");
-			assert.equal(fs.readFileSync(path.join(preservedWorktree!, "async-rejected.txt"), "utf-8"), "recover async edit\n");
+			assert.equal(status.steps?.[0]?.sandbox?.gitMode, "isolated", JSON.stringify(status));
+			assert.match(payload.summary ?? "", /Sequential execution rejected|Async subagent execution rejected|recover isolated worktree/i);
 
 			const watcherEvents = createEventBus();
 			const intercomEvents: unknown[] = [];
@@ -1729,26 +1800,24 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			} finally {
 				watcher.stopResultWatcher();
 			}
-			const intercomPayload = intercomEvents[0] as { status?: string; worktreeExecutionError?: string; message?: string; children?: Array<{ status?: string }> } | undefined;
+			const intercomPayload = intercomEvents[0] as { status?: string; message?: string; children?: Array<{ status?: string; summary?: string; gitBundle?: { path?: string } }> } | undefined;
 			assert.equal(intercomPayload?.status, "failed");
 			assert.notEqual(intercomPayload?.status, "complete");
-			assert.equal(intercomPayload?.worktreeExecutionError, payload.worktreeExecutionError);
 			assert.equal(intercomPayload?.children?.[0]?.status, "failed");
-			assert.match(intercomPayload?.message ?? "", /Execution error:/);
-			assert.match(intercomPayload?.message ?? "", /Recoverable worktree path/i);
+			assert.match(intercomPayload?.children?.[0]?.summary ?? "", /Sequential execution rejected|Async subagent execution rejected|recover isolated worktree/i);
+			assert.ok(intercomPayload?.children?.[0]?.gitBundle?.path);
+			assert.match(intercomPayload?.message ?? "", /Execution error:|recover isolated worktree/i);
 			const completion = completionEvents[0] as { state?: string; results?: Array<{ status?: string }> } | undefined;
 			assert.equal(completion?.state, "failed");
 			assert.notEqual(completion?.state, "complete");
 			assert.equal(completion?.results?.[0]?.status, "failed");
 			assert.equal(fs.existsSync(watcherResultPath), false);
 		} finally {
-			if (preservedWorktree) {
-				spawnSync("git", ["-C", repoDir, "worktree", "remove", "--force", preservedWorktree], { encoding: "utf-8" });
-			}
+			if (previousRejectSeam === undefined) delete process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD;
+			else process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD = previousRejectSeam;
 			fs.rmSync(path.join(ASYNC_DIR, id), { recursive: true, force: true });
-			if (previousEventsPath === undefined) delete process.env.MOCK_PI_RUNNER_EVENTS_PATH;
-			else process.env.MOCK_PI_RUNNER_EVENTS_PATH = previousEventsPath;
 			removeTempDir(watcherResultsDir);
+			removeTempDir(artifactsDir);
 			removeTempDir(repoDir);
 		}
 	});
@@ -1846,7 +1915,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				}
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
-			assert.equal(status?.steps?.[0]?.thinking, item.expected);
+			const step = status?.steps?.[0];
+			assert.ok(step, `startup status should publish a step for ${item.id}`);
+			assert.equal(Object.hasOwn(step!, "thinking"), true, `startup status should preserve thinking for ${item.id}`);
+			assert.equal(step?.thinking, item.expected);
 			await waitForAsyncResultFile(item.id);
 		}
 	});
@@ -2608,6 +2680,48 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
 		assert.match(result.content[0]?.text ?? "", /async-cfg-/);
+	});
+
+	it("preserves the original async setup failure when isolated runtime creation throws before interrupt registration", { skip: !isAsyncAvailable() || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "async Linux Bubblewrap runtime unavailable" : undefined }, async () => {
+		const id = `async-isolated-setup-failure-${Date.now().toString(36)}`;
+		const setupCwd = createTempDir("pi-subagent-async-setup-failure-");
+		const configPath = path.join(TEMP_ROOT_DIR!, `async-cfg-${id}.json`);
+		const asyncDir = path.join(ASYNC_DIR!, id);
+		const resultPath = path.join(RESULTS_DIR!, `${id}.json`);
+		try {
+			const started = executeAsyncSingle(id, {
+				agent: "worker",
+				task: "This must fail before child setup",
+				agentConfig: makeAgent("worker", { tools: ["read", "bash"] }),
+				ctx: { pi: { events: { emit() {} } }, cwd: setupCwd, currentSessionId: "session-setup-failure" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host" },
+			});
+			assert.equal(started.isError, undefined, started.content[0]?.text);
+			await waitForAsyncResultFile(id, 15_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as AsyncResultPayload;
+			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8")) as AsyncStatusPayload;
+			assert.equal(payload.success, false, JSON.stringify(payload));
+			assert.match(payload.results[0]?.error ?? "", /not a git repository|isolated Git/i);
+			assert.doesNotMatch(payload.results[0]?.error ?? "", /interruptRunner|not a function|undefined/i);
+			assert.equal(status.state, "failed");
+			assert.match(status.error ?? "", /not a git repository|isolated Git/i);
+			assert.equal(fs.existsSync(configPath), false, "runner config must be removed after setup failure");
+			const runnerPid = status.pid;
+			const runnerIdentity = status.runnerIdentity;
+			const disappearanceDeadline = Date.now() + 5_000;
+			while (Date.now() < disappearanceDeadline && isExpectedAsyncRunnerPid(runnerPid, id, runnerIdentity)) {
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			assert.equal(isExpectedAsyncRunnerPid(runnerPid, id, runnerIdentity), false, "setup-failed owned runner must disappear before terminal result is considered settled");
+		} finally {
+			fs.rmSync(resultPath, { force: true });
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+			fs.rmSync(configPath, { recursive: true, force: true });
+			removeTempDir(setupCwd);
+		}
 	});
 
 	it("returns a tool error when an async run uses a missing cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {

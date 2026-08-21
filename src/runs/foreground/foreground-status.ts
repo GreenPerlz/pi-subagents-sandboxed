@@ -1,22 +1,46 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import type { ForegroundResumeChild, NestedRunSummary, SubagentRunMode } from "../../shared/types.ts";
+import type { ForegroundResumeChild, GitBundleResult, NestedRunSummary, SubagentRunMode } from "../../shared/types.ts";
 import type { FastModeStatus } from "../../shared/fast-mode.ts";
 
-export type PersistedForegroundState = "queued" | "running" | "complete" | "failed" | "paused";
+export type PersistedForegroundState = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
 
-export interface PersistedForegroundStep {
+export interface PersistedForegroundChild {
 	agent: string;
 	index: number;
 	status: ForegroundResumeChild["status"] | "running" | "pending";
+	groupId?: string;
 	sessionFile?: string;
 	artifactPath?: string;
 	model?: string;
 	thinking?: string;
 	fastMode?: FastModeStatus;
 	totalTokens?: ForegroundResumeChild["totalTokens"];
+	exitCode?: number;
+	detached?: boolean;
+	interrupted?: boolean;
+	cancelled?: boolean;
+	error?: string;
+	teardownUnproven?: boolean;
+	finalOutput?: string;
+	gitBundle?: GitBundleResult;
 }
+
+/** A group diagnostic is not a child and therefore has no synthetic index. */
+export interface PersistedForegroundGroupDiagnostic {
+	agent: string;
+	groupId: string;
+	unindexed: true;
+	status: ForegroundResumeChild["status"] | "running" | "pending";
+	index?: never;
+	sessionFile?: string;
+	error?: string;
+	finalOutput?: string;
+	gitBundle?: GitBundleResult;
+}
+
+export type PersistedForegroundStep = PersistedForegroundChild | PersistedForegroundGroupDiagnostic;
 
 export interface PersistedForegroundStatus {
 	runId: string;
@@ -31,6 +55,8 @@ export interface PersistedForegroundStatus {
 	currentTool?: string;
 	sessionFile?: string;
 	children: PersistedForegroundStep[];
+	groupDiagnostics?: Array<{ groupId: string; unindexed: true; agent: string; status: string; output?: string; error?: string; finalOutput?: string }>;
+	teardownUnproven?: boolean;
 	nestedChildren?: NestedRunSummary[];
 	statusFile?: string;
 }
@@ -71,6 +97,8 @@ function readPersistedForegroundStatus(statusFile: string): PersistedForegroundS
 			...(raw.currentTool ? { currentTool: raw.currentTool } : {}),
 			...(raw.sessionFile ? { sessionFile: raw.sessionFile } : {}),
 			children: Array.isArray(raw.children) ? raw.children : [],
+			...(Array.isArray(raw.groupDiagnostics) ? { groupDiagnostics: raw.groupDiagnostics } : {}),
+			...(raw.teardownUnproven === true ? { teardownUnproven: true } : {}),
 			...(Array.isArray(raw.nestedChildren) ? { nestedChildren: raw.nestedChildren } : {}),
 			statusFile,
 		};

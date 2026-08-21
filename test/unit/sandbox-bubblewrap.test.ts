@@ -51,6 +51,7 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.deepEqual(args.slice(args.indexOf("EMPTY") - 1, args.indexOf("EMPTY") + 2), ["--setenv", "EMPTY", ""]);
 		assert.equal(args.includes("SKIP_ME"), false);
 		assert.equal(args.includes("--unshare-net"), false);
+		assert.ok(args.includes("--die-with-parent"), "sandboxed children must die with their runner");
 		assert.equal(args.includes("/workspace"), false);
 		assert.deepEqual(args.slice(-2), ["pi", "--version"]);
 	});

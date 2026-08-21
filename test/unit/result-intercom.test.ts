@@ -135,6 +135,20 @@ describe("result intercom formatter", () => {
 		assert.doesNotMatch(payload.message, /Revive:/);
 	});
 
+	it("does not let unindexed group diagnostics consume canonical child slots", () => {
+		const children = attachNestedChildrenToResultChildren("root-run", [
+			{ agent: "group", status: "failed", summary: "group failed", groupId: "g1" },
+			{ agent: "owner-a", status: "completed", summary: "done" },
+			{ agent: "owner-b", status: "completed", summary: "done" },
+		], [
+			{ id: "nested-a", parentRunId: "root-run", parentStepIndex: 0, depth: 1, path: [{ runId: "root-run", stepIndex: 0 }], state: "complete", agent: "a" },
+			{ id: "nested-b", parentRunId: "root-run", parentStepIndex: 1, depth: 1, path: [{ runId: "root-run", stepIndex: 1 }], state: "complete", agent: "b" },
+		]);
+		assert.equal(children[0]?.children, undefined);
+		assert.equal(children[1]?.children?.[0]?.id, "nested-a");
+		assert.equal(children[2]?.children?.[0]?.id, "nested-b");
+	});
+
 	it("attaches compact nested children under their parent result child without route secrets", () => {
 		const payload = buildSubagentResultIntercomPayload({
 			to: "chat",
@@ -201,7 +215,7 @@ describe("result intercom formatter", () => {
 			mode: "parallel",
 			source: "foreground",
 			children: [
-				{ agent: "a", status: "completed", summary: "done", artifactPath: "/tmp/a.md", gitBundle: { path: "/tmp/a.bundle", checksum: "abc123", base: "base", head: "head", commitSummary: "head\tAuthor\tcommit" }, intercomTarget: "subagent-a-run-abc-1" },
+				{ agent: "a", status: "completed", summary: "done", artifactPath: "/tmp/a.md", gitBundle: { path: "/tmp/a.bundle", checksum: "abc123", bundleSize: 42, base: "base", head: "head", commitSummary: "head\tAuthor\tcommit", dirtySummary: "M file", payloadChecksum: "payload123", payloadSize: 21, canonicalPayloadChecksum: "canonical123", canonicalPayloadSize: 17 }, intercomTarget: "subagent-a-run-abc-1" },
 				{ agent: "b", status: "failed", summary: "failed", sessionPath: "/tmp/b.jsonl" },
 			],
 		});
@@ -213,11 +227,44 @@ describe("result intercom formatter", () => {
 
 		assert.match(receipt, /Delivered parallel subagent results via intercom\./);
 		assert.match(receipt, /Children: 1 completed, 1 failed/);
-		assert.match(receipt, /Git bundles:\n- a \[completed\]: \/tmp\/a\.bundle \(abc123\) base\.\.head/);
+		assert.match(receipt, /Git bundles:\n- a \[completed\]: \/tmp\/a\.bundle \(abc123, 42 bytes\) base\.\.head/);
+		assert.match(receipt, /dirty summary: M file/);
+		assert.match(receipt, /payload checksum\/size: payload123 \/ 21 bytes/);
+		assert.match(receipt, /canonical payload checksum\/size: canonical123 \/ 17 bytes/);
 		assert.match(receipt, /Artifacts:\n- a \[completed\]: \/tmp\/a\.md/);
 		assert.match(receipt, /Run intercom targets \(may be inactive after completion\):\n- a \[completed\]: subagent-a-run-abc-1/);
 		assert.match(receipt, /Sessions:\n- b \[failed\]: \/tmp\/b\.jsonl/);
 		assert.match(receipt, /Full grouped output was sent over intercom\./);
+	});
+
+	it("preserves interruption reasons and bundle termination in receipts", () => {
+		const payload = buildSubagentResultIntercomPayload({
+			to: "chat",
+			runId: "run-interrupted",
+			mode: "single",
+			source: "foreground",
+			children: [{
+				agent: "worker",
+				status: "paused",
+				summary: "Acceptance finalization interrupted. recovery: /tmp/recovery.bundle; incomplete",
+				gitBundle: {
+					path: "/tmp/recovery.bundle",
+					checksum: "checksum",
+					base: "base",
+					head: "head",
+					commitSummary: "",
+					terminationState: "interrupted",
+					incomplete: true,
+				},
+			}],
+		});
+		const receipt = formatSubagentResultReceipt({ mode: "single", runId: "run-interrupted", payload });
+		assert.match(receipt, /Errors:\n- worker: Acceptance finalization interrupted\./);
+		assert.match(receipt, /Acceptance finalization interrupted\./);
+		assert.match(receipt, /termination: interrupted/);
+		assert.match(receipt, /recovery: \/tmp\/recovery\.bundle/);
+		assert.match(receipt, /recovery incomplete/);
+		assert.match(receipt, /Children: 1 paused/);
 	});
 
 	it("strips heavy output fields from receipt details", () => {
@@ -238,8 +285,9 @@ describe("result intercom formatter", () => {
 		assert.equal(stripped.results[0]?.truncation, undefined);
 	});
 
-	it("resolves paused and detached statuses", () => {
+	it("resolves paused, cancelled, and detached statuses", () => {
 		assert.equal(resolveSubagentResultStatus({ interrupted: true }), "paused");
+		assert.equal(resolveSubagentResultStatus({ cancelled: true }), "cancelled");
 		assert.equal(resolveSubagentResultStatus({ detached: true }), "detached");
 		assert.equal(resolveSubagentResultStatus({ success: true }), "completed");
 		assert.equal(resolveSubagentResultStatus({ exitCode: 1 }), "failed");

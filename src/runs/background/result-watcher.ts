@@ -17,6 +17,7 @@ import {
 	resolveSubagentResultStatus,
 } from "../../intercom/result-intercom.ts";
 import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-events.ts";
+import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 
 const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
@@ -36,13 +37,40 @@ type ResultWatcherDeps = {
 };
 
 type ResultFileChild = {
+	flatIndex?: number;
+	/** Group diagnostics are intentionally not assigned a child index. */
+	groupId?: string;
+	unindexed?: boolean;
 	agent?: string;
+	/** Canonical output; output is retained for legacy result files. */
+	finalOutput?: string;
 	output?: string;
 	error?: string;
 	success?: boolean;
+	interrupted?: boolean;
+	cancelled?: boolean;
+	teardownUnproven?: boolean;
 	sessionFile?: string;
 	artifactPaths?: { outputPath?: string };
-	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
+	gitBundle?: {
+		path: string;
+		checksum: string;
+		base: string;
+		head: string;
+		commitSummary: string;
+		recovery?: string;
+		stagedSnapshot?: string;
+		stagedTree?: string;
+		recoveryTree?: string;
+		terminationState?: string;
+		incomplete?: boolean;
+		dirtySummary?: string;
+		bundleSize?: number;
+		payloadChecksum?: string;
+		canonicalPayloadChecksum?: string;
+		canonicalPayloadSize?: number;
+		portableMetadata?: string;
+	};
 	intercomTarget?: string;
 	children?: unknown;
 };
@@ -55,6 +83,7 @@ type ResultFileData = {
 	state?: string;
 	mode?: string;
 	summary?: string;
+	finalOutput?: string;
 	results?: ResultFileChild[];
 	nestedChildren?: unknown;
 	sessionId?: string;
@@ -88,6 +117,23 @@ function getErrorCode(error: unknown): string | undefined {
 
 function isNotFoundError(error: unknown): boolean {
 	return getErrorCode(error) === "ENOENT";
+}
+
+function hasDurableTerminalStatus(fsApi: ResultWatcherFs, data: ResultFileData, resultPath: string): boolean {
+	// Legacy result-only receipts do not carry an async directory and remain
+	// consumable. When they do, the result is not safe to unlink until the
+	// sibling status rename has durably published terminal truth.
+	if (!data.asyncDir || !fsApi.existsSync(data.asyncDir)) return true;
+	const statusPath = path.join(data.asyncDir, "status.json");
+	try {
+		const status = JSON.parse(fsApi.readFileSync(statusPath, "utf-8")) as { runId?: string; state?: string; teardownUnproven?: boolean };
+		if (data.id && status.runId && data.id !== status.runId) return false;
+		return status.teardownUnproven !== true
+			&& (status.state === "complete" || status.state === "failed" || status.state === "paused" || status.state === "cancelled");
+	} catch (error) {
+		if (!isNotFoundError(error)) console.error(`Failed to verify durable async status before consuming '${resultPath}':`, error);
+		return false;
+	}
 }
 
 function shouldFallBackToPolling(error: unknown): boolean {
@@ -138,6 +184,13 @@ export function createResultWatcher(
 					return;
 				}
 			}
+			if (!hasDurableTerminalStatus(fsApi, data, resultPath)) {
+				// The result may have won the crash race with status publication. Keep
+				// it as the recovery source and retry after the status rename rather than
+				// dropping it or requiring a new result-directory watch event.
+				timers.setTimeout(() => state.resultFileCoalescer.schedule(file, 0), 250);
+				return;
+			}
 			const now = Date.now();
 			const completionKey = buildCompletionKey(data, `result:${file}`);
 			if (markSeenWithTtl(state.completionSeen, completionKey, now, completionTtlMs)) {
@@ -154,7 +207,7 @@ export function createResultWatcher(
 					success: data.success,
 				}];
 			const normalizedChildren = attachNestedChildrenToResultChildren(runId, resultChildren.map((result = {}, index): SubagentResultIntercomChild => {
-				const baseOutput = result.output ?? data.summary;
+				const baseOutput = result.finalOutput ?? result.output ?? data.finalOutput ?? data.summary;
 				const hasRealOutput = typeof baseOutput === "string" && baseOutput.trim().length > 0;
 				const output = hasRealOutput ? baseOutput : "(no output)";
 				const summary = result.success === false && result.error
@@ -164,25 +217,43 @@ export function createResultWatcher(
 				const childNestedChildren = sanitizeNestedResultChildren(result.children, resultPath, `results[${index}].children`);
 				return {
 					agent: result.agent ?? data.agent ?? `step-${index + 1}`,
+					// Child execution truth takes precedence over the top-level paused
+					// state; a completed sibling must remain completed after another
+					// child is interrupted.
 					status: resolveSubagentResultStatus({
 						success: result.success,
-						state: data.state === "paused" || typeof result.success !== "boolean" ? data.state : undefined,
+						interrupted: result.interrupted,
+						cancelled: result.cancelled,
+						teardownUnproven: result.teardownUnproven,
+						state: result.interrupted ? "paused" : typeof result.success === "boolean" ? undefined : data.state,
 					}),
 					summary,
-					index,
+					...(result.groupId ? { groupId: result.groupId } : result.unindexed ? { unindexed: true } : result.flatIndex !== undefined ? { index: result.flatIndex } : resultChildren.length === 1 && !hasResultChildren ? {} : { index }),
 					artifactPath: result.artifactPaths?.outputPath,
 					...(result.gitBundle ? { gitBundle: result.gitBundle } : {}),
+					...(result.teardownUnproven ? { teardownUnproven: true } : {}),
 					...(typeof sessionPath === "string" && fsApi.existsSync(sessionPath) ? { sessionPath } : {}),
 					...(result.intercomTarget ? { intercomTarget: result.intercomTarget } : {}),
 					...(childNestedChildren ? { children: childNestedChildren } : {}),
 				};
 			}), nestedChildren);
 
-			const topLevelFailure = Boolean(data.worktreeCaptureError || data.worktreeExecutionError)
-				|| (data.state !== "paused" && (data.success === false || data.state === "failed"));
-			if (topLevelFailure && normalizedChildren.length > 0 && !normalizedChildren.some((child) => child.status === "failed")) {
-				normalizedChildren[0]!.status = "failed";
+			const childFailure = normalizedChildren.some((child) => child.status === "failed");
+			const aggregateState = resolveAggregateState([
+				{ state: data.state ?? (data.success === true ? "complete" : data.success === false ? "failed" : "pending"), teardownUnproven: data.teardownUnproven },
+				...(data.worktreeCaptureError || data.worktreeExecutionError ? [{ state: "failed" }] : []),
+				...normalizedChildren.map((child) => ({ state: child.status, teardownUnproven: child.teardownUnproven })),
+			]);
+			const topLevelFailure = aggregateState === "failed";
+			if (topLevelFailure && normalizedChildren.length > 0 && !childFailure) {
+				// Group diagnostics are unindexed aggregate records; project a
+				// top-level lifecycle failure onto the first canonical child instead.
+				const canonical = normalizedChildren.find((child) => !child.groupId) ?? normalizedChildren[0];
+				if (canonical) canonical.status = "failed";
 			}
+			const observedFailure = aggregateState === "failed";
+			const observedState = aggregateState === "running" ? "running" : aggregateState === "failed" ? "failed" : aggregateState === "cancelled" ? "cancelled" : aggregateState === "paused" ? "paused" : "complete";
+			const observedSuccess = observedState === "complete";
 			const intercomTarget = data.intercomTarget?.trim();
 			if (intercomTarget) {
 				const mode = data.mode === "single" || data.mode === "parallel" || data.mode === "chain"
@@ -210,6 +281,10 @@ export function createResultWatcher(
 			pi.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
 				...data,
 				runId,
+				success: observedSuccess,
+				state: observedState,
+				finalOutput: data.finalOutput ?? data.summary,
+
 				...(nestedChildren?.length ? { nestedChildren } : {}),
 				...(Array.isArray(data.results) ? {
 					results: hasResultChildren
@@ -218,7 +293,10 @@ export function createResultWatcher(
 							agent: child.agent,
 							status: child.status,
 							summary: child.summary,
-							index: child.index,
+							// Keep the canonical child output raw; `summary` may be decorated
+							// with an execution error for intercom/UI display.
+							finalOutput: data.results![index]?.finalOutput ?? data.results![index]?.output ?? data.finalOutput ?? data.summary,
+							...(child.groupId ? { groupId: child.groupId } : child.index !== undefined ? { index: child.index } : {}),
 							artifactPath: child.artifactPath,
 							...(child.gitBundle ? { gitBundle: child.gitBundle } : {}),
 							sessionPath: child.sessionPath,

@@ -17,6 +17,7 @@ import { readStatus } from "../../shared/utils.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { hasLiveNestedDescendants, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -39,6 +40,13 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		renderWidget(ctx, jobs);
 		ctx.ui.requestRender?.();
 	};
+	const aggregateStatus = (status: Pick<AsyncJobState, "status" | "teardownUnproven" | "steps">): AsyncJobState["status"] => {
+		const state = resolveAggregateState([
+			{ state: status.status, teardownUnproven: status.teardownUnproven },
+			...(status.steps ?? []).map((step) => ({ state: step.status, teardownUnproven: step.teardownUnproven })),
+		]);
+		return state === "completed" ? "complete" : state === "pending" ? "queued" : state as AsyncJobState["status"];
+	};
 	const cancelCleanup = (asyncId: string) => {
 		const existingTimer = state.cleanupTimers.get(asyncId);
 		if (!existingTimer) return;
@@ -49,6 +57,41 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		cancelCleanup(asyncId);
 		const timer = setTimeout(() => {
 			state.cleanupTimers.delete(asyncId);
+			const job = state.asyncJobs.get(asyncId);
+			if (!job) return;
+			// A descendant can publish after the parent's terminal event (or after
+			// handleComplete scheduled this timer). Re-read both durable status and
+			// the nested event projection at fire time; never evict a job while a
+			// descendant is still actionable.
+			try {
+				if (job.nestedRoute) {
+					reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now });
+					updateAsyncJobNestedProjection(job);
+				}
+				const current = readStatus(job.asyncDir);
+				if (current) {
+					job.teardownUnproven = current.teardownUnproven;
+					job.steps = current.steps;
+					job.status = aggregateStatus({ status: current.state, teardownUnproven: current.teardownUnproven, steps: current.steps });
+					job.updatedAt = current.lastUpdate ?? job.updatedAt;
+				}
+			} catch (error) {
+				console.error(`Failed to recheck async cleanup fence for '${asyncId}':`, error);
+				if (hasLiveNestedDescendants(job.nestedChildren)) {
+					scheduleCleanup(asyncId);
+				} else {
+					state.asyncJobs.delete(asyncId);
+					if (state.lastUiContext) rerenderWidget(state.lastUiContext);
+				}
+				return;
+			}
+			if (job.teardownUnproven === true || (job.status !== "complete" && job.status !== "failed" && job.status !== "paused" && job.status !== "cancelled") || hasLiveNestedDescendants(job.nestedChildren)) {
+				// Keep the tracker entry and let the poller observe the eventual
+				// terminal descendant event before trying cleanup again.
+				scheduleCleanup(asyncId);
+				if (state.lastUiContext) rerenderWidget(state.lastUiContext);
+				return;
+			}
 			state.asyncJobs.delete(asyncId);
 			if (state.lastUiContext) {
 				rerenderWidget(state.lastUiContext);
@@ -167,8 +210,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					const status = reconciliation.status ?? readStatus(job.asyncDir);
 					if (status) {
 						const previousStatus = job.status;
-						job.status = status.state;
-						if (job.status !== "complete" && job.status !== "failed" && job.status !== "paused") cancelCleanup(job.asyncId);
+						job.teardownUnproven = status.teardownUnproven;
+						job.status = aggregateStatus({ status: status.state, teardownUnproven: status.teardownUnproven, steps: status.steps });
+						if (job.status !== "complete" && job.status !== "failed" && job.status !== "paused" && job.status !== "cancelled") cancelCleanup(job.asyncId);
 						job.sessionId = status.sessionId ?? job.sessionId;
 						job.activityState = status.activityState;
 						job.lastActivityAt = status.lastActivityAt ?? job.lastActivityAt;
@@ -180,6 +224,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						job.mode = status.mode;
 						job.currentStep = status.currentStep ?? job.currentStep;
 						job.chainStepCount = status.chainStepCount ?? job.chainStepCount;
+						job.groupDiagnostics = status.groupDiagnostics ?? job.groupDiagnostics;
 						job.startedAt = status.startedAt ?? job.startedAt;
 						if (status.lastUpdate !== undefined) job.updatedAt = status.lastUpdate;
 						if (status.steps?.length) {
@@ -196,16 +241,24 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 							job.agents = visibleSteps.map((step) => step.agent);
 							job.steps = visibleSteps;
 							refreshNestedProjection();
-							job.stepsTotal = visibleSteps.length;
+							const logicalGroupDiagnostics = job.groupDiagnostics ?? [];
+							const completedLogicalGroups = logicalGroupDiagnostics.filter((diagnostic) => diagnostic.status === "complete").length;
+							job.stepsTotal = visibleSteps.length + logicalGroupDiagnostics.length;
 							job.runningSteps = visibleSteps.filter((step) => step.status === "running").length;
-							job.completedSteps = visibleSteps.filter((step) => step.status === "complete" || step.status === "completed").length;
-							if (status.state === "complete") job.completedSteps = visibleSteps.length;
+							job.completedSteps = visibleSteps.filter((step) => step.status === "complete" || step.status === "completed").length + completedLogicalGroups;
+							if (status.state === "complete") job.completedSteps = job.stepsTotal;
+						}
+						if (!status.steps?.length && job.groupDiagnostics?.length) {
+							job.stepsTotal = job.groupDiagnostics.length;
+							job.runningSteps = 0;
+							job.completedSteps = job.groupDiagnostics.filter((diagnostic) => diagnostic.status === "complete").length;
 						}
 						job.sessionDir = status.sessionDir ?? job.sessionDir;
 						job.outputFile = status.outputFile ?? job.outputFile;
 						job.totalTokens = status.totalTokens ?? job.totalTokens;
 						job.sessionFile = status.sessionFile ?? job.sessionFile;
-						if ((job.status === "complete" || job.status === "failed" || job.status === "paused") && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
+						job.teardownUnproven = status.teardownUnproven;
+						if (job.teardownUnproven !== true && (job.status === "complete" || job.status === "failed" || job.status === "paused" || job.status === "cancelled") && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 							scheduleCleanup(job.asyncId);
 						}
 						if (widgetRenderKey(job) !== widgetStateBefore) widgetChanged = true;
@@ -255,6 +308,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			agents,
 			chainStepCount: info.chainStepCount,
 			parallelGroups: validParallelGroups,
+			groupDiagnostics: info.groupDiagnostics,
 			nestedRoute: info.nestedRoute,
 			stepsTotal: firstGroupCount ?? agents?.length,
 			hasParallelGroups: validParallelGroups.length > 0,
@@ -269,13 +323,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 
 	const handleComplete = (data: unknown) => {
-		const result = data as { id?: string; success?: boolean; asyncDir?: string };
+		const result = data as { id?: string; success?: boolean; state?: string; cancelled?: boolean; teardownUnproven?: boolean; asyncDir?: string };
 		const asyncId = result.id;
 		if (!asyncId) return;
 		const job = state.asyncJobs.get(asyncId);
 		let nestedRefreshFailed = false;
 		if (job) {
-			job.status = result.success ? "complete" : "failed";
+			const completionState = resolveAggregateState([
+				{ state: result.state ?? (result.success ? "complete" : "failed"), teardownUnproven: result.teardownUnproven },
+				...(result.cancelled ? [{ state: "cancelled" }] : []),
+			]);
+			job.status = completionState === "running" ? "running" : completionState === "completed" ? "complete" : completionState === "cancelled" ? "cancelled" : completionState === "paused" ? "paused" : "failed";
+			job.teardownUnproven = result.teardownUnproven;
 			job.updatedAt = Date.now();
 			if (result.asyncDir) job.asyncDir = result.asyncDir;
 			try {

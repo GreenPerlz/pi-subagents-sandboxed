@@ -55,6 +55,16 @@ function createUiContext() {
 }
 
 describe("subagent async widget rendering", () => {
+	it("renders cancelled jobs as cancelled rather than done or failed", () => {
+		const lines = buildWidgetLines([
+			{ asyncId: "cancelled-1", asyncDir: "/tmp/cancelled", status: "cancelled", agents: ["worker"], startedAt: 0, updatedAt: 1000, currentTool: "bash" },
+		], theme, 120, false);
+		const text = lines.join("\\n");
+		assert.match(text, /⊘/);
+		assert.match(text, /Cancelled/);
+		assert.doesNotMatch(text, /Done/);
+	});
+
 	it("orders running jobs before queued summaries and completions", () => {
 		const lines = buildWidgetLines([
 			{ asyncId: "done-1", asyncDir: "/tmp/done", status: "complete", agents: ["reviewer"], startedAt: 0, updatedAt: 1000 },

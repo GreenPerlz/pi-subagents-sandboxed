@@ -59,7 +59,7 @@ export function buildChainSummary(
 	steps: ChainStep[],
 	results: SingleResult[],
 	chainDir: string,
-	status: "completed" | "failed",
+	status: "completed" | "failed" | "cancelled",
 	failedStep?: { index: number; error: string },
 ): string {
 	const stepNames = steps
@@ -80,6 +80,11 @@ export function buildChainSummary(
 	if (status === "completed") {
 		const stepWord = results.length === 1 ? "step" : "steps";
 		return `✅ Chain completed: ${stepNames} (${results.length} ${stepWord}, ${durationStr})${skillsLine ? `\n${skillsLine}` : ""}
+
+📋 Progress: ${hasProgress ? progressPath : "(none)"}
+📁 Artifacts: ${chainDir}`;
+	} else if (status === "cancelled") {
+		return `⏹️ Chain cancelled${skillsLine ? `\n${skillsLine}` : ""}
 
 📋 Progress: ${hasProgress ? progressPath : "(none)"}
 📁 Artifacts: ${chainDir}`;

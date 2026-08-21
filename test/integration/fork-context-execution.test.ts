@@ -22,7 +22,7 @@ interface ExecutorModule {
 				context?: "fresh" | "fork";
 				mode?: "single" | "parallel" | "chain";
 				asyncId?: string;
-				results?: Array<{ detached?: boolean; exitCode?: number; skills?: string[] }>;
+				results?: Array<{ detached?: boolean; exitCode?: number; finalOutput?: string; skills?: string[] }>;
 			};
 		}>;
 	};
@@ -35,6 +35,7 @@ interface AsyncExecutionModule {
 interface ProgressUpdate {
 	details?: {
 		progress?: Array<{ status?: string; currentTool?: string }>;
+		results?: Array<{ detached?: boolean; exitCode?: number; finalOutput?: string }>;
 	};
 }
 
@@ -750,6 +751,8 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			projectAgentsDir: null,
 		}));
 		let detachEmitted = false;
+		let terminalResolve!: (update: ProgressUpdate) => void;
+		const terminalUpdate = new Promise<ProgressUpdate>((resolve) => { terminalResolve = resolve; });
 		const result = await executor.execute(
 			"intercom-parallel",
 			{
@@ -760,6 +763,8 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			},
 			new AbortController().signal,
 			(update: ProgressUpdate) => {
+				const terminalChild = update.details?.results?.find((entry) => entry.detached !== true && entry.finalOutput === "after handoff");
+				if (terminalChild) terminalResolve(update);
 				if (detachEmitted) return;
 				if (!update.details?.progress?.some((entry) => entry.currentTool === "intercom")) return;
 				detachEmitted = true;
@@ -772,6 +777,11 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.match(result.content[0]?.text ?? "", /Parallel run detached for intercom coordination/);
 		assert.equal(detachEmitted, true);
 		assert.equal(result.details?.results?.some((entry) => entry.detached === true && entry.exitCode === 0), true);
+		const terminal = await Promise.race([
+			terminalUpdate,
+			new Promise<ProgressUpdate>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for parallel detached terminal projection")), 5_000)),
+		]);
+		assert.equal(terminal.details?.results?.some((entry) => entry.detached !== true && entry.exitCode === 0 && entry.finalOutput === "after handoff"), true);
 	});
 
 	it("runs top-level parallel async requests in the background", { skip: !asyncAvailable ? "jiti not available" : undefined }, async () => {

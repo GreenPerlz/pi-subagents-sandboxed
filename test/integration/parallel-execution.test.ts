@@ -26,6 +26,8 @@ import {
 	tryImport,
 	events,
 } from "../support/helpers.ts";
+import { FOREGROUND_DIR } from "../../src/shared/types.ts";
+import { foregroundStatusPath, writePersistedForegroundStatus } from "../../src/runs/foreground/foreground-status.ts";
 
 // Top-level await: try importing pi-dependent modules
 const utils = await tryImport<any>("./src/shared/utils.ts");
@@ -86,6 +88,29 @@ describe("mapConcurrent", { skip: !mapConcurrent ? "utils not importable" : unde
 				}),
 			/boom/,
 		);
+	});
+
+	it("stops assigning queued work after the first rejection while started callbacks settle", async () => {
+		const started: number[] = [];
+		let releaseFirst: (() => void) | undefined;
+		const firstDone = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const task = async (item: number): Promise<number> => {
+			started.push(item);
+			if (item === 1) {
+				await firstDone;
+				throw new Error("first rejection");
+			}
+			if (item === 2) {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				return item;
+			}
+			return item;
+		};
+		const pending = mapConcurrent([1, 2, 3, 4], 2, task);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		releaseFirst!();
+		await assert.rejects(pending, /first rejection/);
+		assert.deepEqual(started, [1, 2], "queued callbacks must not start after rejection");
 	});
 });
 
@@ -324,6 +349,58 @@ process.exit(child.status ?? 0);
 
 		assert.ok(liveModels.includes("runtime/gpt-4o-mini"), "live updates should replace the configured fallback with the runtime model");
 		assert.equal(liveModels.at(-1), "runtime/gpt-4o-mini");
+	});
+
+	it("replaces initial running persistence on isolated parallel setup failure", { skip: !createSubagentExecutor || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf-8" }).status !== 0 ? "Linux Bubblewrap and public executor are required" : undefined }, async () => {
+		const repoDir = path.join(tempDir, "isolated-setup-failure-repo");
+		initGitRepo(repoDir);
+		const hookPath = path.join(tempDir, "failing-setup-hook.mjs");
+		fs.writeFileSync(hookPath, [
+			"import fs from 'node:fs';",
+			"const input = JSON.parse(fs.readFileSync(0, 'utf8'));",
+			"fs.writeFileSync(input.worktreePath + '/setup-partial.txt', 'partial\\n');",
+			"if (input.index === 0) process.exit(23);",
+			"process.stdout.write(JSON.stringify({ syntheticPaths: [] }));",
+		].join("\n"), "utf8");
+		fs.chmodSync(hookPath, 0o755);
+		const runId = "parallel-isolated-setup-persistence";
+		writePersistedForegroundStatus(FOREGROUND_DIR, {
+			runId,
+			cwd: repoDir,
+			mode: "parallel",
+			state: "running",
+			updatedAt: Date.now(),
+			children: [{ agent: "isolated", index: 0, status: "running" }, { agent: "isolated", index: 1, status: "running" }],
+		});
+		const agents = [makeAgent("isolated", { tools: ["read", "bash"], sandbox: { provider: "bubblewrap", gitMode: "isolated" } })];
+		const state = { baseCwd: repoDir, currentSessionId: "session-persistence", asyncJobs: new Map(), foregroundControls: new Map(), foregroundRuns: new Map(), lastForegroundControlId: null };
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: { worktreeSetupHook: hookPath },
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents }),
+		});
+		const ctx = makeMinimalCtx(repoDir);
+		ctx.sessionManager.getSessionId = () => "session-persistence";
+		ctx.sessionManager.getSessionFile = () => path.join(tempDir, "parent-session.jsonl");
+		const result = await executor.execute(runId, {
+			tasks: [{ agent: "isolated", task: "setup failure one" }, { agent: "isolated", task: "setup failure two" }],
+			clarify: false,
+			sandbox: { provider: "bubblewrap", gitMode: "isolated" },
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(result.isError, true, result.content[0]?.text);
+		const persistedRunId = [...state.foregroundRuns.keys()][0] as string;
+		assert.ok(persistedRunId, "terminal setup failure should be remembered under its resolved run id");
+		const persisted = JSON.parse(fs.readFileSync(foregroundStatusPath(FOREGROUND_DIR, persistedRunId), "utf8"));
+		assert.notEqual(persisted.state, "running", `${result.content[0]?.text ?? "no result text"} ${JSON.stringify(result.details)}`);
+		assert.equal(persisted.state, "failed");
+		assert.equal(persisted.children.length, 2);
+		assert.ok(persisted.children.every((child: { status: string }) => child.status === "failed"));
+		assert.ok(persisted.children.some((child: { gitBundle?: { path?: string }; error?: string }) => child.gitBundle?.path || /recover isolated runtime|runtime retained at/i.test(child.error ?? "")), `failed setup should retain an actionable recovery projection: ${JSON.stringify(persisted.children)}`);
 	});
 
 	it("preserves top-level worktrees after a post-child artifact rejection", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

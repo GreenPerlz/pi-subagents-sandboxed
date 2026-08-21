@@ -154,7 +154,7 @@ function createSlashResultComponent(
 function parseSubagentNotifyContent(content: string): SubagentNotifyDetails | undefined {
 	const lines = content.split("\n");
 	const header = lines[0] ?? "";
-	const match = header.match(/^Background task (completed|failed|paused): \*\*(.+?)\*\*(?:\s+(\([^)]*\)))?$/);
+	const match = header.match(/^Background task (completed|failed|paused|cancelled): \*\*(.+?)\*\*(?:\s+(\([^)]*\)))?$/);
 	if (!match) return undefined;
 	const body = lines.slice(2);
 	let sessionIndex = -1;
@@ -303,9 +303,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		if (!details) return new Text(content, 0, 0);
 		const icon = details.status === "completed"
 			? theme.fg("success", "✓")
-			: details.status === "paused"
-				? theme.fg("warning", "■")
-				: theme.fg("error", "✗");
+			: details.status === "cancelled"
+				? theme.fg("warning", "⊘")
+				: details.status === "paused"
+					? theme.fg("warning", "■")
+					: theme.fg("error", "✗");
 		const parts: string[] = [];
 		if (details.taskInfo) parts.push(details.taskInfo);
 		if (details.durationMs !== undefined) parts.push(formatDuration(details.durationMs));

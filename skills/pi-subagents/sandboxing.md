@@ -2,6 +2,10 @@
 
 Use this note when you need to explain or change how sandboxed subagent runs work in this fork.
 
+## Cancellation semantics
+
+Detached async runs have no public cancellation producer today: `interrupt` pauses the run. `cancelled` is produced by foreground `AbortSignal` paths and is supported when persisted or reconciled; do not assume an async cancel API.
+
 ## Mental model
 
 Sandboxing happens in three stages:
@@ -93,8 +97,14 @@ sandboxPackageDiscovery: closed
 ### Git mode
 
 - Omitted and `read-only` are the safe default. In a Bubblewrap run, read-only mode protects the visible `.git` metadata from writes.
-- `isolated` is opt-in only. It requires Linux, `bubblewrap`, a runtime-created worktree handle, and both parent `user.name` and `user.email`. The runtime builds a sanitized exact-base object history, never mounts the parent common `.git`, disables remotes/credentials/hooks/signing/editors, and exports one compact successful-run bundle containing portable metadata. Ordinary checkouts, unsupported providers/platforms, inherited `GIT_*` redirection, and writable mounts overlapping parent `.git` fail closed.
+- `isolated` is opt-in only. It requires Linux, `bubblewrap`, a runtime-created worktree handle, and both parent `user.name` and `user.email`. The runtime builds a sanitized exact-base object history, never mounts the parent common `.git`, disables remotes/credentials/hooks/signing/editors, and exports one owner-only compact recovery bundle for every terminal outcome. Dirty staged, modified, deleted, binary, executable, symlink, and non-ignored untracked state is represented by an internal recovery snapshot; ignored and runtime-synthetic paths are excluded. Ordinary checkouts, unsupported providers/platforms, inherited `GIT_*` redirection, and writable mounts overlapping parent `.git` fail closed.
 - Configure `sandboxGitMode: isolated` in agent frontmatter, `sandbox.gitMode` in settings/run configuration, or use the guarded `sandbox.gitMode` run override. An omitted/custom agent remains read-only unless it explicitly opts in.
+
+### Recovery bundle consumption
+
+The result/status/intercom projections carry the bundle path, checksum, base/head, agent, termination state, recovery ref, dirty summary, incomplete flag, payload checksum, and payload byte size. The raw payload checksum and size cover the Git payload generated before metadata embedding; a deterministic refs/object-ID manifest checksum and size is also included for reconstructable canonical verification. Consumers should run `git bundle verify` and use ordinary Git commands to inspect/fetch the bundle. The internal recovery ref is packaging evidence, not a child-authored commit. A commit-required isolated writer with no authored commit is incomplete; allowed clean no-change review/read runs are not.
+
+Portable metadata omits personal or temporary absolute filesystem paths while preserving ordinary non-path prose in commit summaries. Bundle files and directories are owner-only and retained for seven days by default. Cleanup is best-effort, startup-gated, and at most daily; an export failure preserves the runtime-managed worktree and reports its actionable path alongside the original child error. Setting `artifacts: false` disables ordinary artifacts only; recovery bundles still export.
 
 ### Provider
 

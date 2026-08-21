@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
 	AcceptanceEvidenceKind,
@@ -14,6 +15,7 @@ import type {
 } from "../../shared/types.ts";
 import { requiredAcceptanceEvidence } from "./acceptance-contract.ts";
 import { parseAcceptanceReport } from "./acceptance-reports.ts";
+import { captureChildProcessGroupMembers, captureChildProcessIdentity, isChildProcessGroupGone, processControlUnsupported, signalChildProcessGroup, waitForChildProcessGroupGone } from "../../shared/post-exit-stdio-guard.ts";
 
 const LEVEL_RANK: Record<AcceptanceProvenanceLevel, number> = {
 	none: 0,
@@ -52,9 +54,15 @@ function reportEvidencePresent(report: AcceptanceReport, kind: AcceptanceEvidenc
 }
 
 function checkNoStagedFiles(cwd: string): AcceptanceRuntimeCheck {
-	const result = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf-8" });
-	if (result.status !== 0) {
-		return { id: "no-staged-files", status: "not-applicable", message: "git status unavailable; no staged-files check skipped" };
+	const result = spawnSync("git", ["status", "--short"], {
+		cwd,
+		encoding: "utf-8",
+		timeout: 15_000,
+		maxBuffer: 8 * 1024 * 1024,
+	});
+	if (result.status !== 0 || result.error) {
+		const evidence = result.error?.message ?? result.stderr?.trim() ?? `git exited with status ${result.status ?? "unknown"}`;
+		return { id: "no-staged-files", status: "failed", message: `git status failed; no-staged-files proof unavailable: ${evidence}` };
 	}
 	const staged = result.stdout.split(/\r?\n/).filter((line) => line.length >= 2 && line[0] !== " " && line[0] !== "?");
 	return staged.length === 0
@@ -83,59 +91,151 @@ function trimOutput(value: string): string | undefined {
 	return trimmed.length > 12_000 ? `${trimmed.slice(0, 12_000)}\n...[truncated]` : trimmed;
 }
 
+function processStartToken(pid: number): string | undefined {
+	if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return undefined;
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const closeParen = stat.lastIndexOf(")");
+		return stat.slice(closeParen + 2).trim().split(/\s+/u)[19] || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+const VERIFY_MAX_OUTPUT = 8 * 1024 * 1024;
+
+function parseVerifyCommand(command: string): string[] {
+	// Verification commands are intentionally not run through a shell. Support
+	// the usual quoted arguments while preventing shell descendants from escaping
+	// the private process group.
+	const args: string[] = [];
+	let current = "";
+	let quote: '"' | "'" | undefined;
+	let escaped = false;
+	for (const char of command) {
+		if (escaped) { current += char; escaped = false; continue; }
+		if (char === "\\" && quote !== "'") { escaped = true; continue; }
+		if (quote) { if (char === quote) quote = undefined; else current += char; continue; }
+		if (char === '"' || char === "'") { quote = char; continue; }
+		if (/\s/.test(char)) { if (current) { args.push(current); current = ""; } continue; }
+		current += char;
+	}
+	if (escaped) current += "\\";
+	if (current) args.push(current);
+	return args;
+}
+
 function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string): Promise<AcceptanceVerifyResult> {
 	return new Promise((resolve) => {
 		const startedAt = Date.now();
 		const cwd = command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd;
+		const args = parseVerifyCommand(command.command);
+		if (args.length === 0) {
+			resolve({ id: command.id, command: command.command, cwd, exitCode: 1, status: "failed", stderr: "Verification command is empty.", durationMs: 0 });
+			return;
+		}
+		const processControlError = processControlUnsupported();
+		if (processControlError) {
+			resolve({ id: command.id, command: command.command, cwd, exitCode: 1, status: "failed", stderr: processControlError, durationMs: 0 });
+			return;
+		}
 		let stdout = "";
 		let stderr = "";
 		let timedOut = false;
-		const child = spawn(command.command, {
+		let overflowed = false;
+		let settled = false;
+		const child = spawn(args[0]!, args.slice(1), {
 			cwd,
 			env: { ...process.env, ...(command.env ?? {}) },
-			shell: true,
+			detached: process.platform === "linux",
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
 		});
-		const timeout = setTimeout(() => {
-			timedOut = true;
-			child.kill("SIGTERM");
-			setTimeout(() => child.kill("SIGKILL"), 1000).unref?.();
-		}, command.timeoutMs ?? 120_000);
+		const pid = child.pid;
+		const childIdentity = captureChildProcessIdentity(child);
+		// Snapshot members while the leader is still live. The close event is too
+		// late: Node may have reaped the leader by then, leaving only exact member
+		// continuity as authority for descendants that survived naturally.
+		captureChildProcessGroupMembers(child, childIdentity?.pgid ?? pid);
+		const groupIdentityMatches = (): boolean => Boolean(
+			process.platform === "linux"
+				&& pid && pid > 0
+				&& childIdentity?.pid === pid
+				&& childIdentity.pgid === pid,
+		);
+		const groupGone = (): boolean => isChildProcessGroupGone(child);
+		const terminate = (signal: NodeJS.Signals): void => {
+			if (!pid || pid <= 0) return;
+			if (process.platform === "win32") {
+				try { child.kill(signal); } catch { /* already gone */ }
+				return;
+			}
+			if (groupGone()) return;
+			if (groupIdentityMatches()) {
+				signalChildProcessGroup(child, signal, { identity: childIdentity });
+				return;
+			}
+			// If the leader exited naturally, exact member snapshots captured while
+			// it was live retain continuity authority for surviving descendants.
+			// This path never falls back to the leader PID after reaping.
+			if (signalChildProcessGroup(child, signal, { identity: childIdentity })) return;
+			// A detached ChildProcess that is still unreaped is an owned private
+			// group even when /proc token capture lost the startup race. This is the
+			// sole tokenless fallback; after exit, never signal the bare PID/PGID.
+			if (process.platform === "linux" && child.exitCode == null && child.signalCode == null) {
+				try { process.kill(-pid, signal); } catch { /* preserve evidence on refusal */ }
+			}
+		};
+		let hardKillTimer: NodeJS.Timeout | undefined;
+		const scheduleHardKill = (): void => {
+			if (hardKillTimer) return;
+			hardKillTimer = setTimeout(() => {
+				hardKillTimer = undefined;
+				if (!settled) terminate("SIGKILL");
+			}, 1000);
+			hardKillTimer.unref?.();
+		};
+		const timeout = setTimeout(() => { timedOut = true; terminate("SIGTERM"); scheduleHardKill(); }, command.timeoutMs ?? 120_000);
 		timeout.unref?.();
-		child.stdout.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString();
-		});
-		child.stderr.on("data", (chunk: Buffer) => {
-			stderr += chunk.toString();
-		});
-		child.on("close", (exitCode) => {
+		const append = (target: "stdout" | "stderr", chunk: Buffer): void => {
+			const remaining = VERIFY_MAX_OUTPUT - Buffer.byteLength(stdout) - Buffer.byteLength(stderr);
+			const text = chunk.subarray(0, Math.max(0, remaining)).toString();
+			if (target === "stdout") stdout += text; else stderr += text;
+			if (chunk.byteLength > Math.max(0, remaining) && !overflowed) {
+				overflowed = true;
+				stderr += "\n[acceptance verification output exceeded 8 MiB; process group terminated]";
+				terminate("SIGTERM");
+				scheduleHardKill();
+			}
+		};
+		child.stdout.on("data", (chunk: Buffer) => append("stdout", chunk));
+		child.stderr.on("data", (chunk: Buffer) => append("stderr", chunk));
+		const teardownGroup = async (): Promise<boolean> => {
+			if (process.platform === "win32") return child.exitCode !== null || child.pid === undefined;
+			if (groupGone()) return true;
+			terminate("SIGTERM");
+			if (await waitForChildProcessGroupGone(child, 1_000)) return true;
+			terminate("SIGKILL");
+			return waitForChildProcessGroupGone(child, 2_000);
+		};
+		const finish = async (exitCode: number | null, error?: unknown): Promise<void> => {
+			if (settled) return;
+			const groupGone = await teardownGroup();
+			if (settled) return;
+			settled = true;
 			clearTimeout(timeout);
+			if (hardKillTimer) {
+				clearTimeout(hardKillTimer);
+				hardKillTimer = undefined;
+			}
 			const durationMs = Date.now() - startedAt;
-			const passed = exitCode === 0 && !timedOut;
-			resolve({
-				id: command.id,
-				command: command.command,
-				cwd,
-				exitCode,
-				status: timedOut ? "timed-out" : passed ? "passed" : command.allowFailure ? "allowed-failure" : "failed",
-				stdout: trimOutput(stdout),
-				stderr: trimOutput(stderr),
-				durationMs,
-			});
-		});
-		child.on("error", (error) => {
-			clearTimeout(timeout);
-			resolve({
-				id: command.id,
-				command: command.command,
-				cwd,
-				exitCode: 1,
-				status: command.allowFailure ? "allowed-failure" : "failed",
-				stderr: error instanceof Error ? error.message : String(error),
-				durationMs: Date.now() - startedAt,
-			});
-		});
+			const teardownError = groupGone ? undefined : "verification process group did not disappear within teardown bound";
+			const passed = exitCode === 0 && !timedOut && !overflowed && !error && groupGone;
+			resolve({ id: command.id, command: command.command, cwd, exitCode, status: timedOut ? "timed-out" : overflowed || !groupGone ? "failed" : passed ? "passed" : command.allowFailure ? "allowed-failure" : "failed", stdout: trimOutput(stdout), stderr: error || teardownError ? `${stderr}${stderr ? "\n" : ""}${error instanceof Error ? error.message : error ? String(error) : teardownError}` : trimOutput(stderr), durationMs });
+		};
+		child.on("exit", () => { captureChildProcessGroupMembers(child, childIdentity?.pgid ?? pid); });
+		child.on("close", (exitCode) => { captureChildProcessGroupMembers(child, childIdentity?.pgid ?? pid); void finish(exitCode); });
+		child.on("error", (error) => { void finish(1, error); });
 	});
 }
 

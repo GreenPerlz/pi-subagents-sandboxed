@@ -273,6 +273,7 @@ export function compactForegroundResult(result: SingleResult): SingleResult {
 export function compactForegroundDetails(details: Details): Details {
 	return {
 		...details,
+		...(details.results.some((result) => result.teardownUnproven) ? { teardownUnproven: true } : {}),
 		results: details.results.map(compactForegroundResult),
 		progress: details.progress
 			? details.progress.map(compactCompletedProgress)

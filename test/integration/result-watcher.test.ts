@@ -70,6 +70,48 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("retains a result until terminal status is durable across a result/status crash race", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-crash-race-"));
+		const asyncDir = path.join(resultsDir, "async-run");
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "crash-race",
+				mode: "parallel",
+				state: "running",
+				startedAt: Date.now(),
+				steps: [{ agent: "worker", status: "running" }],
+			}), "utf-8");
+			const resultPath = path.join(resultsDir, "crash-race.json");
+			fs.writeFileSync(resultPath, JSON.stringify({
+				id: "crash-race",
+				asyncDir,
+				success: false,
+				state: "failed",
+				results: [{ flatIndex: 0, agent: "worker", success: false, error: "cleanup failed", finalOutput: "recover me", gitBundle: { path: "/recover/bundle", checksum: "sha", base: "base", head: "head", commitSummary: "recovery" } }],
+				groupDiagnostics: [{ groupId: "dynamic-group-1", unindexed: true, agent: "fanout", status: "failed", error: "group failed", finalOutput: "diagnostic" }],
+				workflowGraph: { nodes: [{ id: "group-1", kind: "dynamic-parallel-group", status: "failed" }] },
+			}), "utf-8");
+			const emitted: unknown[] = [];
+			const state = createState();
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit: (_event, data) => emitted.push(data) } }, state, resultsDir, 60_000);
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.equal(fs.existsSync(resultPath), true);
+			assert.equal(emitted.length, 0);
+
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "crash-race", mode: "parallel", state: "failed", startedAt: Date.now(), steps: [{ agent: "worker", status: "failed" }],
+			}), "utf-8");
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 400));
+			watcher.stopResultWatcher();
+			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("logs malformed result files instead of swallowing them silently", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
@@ -480,6 +522,41 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("uses canonical finalOutput and child failure when projecting completion", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-canonical-output-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const pi = { events: { on: () => () => {}, emit: (event: string, data: unknown) => emitted.push({ event, data }) } };
+			const state = createState();
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			const resultPath = path.join(resultsDir, "canonical-output.json");
+			fs.writeFileSync(resultPath, JSON.stringify({
+				id: "canonical-output",
+				runId: "canonical-output",
+				success: true,
+				state: "complete",
+				finalOutput: "canonical top-level output",
+				results: [{ agent: "failed-child", finalOutput: "canonical child output", output: "stale legacy output", success: false, error: "child failed" }],
+			}), "utf-8");
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			watcher.stopResultWatcher();
+			const completion = emitted.find((entry) => entry.event === "subagent:async-complete")?.data as {
+				success?: boolean;
+				state?: string;
+				finalOutput?: string;
+				results?: Array<{ finalOutput?: string; summary?: string; status?: string }>;
+			} | undefined;
+			assert.equal(completion?.success, false);
+			assert.equal(completion?.state, "failed");
+			assert.equal(completion?.finalOutput, "canonical top-level output");
+			assert.equal(completion?.results?.[0]?.finalOutput, "canonical child output");
+			assert.match(completion?.results?.[0]?.summary ?? "", /child failed/);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("enriches async completion and intercom payloads with nested registry children before deletion", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-nested-"));
 		const route = createNestedRoute("async-nested-root");
@@ -777,7 +854,7 @@ describe("result watcher", () => {
 		}
 	});
 
-	it("marks grouped async results as paused when the result file is paused", async () => {
+	it("keeps grouped child statuses local when the result file is paused", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
 			const emitted: Array<{ event: string; data: unknown }> = [];
@@ -831,11 +908,12 @@ describe("result watcher", () => {
 			assert.equal(intercomEvents.length, 1);
 			const payload = intercomEvents[0]?.data as { mode?: string; status?: string; message?: string; children?: Array<{ status?: string }> };
 			assert.equal(payload.mode, "chain");
-			assert.equal(payload.status, "paused");
-			assert.equal(payload.children?.every((child) => child.status === "paused"), true);
-			assert.match(String(payload.message ?? ""), /Status: paused/);
-			assert.match(String(payload.message ?? ""), /1\. a — paused/);
-			assert.match(String(payload.message ?? ""), /2\. b — paused/);
+			assert.equal(payload.status, "failed");
+			assert.equal(payload.children?.[0]?.status, "completed");
+			assert.equal(payload.children?.[1]?.status, "failed");
+			assert.match(String(payload.message ?? ""), /Status: failed/);
+			assert.match(String(payload.message ?? ""), /1\. a — completed/);
+			assert.match(String(payload.message ?? ""), /2\. b — failed/);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}

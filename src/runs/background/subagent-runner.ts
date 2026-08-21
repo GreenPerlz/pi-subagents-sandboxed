@@ -1,15 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { resolveProjectLocalPiPackageResources } from "../../agents/pi-packages.ts";
 import { PI_CHILD_RUNTIME_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { resolveGitMode } from "../../sandbox/config.ts";
-import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, mapIsolatedGitCwd, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, mapIsolatedGitCwd, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
@@ -34,6 +35,7 @@ import {
 	type Usage,
 	type WorkflowGraphSnapshot,
 	DEFAULT_MAX_OUTPUT,
+	TEMP_ARTIFACTS_DIR,
 	type MaxOutputConfig,
 	truncateOutput,
 	getSubagentDepthEnv,
@@ -53,6 +55,7 @@ import {
 	isParallelGroup,
 	flattenSteps,
 	mapConcurrent,
+	MapConcurrentError,
 	aggregateParallelOutputs,
 	MAX_PARALLEL_CONCURRENCY,
 } from "../shared/parallel-utils.ts";
@@ -60,11 +63,12 @@ import { buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime, readStructuredOutput } from "../shared/structured-output.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
-import { hasLiveNestedDescendantsForParent, nestedSummaryFromAsyncStatus, projectNestedEvents, writeNestedEvent } from "../shared/nested-events.ts";
+import { formatAsyncRunnerIdentity, readProcessStartToken } from "./pid-identity.ts";
+import { hasLiveNestedDescendantsForParent, nestedSummaryFromAsyncStatus, projectNestedEvents, waitForNestedDescendantsToStop, writeNestedEvent } from "../shared/nested-events.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { shouldRequestFastMode, type FastModeStatus } from "../../shared/fast-mode.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
-import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
+import { attachPostExitStdioGuard, isChildProcessGroupGone, processControlUnsupported, signalChildProcessGroup } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
 import {
 	createMutatingFailureState,
@@ -87,10 +91,12 @@ import {
 	formatWorktreeTaskCwdConflict,
 	formatRecoverableWorktreePaths,
 	WorktreeDiffCaptureError,
+	WorktreeSetupHookTeardownError,
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import { resolveCandidateLaunchThinking, resolveEffectiveThinking } from "../../shared/model-info.ts";
-import { writeInitialProgressFile } from "../../shared/settings.ts";
+import { taskDisallowsFileUpdates, writeInitialProgressFile } from "../../shared/settings.ts";
+import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
 import {
 	acceptanceFailureMessage,
@@ -137,13 +143,18 @@ interface SubagentRunConfig {
 	progressPaths?: string[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	ownerPid?: number;
+	ownerStartToken?: string;
 }
 
 interface StepResult {
+	flatIndex?: number;
+	groupId?: string;
 	agent: string;
 	output: string;
 	error?: string;
 	success: boolean;
+	interrupted?: boolean;
+	cancelled?: boolean;
 	exitCode?: number | null;
 	skipped?: boolean;
 	sessionFile?: string;
@@ -164,10 +175,37 @@ interface StepResult {
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
 	sandbox?: SandboxResultDetails;
-	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
+	teardownUnproven?: boolean;
+	gitBundle?: {
+		path: string;
+		checksum: string;
+		base: string;
+		head: string;
+		commitSummary: string;
+		recovery?: string;
+		stagedSnapshot?: string;
+		stagedTree?: string;
+		recoveryTree?: string;
+		terminationState?: "success" | "failure" | "timeout" | "cancelled" | "execution-rejected" | "interrupted" | "unknown";
+		incomplete?: boolean;
+		dirtySummary?: string;
+		bundleSize?: number;
+		payloadChecksum?: string;
+		canonicalPayloadChecksum?: string;
+		canonicalPayloadSize?: number;
+		portableMetadata?: string;
+		payloadSize?: number;
+	};
 }
 
 const ASYNC_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
+// This signal is an interrupt/pause operation only. There is deliberately no
+// async cancellation producer in this runner; persisted/reconciled cancelled
+// states are consumed by projection paths, but SIGUSR2 must never become one.
+// Internal integration seam only. It is intentionally not part of the async
+// request/config schema and production does nothing unless a test process opts
+// in with the exact run id after the real child has returned.
+const TEST_REJECT_AFTER_CHILD_ENV = "PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD";
 
 function findLatestSessionFile(sessionDir: string): string | null {
 	try {
@@ -354,6 +392,7 @@ function runPiStreaming(
 			}
 		} catch (setupError) {
 			const message = setupError instanceof Error ? setupError.message : String(setupError);
+			cleanupTempDir(sandbox?.tempDir);
 			outputStream.end();
 			resolve({
 				stderr: message,
@@ -366,12 +405,38 @@ function runPiStreaming(
 			});
 			return;
 		}
-		const child = spawn(spawnSpec.command, spawnSpec.args, {
-			cwd: spawnSpec.cwd ?? cwd,
-			stdio: ["ignore", "pipe", "pipe"],
-			env: spawnSpec.env ?? spawnEnv,
-			windowsHide: true,
-		});
+		const processControlError = processControlUnsupported();
+		if (processControlError) {
+			cleanupTempDir(sandbox?.tempDir);
+			outputStream.end();
+			resolve({
+				stderr: processControlError,
+				exitCode: 1,
+				messages: [],
+				usage: emptyUsage(),
+				error: processControlError,
+				finalOutput: "",
+				...(sandboxDetails ? { sandbox: sandboxDetails } : {}),
+			});
+			return;
+		}
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(spawnSpec.command, spawnSpec.args, {
+				cwd: spawnSpec.cwd ?? cwd,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: spawnSpec.env ?? spawnEnv,
+				// Give every subagent its own process group so interruption also
+				// terminates Bubblewrap, shells, and tool descendants.
+				detached: process.platform === "linux",
+				windowsHide: true,
+			});
+		} catch (spawnError) {
+			cleanupTempDir(sandbox?.tempDir);
+			outputStream.end();
+			resolve({ stderr: String(spawnError), exitCode: 1, messages: [], usage: emptyUsage(), error: spawnError instanceof Error ? spawnError.message : String(spawnError), finalOutput: "" });
+			return;
+		}
 		let stderr = "";
 		let stdoutBuf = "";
 		let stderrBuf = "";
@@ -501,8 +566,36 @@ function runPiStreaming(
 		let cleanTerminalAssistantStopReceived = false;
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardKillTimer: NodeJS.Timeout | undefined;
+		let interruptTermTimer: NodeJS.Timeout | undefined;
+		let interruptKillTimer: NodeJS.Timeout | undefined;
+		let interruptKillExecuted = false;
+		let mandatoryKillExecuted = false;
+		let pendingTerminalClose: { kind: "close" | "error"; exitCode?: number | null; signal?: NodeJS.Signals; error?: Error } | undefined;
+		let teardownPollTimer: NodeJS.Timeout | undefined;
+		let teardownFailure: string | undefined;
 		let settled = false;
-		const clearStdioGuard = attachPostExitStdioGuard(child, { idleMs: 2000, hardMs: 8000 });
+		const clearStdioGuard = attachPostExitStdioGuard(child, {
+			idleMs: 2000,
+			hardMs: 8000,
+			killProcessGroupOnCutoff: process.platform === "linux",
+			onHardCutoff: () => { mandatoryKillExecuted = true; },
+			onTeardownFailure: (reason) => {
+				teardownFailure = reason;
+				forcedTerminationSignal = true;
+				if (sandbox?.isolatedGit) {
+					// Synthetic close is only a publication escape hatch. Fence first so
+					// isolated export/cleanup cannot delete a runtime with unknown heirs.
+					sandbox.isolatedGit.runtime.markExportFenceFailed();
+					const recovery = `Subagent teardown failed before isolated Git cleanup could be proven; recover isolated worktree at ${sandbox.isolatedGit.runtime.root}`;
+					error = error ? `${error}\n${recovery}` : recovery;
+				}
+				error ??= `Subagent teardown failed closed: ${reason}. Runtime evidence is retained for recovery.`;
+				// The hard cutoff is bounded even when the private group cannot be
+				// proven gone. Re-enter the normal terminal path so callers receive a
+				// failed/incomplete result instead of an unbounded close poll.
+				queueMicrotask(() => child.emit("close", 1, "SIGKILL"));
+			},
+		});
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
 			stdoutBuf += text;
@@ -518,12 +611,32 @@ function runPiStreaming(
 			if (settled) return;
 			interrupted = true;
 			if (!error) error = "Interrupted. Waiting for explicit next action.";
-			trySignalChild(child, "SIGINT");
-			setTimeout(() => {
-				if (!settled) trySignalChild(child, "SIGTERM");
-			}, 1000).unref?.();
+			signalChildProcessGroup(child, "SIGINT");
+			if (!interruptTermTimer) {
+				interruptTermTimer = setTimeout(() => {
+					interruptTermTimer = undefined;
+					if (settled) return;
+					signalChildProcessGroup(child, "SIGTERM");
+					// The child owns a private process group. If it ignores both
+					// graceful signals, force-kill that group rather than leaving
+					// Bubblewrap/shell descendants running indefinitely.
+					interruptKillTimer = setTimeout(() => {
+						interruptKillTimer = undefined;
+						if (settled) return;
+						interruptKillExecuted = true;
+						mandatoryKillExecuted = true;
+						signalChildProcessGroup(child, "SIGKILL");
+					}, 2000);
+					interruptKillTimer.unref?.();
+				}, 1000);
+				interruptTermTimer.unref?.();
+			}
 		});
 		const clearDrainTimers = () => {
+			if (teardownPollTimer) {
+				clearInterval(teardownPollTimer);
+				teardownPollTimer = undefined;
+			}
 			if (finalDrainTimer) {
 				clearTimeout(finalDrainTimer);
 				finalDrainTimer = undefined;
@@ -532,28 +645,38 @@ function runPiStreaming(
 				clearTimeout(finalHardKillTimer);
 				finalHardKillTimer = undefined;
 			}
+			if (interruptTermTimer) {
+				clearTimeout(interruptTermTimer);
+				interruptTermTimer = undefined;
+			}
+			if (interruptKillTimer) {
+				clearTimeout(interruptKillTimer);
+				interruptKillTimer = undefined;
+			}
 		};
 		function startFinalDrain(): void {
 			if (childExited || finalDrainTimer || settled) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled) return;
-				const termSent = trySignalChild(child, "SIGTERM");
+				const termSent = signalChildProcessGroup(child, "SIGTERM");
 				if (!termSent) return;
 				forcedTerminationSignal = true;
 				if (!cleanTerminalAssistantStopReceived && !error && !assistantError) {
 					error = `Subagent process did not exit within ${FINAL_STOP_GRACE_MS}ms after its final message. Forcing termination.`;
 				}
 				finalHardKillTimer = setTimeout(() => {
-					if (settled) return;
-					forcedTerminationSignal = trySignalChild(child, "SIGKILL") || forcedTerminationSignal;
+					if (settled || isChildProcessGroupGone(child)) return;
+					mandatoryKillExecuted = true;
+					forcedTerminationSignal = signalChildProcessGroup(child, "SIGKILL") || forcedTerminationSignal;
 				}, HARD_KILL_MS);
-				finalHardKillTimer.unref?.();
 			}, FINAL_STOP_GRACE_MS);
 			finalDrainTimer.unref?.();
 		}
 		child.on("exit", () => {
 			childExited = true;
-			clearDrainTimers();
+			// Preserve owed interrupt/final-drain escalation; wrapper exit is not
+			// proof that the detached process group has disappeared.
+			if (!interrupted && !finalDrainTimer && !finalHardKillTimer) clearDrainTimers();
 		});
 		const attachFailureDiagnostics = (message?: string): void => {
 			if (!sandboxDetails || !sandbox) return;
@@ -571,6 +694,27 @@ function runPiStreaming(
 		};
 
 		child.on("close", (exitCode, signal) => {
+			if (settled) return;
+			// A close event only proves the wrapper streams closed. Keep the
+			// escalation timer alive until the private group is absent or KILL has
+			// executed, then replay this terminal event through the normal path.
+			if (process.platform === "linux" && !isChildProcessGroupGone(child) && !teardownFailure) {
+				pendingTerminalClose ??= { kind: "close", exitCode, signal: signal ?? undefined };
+				if (!teardownPollTimer) {
+					teardownPollTimer = setInterval(() => {
+						if (settled || !pendingTerminalClose) return;
+						if (!isChildProcessGroupGone(child)) return;
+						const pending = pendingTerminalClose;
+						pendingTerminalClose = undefined;
+						if (teardownPollTimer) clearInterval(teardownPollTimer);
+						teardownPollTimer = undefined;
+						child.emit("close", pending.exitCode, pending.signal);
+					}, 25);
+					teardownPollTimer.unref?.();
+				}
+				return;
+			}
+			pendingTerminalClose = undefined;
 			settled = true;
 			registerInterrupt?.(undefined);
 			clearDrainTimers();
@@ -584,19 +728,38 @@ function runPiStreaming(
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !finalError;
 			resolve({
 				stderr,
-				exitCode: interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
+				teardownUnproven: Boolean(teardownFailure),
+				exitCode: teardownFailure ? 1 : interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
 				messages,
 				usage,
 				model,
-				error: interrupted || forcedDrainAfterFinalSuccess ? undefined : finalError,
+				error: teardownFailure ? finalError : interrupted ? (error ?? "Interrupted. Waiting for explicit next action.") : forcedDrainAfterFinalSuccess ? undefined : finalError,
 				finalOutput,
-				interrupted,
+				interrupted: teardownFailure ? undefined : interrupted,
 				observedMutationAttempt,
 				...(sandboxDetails ? { sandbox: sandboxDetails } : {}),
 			});
 		});
 
 		child.on("error", (spawnError) => {
+			if (settled) return;
+			if (process.platform === "linux" && !isChildProcessGroupGone(child) && !teardownFailure) {
+				pendingTerminalClose ??= { kind: "error", error: spawnError };
+				if (!teardownPollTimer) {
+					teardownPollTimer = setInterval(() => {
+						if (settled || !pendingTerminalClose) return;
+						if (!isChildProcessGroupGone(child)) return;
+						const pending = pendingTerminalClose;
+						pendingTerminalClose = undefined;
+						if (teardownPollTimer) clearInterval(teardownPollTimer);
+						teardownPollTimer = undefined;
+						if (pending.kind === "error") child.emit("error", pending.error);
+						else child.emit("close", pending.exitCode, pending.signal);
+					}, 25);
+					teardownPollTimer.unref?.();
+				}
+				return;
+			}
 			settled = true;
 			registerInterrupt?.(undefined);
 			clearDrainTimers();
@@ -766,6 +929,7 @@ async function runSingleStep(
 	step: SubagentStep,
 	ctx: SingleStepContext,
 ): Promise<{
+	flatIndex: number;
 	agent: string;
 	output: string;
 	exitCode: number | null;
@@ -777,6 +941,7 @@ async function runSingleStep(
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
 	interrupted?: boolean;
+	teardownUnproven?: boolean;
 	sessionFile?: string;
 	intercomTarget?: string;
 	outputMode?: "inline" | "file-only";
@@ -787,7 +952,26 @@ async function runSingleStep(
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
-	gitBundle?: { path: string; checksum: string; base: string; head: string; commitSummary: string };
+	gitBundle?: {
+		path: string;
+		checksum: string;
+		base: string;
+		head: string;
+		commitSummary: string;
+		recovery?: string;
+		stagedSnapshot?: string;
+		stagedTree?: string;
+		recoveryTree?: string;
+		terminationState?: "success" | "failure" | "timeout" | "cancelled" | "execution-rejected" | "interrupted" | "unknown";
+		incomplete?: boolean;
+		dirtySummary?: string;
+		bundleSize?: number;
+		payloadChecksum?: string;
+		canonicalPayloadChecksum?: string;
+		canonicalPayloadSize?: number;
+		portableMetadata?: string;
+		payloadSize?: number;
+	};
 }> {
 	const effectiveStructuredOutput = step.structuredOutput ?? (step.structuredOutputSchema
 		? createStructuredOutputRuntime(step.structuredOutputSchema, path.join(path.dirname(ctx.outputFile), "structured-output"))
@@ -908,7 +1092,9 @@ async function runSingleStep(
 			sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.extensionDir : undefined,
 			sandboxIntercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.stateDir : undefined,
 		});
-		const run = await runPiStreaming(
+		let run: RunPiStreamingResult;
+		try {
+			run = await runPiStreaming(
 			args,
 			executionCwd,
 			ctx.outputFile,
@@ -920,8 +1106,15 @@ async function runSingleStep(
 			ctx.registerInterrupt,
 			ctx.onChildEvent,
 			buildSandboxInput({ args, tempDir, sessionDir, sessionFile: step.sessionFile, outputFile: ctx.outputFile, structuredOutput: effectiveStructuredOutput }),
-		);
-		cleanupTempDir(tempDir);
+			);
+		} finally {
+			// runPiStreaming resolves only after child/group teardown; its finally
+			// also covers spawn/setup rejection and interrupt paths.
+			cleanupTempDir(tempDir);
+		}
+		if (process.env[TEST_REJECT_AFTER_CHILD_ENV] === ctx.id) {
+			throw new Error("test callback rejection after child completion");
+		}
 
 		const hiddenError = run.exitCode === 0 && !run.error ? detectSubagentError(run.messages) : null;
 		let structuredOutput: unknown;
@@ -1081,7 +1274,9 @@ async function runSingleStep(
 				});
 				ctx.onAttemptStart?.({ model: finalizationModel, thinking: resolveCandidateLaunchThinking(finalizationModel, step.thinking) });
 				const finalizationOutputFile = `${ctx.outputFile}.finalization-${turn}.log`;
-				const finalizationRun = await runPiStreaming(
+				let finalizationRun: RunPiStreamingResult;
+				try {
+					finalizationRun = await runPiStreaming(
 					args,
 					executionCwd,
 					finalizationOutputFile,
@@ -1093,8 +1288,10 @@ async function runSingleStep(
 					ctx.registerInterrupt,
 					ctx.onChildEvent,
 					buildSandboxInput({ args, tempDir, sessionFile, outputFile: finalizationOutputFile }),
-				);
-				cleanupTempDir(tempDir);
+					);
+				} finally {
+					cleanupTempDir(tempDir);
+				}
 				modelAttempts.push({
 					model: finalizationModel ?? finalizationRun.model ?? "default",
 					success: finalizationRun.exitCode === 0 && !finalizationRun.error,
@@ -1136,12 +1333,57 @@ async function runSingleStep(
 	}
 	const acceptanceFailure = acceptance ? acceptanceFailureMessage(acceptance) : undefined;
 	const acceptanceCanFailRun = acceptanceFailure && acceptance?.explicit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted;
-	let gitBundle: { path: string; checksum: string; base: string; head: string; commitSummary: string } | undefined;
-	if (ctx.isolatedGit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.error && !finalResult?.interrupted && !acceptanceCanFailRun) {
+	let gitBundle: {
+		path: string;
+		checksum: string;
+		base: string;
+		head: string;
+		commitSummary: string;
+		recovery?: string;
+		stagedSnapshot?: string;
+		stagedTree?: string;
+		recoveryTree?: string;
+		terminationState?: "success" | "failure" | "timeout" | "cancelled" | "execution-rejected" | "interrupted" | "unknown";
+		incomplete?: boolean;
+		dirtySummary?: string;
+		bundleSize?: number;
+		payloadChecksum?: string;
+		canonicalPayloadChecksum?: string;
+		canonicalPayloadSize?: number;
+		portableMetadata?: string;
+		payloadSize?: number;
+	} | undefined;
+	if (ctx.isolatedGit) {
+		const nestedFence = await waitForNestedDescendantsToStop(ctx.nestedRoute, ctx.id, ctx.flatIndex);
+		if (!nestedFence.stopped) {
+			ctx.isolatedGit.runtime.markExportFenceFailed();
+			const recovery = `Nested descendants did not reach a proven terminal state before the export fence timed out; recover isolated worktree at ${ctx.isolatedGit.runtime.root}`;
+			if (finalResult) {
+				finalResult.teardownUnproven = true;
+				finalResult.exitCode = finalResult.exitCode === 0 ? 1 : finalResult.exitCode;
+				finalResult.error = finalResult.error ? `${finalResult.error}\n${recovery}` : recovery;
+			} else {
+				return { flatIndex: ctx.flatIndex, agent: step.agent, output: outputForSummary, exitCode: 1, error: recovery, teardownUnproven: true, model: finalResult?.model, acceptance };
+			}
+		}
+		const terminationState = finalResult?.interrupted
+			? "interrupted"
+			: acceptanceCanFailRun || (finalResult?.exitCode ?? 1) !== 0 || Boolean(finalResult?.error)
+				? /timeout|timed out/i.test(finalResult?.error ?? "") ? "timeout" : "failure"
+				: "success";
 		try {
+			if (!nestedFence.stopped) {
+				// The runtime is deliberately retained until descendants publish a
+				// terminal event; stdio closure is not a stop proof.
+				throw new Error(`nested export fence timed out; recover isolated worktree at ${ctx.isolatedGit.runtime.root}`);
+			}
 			const bundle = exportIsolatedGitBundle(ctx.isolatedGit.runtime, {
-				outputDir: ctx.artifactsDir ?? path.join(path.dirname(ctx.outputFile), "isolated-git-bundles"),
+				outputDir: ctx.artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
 				worktree: ctx.isolatedGit,
+				syntheticPaths: ctx.isolatedGit.syntheticPaths,
+				terminationState,
+				agent: step.agent,
+				commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }),
 			});
 			gitBundle = {
 				path: bundle.path,
@@ -1149,16 +1391,39 @@ async function runSingleStep(
 				base: bundle.base,
 				head: bundle.head,
 				commitSummary: bundle.commitSummary,
+				...(bundle.recovery ? { recovery: bundle.recovery } : {}),
+				...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
+				...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}),
+				...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}),
+				terminationState: bundle.terminationState,
+				incomplete: bundle.incomplete,
+				dirtySummary: bundle.dirtySummary,
+				bundleSize: bundle.bundleSize,
+				payloadChecksum: bundle.payloadChecksum,
+				payloadSize: bundle.payloadSize,
+				canonicalPayloadChecksum: bundle.canonicalPayloadChecksum,
+				canonicalPayloadSize: bundle.canonicalPayloadSize,
+				portableMetadata: bundle.portableMetadata,
 			};
+			if (bundle.incomplete && !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }) && !finalResult?.error) {
+				if (finalResult) {
+					finalResult.exitCode = 1;
+					finalResult.error = "Isolated writer completed without a required authored commit; recovery bundle is incomplete.";
+					delete finalResult.interrupted;
+					delete finalResult.cancelled;
+				}
+			}
 		} catch (error) {
-			return {
-				agent: step.agent,
-				output: outputForSummary,
-				exitCode: 1,
-				error: `Isolated Git bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
-				model: finalResult?.model,
-				acceptance,
-			};
+			ctx.isolatedGit.runtime.markExportFailed();
+			const exportError = `Isolated Git bundle export failed; recover isolated worktree at ${ctx.isolatedGit.runtime.root}: ${error instanceof Error ? error.message : String(error)}`;
+			if (finalResult) {
+				finalResult.error = finalResult.error ? `${finalResult.error}\n${exportError}` : exportError;
+				if (finalResult.exitCode === 0) finalResult.exitCode = 1;
+				delete finalResult.interrupted;
+				delete finalResult.cancelled;
+			} else {
+				return { flatIndex: ctx.flatIndex, agent: step.agent, output: outputForSummary, exitCode: 1, error: exportError, model: finalResult?.model, acceptance };
+			}
 		}
 	}
 	const effectiveFinalExitCode = acceptanceCanFailRun ? 1 : finalResult?.exitCode ?? 1;
@@ -1191,6 +1456,7 @@ async function runSingleStep(
 	}
 
 	return {
+		flatIndex: ctx.flatIndex,
 		agent: step.agent,
 		output: outputForSummary,
 		exitCode: effectiveFinalExitCode,
@@ -1204,6 +1470,7 @@ async function runSingleStep(
 		modelAttempts,
 		artifactPaths,
 		interrupted: finalResult?.interrupted,
+		teardownUnproven: finalResult?.teardownUnproven,
 		outputMode: step.outputMode,
 		savedOutputPath,
 		savedOutputAnnounced: announceSavedOutput,
@@ -1249,6 +1516,7 @@ function markParallelGroupSetupFailure(input: {
 	asyncDir: string;
 	runId: string;
 	stepIndex: number;
+	teardownUnproven?: boolean;
 }): void {
 	for (let taskIndex = 0; taskIndex < input.group.parallel.length; taskIndex++) {
 		const flatTaskIndex = input.groupStartFlatIndex + taskIndex;
@@ -1257,9 +1525,10 @@ function markParallelGroupSetupFailure(input: {
 		input.statusPayload.steps[flatTaskIndex].endedAt = input.failedAt;
 		input.statusPayload.steps[flatTaskIndex].durationMs = 0;
 		input.statusPayload.steps[flatTaskIndex].exitCode = 1;
-		input.results.push({ agent: input.group.parallel[taskIndex].agent, output: input.setupError, success: false, exitCode: 1, sessionFile: input.group.parallel[taskIndex].sessionFile });
+		input.results.push({ flatIndex: flatTaskIndex, agent: input.group.parallel[taskIndex].agent, output: input.setupError, success: false, exitCode: 1, sessionFile: input.group.parallel[taskIndex].sessionFile });
 	}
 	input.statusPayload.currentStep = input.groupStartFlatIndex;
+	if (input.teardownUnproven) input.statusPayload.teardownUnproven = true;
 	input.statusPayload.lastUpdate = input.failedAt;
 	input.statusPayload.outputFile = path.join(input.asyncDir, `output-${input.groupStartFlatIndex}.log`);
 	writeAtomicJson(input.statusPath, input.statusPayload);
@@ -1340,14 +1609,36 @@ function ensureParallelProgressFile(cwd: string, group: Extract<RunnerStep, { pa
 	writeInitialProgressFile(cwd);
 }
 
-type ParallelStepResult = Awaited<ReturnType<typeof runSingleStep>> & { skipped?: boolean };
+type ParallelStepResult = Awaited<ReturnType<typeof runSingleStep>> & { skipped?: boolean; flatIndex?: number };
 
-async function runSubagent(config: SubagentRunConfig): Promise<void> {
+async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 	const { id, steps, resultPath, cwd, placeholder, taskIndex, totalTasks, maxOutput, artifactsDir, artifactConfig } =
 		config;
 	let previousOutput = "";
 	const outputs: ChainOutputMap = {};
 	const results: StepResult[] = [];
+	// Keep a durable result projection keyed by materialized flat index. Export
+	// finalization can run after a callback/mapConcurrent failure, and a later
+	// fallback must never discard a bundle that was already verified.
+	const canonicalResults = new Map<number, StepResult>();
+	const syncCanonicalResults = (): void => {
+		for (const result of results) {
+			if (result.flatIndex !== undefined) canonicalResults.set(result.flatIndex, result);
+		}
+	};
+	const projectCanonicalResults = (): void => {
+		for (const [flatIndex, canonical] of canonicalResults) {
+			const existingIndex = results.findIndex((result) => result.flatIndex === flatIndex);
+			if (existingIndex >= 0) results[existingIndex] = { ...results[existingIndex], ...canonical, gitBundle: canonical.gitBundle ?? results[existingIndex]?.gitBundle };
+			else results.push(canonical);
+		}
+		// Persisted receipts/details must not inherit detached callback order.
+		results.sort((left, right) => {
+			if (left.flatIndex === undefined) return 1;
+			if (right.flatIndex === undefined) return -1;
+			return left.flatIndex - right.flatIndex;
+		});
+	};
 	const worktreeSummaries: string[] = [];
 	const overallStartTime = Date.now();
 	const shareEnabled = config.share === true;
@@ -1356,14 +1647,31 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const eventsPath = path.join(asyncDir, "events.jsonl");
 	const logPath = path.join(asyncDir, `subagent-log-${id}.md`);
 	const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG;
-	let activeChildInterrupt: (() => void) | undefined;
+	const activeChildInterrupts = new Set<() => void>();
+	const registerChildInterrupt = () => {
+		let current: (() => void) | undefined;
+		return (interrupt: (() => void) | undefined): void => {
+			if (current) activeChildInterrupts.delete(current);
+			current = interrupt;
+			if (interrupt) activeChildInterrupts.add(interrupt);
+		};
+	};
 	let interrupted = false;
 	let worktreeCaptureError: string | undefined;
 	let worktreeExecutionError: string | undefined;
 	let currentActivityState: ActivityState | undefined;
 	let activityTimer: NodeJS.Timeout | undefined;
+	let ownerLivenessTimer: NodeJS.Timeout | undefined;
 	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
 	let latestSessionFile: string | undefined;
+	// Setup can fail before the async signal handler is installed. Keep the
+	// callback optional and track registration so cleanup never invokes or removes
+	// an uninitialized listener (or masks the original setup error).
+	let interruptRunner: (() => void) | undefined;
+	let interruptHandlerRegistered = false;
+	// Once terminal status/result publication starts, recovery state is frozen;
+	// cleanup/fallback work must never run from finally afterward.
+	let terminalPublicationStarted = false;
 
 	const parallelGroups: Array<{ start: number; count: number; stepIndex: number }> = [];
 	const initialStatusSteps: RunnerStatusStep[] = [];
@@ -1430,11 +1738,21 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const flatSteps = flattenSteps(steps);
 	let isolatedGitRuntime: IsolatedGitRuntime | undefined;
 	const isolatedGitWorktrees = new Map<number, IsolatedGitWorktree>();
+	// The source `flatSteps` excludes dynamic fanout items. Persist the exact
+	// materialized step policy for every created runtime worktree so fallback
+	// exports cannot project the placeholder agent/commit policy.
+	const materializedWorktreePolicies = new Map<number, { step: SubagentStep; agent: string; commitRequired: boolean }>();
 	const isolatedSandboxConfigs = [
 		...(config.sandbox?.gitMode === "isolated" ? [config.sandbox] : []),
 		...flatSteps.map((step) => step.sandbox).filter((sandbox): sandbox is ResolvedSandboxConfig => sandbox?.gitMode === "isolated"),
+		...steps
+			.filter(isDynamicRunnerGroup)
+			.map((step) => step.parallel.sandbox ?? config.sandbox)
+			.filter((sandbox): sandbox is ResolvedSandboxConfig => sandbox?.gitMode === "isolated"),
 	];
 	const hasIsolatedGit = isolatedSandboxConfigs.length > 0;
+	let exportRemainingIsolated: ((terminationState: "execution-rejected" | "interrupted") => Promise<void>) | undefined;
+	let statusPayloadReady = false;
 	try {
 	if (hasIsolatedGit) {
 		if (isolatedSandboxConfigs.some((sandbox) => sandbox.provider !== "bubblewrap")) {
@@ -1443,10 +1761,12 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		isolatedGitRuntime = createIsolatedGitRuntime({
 			cwd,
 			runId: id,
+			ownerPid: process.pid,
 			provider: isolatedSandboxConfigs[0]?.provider,
 			network: isolatedSandboxConfigs[0]?.network,
 			profile: isolatedSandboxConfigs[0]?.profile,
 			fallback: isolatedSandboxConfigs[0]?.fallback,
+			worktreeSetupHook: config.worktreeSetupHook ? { hookPath: config.worktreeSetupHook, timeoutMs: config.worktreeSetupHookTimeoutMs } : undefined,
 			extraReadOnlyMounts: [...new Set(isolatedSandboxConfigs.flatMap((sandbox) => sandbox.extraReadOnlyMounts ?? []))],
 			extraWritableMounts: [...new Set(isolatedSandboxConfigs.flatMap((sandbox) => sandbox.extraWritableMounts ?? []))],
 		});
@@ -1454,16 +1774,63 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const resolveIsolatedGitWorktree = (step: SubagentStep, flatIndex: number): IsolatedGitWorktree | undefined => {
 		const sandbox = step.sandbox ?? config.sandbox;
 		if (sandbox?.gitMode !== "isolated") return undefined;
-		const existing = isolatedGitWorktrees.get(flatIndex);
-		if (existing) return existing;
+		const existing = isolatedGitWorktrees.get(flatIndex) ?? isolatedGitRuntime?.worktrees.find((candidate) => candidate.index === flatIndex);
+		if (existing) {
+			isolatedGitWorktrees.set(flatIndex, existing);
+			materializedWorktreePolicies.set(flatIndex, { step, agent: step.agent, commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }) });
+			return existing;
+		}
 		if (!isolatedGitRuntime) throw new Error("isolated Git runtime was not created");
-		const worktree = createIsolatedGitWorktree(isolatedGitRuntime, { index: flatIndex });
+		const policy = {
+			step,
+			agent: step.agent,
+			commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }),
+		};
+		// Materialize policy before checkout/setup so a failing hook still has the
+		// correct agent and commitRequired metadata for its recovery bundle.
+		materializedWorktreePolicies.set(flatIndex, policy);
+		const worktree = createIsolatedGitWorktree(isolatedGitRuntime, { index: flatIndex, agent: step.agent });
 		isolatedGitWorktrees.set(flatIndex, worktree);
 		return worktree;
+	};
+	/**
+	 * Create a missing recovery slot without invoking the user setup hook.
+	 * Existing registered slots are always reused, including slots whose hook
+	 * failed after making edits.
+	 */
+	const createRecoverySlot = (step: SubagentStep, flatIndex: number): IsolatedGitWorktree | undefined => {
+		const sandbox = step.sandbox ?? config.sandbox;
+		if (sandbox?.gitMode !== "isolated") return undefined;
+		const existing = isolatedGitWorktrees.get(flatIndex) ?? isolatedGitRuntime?.worktrees.find((candidate) => candidate.index === flatIndex);
+		if (existing) {
+			isolatedGitWorktrees.set(flatIndex, existing);
+			materializedWorktreePolicies.set(flatIndex, { step, agent: step.agent, commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }) });
+			return existing;
+		}
+		if (!isolatedGitRuntime) throw new Error("isolated Git runtime was not created");
+		const policy = {
+			step,
+			agent: step.agent,
+			commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }),
+		};
+		materializedWorktreePolicies.set(flatIndex, policy);
+		const worktree = isolatedGitRuntime.createRecoveryWorktree({ index: flatIndex, agent: step.agent });
+		isolatedGitWorktrees.set(flatIndex, worktree);
+		return worktree;
+	};
+	const tryCreateRecoverySlot = (step: SubagentStep, flatIndex: number): { worktree?: IsolatedGitWorktree; error?: string } => {
+		try {
+			return { worktree: createRecoverySlot(step, flatIndex) };
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			isolatedGitRuntime?.markExportFailed();
+			return { error: `Recovery worktree creation failed for slot ${flatIndex} (${step.agent}): ${detail}. Preserve the isolated runtime at ${isolatedGitRuntime?.root ?? "the runtime root"} for manual recovery.` };
+		}
 	};
 	const sessionEnabled = Boolean(config.sessionDir)
 		|| shareEnabled
 		|| flatSteps.some((step) => Boolean(step.sessionFile));
+	let isolatedGitCleanupVerified = !isolatedGitRuntime;
 	const statusPayload: RunnerStatusPayload = {
 		runId: id,
 		...(config.sessionId ? { sessionId: config.sessionId } : {}),
@@ -1473,7 +1840,26 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		startedAt: overallStartTime,
 		lastUpdate: overallStartTime,
 		pid: process.pid,
+		runnerIdentity: process.argv[2]
+			? formatAsyncRunnerIdentity(
+				fileURLToPath(import.meta.url),
+				process.argv[2],
+				id,
+				readProcessStartToken(process.pid),
+				typeof process.getuid === "function" ? process.getuid() : undefined,
+				(() => {
+					try {
+						const raw = fs.readFileSync(`/proc/${process.pid}/cmdline`, "utf8");
+						const argv = raw.split("\0").filter(Boolean);
+						return argv.length > 0 ? argv : process.argv;
+					} catch { return process.argv; }
+				})(),
+			)
+			: `run:${id}`,
+		...(readProcessStartToken(process.pid) ? { runnerStartToken: readProcessStartToken(process.pid) } : {}),
+		...(typeof process.getuid === "function" ? { runnerUid: process.getuid() } : {}),
 		...(config.ownerPid ? { ownerPid: config.ownerPid } : {}),
+		...(config.ownerStartToken ? { ownerStartToken: config.ownerStartToken } : {}),
 		cwd,
 		currentStep: 0,
 		chainStepCount: steps.length,
@@ -1485,6 +1871,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		outputFile: path.join(asyncDir, "output-0.log"),
 		...(config.nestedRoute ? { nestedRoute: config.nestedRoute } : {}),
 	};
+	statusPayloadReady = true;
 
 	fs.mkdirSync(asyncDir, { recursive: true });
 	writeAtomicJson(statusPath, statusPayload);
@@ -1513,8 +1900,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const refreshWorkflowGraph = (): void => {
 		if (!config.workflowGraph) return;
 		const graph = structuredClone(statusPayload.workflowGraph ?? config.workflowGraph);
-		const normalize = (status: RunnerStatusStep["status"]): "pending" | "running" | "completed" | "failed" | "paused" | "detached" => {
+		const normalize = (status: RunnerStatusStep["status"]): "pending" | "running" | "completed" | "failed" | "paused" | "cancelled" | "detached" => {
 			if (status === "complete" || status === "completed") return "completed";
+			if (status === "cancelled") return "cancelled";
 			if (status === "running" || status === "failed" || status === "paused" || status === "pending") return status;
 			return "pending";
 		};
@@ -1530,10 +1918,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 			for (const child of node.children ?? []) updateNode(child);
 			if (node.children?.length) {
-				if (node.children.every((child) => child.status === "completed")) node.status = "completed";
-				else if (node.children.some((child) => child.status === "running")) node.status = "running";
-				else if (node.children.some((child) => child.status === "failed")) node.status = "failed";
-				else if (node.children.some((child) => child.status === "paused")) node.status = "paused";
+				const state = resolveAggregateState(node.children.map((child) => ({
+					state: child.status,
+					teardownUnproven: child.flatIndex !== undefined && statusPayload.steps[child.flatIndex]?.teardownUnproven === true,
+				})));
+				node.status = state === "completed" ? "completed" : state as typeof node.status;
 			}
 			if (node.error) node.status = "failed";
 		};
@@ -1541,6 +1930,21 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		statusPayload.workflowGraph = graph;
 	};
 	const writeStatusPayload = (): void => {
+		const terminalState = statusPayload.state === "complete" || statusPayload.state === "failed" || statusPayload.state === "paused" || statusPayload.state === "cancelled";
+		// A hook group that survived teardown is still live/actionable; do not emit
+		// a terminal nested event until a later explicit acknowledgement proves it.
+		if (isolatedGitRuntime?.hookTeardownFailed) statusPayload.teardownUnproven = true;
+		// A teardown refusal is live recovery state even when child setup already
+		// produced failed projections. Keep the durable status nonterminal so parent
+		// fences cannot mistake an updated event for proof that writers stopped.
+		if (statusPayload.teardownUnproven) {
+			statusPayload.incomplete = true;
+			statusPayload.state = "running";
+		}
+		// Do not expose a terminal isolated run while its verified export/cleanup
+		// fence is still pending. Export failures and fence refusals are explicitly
+		// publishable because the runtime remains the recovery artifact.
+		if (terminalState && isolatedGitRuntime && !isolatedGitCleanupVerified && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) return;
 		refreshWorkflowGraph();
 		if (config.nestedRoute) {
 			try {
@@ -1550,9 +1954,226 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 		}
 		writeAtomicJson(statusPath, statusPayload);
-		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" ? "subagent.nested.updated" : "subagent.nested.completed");
+		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" || isolatedGitRuntime?.hookTeardownFailed ? "subagent.nested.updated" : "subagent.nested.completed");
 	};
-	const markDynamicGraphGroup = (stepIndex: number, status: "completed" | "failed" | "running", error?: string, acceptance?: AcceptanceLedger): void => {
+	type PendingTerminalPublication = {
+		result: Awaited<ReturnType<typeof runSingleStep>>;
+		agent: string;
+		startedAt: number;
+		endedAt: number;
+	};
+	const pendingTerminalPublications = new Map<number, PendingTerminalPublication>();
+	const publishedTerminalIndexes = new Set<number>();
+	const persistGroupDiagnostic = (diagnostic: { groupId: string; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string }): void => {
+		statusPayload.groupDiagnostics ??= [];
+		const existing = statusPayload.groupDiagnostics.findIndex((entry) => entry.groupId === diagnostic.groupId);
+		const value = { ...diagnostic, unindexed: true as const, finalOutput: diagnostic.output };
+		if (existing >= 0) statusPayload.groupDiagnostics[existing] = value;
+		else statusPayload.groupDiagnostics.push(value);
+	};
+	const applyChildTerminal = (flatIndex: number, pending: PendingTerminalPublication, publishEvent: boolean): void => {
+		const step = statusPayload.steps[flatIndex];
+		if (!step) return;
+		const { agent, startedAt, endedAt } = pending;
+		const canonical = canonicalResults.get(flatIndex);
+		const result = canonical ? { ...pending.result, ...canonical, gitBundle: canonical.gitBundle ?? pending.result.gitBundle } : pending.result;
+		// The interrupt handler marks only children that were running. A callback
+		// arriving afterward must retain that paused truth instead of deriving a
+		// successful completion from the child's exit code.
+		const cancelled = result.cancelled === true || step.status === "cancelled";
+		const paused = !cancelled && (result.interrupted || step.status === "paused");
+		if (paused) interrupted = true;
+		if (step.status !== "paused" && step.status !== "cancelled") step.status = cancelled ? "cancelled" : paused ? "paused" : result.exitCode === 0 ? "complete" : "failed";
+		step.endedAt ??= endedAt;
+		step.durationMs ??= endedAt - startedAt;
+		step.exitCode = result.exitCode;
+		step.model = result.model;
+		step.thinking = resolveEffectiveThinking(result.model, step.thinking);
+		step.fastMode = result.fastMode;
+		step.attemptedModels = result.attemptedModels;
+		step.modelAttempts = result.modelAttempts;
+		step.error = paused && step.error ? step.error : result.error;
+		step.success = result.exitCode === 0 && !paused && !cancelled;
+		step.finalOutput = result.output;
+		step.interrupted = Boolean(result.interrupted);
+		step.cancelled = cancelled;
+		step.structuredOutput = result.structuredOutput;
+		step.structuredOutputPath = result.structuredOutputPath;
+		step.structuredOutputSchemaPath = result.structuredOutputSchemaPath;
+		step.acceptance = result.acceptance;
+		step.sandbox = result.sandbox;
+		step.gitBundle = result.gitBundle ?? step.gitBundle;
+		step.teardownUnproven = result.teardownUnproven === true || step.teardownUnproven === true ? true : undefined;
+		if (result.teardownUnproven) statusPayload.teardownUnproven = true;
+		statusPayload.lastUpdate = endedAt;
+		if (!publishEvent) return;
+		writeStatusPayload();
+		// An unproven teardown is actionable running truth, not a terminal child
+		// publication. The status write above still persists the recovery flag.
+		if (result.teardownUnproven === true || step.teardownUnproven === true) return;
+		appendJsonl(eventsPath, JSON.stringify({
+			type: cancelled ? "subagent.step.cancelled" : paused ? "subagent.step.paused" : result.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
+			ts: endedAt, runId: id, stepIndex: flatIndex, agent,
+			exitCode: result.exitCode, durationMs: step.durationMs,
+		}));
+		publishedTerminalIndexes.add(flatIndex);
+	};
+	const recordChildTerminal = (flatIndex: number, result: Awaited<ReturnType<typeof runSingleStep>>, agent: string, startedAt: number, endedAt: number): void => {
+		const pending = { result, agent, startedAt, endedAt };
+		if (isolatedGitRuntime) pendingTerminalPublications.set(flatIndex, pending);
+		else applyChildTerminal(flatIndex, pending, true);
+	};
+	const publishPendingTerminalPublications = (): void => {
+		for (const [flatIndex, pending] of pendingTerminalPublications) applyChildTerminal(flatIndex, pending, true);
+		pendingTerminalPublications.clear();
+	};
+	exportRemainingIsolated = async (terminationState: "execution-rejected" | "interrupted"): Promise<void> => {
+		if (!isolatedGitRuntime || isolatedGitRuntime.exportFenceFailed) return;
+		// A child process can close before its nested foreground/background
+		// descendants publish terminal events. Never package or remove the runtime
+		// until the route is fenced on those terminal events.
+		const fence = await waitForNestedDescendantsToStop(config.nestedRoute, id);
+		const exportErrors: string[] = [];
+		if (!fence.stopped) {
+			isolatedGitRuntime.markExportFenceFailed();
+			statusPayload.teardownUnproven = true;
+			const message = `Nested descendants did not reach a proven terminal state before export; recover isolated worktrees at ${isolatedGitRuntime.root}`;
+			exportErrors.push(message);
+			statusPayload.state = "failed";
+			statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${message}` : message;
+			const endedAt = Date.now();
+			for (const worktree of isolatedGitRuntime.worktrees) {
+				const existing = canonicalResults.get(worktree.index) ?? results.find((result) => result.flatIndex === worktree.index);
+				const error = existing?.error?.includes(message) ? existing.error : existing?.error ? `${existing.error}\n${message}` : message;
+				const fallback = existing
+					? { ...existing, success: false, exitCode: 1, error, interrupted: undefined, cancelled: undefined, teardownUnproven: true }
+					: { flatIndex: worktree.index, agent: materializedWorktreePolicies.get(worktree.index)?.agent ?? `task-${worktree.index + 1}`, output: "(isolated task did not reach a fenced terminal state)", success: false, exitCode: 1, error, teardownUnproven: true };
+				canonicalResults.set(worktree.index, fallback);
+				const resultIndex = results.findIndex((result) => result.flatIndex === worktree.index);
+				if (resultIndex >= 0) results[resultIndex] = fallback;
+				else results.push(fallback);
+				const statusStep = statusPayload.steps[worktree.index];
+				if (statusStep) {
+					statusStep.status = "failed";
+					statusStep.interrupted = undefined;
+					statusStep.cancelled = undefined;
+					statusStep.exitCode = 1;
+					statusStep.endedAt = statusStep.endedAt ?? endedAt;
+					statusStep.durationMs = statusStep.durationMs ?? (statusStep.startedAt ? endedAt - statusStep.startedAt : 0);
+					statusStep.error = error;
+					statusStep.teardownUnproven = true;
+				}
+			}
+			statusPayload.lastUpdate = endedAt;
+			return;
+		}
+		isolatedGitRuntime.markExportFenceResolved();
+		for (const worktree of isolatedGitRuntime.worktrees) {
+			if (isolatedGitRuntime.isExported(worktree.index)) continue;
+			const policy = materializedWorktreePolicies.get(worktree.index);
+			const step = policy?.step;
+			let bundle: ReturnType<typeof exportIsolatedGitBundle> | undefined;
+			let exportError: unknown;
+			// Complete the fence and verified export, including one bounded retry,
+			// before any terminal projection is published.
+			for (let attempt = 0; attempt < 2 && !bundle; attempt++) {
+				try {
+					bundle = exportIsolatedGitBundle(isolatedGitRuntime, {
+						outputDir: artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
+						worktree,
+						syntheticPaths: worktree.syntheticPaths,
+						terminationState,
+						agent: policy?.agent,
+						commitRequired: policy?.commitRequired,
+					});
+				} catch (error) {
+					exportError = error;
+				}
+			}
+			if (bundle) {
+				const gitBundle = {
+					path: bundle.path,
+					checksum: bundle.checksum,
+					base: bundle.base,
+					head: bundle.head,
+					commitSummary: bundle.commitSummary,
+					...(bundle.recovery ? { recovery: bundle.recovery } : {}),
+					...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
+					...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}),
+					...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}),
+					terminationState: bundle.terminationState,
+					incomplete: bundle.incomplete,
+					dirtySummary: bundle.dirtySummary,
+					bundleSize: bundle.bundleSize,
+					payloadChecksum: bundle.payloadChecksum,
+					payloadSize: bundle.payloadSize,
+					canonicalPayloadChecksum: bundle.canonicalPayloadChecksum,
+					canonicalPayloadSize: bundle.canonicalPayloadSize,
+					portableMetadata: bundle.portableMetadata,
+				};
+				const existing = canonicalResults.get(worktree.index) ?? results.find((result) => result.flatIndex === worktree.index);
+				const normalizedExistingError = stripIsolatedGitExportDiagnostics(existing?.error);
+				const recoveredExportOnlyFailure = Boolean(existing && normalizedExistingError.onlyDiagnostics);
+				const recoveredExisting = existing && normalizedExistingError.error !== existing.error
+					? { ...existing, ...(normalizedExistingError.error ? { error: normalizedExistingError.error } : { error: undefined }), ...(recoveredExportOnlyFailure ? { success: true, exitCode: 0 } : {}) }
+					: existing;
+				const projected = recoveredExisting
+					? { ...recoveredExisting, gitBundle }
+					: { flatIndex: worktree.index, agent: step?.agent ?? `task-${worktree.index + 1}`, output: "(isolated task did not start)", success: false, exitCode: 1, error: "Execution rejected before this isolated task completed.", gitBundle };
+				const effectiveProjected = bundle.incomplete && projected.success === true
+					? { ...projected, success: false, exitCode: projected.exitCode === 0 ? 1 : projected.exitCode, error: projected.error ?? "Isolated writer completed without a required authored commit; recovery bundle is incomplete." }
+					: projected;
+				canonicalResults.set(worktree.index, effectiveProjected);
+				const resultIndex = results.findIndex((result) => result.flatIndex === worktree.index);
+				if (resultIndex >= 0) results[resultIndex] = effectiveProjected;
+				else results.push(effectiveProjected);
+				const statusStep = statusPayload.steps[worktree.index];
+				if (statusStep) {
+					const recovered = recoveredExportOnlyFailure;
+					const incompleteFailure = bundle.incomplete && existing?.success === true;
+					const childPaused = Boolean(existing?.interrupted) || statusStep.status === "paused";
+					statusStep.status = childPaused ? "paused" : incompleteFailure ? "failed" : recovered ? "complete" : "failed";
+					statusStep.exitCode = childPaused ? (statusStep.exitCode ?? 0) : incompleteFailure ? 1 : recovered ? 0 : statusStep.exitCode ?? 1;
+					statusStep.endedAt ??= Date.now();
+					statusStep.gitBundle = gitBundle;
+					if (recovered && !childPaused && !incompleteFailure) statusStep.error = undefined;
+					else if (incompleteFailure) statusStep.error = "Isolated writer completed without a required authored commit; recovery bundle is incomplete.";
+					else if (!recovered) statusStep.error ??= "Execution rejected before this isolated task completed.";
+				}
+			} else {
+				isolatedGitRuntime.markExportFailed();
+				const packaging = `Isolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
+				const existing = canonicalResults.get(worktree.index) ?? results.find((result) => result.flatIndex === worktree.index);
+				const original = existing?.error ?? statusPayload.steps[worktree.index]?.error ?? statusPayload.error ?? "Execution rejected before isolated export completed.";
+				const message = `${original}\n${packaging}`;
+				exportErrors.push(message);
+				const paused = terminationState === "interrupted";
+				const fallback = existing
+					? { ...existing, success: false, interrupted: existing.interrupted || paused, exitCode: existing.exitCode ?? (paused ? 0 : 1), error: message }
+					: { flatIndex: worktree.index, agent: step?.agent ?? `task-${worktree.index + 1}`, output: "(isolated task did not start)", success: false, interrupted: paused, exitCode: paused ? 0 : 1, error: message };
+				canonicalResults.set(worktree.index, fallback);
+				const resultIndex = results.findIndex((result) => result.flatIndex === worktree.index);
+				if (resultIndex >= 0) results[resultIndex] = fallback;
+				else results.push(fallback);
+				const statusStep = statusPayload.steps[worktree.index];
+				if (statusStep) {
+					statusStep.status = paused ? "paused" : "failed";
+					statusStep.exitCode = statusStep.exitCode ?? fallback.exitCode ?? 1;
+					statusStep.endedAt = statusStep.endedAt ?? Date.now();
+					statusStep.durationMs = statusStep.durationMs ?? (statusStep.startedAt ? statusStep.endedAt - statusStep.startedAt : 0);
+					statusStep.error = message;
+				}
+			}
+
+		}
+		if (exportErrors.length > 0) {
+			statusPayload.state = terminationState === "interrupted" ? "paused" : "failed";
+			statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${exportErrors.join("\n")}` : exportErrors.join("\n");
+		}
+		projectCanonicalResults();
+		statusPayload.lastUpdate = Date.now();
+	};
+	const markDynamicGraphGroup = (stepIndex: number, status: "completed" | "failed" | "running" | "paused", error?: string, acceptance?: AcceptanceLedger): void => {
 		const groupNode = statusPayload.workflowGraph?.nodes.find((node) => node.id === `step-${stepIndex}`);
 		if (!groupNode) return;
 		groupNode.status = status;
@@ -1864,26 +2485,35 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	// Monitor owner process liveness. If the parent Pi session exits without
 	// graceful shutdown (e.g. SIGKILL), the child runner detects the owner death
 	// and pauses itself, preventing orphaned runs from continuing indefinitely.
-	let ownerLivenessTimer: NodeJS.Timeout | undefined;
-	if (config.ownerPid) {
+	if (typeof config.ownerPid === "number" && Number.isFinite(config.ownerPid) && Number.isInteger(config.ownerPid) && config.ownerPid > 0) {
 		const ownerPid = config.ownerPid;
+		const ownerStartToken = config.ownerStartToken;
 		ownerLivenessTimer = setInterval(() => {
 			if (interrupted || statusPayload.state !== "running") return;
-			try {
-				process.kill(ownerPid, 0);
-			} catch (error) {
-				const code = typeof error === "object" && error !== null && "code" in error
-					? (error as NodeJS.ErrnoException).code : undefined;
-				if (code === "ESRCH") {
-					console.warn(`[pi-subagents] Owner process ${ownerPid} is gone. Pausing async run ${id}.`);
-					interruptRunner();
+			// PID existence alone is unsafe: after owner exit the PID may be reused.
+			// Linux start-time identity is authoritative even when a launcher or
+			// reparenting boundary means getppid() is not the original Pi owner.
+			if (process.platform === "linux" && ownerStartToken) {
+				if (readProcessStartToken(ownerPid) !== ownerStartToken) {
+					console.warn(`[pi-subagents] Owner process ${ownerPid} start identity changed or is unavailable. Pausing async run ${id}.`);
+					interruptRunner?.();
 				}
+				return;
 			}
+			// On platforms without a process-start token, and during rolling upgrades
+			// from an older parent that did not persist one, the direct-parent relation
+			// is the only safe ownership proof; do not probe arbitrary PID existence
+			// (which is vulnerable to reuse and EPERM ambiguity).
+			if (process.ppid !== ownerPid) {
+				console.warn(`[pi-subagents] Owner process ${ownerPid} is no longer the runner parent. Pausing async run ${id}.`);
+				interruptRunner?.();
+			}
+
 		}, 3000);
 		ownerLivenessTimer.unref?.();
 	}
 
-	const interruptRunner = () => {
+	interruptRunner = () => {
 		if (interrupted || statusPayload.state !== "running") return;
 		interrupted = true;
 		const now = Date.now();
@@ -1906,9 +2536,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			ts: now,
 			runId: id,
 		}));
-		activeChildInterrupt?.();
+		for (const interrupt of [...activeChildInterrupts]) interrupt();
 	};
 	process.on(ASYNC_INTERRUPT_SIGNAL, interruptRunner);
+	interruptHandlerRegistered = true;
 	appendJsonl(
 		eventsPath,
 		JSON.stringify({
@@ -1930,7 +2561,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		if (isDynamicRunnerGroup(step)) {
 			const groupStartFlatIndex = flatIndex;
 			const dynamicSandbox = step.parallel.sandbox ?? config.sandbox;
-			if (dynamicSandbox && inferSandboxCwdWritable({ agentName: step.parallel.agent, tools: step.parallel.tools, sandbox: dynamicSandbox })) {
+			if (dynamicSandbox && dynamicSandbox.gitMode !== "isolated" && inferSandboxCwdWritable({ agentName: step.parallel.agent, tools: step.parallel.tools, sandbox: dynamicSandbox })) {
 				const now = Date.now();
 				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
 				statusPayload.state = "failed";
@@ -1947,8 +2578,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				}
 				statusPayload.lastUpdate = now;
 				markDynamicGraphGroup(stepIndex, "failed", message);
+				results.push({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1 });
+				persistGroupDiagnostic({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, status: "failed", output: message, error: message });
 				writeStatusPayload();
-				results.push({ agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1 });
 				break;
 			}
 			let materialized: ReturnType<typeof materializeDynamicParallelStep>;
@@ -1972,8 +2604,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				}
 				statusPayload.lastUpdate = now;
 				markDynamicGraphGroup(stepIndex, "failed", message);
+				results.push({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1 });
+				persistGroupDiagnostic({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, status: "failed", output: message, error: message });
 				writeStatusPayload();
-				results.push({ agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1 });
 				break;
 			}
 
@@ -1987,15 +2620,35 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					stepIndex,
 				};
 				statusPayload.outputs = outputs;
-				const placeholder = statusPayload.steps[groupStartFlatIndex];
-				if (placeholder) {
-					placeholder.status = "complete";
-					placeholder.startedAt = now;
-					placeholder.endedAt = now;
-					placeholder.durationMs = 0;
+				// The placeholder exists only to make pre-materialization status
+				// renderable. An empty fanout has no child in the workflow graph, so
+				// retaining that slot would shift every later sequential child.
+				statusPayload.steps.splice(groupStartFlatIndex, 1);
+				mutatingFailureStates.splice(groupStartFlatIndex, 1);
+				mutatingFailureAttentionSteps.splice(groupStartFlatIndex, 1);
+				pendingToolResults.splice(groupStartFlatIndex, 1);
+				for (const group of statusPayload.parallelGroups) {
+					if (group.stepIndex === stepIndex) group.count = 0;
+					else if (group.start > groupStartFlatIndex) group.start--;
+				}
+				statusPayload.parallelGroups = statusPayload.parallelGroups.filter((group) => group.stepIndex !== stepIndex);
+				if (config.childIntercomTargets) {
+					config.childIntercomTargets = statusPayload.steps.map((statusStep, index) => resolveSubagentIntercomTarget(id, statusStep.agent, index));
 				}
 				previousOutput = "Dynamic fanout produced 0 results.";
-				flatIndex++;
+				// Preserve the completed logical group as unindexed metadata. The
+				// placeholder is removed from the canonical child array so the next
+				// child retains this flat index, while the TUI still gets a completed
+				// group row instead of a phantom pending child.
+				persistGroupDiagnostic({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, status: "complete", output: previousOutput });
+				// Persist the logical group receipt alongside indexed children without
+				// consuming a flat child slot. Result-only consumers must retain this
+				// diagnostic even when status.json is unavailable after cleanup.
+				results.push({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, output: previousOutput, success: true, exitCode: 0 });
+				// No status step was consumed; the next sequential child reuses this
+				// index and will publish the real current step.
+				flatIndex = groupStartFlatIndex;
+				statusPayload.currentStep = statusPayload.steps.length > 0 ? Math.min(groupStartFlatIndex, statusPayload.steps.length - 1) : 0;
 				statusPayload.lastUpdate = now;
 				markDynamicGraphGroup(stepIndex, "completed");
 				writeStatusPayload();
@@ -2045,7 +2698,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				const shiftFlatIndexes = (nodes: NonNullable<typeof statusPayload.workflowGraph>["nodes"]): void => {
 					for (const node of nodes) {
 						if (node.stepIndex !== undefined && node.stepIndex > stepIndex && node.flatIndex !== undefined && node.flatIndex >= groupStartFlatIndex) {
-							node.flatIndex += dynamicStatusSteps.length;
+							node.flatIndex += materializedDelta;
 						}
 						if (node.children) shiftFlatIndexes(node.children);
 					}
@@ -2072,8 +2725,25 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const concurrency = step.concurrency ?? MAX_PARALLEL_CONCURRENCY;
 			const failFast = step.failFast ?? false;
 			let aborted = false;
-			const parallelResults = await mapConcurrent(dynamicSteps, concurrency, async (task, taskIdx) => {
+			let parallelResults: ParallelStepResult[];
+			try {
+			parallelResults = await mapConcurrent(dynamicSteps, concurrency, async (task, taskIdx) => {
 				const fi = groupStartFlatIndex + taskIdx;
+				if (interrupted) {
+					const pausedAt = Date.now();
+					const statusStep = statusPayload.steps[fi];
+					if (statusStep) {
+						statusStep.status = "paused";
+						statusStep.error = "Interrupted before this task started.";
+						statusStep.startedAt = undefined;
+						statusStep.endedAt = pausedAt;
+						statusStep.durationMs = 0;
+						statusStep.exitCode = 0;
+					}
+					statusPayload.lastUpdate = pausedAt;
+					writeStatusPayload();
+					return { flatIndex: fi, agent: task.agent, output: "(interrupted before this task started)", exitCode: 0, interrupted: true, skipped: true };
+				}
 				if (aborted && failFast) {
 					const skippedAt = Date.now();
 					statusPayload.steps[fi].status = "failed";
@@ -2084,7 +2754,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					statusPayload.steps[fi].exitCode = -1;
 					statusPayload.lastUpdate = skippedAt;
 					writeStatusPayload();
-					return { agent: task.agent, output: "(skipped — fail-fast)", exitCode: -1 as number | null, skipped: true };
+					return { flatIndex: fi, agent: task.agent, output: "(skipped — fail-fast)", exitCode: -1 as number | null, skipped: true };
 				}
 				const taskStartTime = Date.now();
 				statusPayload.currentStep = fi;
@@ -2116,47 +2786,62 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					isolatedGit: resolveIsolatedGitWorktree(task, fi),
 					progressPaths: config.progressPaths,
 					sandboxIntercomBridge: config.sandboxIntercomBridge,
-					registerInterrupt: (interrupt) => {
-						activeChildInterrupt = interrupt;
-					},
+					registerInterrupt: registerChildInterrupt(),
 					onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
 					onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 				});
 				const taskEndTime = Date.now();
-				statusPayload.steps[fi].status = singleResult.exitCode === 0 ? "complete" : "failed";
-				statusPayload.steps[fi].endedAt = taskEndTime;
-				statusPayload.steps[fi].durationMs = taskEndTime - taskStartTime;
-				statusPayload.steps[fi].exitCode = singleResult.exitCode;
-				statusPayload.steps[fi].model = singleResult.model;
-				statusPayload.steps[fi].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[fi].thinking);
-				statusPayload.steps[fi].fastMode = singleResult.fastMode;
-				statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
-				statusPayload.steps[fi].modelAttempts = singleResult.modelAttempts;
-				statusPayload.steps[fi].error = singleResult.error;
-				statusPayload.steps[fi].structuredOutput = singleResult.structuredOutput;
-				statusPayload.steps[fi].structuredOutputPath = singleResult.structuredOutputPath;
-				statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
-				statusPayload.steps[fi].acceptance = singleResult.acceptance;
-				statusPayload.steps[fi].sandbox = singleResult.sandbox;
-				statusPayload.steps[fi].gitBundle = singleResult.gitBundle;
-				statusPayload.lastUpdate = taskEndTime;
-				writeStatusPayload();
-				appendJsonl(eventsPath, JSON.stringify({
-					type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
-					ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
-					exitCode: singleResult.exitCode, durationMs: taskEndTime - taskStartTime,
-				}));
+				const childStatusSnapshot = isolatedGitRuntime ? structuredClone(statusPayload.steps[fi]) : undefined;
+				if (singleResult.interrupted || statusPayload.steps[fi]?.status === "paused") interrupted = true;
+				if (isolatedGitRuntime) {
+					pendingTerminalPublications.set(fi, { result: singleResult, agent: task.agent, startedAt: taskStartTime, endedAt: taskEndTime });
+					if (childStatusSnapshot) statusPayload.steps[fi] = childStatusSnapshot;
+				} else {
+					applyChildTerminal(fi, { result: singleResult, agent: task.agent, startedAt: taskStartTime, endedAt: taskEndTime }, true);
+				}
 				if (singleResult.exitCode !== 0 && failFast) aborted = true;
 				return { ...singleResult, skipped: false };
-			});
+				});
+			} catch (error) {
+				const reason = error instanceof MapConcurrentError ? error.reason : error;
+				const message = `Dynamic fanout execution rejected: ${reason instanceof Error ? reason.message : String(reason)}`;
+				const partialResults = error instanceof MapConcurrentError ? error.partialResults : [];
+				const rejectedIndex = error instanceof MapConcurrentError ? error.rejectionIndex : undefined;
+				statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${message}` : message;
+				statusPayload.state = "failed";
+				const endedAt = Date.now();
+				parallelResults = dynamicSteps.map((task, taskIdx) => {
+					const fi = groupStartFlatIndex + taskIdx;
+					const settled = partialResults[taskIdx];
+					if (settled) return { ...settled, flatIndex: fi, skipped: false };
+					const taskMessage = taskIdx === rejectedIndex ? message : `${message}; execution rejected before this task completed`;
+					const statusStep = statusPayload.steps[fi];
+					if (statusStep) {
+						statusStep.status = "failed";
+						statusStep.exitCode = 1;
+						statusStep.endedAt = endedAt;
+						statusStep.error = statusStep.error ? `${statusStep.error}\n${taskMessage}` : taskMessage;
+					}
+					const recovery = !interrupted ? tryCreateRecoverySlot(task, fi) : {};
+					const projectedError = recovery.error ? `${taskMessage}\n${recovery.error}` : taskMessage;
+					return { flatIndex: fi, agent: task.agent, output: "(dynamic fanout execution rejected)", error: projectedError, exitCode: 1, skipped: false };
+				});
+				statusPayload.lastUpdate = endedAt;
+				writeStatusPayload();
+			}
 
+			if (parallelResults.some((result) => result.interrupted)) interrupted = true;
 			flatIndex += dynamicSteps.length;
 			for (const pr of parallelResults) {
+				const childInterrupted = pr.interrupted || (pr.flatIndex !== undefined && statusPayload.steps[pr.flatIndex]?.status === "paused");
 				results.push({
+					flatIndex: pr.flatIndex,
 					agent: pr.agent,
 					output: pr.output,
 					error: pr.error,
-					success: pr.exitCode === 0,
+					success: pr.exitCode === 0 && !childInterrupted,
+					interrupted: childInterrupted,
+					cancelled: pr.cancelled,
 					exitCode: pr.exitCode,
 					skipped: pr.skipped,
 					sessionFile: pr.sessionFile,
@@ -2176,11 +2861,12 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
 					acceptance: pr.acceptance,
 					sandbox: pr.sandbox,
+					teardownUnproven: pr.teardownUnproven,
 					gitBundle: pr.gitBundle,
 				});
 			}
 			const collection = collectDynamicResults(step as Parameters<typeof collectDynamicResults>[0], materialized.items, parallelResults);
-			const failures = parallelResults.filter((result) => result.exitCode !== 0 && result.exitCode !== -1);
+			const failures = parallelResults.filter((result) => (result.exitCode !== 0 && result.exitCode !== -1) || result.interrupted);
 			if (failures.length === 0) {
 				try {
 					validateDynamicCollection(step.collect.outputSchema, collection);
@@ -2194,7 +2880,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					markDynamicGraphGroup(stepIndex, "completed");
 				} catch (error) {
 					const message = error instanceof DynamicFanoutError ? error.message : error instanceof Error ? error.message : String(error);
-					results.push({ agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1, structuredOutput: collection });
+					// Collection validation describes the group, not a materialized child slot.
+					// Keep it unindexed so canonical child projection cannot overwrite the first item.
+					results.push({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1, structuredOutput: collection });
+					persistGroupDiagnostic({ groupId: `dynamic-group-${stepIndex}`, agent: step.parallel.agent, status: "failed", output: message, error: message });
 					statusPayload.error = message;
 					markDynamicGraphGroup(stepIndex, "failed", message);
 				}
@@ -2216,10 +2905,17 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				stepIndex,
 				success: failures.length === 0,
 			}));
-			if (failures.length > 0) markDynamicGraphGroup(stepIndex, "failed", failures[0]?.error ?? "Dynamic fanout child failed.");
+			const aggregateState = resolveAggregateState(parallelResults.map((result) => ({
+				state: result.teardownUnproven ? "running" : result.cancelled ? "cancelled" : result.interrupted ? "paused" : result.exitCode === 0 ? "completed" : "failed",
+				teardownUnproven: result.teardownUnproven,
+			})));
+			const aggregateError = failures[0]?.error ?? "Dynamic fanout child failed.";
+			if (aggregateState === "failed") markDynamicGraphGroup(stepIndex, "failed", aggregateError);
+			else if (aggregateState === "cancelled") markDynamicGraphGroup(stepIndex, "cancelled", failures[0]?.error ?? "Dynamic fanout child cancelled.");
+			else if (aggregateState === "paused") markDynamicGraphGroup(stepIndex, "paused", failures[0]?.error ?? "Dynamic fanout child interrupted.");
 			statusPayload.lastUpdate = Date.now();
 			writeStatusPayload();
-			if (failures.length > 0 || statusPayload.error) break;
+			if (aggregateState === "failed" || aggregateState === "cancelled" || aggregateState === "paused" || statusPayload.error) break;
 			continue;
 		}
 
@@ -2285,6 +2981,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						groupStartFlatIndex,
 						setupError,
 						failedAt,
+						teardownUnproven: error instanceof WorktreeSetupHookTeardownError,
 						statusPath,
 						eventsPath,
 						asyncDir,
@@ -2320,6 +3017,20 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						concurrency,
 						async (task, taskIdx) => {
 						const fi = groupStartFlatIndex + taskIdx;
+						if (interrupted) {
+							const pausedAt = Date.now();
+							const statusStep = statusPayload.steps[fi];
+							if (statusStep) {
+								statusStep.status = "paused";
+								statusStep.error = "Interrupted before this task started.";
+								statusStep.endedAt = pausedAt;
+								statusStep.durationMs = 0;
+								statusStep.exitCode = 0;
+							}
+							statusPayload.lastUpdate = pausedAt;
+							writeStatusPayload();
+							return { flatIndex: fi, agent: task.agent, output: "(interrupted before this task started)", exitCode: 0, interrupted: true, skipped: true };
+						}
 						if (aborted && failFast) {
 							const skippedAt = Date.now();
 							statusPayload.steps[fi].status = "failed";
@@ -2334,7 +3045,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							appendJsonl(eventsPath, JSON.stringify({
 								type: "subagent.step.failed", ts: skippedAt, runId: id, stepIndex: fi, agent: task.agent, exitCode: -1, durationMs: 0,
 							}));
-							return { agent: task.agent, output: "(skipped — fail-fast)", exitCode: -1 as number | null, skipped: true };
+							return { flatIndex: fi, agent: task.agent, output: "(skipped — fail-fast)", exitCode: -1 as number | null, skipped: true };
 						}
 
 						const taskStartTime = Date.now();
@@ -2382,9 +3093,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							isolatedGit,
 							progressPaths: config.progressPaths,
 							sandboxIntercomBridge: config.sandboxIntercomBridge,
-							registerInterrupt: (interrupt) => {
-								activeChildInterrupt = interrupt;
-							},
+							registerInterrupt: registerChildInterrupt(),
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 						});
@@ -2394,31 +3103,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 						const taskEndTime = Date.now();
 						const taskDuration = taskEndTime - taskStartTime;
-
-						statusPayload.steps[fi].status = singleResult.exitCode === 0 ? "complete" : "failed";
-						statusPayload.steps[fi].endedAt = taskEndTime;
-						statusPayload.steps[fi].durationMs = taskDuration;
-						statusPayload.steps[fi].exitCode = singleResult.exitCode;
-						statusPayload.steps[fi].model = singleResult.model;
-						statusPayload.steps[fi].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[fi].thinking);
-						statusPayload.steps[fi].fastMode = singleResult.fastMode;
-						statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
-						statusPayload.steps[fi].modelAttempts = singleResult.modelAttempts;
-						statusPayload.steps[fi].error = singleResult.error;
-						statusPayload.steps[fi].structuredOutput = singleResult.structuredOutput;
-						statusPayload.steps[fi].structuredOutputPath = singleResult.structuredOutputPath;
-						statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
-						statusPayload.steps[fi].acceptance = singleResult.acceptance;
-						statusPayload.steps[fi].sandbox = singleResult.sandbox;
-						statusPayload.steps[fi].gitBundle = singleResult.gitBundle;
-						statusPayload.lastUpdate = taskEndTime;
-						writeStatusPayload();
-
-						appendJsonl(eventsPath, JSON.stringify({
-							type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
-							ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
-							exitCode: singleResult.exitCode, durationMs: taskDuration,
-						}));
+						const childStatusSnapshot = isolatedGitRuntime ? structuredClone(statusPayload.steps[fi]) : undefined;
+						if (singleResult.interrupted || statusPayload.steps[fi]?.status === "paused") interrupted = true;
+						if (isolatedGitRuntime) {
+							pendingTerminalPublications.set(fi, { result: singleResult, agent: task.agent, startedAt: taskStartTime, endedAt: taskEndTime });
+							if (childStatusSnapshot) statusPayload.steps[fi] = childStatusSnapshot;
+						} else {
+							applyChildTerminal(fi, { result: singleResult, agent: task.agent, startedAt: taskStartTime, endedAt: taskEndTime }, true);
+						}
 
 						if (singleResult.exitCode !== 0 && failFast) aborted = true;
 						return { ...singleResult, skipped: false };
@@ -2426,7 +3118,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					);
 				} catch (error) {
 					preserveWorktree = true;
-					const executionBase = `Parallel execution failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`;
+					const rejection = error instanceof MapConcurrentError ? error.reason : error;
+					const partialResults = error instanceof MapConcurrentError ? error.partialResults : [];
+					const rejectedIndex = error instanceof MapConcurrentError ? error.rejectionIndex : undefined;
+					const executionBase = `Parallel execution failed unexpectedly: ${rejection instanceof Error ? rejection.message : String(rejection)}`;
 					try {
 						worktreeSummaryForGroup = captureParallelWorktreeSummary(worktreeSetup, asyncDir, stepIndex, group);
 					} catch (captureError) {
@@ -2445,37 +3140,107 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						: parallelExecutionError;
 					const endedAt = Date.now();
 					for (let taskIndex = 0; taskIndex < group.parallel.length; taskIndex++) {
+						if (partialResults[taskIndex]) continue;
 						const step = statusPayload.steps[groupStartFlatIndex + taskIndex];
 						if (!step) continue;
 						step.status = "failed";
 						step.endedAt = endedAt;
 						step.durationMs = step.startedAt ? endedAt - step.startedAt : 0;
 						step.exitCode = 1;
-						step.error = step.error ? `${step.error}\n${stepError}` : stepError;
+						const taskError = taskIndex === rejectedIndex ? stepError : `${stepError}; execution rejected before this task completed`;
+						step.error = step.error ? `${step.error}\n${taskError}` : taskError;
 					}
 					statusPayload.error = stepError;
 					statusPayload.lastUpdate = endedAt;
 					writeStatusPayload();
-					parallelResults = group.parallel.map((task) => ({
-						agent: task.agent,
-						output: "(parallel execution failed unexpectedly)",
-						error: parallelExecutionError,
-						exitCode: 1,
-						skipped: false,
-					}));
+					const nestedFence = await waitForNestedDescendantsToStop(config.nestedRoute, id);
+					if (!nestedFence.stopped) {
+						isolatedGitRuntime?.markExportFenceFailed();
+						parallelExecutionError = `${parallelExecutionError}; nested descendants did not reach a proven terminal state before export; recover isolated worktrees at ${isolatedGitRuntime?.root ?? "the runtime root"}`;
+						statusPayload.error = parallelExecutionError;
+						worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${parallelExecutionError}` : parallelExecutionError;
+						statusPayload.worktreeExecutionError = worktreeExecutionError;
+					}
+					parallelResults = group.parallel.map((task, taskOffset) => {
+						const fi = groupStartFlatIndex + taskOffset;
+						const settled = partialResults[taskOffset];
+						if (settled) return { ...settled, flatIndex: fi, skipped: false };
+						const taskExecutionError = taskOffset === rejectedIndex ? parallelExecutionError! : `${parallelExecutionError}; execution rejected before this task completed`;
+						const recovery = tryCreateRecoverySlot(task, fi);
+						const isolatedGit = recovery.worktree;
+						const projectedTaskError = recovery.error ? `${taskExecutionError}\n${recovery.error}` : taskExecutionError;
+						let gitBundle;
+						if (nestedFence.stopped && isolatedGit && !isolatedGit.runtime.isExported(isolatedGit.index)) {
+							try {
+								const bundle = exportIsolatedGitBundle(isolatedGit.runtime, {
+									outputDir: artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
+									worktree: isolatedGit,
+									syntheticPaths: isolatedGit.syntheticPaths,
+									terminationState: "execution-rejected",
+									agent: task.agent,
+									commitRequired: !taskDisallowsFileUpdates(task.task) && inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }),
+								});
+								gitBundle = {
+									path: bundle.path,
+									checksum: bundle.checksum,
+									base: bundle.base,
+									head: bundle.head,
+									commitSummary: bundle.commitSummary,
+									...(bundle.recovery ? { recovery: bundle.recovery } : {}),
+									...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
+									...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}),
+									...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}),
+									terminationState: bundle.terminationState,
+									incomplete: bundle.incomplete,
+									dirtySummary: bundle.dirtySummary,
+									bundleSize: bundle.bundleSize,
+									payloadChecksum: bundle.payloadChecksum,
+									payloadSize: bundle.payloadSize,
+									canonicalPayloadChecksum: bundle.canonicalPayloadChecksum,
+									canonicalPayloadSize: bundle.canonicalPayloadSize,
+									portableMetadata: bundle.portableMetadata,
+								};
+							} catch (exportError) {
+								isolatedGit.runtime.markExportFailed();
+								parallelExecutionError = `${parallelExecutionError}; recover isolated worktree at ${isolatedGit.runtime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
+							}
+						}
+						const projectedStep = statusPayload.steps[fi];
+						if (projectedStep) {
+							projectedStep.gitBundle = gitBundle;
+							projectedStep.error = projectedStep.error ? `${projectedStep.error}\n${projectedTaskError}` : projectedTaskError;
+						}
+						return {
+							flatIndex: fi,
+							agent: task.agent,
+							output: "(parallel execution failed unexpectedly)",
+							error: projectedTaskError,
+							exitCode: 1,
+							skipped: false,
+							gitBundle,
+						};
+					});
+					statusPayload.state = "failed";
+					statusPayload.lastUpdate = Date.now();
+					writeStatusPayload();
 				}
 
+				if (parallelResults.some((result) => result.interrupted)) interrupted = true;
 				flatIndex += group.parallel.length;
 
 				// Materialize child results before post-child lifecycle work. If status,
 				// artifact, or event aggregation rejects, successful child output must
 				// remain available in the serialized top-level failure.
 				for (const pr of parallelResults) {
+					const childInterrupted = pr.interrupted || (pr.flatIndex !== undefined && statusPayload.steps[pr.flatIndex]?.status === "paused");
 					results.push({
+						flatIndex: pr.flatIndex,
 						agent: pr.agent,
 						output: pr.output,
 						error: pr.error,
-						success: pr.exitCode === 0,
+						success: pr.exitCode === 0 && !childInterrupted,
+						interrupted: childInterrupted,
+						cancelled: pr.cancelled,
 						exitCode: pr.exitCode,
 						skipped: pr.skipped,
 						sessionFile: pr.sessionFile,
@@ -2491,6 +3256,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
 						acceptance: pr.acceptance,
 						sandbox: pr.sandbox,
+						teardownUnproven: pr.teardownUnproven,
 						gitBundle: pr.gitBundle,
 					});
 				}
@@ -2561,10 +3327,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					ts: Date.now(),
 					runId: id,
 					stepIndex,
-					success: !worktreeCaptureError && parallelResults.every((r) => r.exitCode === 0 || r.exitCode === -1),
+					success: !worktreeCaptureError && parallelResults.every((r) => (r.exitCode === 0 || r.exitCode === -1) && !r.interrupted),
 				}));
 
-				if (worktreeCaptureError || parallelResults.some((r) => r.exitCode !== 0 && r.exitCode !== -1)) {
+				if (worktreeCaptureError || parallelResults.some((r) => (r.exitCode !== 0 && r.exitCode !== -1) || r.interrupted)) {
 					break;
 				}
 			} catch (error) {
@@ -2603,7 +3369,69 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				writeStatusPayload();
 				break;
 			} finally {
-				if (worktreeSetup) cleanupWorktrees(worktreeSetup, { preserve: preserveWorktree });
+				if (worktreeSetup && !preserveWorktree) {
+					const fence = await waitForNestedDescendantsToStop(config.nestedRoute, id);
+					if (!fence.stopped) {
+						preserveWorktree = true;
+						statusPayload.teardownUnproven = true;
+						const message = `Nested descendants did not reach a proven terminal state before worktree cleanup; ${formatRecoverableWorktreePaths(worktreeSetup)}`;
+						worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${message}` : message;
+						statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${message}` : message;
+						statusPayload.worktreeExecutionError = worktreeExecutionError;
+						for (const worktree of worktreeSetup.worktrees) {
+							const result = results.find((candidate) => candidate.flatIndex === worktree.index);
+							if (result) {
+								result.success = false;
+								result.interrupted = undefined;
+								result.cancelled = undefined;
+								result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
+								result.error = result.error ? `${result.error}\\n${message}` : message;
+							}
+							const step = statusPayload.steps[worktree.index];
+							if (step) {
+								step.status = "failed";
+								step.success = false;
+								step.interrupted = undefined;
+								step.cancelled = undefined;
+								step.exitCode = step.exitCode === 0 ? 1 : (step.exitCode ?? 1);
+								step.error = step.error ? `${step.error}\\n${message}` : message;
+							}
+						}
+						writeStatusPayload();
+					} else try { cleanupWorktrees(worktreeSetup); }
+					catch (cleanupError) {
+						preserveWorktree = true;
+						statusPayload.teardownUnproven = true;
+						const message = `Worktree cleanup failed; recover worktrees at ${formatRecoverableWorktreePaths(worktreeSetup)}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+						worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${message}` : message;
+						statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${message}` : message;
+						statusPayload.worktreeExecutionError = worktreeExecutionError;
+						const endedAt = Date.now();
+						for (const worktree of worktreeSetup.worktrees) {
+							const index = worktree.index;
+							const step = statusPayload.steps[index];
+							if (step) {
+								step.status = "failed";
+								step.success = false;
+								step.interrupted = undefined;
+								step.cancelled = undefined;
+								step.exitCode = step.exitCode === 0 ? 1 : (step.exitCode ?? 1);
+								step.endedAt ??= endedAt;
+								step.error = step.error ? `${step.error}\\n${message}` : message;
+							}
+							const result = results.find((candidate) => candidate.flatIndex === index);
+							if (result) {
+								result.success = false;
+								result.interrupted = undefined;
+								result.cancelled = undefined;
+								result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
+								result.error = result.error ? `${result.error}\\n${message}` : message;
+							}
+						}
+						statusPayload.lastUpdate = endedAt;
+						writeStatusPayload();
+					}
+				}
 			}
 		} else {
 			const seqStep = step as SubagentStep;
@@ -2630,7 +3458,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				agent: seqStep.agent,
 			}));
 
-			const singleResult = await runSingleStep(seqStep, {
+			const isolatedGit = resolveIsolatedGitWorktree(seqStep, flatIndex);
+			let singleResult: Awaited<ReturnType<typeof runSingleStep>>;
+			try {
+				singleResult = await runSingleStep(seqStep, {
 				previousOutput, placeholder, cwd, sessionEnabled,
 				outputs,
 				sessionDir: config.sessionDir,
@@ -2643,25 +3474,100 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				orchestratorIntercomTarget: config.controlIntercomTarget,
 				nestedRoute: config.nestedRoute,
 				sandbox: config.sandbox,
-				isolatedGit: resolveIsolatedGitWorktree(seqStep, flatIndex),
+				isolatedGit,
 				progressPaths: config.progressPaths,
 				sandboxIntercomBridge: config.sandboxIntercomBridge,
-				registerInterrupt: (interrupt) => {
-					activeChildInterrupt = interrupt;
-				},
+				registerInterrupt: registerChildInterrupt(),
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
-			});
+				});
+			} catch (error) {
+				// A sequential callback can reject after its isolated worktree has
+				// been materialized (for example during artifact persistence). Mark
+				// the real step and package it before the outer terminal projection.
+				let rejection = `Sequential execution rejected: ${error instanceof Error ? error.message : String(error)}`;
+				const statusStep = statusPayload.steps[flatIndex];
+				if (singleResult && statusStep?.gitBundle === undefined && singleResult.gitBundle) statusStep.gitBundle = singleResult.gitBundle;
+				if (isolatedGit && !isolatedGit.runtime.isExported(isolatedGit.index)) {
+					const fence = await waitForNestedDescendantsToStop(config.nestedRoute, id);
+					if (!fence.stopped) {
+						isolatedGit.runtime.markExportFenceFailed();
+						statusPayload.teardownUnproven = true;
+						if (singleResult) singleResult.teardownUnproven = true;
+						rejection = `${rejection}; nested descendants did not reach a proven terminal state before export; recover isolated worktree at ${isolatedGit.runtime.root}`;
+					} else {
+						try {
+							const bundle = exportIsolatedGitBundle(isolatedGit.runtime, {
+								outputDir: artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
+								worktree: isolatedGit,
+								syntheticPaths: isolatedGit.syntheticPaths,
+								terminationState: interrupted ? "interrupted" : "execution-rejected",
+								agent: seqStep.agent,
+								commitRequired: !taskDisallowsFileUpdates(seqStep.task) && inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }),
+							});
+							if (statusStep) statusStep.gitBundle = {
+								path: bundle.path,
+								checksum: bundle.checksum,
+								base: bundle.base,
+								head: bundle.head,
+								commitSummary: bundle.commitSummary,
+								...(bundle.recovery ? { recovery: bundle.recovery } : {}),
+								...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
+								...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}),
+								...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}),
+								terminationState: bundle.terminationState,
+								incomplete: bundle.incomplete,
+								dirtySummary: bundle.dirtySummary,
+								bundleSize: bundle.bundleSize,
+								payloadChecksum: bundle.payloadChecksum,
+								payloadSize: bundle.payloadSize,
+								canonicalPayloadChecksum: bundle.canonicalPayloadChecksum,
+								canonicalPayloadSize: bundle.canonicalPayloadSize,
+								portableMetadata: bundle.portableMetadata,
+							};
+						} catch (exportError) {
+							isolatedGit.runtime.markExportFailed();
+							rejection = `${rejection}\nIsolated Git bundle export failed; recover isolated worktree at ${isolatedGit.runtime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
+						}
+					}
+				}
+				if (statusStep) {
+					statusStep.status = "failed";
+					statusStep.exitCode = 1;
+					statusStep.endedAt = Date.now();
+					statusStep.error = rejection;
+				}
+				statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${rejection}` : rejection;
+				worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${rejection}` : rejection;
+				statusPayload.lastUpdate = Date.now();
+				// Keep this rejection in the normal terminal path. Publishing status
+				// here would race runtime cleanup and expose a live isolated checkout.
+				results.push({
+					flatIndex,
+					agent: seqStep.agent,
+					output: "",
+					error: rejection,
+					success: false,
+					exitCode: 1,
+					gitBundle: statusStep?.gitBundle,
+				});
+				break;
+			}
 			if (seqStep.sessionFile) {
 				latestSessionFile = seqStep.sessionFile;
 			}
 
 			previousOutput = singleResult.output;
+			const childInterrupted = singleResult.interrupted || statusPayload.steps[flatIndex]?.status === "paused";
+			const childCancelled = singleResult.cancelled === true || statusPayload.steps[flatIndex]?.status === "cancelled";
 			results.push({
+				flatIndex,
 				agent: singleResult.agent,
 				output: singleResult.output,
 				error: singleResult.error,
-				success: singleResult.exitCode === 0,
+				success: singleResult.exitCode === 0 && !childInterrupted && !childCancelled,
+				interrupted: childInterrupted,
+				...(childCancelled ? { cancelled: true } : {}),
 				exitCode: singleResult.exitCode,
 				sessionFile: singleResult.sessionFile,
 				intercomTarget: singleResult.intercomTarget,
@@ -2680,6 +3586,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				structuredOutputSchemaPath: singleResult.structuredOutputSchemaPath,
 				acceptance: singleResult.acceptance,
 				sandbox: singleResult.sandbox,
+				teardownUnproven: singleResult.teardownUnproven,
 				gitBundle: singleResult.gitBundle,
 			});
 			if (seqStep.outputName) {
@@ -2713,44 +3620,44 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 
 			const stepEndTime = Date.now();
-			statusPayload.steps[flatIndex].status = singleResult.exitCode === 0 ? "complete" : "failed";
-			statusPayload.steps[flatIndex].endedAt = stepEndTime;
-			statusPayload.steps[flatIndex].durationMs = stepEndTime - stepStartTime;
-			statusPayload.steps[flatIndex].exitCode = singleResult.exitCode;
-			statusPayload.steps[flatIndex].model = singleResult.model;
-			statusPayload.steps[flatIndex].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[flatIndex].thinking);
-			statusPayload.steps[flatIndex].fastMode = singleResult.fastMode;
-			statusPayload.steps[flatIndex].attemptedModels = singleResult.attemptedModels;
-			statusPayload.steps[flatIndex].modelAttempts = singleResult.modelAttempts;
-			statusPayload.steps[flatIndex].error = singleResult.error;
-			statusPayload.steps[flatIndex].structuredOutput = singleResult.structuredOutput;
-			statusPayload.steps[flatIndex].structuredOutputPath = singleResult.structuredOutputPath;
-			statusPayload.steps[flatIndex].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
-			statusPayload.steps[flatIndex].acceptance = singleResult.acceptance;
-			statusPayload.steps[flatIndex].sandbox = singleResult.sandbox;
-			statusPayload.steps[flatIndex].gitBundle = singleResult.gitBundle;
+			const childStatusSnapshot = isolatedGitRuntime ? structuredClone(statusPayload.steps[flatIndex]) : undefined;
+			if (singleResult.interrupted || statusPayload.steps[flatIndex]?.status === "paused") interrupted = true;
 			if (stepTokens) {
 				statusPayload.steps[flatIndex].tokens = stepTokens;
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
 			}
-			statusPayload.lastUpdate = stepEndTime;
-			writeStatusPayload();
-
-			appendJsonl(eventsPath, JSON.stringify({
-				type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
-				ts: stepEndTime,
-				runId: id,
-				stepIndex: flatIndex,
-				agent: seqStep.agent,
-				exitCode: singleResult.exitCode,
-				durationMs: stepEndTime - stepStartTime,
-				tokens: stepTokens,
-			}));
+			if (isolatedGitRuntime) {
+				pendingTerminalPublications.set(flatIndex, { result: singleResult, agent: seqStep.agent, startedAt: stepStartTime, endedAt: stepEndTime });
+				if (childStatusSnapshot) statusPayload.steps[flatIndex] = childStatusSnapshot;
+			} else {
+				applyChildTerminal(flatIndex, { result: singleResult, agent: seqStep.agent, startedAt: stepStartTime, endedAt: stepEndTime }, true);
+			}
 
 			flatIndex++;
-			if (singleResult.exitCode !== 0) {
+			if (singleResult.interrupted || singleResult.exitCode !== 0) {
 				break;
 			}
+		}
+	}
+
+	// Preserve positional identity for every queued sequential child after an
+	// interrupt. These are synthetic paused results: no worktree is created and
+	// no child process is spawned, but consumers still receive one slot per step.
+	if (interrupted) {
+		const pausedAt = Date.now();
+		for (let index = flatIndex; index < flatSteps.length; index++) {
+			if (results.some((result) => result.flatIndex === index)) continue;
+			const queued = flatSteps[index];
+			if (!queued) continue;
+			const statusStep = statusPayload.steps[index];
+			if (statusStep) {
+				statusStep.status = "paused";
+				statusStep.error ??= "Interrupted before this task started.";
+				statusStep.exitCode = 0;
+				statusStep.endedAt ??= pausedAt;
+				statusStep.durationMs ??= 0;
+			}
+			results.push({ flatIndex: index, agent: queued.agent, output: "(interrupted before this task started)", error: "Interrupted before this task started.", success: false, interrupted: true, exitCode: 0 });
 		}
 	}
 
@@ -2770,6 +3677,72 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	if (worktreeExecutionError) summary = summary ? `${summary}\n\n${worktreeExecutionError}` : worktreeExecutionError;
 	if (worktreeCaptureError) summary = summary ? `${summary}\n\n${worktreeCaptureError}` : worktreeCaptureError;
 
+	// Export before terminal status/result serialization so every projection sees
+	// the same bundle or actionable export failure details.
+	if (isolatedGitRuntime) {
+		syncCanonicalResults();
+		await exportRemainingIsolated?.(interrupted ? "interrupted" : "execution-rejected");
+		projectCanonicalResults();
+		// Verified exports are the cleanup fence. Keep failed/detached/fence-
+		// refused runtimes live, with the terminal projection below reporting the
+		// actionable recovery path.
+		if (!isolatedGitRuntime.exportFenceFailed && !isolatedGitRuntime.exportFailed) await cleanupIsolatedGitRuntime(isolatedGitRuntime);
+		isolatedGitCleanupVerified = !fs.existsSync(isolatedGitRuntime.root);
+		if (!isolatedGitCleanupVerified) {
+			// Cleanup refusal is itself an unproven teardown fence. Mark it before
+			// terminal status serialization so the guarded publisher emits the
+			// failed recovery state rather than suppressing it as an in-progress run.
+			isolatedGitRuntime.markExportFenceFailed();
+			statusPayload.teardownUnproven = true;
+			const recovery = `Isolated Git cleanup was not proven; recover isolated worktrees at ${isolatedGitRuntime.root}.`;
+			worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${recovery}` : recovery;
+			statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${recovery}` : recovery;
+			summary = summary ? `${summary}\n\n${recovery}` : recovery;
+			const isolatedIndexes = new Set(isolatedGitRuntime.worktrees.map((worktree) => worktree.index));
+			// Cleanup refusal is a child failure, not merely run-level commentary.
+			// Apply the failed/nonzero/error projection before status, events, and
+			// watcher result publication, including deferred isolated terminals.
+			for (const result of results) {
+				if (!isolatedIndexes.has(result.flatIndex ?? -1)) continue;
+				result.success = false;
+				delete result.interrupted;
+				delete result.cancelled;
+				result.exitCode = 1;
+				result.error = result.error ? `${result.error}\n${recovery}` : recovery;
+			}
+			for (const pending of pendingTerminalPublications.values()) {
+				pending.result.exitCode = 1;
+				pending.result.error = pending.result.error ? `${pending.result.error}\n${recovery}` : recovery;
+				pending.result.interrupted = undefined;
+				pending.result.cancelled = undefined;
+			}
+			for (const index of isolatedIndexes) {
+				const step = statusPayload.steps[index];
+				if (!step) continue;
+				step.status = "failed";
+				step.success = false;
+				step.interrupted = undefined;
+				step.cancelled = undefined;
+				step.exitCode = 1;
+				step.error = step.error ? `${step.error}\n${recovery}` : recovery;
+			}
+		}
+		// Export/recovery is now final. Publish deferred child terminals only after
+		// the verified bundle or fail-closed recovery projection is in place.
+		publishPendingTerminalPublications();
+		for (const worktree of isolatedGitRuntime.worktrees) {
+			if (publishedTerminalIndexes.has(worktree.index)) continue;
+			const step = statusPayload.steps[worktree.index];
+			if (!step || step.teardownUnproven === true || !["complete", "completed", "failed", "paused"].includes(step.status)) continue;
+			appendJsonl(eventsPath, JSON.stringify({
+				type: step.status === "paused" ? "subagent.step.paused" : step.status === "failed" ? "subagent.step.failed" : "subagent.step.completed",
+				ts: step.endedAt ?? Date.now(), runId: id, stepIndex: worktree.index, agent: step.agent,
+				exitCode: step.exitCode,
+				durationMs: step.durationMs,
+			}));
+			publishedTerminalIndexes.add(worktree.index);
+		}
+	}
 	const resultMode = config.resultMode ?? statusPayload.mode;
 	const agentName = flatSteps.length === 1
 		? flatSteps[0].agent
@@ -2816,8 +3789,25 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	}
 	const effectiveSessionFile = sessionFile ?? latestSessionFile;
 	const runEndedAt = Date.now();
-	statusPayload.state = worktreeCaptureError || worktreeExecutionError ? "failed" : interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed";
+	const exportFailure = Boolean(isolatedGitRuntime?.exportFenceFailed || isolatedGitRuntime?.exportFailed);
+	statusPayload.teardownUnproven = statusPayload.teardownUnproven || isolatedGitRuntime?.hookTeardownFailed || isolatedGitRuntime?.exportFenceFailed ? true : undefined;
+	const finalAggregate = resolveAggregateState([
+		...(exportFailure || worktreeCaptureError || worktreeExecutionError ? [{ state: "failed" }] : []),
+		...(interrupted ? [{ state: "paused" }] : []),
+		...results.map((result) => ({
+			state: result.teardownUnproven ? "running" : result.cancelled ? "cancelled" : result.interrupted ? "paused" : result.success ? "completed" : "failed",
+			teardownUnproven: result.teardownUnproven,
+		})),
+	]);
+	statusPayload.state = statusPayload.teardownUnproven
+		? "running"
+		: finalAggregate === "completed" ? "complete"
+			: finalAggregate === "failed" ? "failed"
+				: finalAggregate === "cancelled" ? "cancelled"
+					: finalAggregate === "paused" ? "paused"
+						: "failed";
 	statusPayload.worktreeExecutionError = worktreeExecutionError;
+	statusPayload.finalOutput = summary;
 	statusPayload.activityState = undefined;
 	statusPayload.endedAt = runEndedAt;
 	statusPayload.lastUpdate = runEndedAt;
@@ -2825,6 +3815,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	statusPayload.shareUrl = shareUrl;
 	statusPayload.gistUrl = gistUrl;
 	statusPayload.shareError = shareError;
+	// All export/retry/cleanup truth is finalized before this terminal write.
+	// A teardown fence keeps the run actionable and must not enter the terminal
+	// publication path, even if a later log/result write rejects.
+	terminalPublicationStarted = statusPayload.state !== "running";
 	if (statusPayload.state === "failed" && !statusPayload.error) {
 		const failedStep = statusPayload.steps.find((s) => s.status === "failed");
 		if (failedStep?.agent) {
@@ -2832,7 +3826,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 	writeStatusPayload();
-	try {
+	if (statusPayload.state !== "running") try {
 		appendJsonl(
 			eventsPath,
 			JSON.stringify({
@@ -2872,11 +3866,17 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			id,
 			agent: agentName,
 			mode: resultMode,
-			success: !worktreeCaptureError && !worktreeExecutionError && !interrupted && results.every((r) => r.success),
-			state: worktreeCaptureError || worktreeExecutionError ? "failed" : interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed",
+			success: statusPayload.state === "complete",
+			state: statusPayload.state,
+			teardownUnproven: statusPayload.teardownUnproven,
+			finalOutput: summary,
 			summary: worktreeCaptureError || worktreeExecutionError ? summary : interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
 			results: results.map((r) => ({
+				flatIndex: r.flatIndex,
+				groupId: r.groupId,
 				agent: r.agent,
+				// finalOutput is canonical; output remains for legacy consumers.
+				finalOutput: r.output,
 				output: r.output,
 				error: r.error,
 				success: r.success,
@@ -2891,6 +3891,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				artifactPaths: r.artifactPaths,
 				truncated: r.truncated,
 				outputMode: r.outputMode,
+				interrupted: r.interrupted,
+				cancelled: r.cancelled,
 				savedOutputPath: r.savedOutputPath,
 				outputReference: r.outputReference,
 				outputSaveError: r.outputSaveError,
@@ -2900,13 +3902,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				acceptance: r.acceptance,
 				sandbox: r.sandbox,
 				gitBundle: r.gitBundle,
+				teardownUnproven: r.teardownUnproven,
 			})),
 			outputs,
 			workflowGraph: statusPayload.workflowGraph,
 			...(worktreeSummaries.length > 0 ? { worktreeSummary: worktreeSummaries.join("\n\n") } : {}),
 			...(worktreeCaptureError ? { worktreeCaptureError } : {}),
 			...(worktreeExecutionError ? { worktreeExecutionError } : {}),
-			exitCode: !worktreeCaptureError && !worktreeExecutionError && (interrupted || results.every((r) => r.success)) ? 0 : 1,
+			exitCode: statusPayload.state === "complete" ? 0 : 1,
 			timestamp: runEndedAt,
 			durationMs: runEndedAt - overallStartTime,
 			truncated,
@@ -2925,11 +3928,320 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	} catch (err) {
 		console.error(`Failed to write result file ${resultPath}:`, err);
 	}
+	} catch (error) {
+		let cleanupFailureProjected = false;
+		// Setup/callback failures before terminal publication still receive the
+		// same fenced export and remain recoverable on permanent failure. Once a
+		// terminal write began, do not mutate recovery truth here.
+		if (!statusPayloadReady) throw error;
+		const teardownUnproven = statusPayload.teardownUnproven === true
+			|| statusPayload.steps.some((step) => step.teardownUnproven === true)
+			|| results.some((result) => result.teardownUnproven === true)
+			|| isolatedGitRuntime?.hookTeardownFailed === true
+			|| isolatedGitRuntime?.exportFenceFailed === true;
+		if (teardownUnproven) statusPayload.teardownUnproven = true;
+		if (!terminalPublicationStarted) {
+			const lifecycleError = error instanceof Error ? error.message : String(error);
+			statusPayload.state = teardownUnproven ? "running" : "failed";
+			statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${lifecycleError}` : lifecycleError;
+			const endedAt = Date.now();
+			for (const step of statusPayload.steps) {
+				if (!teardownUnproven && (step.status === "running" || step.status === "pending")) {
+					step.status = interrupted ? "paused" : "failed";
+					step.exitCode = step.exitCode ?? (interrupted ? 0 : 1);
+					step.endedAt = step.endedAt ?? endedAt;
+					step.durationMs = step.durationMs ?? (step.startedAt ? endedAt - step.startedAt : 0);
+					step.error = step.error ? `${step.error}\n${lifecycleError}` : lifecycleError;
+				}
+			}
+		}
+		if (!terminalPublicationStarted && isolatedGitRuntime) {
+			const projectIsolatedCleanupFailure = (message: string): void => {
+				// A first cleanup observation changes child truth even when retry later
+				// succeeds; force the workflow graph to rebuild from those projections.
+				cleanupFailureProjected = true;
+				const isolatedIndexes = new Set(isolatedGitRuntime!.worktrees.map((worktree) => worktree.index));
+				for (const result of results) {
+					if (!isolatedIndexes.has(result.flatIndex ?? -1)) continue;
+					result.success = false;
+					delete result.interrupted;
+					delete result.cancelled;
+					result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
+					result.error = result.error?.includes(message) ? result.error : result.error ? `${result.error}\\n${message}` : message;
+				}
+				for (const pending of pendingTerminalPublications.values()) {
+					pending.result.success = false;
+					delete pending.result.interrupted;
+					delete pending.result.cancelled;
+					pending.result.exitCode = pending.result.exitCode === 0 ? 1 : (pending.result.exitCode ?? 1);
+					pending.result.error = pending.result.error?.includes(message) ? pending.result.error : pending.result.error ? `${pending.result.error}\\n${message}` : message;
+				}
+				for (const index of isolatedIndexes) {
+					const step = statusPayload.steps[index];
+					if (!step) continue;
+					step.status = "failed";
+					step.success = false;
+					delete step.interrupted;
+					delete step.cancelled;
+					step.exitCode = step.exitCode === 0 ? 1 : (step.exitCode ?? 1);
+					step.error = step.error?.includes(message) ? step.error : step.error ? `${step.error}\\n${message}` : message;
+					if (statusPayload.teardownUnproven !== true && step.teardownUnproven !== true) {
+						try { appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.failed", ts: Date.now(), runId: id, stepIndex: index, agent: step.agent, exitCode: step.exitCode, durationMs: step.durationMs })); } catch { /* outer fallback still writes status/result */ }
+					}
+				}
+			};
+			const cleanupFailure = `Isolated Git cleanup/recovery finalization failed; recover worktree at ${isolatedGitRuntime.root}.`;
+			statusPayload.error = statusPayload.error ? `${statusPayload.error}\\n${cleanupFailure}` : cleanupFailure;
+			worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\\n${cleanupFailure}` : cleanupFailure;
+			summary = summary ? `${summary}\\n\\n${cleanupFailure}` : cleanupFailure;
+			// Project before retrying cleanup: a throw is already a failed teardown
+			// observation, even if a later retry happens to remove the root.
+			projectIsolatedCleanupFailure(cleanupFailure);
+			try {
+				syncCanonicalResults();
+				await exportRemainingIsolated?.(interrupted ? "interrupted" : "execution-rejected");
+				projectCanonicalResults();
+				await cleanupIsolatedGitRuntime(isolatedGitRuntime);
+				if (fs.existsSync(isolatedGitRuntime.root)) throw new Error(`Isolated Git cleanup was not proven; recover isolated worktrees at ${isolatedGitRuntime.root}`);
+			} catch (exportError) {
+				cleanupFailureProjected = true;
+				isolatedGitRuntime.markExportFailed();
+				const recovery = `Isolated Git recovery finalization failed; recover worktree at ${isolatedGitRuntime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
+				statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${recovery}` : recovery;
+				worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${recovery}` : recovery;
+				summary = summary ? `${summary}\n\n${recovery}` : recovery;
+				const isolatedIndexes = new Set(isolatedGitRuntime.worktrees.map((worktree) => worktree.index));
+				// Cleanup failure invalidates even already-complete isolated children.
+				// Project the failure before the outer fallback serializes status/result,
+				// and emit failed child events instead of leaving complete events behind.
+				for (const result of results) {
+					if (!isolatedIndexes.has(result.flatIndex ?? -1)) continue;
+					result.success = false;
+					delete result.interrupted;
+					delete result.cancelled;
+					result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
+					result.error = result.error ? `${result.error}\n${recovery}` : recovery;
+				}
+				for (const pending of pendingTerminalPublications.values()) {
+					pending.result.success = false;
+					delete pending.result.interrupted;
+					delete pending.result.cancelled;
+					pending.result.exitCode = pending.result.exitCode === 0 ? 1 : (pending.result.exitCode ?? 1);
+					pending.result.error = pending.result.error ? `${pending.result.error}\n${recovery}` : recovery;
+				}
+				for (const index of isolatedIndexes) {
+					const step = statusPayload.steps[index];
+					if (!step) continue;
+					step.status = "failed";
+					step.success = false;
+					delete step.interrupted;
+					delete step.cancelled;
+					step.exitCode = step.exitCode === 0 ? 1 : (step.exitCode ?? 1);
+					step.error = step.error ? `${step.error}\n${recovery}` : recovery;
+					if (statusPayload.teardownUnproven !== true && step.teardownUnproven !== true) appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.failed", ts: Date.now(), runId: id, stepIndex: index, agent: step.agent, exitCode: step.exitCode, durationMs: step.durationMs }));
+				}
+				console.error(recovery);
+			}
+		}
+		if (cleanupFailureProjected) {
+			// Cleanup rejection changes terminal truth after child callbacks may have
+			// already marked nodes complete. Rebuild the graph from the failed status
+			// and canonical flat-index results before the status write so graph,
+			// status, events, and result projections cannot disagree.
+			const indexedResults = Array.from({ length: statusPayload.steps.length }, (_, index) => results.find((result) => result.flatIndex === index));
+			const existingGraph = statusPayload.workflowGraph;
+			const dynamicChildren: Record<number, Array<{ agent: string; label?: string; flatIndex: number; itemKey: string; outputName?: string; structured?: boolean; error?: string }>> = {};
+			const dynamicGroupStatuses: Record<number, { status: any; error?: string }> = {};
+			for (const node of existingGraph?.nodes ?? []) {
+				if (node.kind !== "dynamic-parallel-group" || node.stepIndex === undefined) continue;
+				dynamicChildren[node.stepIndex] = (node.children ?? []).flatMap((child) => child.flatIndex === undefined || !child.itemKey ? [] : [{ agent: child.agent, label: child.label, flatIndex: child.flatIndex, itemKey: child.itemKey, outputName: child.outputName, structured: child.structured, error: child.error }]);
+				if ((node.children ?? []).length === 0) dynamicGroupStatuses[node.stepIndex] = { status: node.status, error: node.error };
+			}
+			statusPayload.workflowGraph = buildWorkflowGraphSnapshot({
+				runId: id,
+				mode: statusPayload.mode,
+				steps: config.steps as any,
+				results: indexedResults,
+				stepStatuses: statusPayload.steps,
+				dynamicChildren,
+				dynamicGroupStatuses,
+				currentFlatIndex: statusPayload.currentStep,
+			});
+		}
+		const recoveryTeardownUnproven = statusPayload.teardownUnproven === true
+			|| statusPayload.steps.some((step) => step.teardownUnproven === true)
+			|| results.some((result) => result.teardownUnproven === true)
+			|| isolatedGitRuntime?.hookTeardownFailed === true
+			|| isolatedGitRuntime?.exportFenceFailed === true;
+		if (recoveryTeardownUnproven) {
+			statusPayload.teardownUnproven = true;
+			statusPayload.state = "running";
+		}
+		if (statusPayloadReady) {
+			try { writeAtomicJson(statusPath, statusPayload); } catch (statusError) { console.error(`Failed to persist rejected async status: ${statusError}`); }
+		}
+		throw error;
 	} finally {
-		if (isolatedGitRuntime) cleanupIsolatedGitRuntime(isolatedGitRuntime);
+		// Recovery export and cleanup intentionally do not run from finally.
+		// This block only tears down process-local timers/signal handlers.
+		if (activityTimer) {
+			clearInterval(activityTimer);
+			activityTimer = undefined;
+		}
+		if (ownerLivenessTimer) {
+			clearInterval(ownerLivenessTimer);
+			ownerLivenessTimer = undefined;
+		}
+		if (interruptHandlerRegistered && interruptRunner) {
+			process.off(ASYNC_INTERRUPT_SIGNAL, interruptRunner);
+			interruptHandlerRegistered = false;
+		}
 	}
 }
 
+export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: unknown): void {
+	const message = error instanceof Error ? error.message : String(error);
+	const terminalError = `Async subagent execution rejected: ${message}`;
+	const statusPath = path.join(config.asyncDir, "status.json");
+	const now = Date.now();
+	let status: Record<string, any> = {};
+	try {
+		status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as Record<string, any>;
+	} catch {
+		status = {
+			runId: config.id,
+			mode: config.resultMode ?? (config.steps.length > 1 ? "chain" : "single"),
+			cwd: config.cwd,
+			steps: config.steps.flatMap((step) => isParallelGroup(step) ? step.parallel.map((child) => ({ agent: child.agent, status: "failed" })) : isDynamicRunnerGroup(step) ? [{ agent: `expand:${step.parallel.agent}`, status: "failed" }] : [{ agent: step.agent, status: "failed" }]),
+		};
+	}
+	let existing: Record<string, any> | undefined;
+	try { existing = JSON.parse(fs.readFileSync(config.resultPath, "utf-8")) as Record<string, any>; } catch { /* result not written yet */ }
+	const statusSteps = Array.isArray(status.steps) ? status.steps : [];
+	const existingResults = Array.isArray(existing?.results) ? existing.results : [];
+	const teardownUnproven = status.teardownUnproven === true
+		|| statusSteps.some((step: Record<string, any>) => step.teardownUnproven === true)
+		|| existing?.teardownUnproven === true
+		|| existingResults.some((child: Record<string, any>) => child.teardownUnproven === true);
+	fs.mkdirSync(config.asyncDir, { recursive: true });
+	status.teardownUnproven = teardownUnproven ? true : undefined;
+	status.state = teardownUnproven ? "running" : "failed";
+	status.error = status.error ? `${status.error}\n${terminalError}` : terminalError;
+	status.worktreeExecutionError = status.worktreeExecutionError ?? terminalError;
+	status.endedAt = status.endedAt ?? now;
+	status.lastUpdate = now;
+	// A cleanup throw can arrive after isolated children were already marked
+	// complete. Those projections are not durable truth once the runtime root is
+	// retained: force every affected status slot failed before the outer fallback
+	// writes its terminal receipt, avoiding a complete-child/failed-run split.
+	const forceAllChildrenFailed = /isolated Git (?:cleanup|recovery finalization)/u.test(message)
+		|| /isolated Git (?:cleanup|recovery finalization)/u.test(String(status.error ?? ""));
+	for (const step of statusSteps) {
+		if (!teardownUnproven && (forceAllChildrenFailed || step.status === "running" || step.status === "pending")) {
+			step.status = "failed";
+			step.success = false;
+			step.exitCode = step.exitCode ?? 1;
+			step.error = step.error ? `${step.error}\n${terminalError}` : terminalError;
+			step.endedAt = step.endedAt ?? now;
+		}
+	}
+	// Rejected-run fallback still needs the same graph projection as the normal
+	// terminal path. Rebuild from failed status slots before either status or
+	// result is written so graph/status/results agree.
+	const indexedResults = statusSteps.map((step: Record<string, any>, index: number) => ({
+		flatIndex: step.flatIndex ?? index,
+		agent: step.agent ?? `step-${index + 1}`,
+		success: !teardownUnproven && step.success === true && step.status !== "failed",
+		exitCode: step.exitCode ?? 1,
+		error: step.error ?? terminalError,
+		...(step.teardownUnproven === true ? { teardownUnproven: true } : {}),
+	}));
+	const dynamicChildren: Record<number, Array<{ agent: string; label?: string; flatIndex: number; itemKey: string; outputName?: string; structured?: boolean; error?: string }>> = {};
+	const dynamicGroupStatuses: Record<number, { status: any; error?: string }> = {};
+	for (const node of (status.workflowGraph?.nodes ?? [])) {
+		if (node.kind !== "dynamic-parallel-group" || node.stepIndex === undefined) continue;
+		dynamicChildren[node.stepIndex] = (node.children ?? []).flatMap((child) => child.flatIndex === undefined || !child.itemKey ? [] : [{ agent: child.agent, label: child.label, flatIndex: child.flatIndex, itemKey: child.itemKey, outputName: child.outputName, structured: child.structured, error: child.error }]);
+		if ((node.children ?? []).length === 0) dynamicGroupStatuses[node.stepIndex] = { status: node.status, error: node.error };
+	}
+	status.workflowGraph = buildWorkflowGraphSnapshot({
+		runId: config.id,
+		mode: status.mode,
+		steps: config.steps as any,
+		results: indexedResults as any,
+		stepStatuses: status.steps as any,
+		dynamicChildren,
+		dynamicGroupStatuses,
+		currentFlatIndex: status.currentStep,
+	});
+	try { writeAtomicJson(statusPath, status); } catch (writeError) { console.error(`Failed to persist rejected async status: ${writeError}`); }
+
+	const results = existingResults.length > 0
+		? existingResults
+		: statusSteps.map((step: Record<string, any>, index: number) => ({
+			flatIndex: step.flatIndex ?? index,
+			agent: step.agent ?? `step-${index + 1}`,
+			output: "",
+			error: step.error ?? terminalError,
+			success: false,
+			exitCode: step.exitCode ?? 1,
+			...(step.gitBundle ? { gitBundle: step.gitBundle } : {}),
+			...(step.teardownUnproven === true ? { teardownUnproven: true } : {}),
+		}));
+	if (forceAllChildrenFailed) {
+		for (const child of results) {
+			child.success = false;
+			child.exitCode = child.exitCode === 0 ? 1 : (child.exitCode ?? 1);
+			child.error = child.error ? `${child.error}\n${terminalError}` : terminalError;
+		}
+	}
+	const result = {
+		...(existing ?? {}),
+		id: config.id,
+		agent: existing?.agent ?? (results.length === 1 ? results[0]?.agent : `chain:${results.map((item: any) => item.agent).join("->")}`),
+		mode: config.resultMode ?? existing?.mode ?? (results.length > 1 ? "chain" : "single"),
+		success: false,
+		state: teardownUnproven ? "running" : "failed",
+		summary: existing?.summary ? `${existing.summary}\n\n${terminalError}` : terminalError,
+		results,
+		workflowGraph: status.workflowGraph,
+		exitCode: 1,
+		timestamp: now,
+		durationMs: typeof status.startedAt === "number" ? Math.max(0, now - status.startedAt) : 0,
+		cwd: config.cwd,
+		asyncDir: config.asyncDir,
+		...(config.sessionId ? { sessionId: config.sessionId } : {}),
+		...(config.controlIntercomTarget ? { intercomTarget: config.controlIntercomTarget } : {}),
+		worktreeExecutionError: status.worktreeExecutionError,
+		...(teardownUnproven ? { teardownUnproven: true } : {}),
+	};
+	try { writeAtomicJson(config.resultPath, result); } catch (writeError) { console.error(`Failed to persist rejected async result: ${writeError}`); }
+	// A teardown fence remains actionable. Do not publish a terminal event that
+	// would let nested cleanup/export treat this rejection as proof of shutdown.
+	if (teardownUnproven) return;
+	try {
+		appendJsonl(path.join(config.asyncDir, "events.jsonl"), JSON.stringify({
+			type: "subagent.run.completed",
+			ts: now,
+			runId: config.id,
+			status: "failed",
+			recovery: true,
+			durationMs: result.durationMs,
+		}));
+	} catch (eventError) {
+		console.error(`Failed to append rejected async completion event for '${config.id}':`, eventError);
+	}
+}
+
+async function runSubagent(config: SubagentRunConfig): Promise<void> {
+	try {
+		await runSubagentCore(config);
+	} catch (error) {
+		writeRejectedRunnerTerminal(config, error);
+		console.error("Subagent runner error:", error);
+	}
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
 const configArg = process.argv[2];
 if (configArg) {
 	try {
@@ -2966,4 +4278,6 @@ if (configArg) {
 			process.exit(1);
 		}
 	});
+}
+
 }

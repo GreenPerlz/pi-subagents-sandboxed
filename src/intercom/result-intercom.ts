@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import { resolveAggregateState } from "../shared/aggregate-state.ts";
 import {
 	type Details,
 	type IntercomEventBus,
@@ -19,14 +20,21 @@ export function resolveSubagentResultStatus(input: {
 	success?: boolean;
 	state?: string;
 	interrupted?: boolean;
+	cancelled?: boolean;
 	detached?: boolean;
+	teardownUnproven?: boolean;
 }): SubagentResultStatus {
-	if (input.detached) return "detached";
-	if (input.interrupted || input.state === "paused") return "paused";
-	if (typeof input.success === "boolean") return input.success ? "completed" : "failed";
-	if (input.state === "complete") return "completed";
-	if (input.state === "failed") return "failed";
-	if (typeof input.exitCode === "number") return input.exitCode === 0 ? "completed" : "failed";
+	const state = resolveAggregateState([
+		{ state: input.state ?? (input.teardownUnproven ? "running" : input.detached ? "detached" : input.cancelled ? "cancelled" : input.interrupted ? "paused" : typeof input.success === "boolean" ? input.success ? "complete" : "failed" : typeof input.exitCode === "number" ? input.exitCode === 0 ? "complete" : "failed" : "failed"), teardownUnproven: input.teardownUnproven },
+		...(input.detached ? [{ state: "detached" }] : []),
+		...(input.cancelled ? [{ state: "cancelled" }] : []),
+		...(input.interrupted ? [{ state: "paused" }] : []),
+	]);
+	if (state === "running") return "detached";
+	if (state === "failed") return "failed";
+	if (state === "cancelled") return "cancelled";
+	if (state === "paused") return "paused";
+	if (state === "completed") return "completed";
 	return "failed";
 }
 
@@ -35,6 +43,7 @@ function countStatuses(children: SubagentResultIntercomChild[]): Record<Subagent
 		completed: 0,
 		failed: 0,
 		paused: 0,
+		cancelled: 0,
 		detached: 0,
 	};
 	for (const child of children) {
@@ -48,17 +57,19 @@ function formatStatusCounts(counts: Record<SubagentResultStatus, number>): strin
 		counts.completed ? `${counts.completed} completed` : undefined,
 		counts.failed ? `${counts.failed} failed` : undefined,
 		counts.paused ? `${counts.paused} paused` : undefined,
+		counts.cancelled ? `${counts.cancelled} cancelled` : undefined,
 		counts.detached ? `${counts.detached} detached` : undefined,
 	].filter((part): part is string => Boolean(part));
 	return parts.length ? parts.join(", ") : "0 results";
 }
 
 function resolveGroupedStatus(children: SubagentResultIntercomChild[]): SubagentResultStatus {
-	const counts = countStatuses(children);
-	if (counts.failed > 0) return "failed";
-	if (counts.paused > 0) return "paused";
-	if (counts.completed > 0) return "completed";
-	if (counts.detached > 0) return "detached";
+	const state = resolveAggregateState(children.map((child) => ({ state: child.status, teardownUnproven: child.teardownUnproven })));
+	if (state === "failed") return "failed";
+	if (state === "cancelled") return "cancelled";
+	if (state === "paused") return "paused";
+	if (state === "completed") return "completed";
+	if (state === "running") return "detached";
 	return "failed";
 }
 
@@ -101,6 +112,7 @@ function compactNestedRun(run: NestedRunSummary | PublicNestedRunSummary, depth 
 		...(run.endedAt !== undefined ? { endedAt: run.endedAt } : {}),
 		...(run.lastUpdate !== undefined ? { lastUpdate: run.lastUpdate } : {}),
 		...(run.error ? { error: run.error } : {}),
+		...(run.teardownUnproven ? { teardownUnproven: true } : {}),
 		...(run.steps?.length ? { steps: run.steps.slice(0, 12).map((step) => ({
 			agent: step.agent,
 			status: step.status,
@@ -135,8 +147,23 @@ export function attachNestedChildrenToResultChildren(
 ): SubagentResultIntercomChild[] {
 	const compact = compactNestedResultChildren(nestedChildren);
 	if (!compact?.length) return children.map((child) => ({ ...child, children: compactNestedResultChildren(child.children) }));
-	return children.map((child, index) => {
-		const childIndex = child.index ?? index;
+	// Group diagnostics are records, not materialized children. Resolve fallback
+	// positions from the canonical flat child sequence so an unindexed diagnostic
+	// can never shift every later nested attachment by one slot.
+	const isDiagnostic = (child: SubagentResultIntercomChild): boolean => Boolean(child.groupId || child.unindexed);
+	const claimedIndexes = new Set(children.filter((child) => !isDiagnostic(child) && child.index !== undefined).map((child) => child.index!));
+	let nextCanonicalIndex = 0;
+	const resolveCanonicalIndex = (child: SubagentResultIntercomChild): number | undefined => {
+		if (isDiagnostic(child)) return undefined;
+		if (child.index !== undefined) return child.index;
+		while (claimedIndexes.has(nextCanonicalIndex)) nextCanonicalIndex++;
+		const resolved = nextCanonicalIndex++;
+		claimedIndexes.add(resolved);
+		return resolved;
+	};
+	return children.map((child) => {
+		const childIndex = resolveCanonicalIndex(child);
+		if (childIndex === undefined) return { ...child, children: compactNestedResultChildren(child.children) };
 		const alreadyAttachedIds = new Set(child.children?.map((nested) => nested.id) ?? []);
 		const attached = compact.filter((nested) => nested.parentRunId === runId && nested.parentStepIndex === childIndex && !alreadyAttachedIds.has(nested.id));
 		const fallbackAttached = children.length === 1
@@ -246,8 +273,20 @@ function formatSubagentResultIntercomMessage(input: {
 		if (child.gitBundle) {
 			lines.push(`Git bundle: ${child.gitBundle.path}`);
 			lines.push(`Git bundle checksum: ${child.gitBundle.checksum}`);
+			if (child.gitBundle.bundleSize !== undefined) lines.push(`Git bundle size: ${child.gitBundle.bundleSize} bytes`);
 			lines.push(`Git base/head: ${child.gitBundle.base}..${child.gitBundle.head}`);
 			if (child.gitBundle.commitSummary) lines.push(`Git commits: ${child.gitBundle.commitSummary}`);
+			if (child.gitBundle.recovery) lines.push(`Git recovery snapshot: ${child.gitBundle.recovery}`);
+			if (child.gitBundle.stagedSnapshot) lines.push(`Git staged snapshot: ${child.gitBundle.stagedSnapshot}`);
+			if (child.gitBundle.stagedTree) lines.push(`Git staged tree: ${child.gitBundle.stagedTree}`);
+			if (child.gitBundle.recoveryTree) lines.push(`Git recovery tree: ${child.gitBundle.recoveryTree}`);
+			if (child.gitBundle.dirtySummary) lines.push(`Git dirty summary: ${child.gitBundle.dirtySummary}`);
+			if (child.gitBundle.terminationState) lines.push(`Git termination: ${child.gitBundle.terminationState}`);
+			if (child.gitBundle.payloadSize !== undefined) lines.push(`Git payload size: ${child.gitBundle.payloadSize} bytes`);
+			if (child.gitBundle.payloadChecksum) lines.push(`Git payload checksum: ${child.gitBundle.payloadChecksum}`);
+			if (child.gitBundle.canonicalPayloadSize !== undefined) lines.push(`Git canonical payload size: ${child.gitBundle.canonicalPayloadSize} bytes`);
+			if (child.gitBundle.canonicalPayloadChecksum) lines.push(`Git canonical payload checksum: ${child.gitBundle.canonicalPayloadChecksum}`);
+			if (child.gitBundle.incomplete) lines.push("Git recovery is incomplete: a child-authored commit was required.");
 		}
 		if (child.sessionPath) lines.push(`Session: ${child.sessionPath}`);
 		lines.push(...formatNestedResultLines(child.children));
@@ -259,15 +298,20 @@ function formatSubagentResultIntercomMessage(input: {
 }
 
 export function buildSubagentResultIntercomPayload(input: GroupedResultIntercomMessageInput): SubagentResultIntercomPayload {
-	const children = input.children.map((child, index) => ({
+	const children = input.children.map((child) => ({
 		...child,
-		...(input.worktreeExecutionError && index === 0 ? { status: "failed" as const } : {}),
 		summary: child.summary.trim() || "(no output)",
 		children: compactNestedResultChildren(child.children),
 	}));
+	if (input.worktreeExecutionError) {
+		// Unindexed group diagnostics must remain diagnostics; lifecycle failure
+		// belongs to the first canonical indexed child for revive/projection.
+		const canonical = children.find((child) => !child.groupId) ?? children[0];
+		if (canonical) canonical.status = "failed";
+	}
 	const status = input.worktreeExecutionError ? "failed" : resolveGroupedStatus(children);
 	const summary = formatStatusCounts(countStatuses(children));
-	const firstChild = children[0];
+	const firstChild = children.find((child) => !child.groupId) ?? children[0];
 	const payload: SubagentResultIntercomPayload = {
 		to: input.to,
 		runId: input.runId,
@@ -366,12 +410,30 @@ export function formatSubagentResultReceipt(input: {
 		`Children: ${formatStatusCounts(counts)}`,
 	];
 
+	const nonCompletedChildren = input.payload.children.filter((child) => child.status === "failed" || child.status === "paused" || child.status === "cancelled" || child.status === "detached");
+	if (input.payload.worktreeExecutionError || nonCompletedChildren.length > 0) {
+		lines.push("Errors:");
+		if (input.payload.worktreeExecutionError) lines.push(`- ${input.payload.worktreeExecutionError}`);
+		for (const child of nonCompletedChildren) {
+			// Failure and interruption reasons are carried in the child summary
+			// when no bundle was produced (for example packaging/finalization
+			// failure). Preserve them for paused children as well as failures.
+			lines.push(`- ${child.agent}: ${child.summary}`);
+		}
+	}
+
 	const bundles = input.payload.children.filter((child) => child.gitBundle);
 	if (bundles.length > 0) {
 		lines.push("Git bundles:");
 		for (const child of bundles) {
 			const bundle = child.gitBundle!;
-			lines.push(`- ${child.agent} [${child.status}]: ${bundle.path} (${bundle.checksum}) ${bundle.base}..${bundle.head}`);
+			lines.push(`- ${child.agent} [${child.status}]: ${bundle.path} (${bundle.checksum}, ${bundle.bundleSize ?? "?"} bytes) ${bundle.base}..${bundle.head}`);
+			if (bundle.recovery) lines.push(`  recovery: ${bundle.recovery}`);
+			if (bundle.dirtySummary) lines.push(`  dirty summary: ${bundle.dirtySummary}`);
+			if (bundle.payloadChecksum) lines.push(`  payload checksum/size: ${bundle.payloadChecksum} / ${bundle.payloadSize ?? "?"} bytes`);
+			if (bundle.canonicalPayloadChecksum) lines.push(`  canonical payload checksum/size: ${bundle.canonicalPayloadChecksum} / ${bundle.canonicalPayloadSize ?? "?"} bytes`);
+			if (bundle.terminationState) lines.push(`  termination: ${bundle.terminationState}`);
+			if (bundle.incomplete) lines.push("  recovery incomplete: authored commit required");
 		}
 	}
 

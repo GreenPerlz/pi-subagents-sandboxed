@@ -27,14 +27,19 @@ import {
 	events,
 	tryImport,
 } from "../support/helpers.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT } from "../../src/shared/types.ts";
-import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
+import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { cleanupIsolatedGitRuntime, createIsolatedGitRuntime, createIsolatedGitWorktree } from "../../src/sandbox/isolated-git.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
 	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
 	SUBAGENT_PARENT_EVENT_SINK_ENV,
 	SUBAGENT_PARENT_RUN_ID_ENV,
+	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
+	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
+	SUBAGENT_PARENT_DEPTH_ENV,
+	SUBAGENT_PARENT_PATH_ENV,
 } from "../../src/runs/shared/pi-args.ts";
 
 interface ModelAttempt {
@@ -397,20 +402,24 @@ process.exit(${exitCode});
 			config?: Record<string, unknown>;
 			getSessionName?: () => string | undefined;
 			events?: ReturnType<typeof createEventBus>;
+			nestedFenceTimeoutMs?: number;
 		} = {},
 	) {
+		const state = { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null };
 		const baseExecutor = createSubagentExecutor!({
 			pi: { events: overrides.events ?? createEventBus(), getSessionName: overrides.getSessionName ?? (() => undefined) },
-			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			state,
 			config: overrides.config ?? {},
 			asyncByDefault: false,
 			tempArtifactsDir: tempDir,
 			getSubagentSessionRoot: () => tempDir,
 			expandTilde: (value: string) => value,
 			discoverAgents: () => ({ agents }),
+			nestedFenceTimeoutMs: overrides.nestedFenceTimeoutMs,
 		});
 		return {
 			...baseExecutor,
+			state,
 			execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: ((r: unknown) => void) | undefined, ctx: unknown) =>
 				baseExecutor.execute(id, {
 					...params,
@@ -418,6 +427,21 @@ process.exit(${exitCode});
 						? { sandbox: { provider: "none" } } : {}),
 				}, signal, onUpdate as never, ctx as never),
 		};
+	}
+
+	function makeLifecycleRepo(name: string): string {
+		const repo = path.join(tempDir, name);
+		fs.mkdirSync(repo, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.name", "Lifecycle Parent"], ["config", "user.email", "lifecycle@example.invalid"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		return repo;
 	}
 
 	function canonicalFastModeCtx() {
@@ -2152,6 +2176,98 @@ process.exit(${exitCode});
 		}
 	});
 
+	it("persists a foreground isolated rejection with its recovery bundle and grouped receipt", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("isolated-rejection-projection-repo");
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-foreground-rejection-agent-"));
+		const extensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		fs.mkdirSync(extensionDir, { recursive: true });
+		fs.writeFileSync(path.join(extensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf8");
+		fs.writeFileSync(path.join(extensionDir, "extension.ts"), "export default function register() {}\n", "utf8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const bus = createEventBus();
+		const runtimePrefix = "pi-isolated-git-isolated-foreground-rejection-";
+		const beforeRuntimes = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix)));
+		let grouped: any;
+		let runtimesAtPublication: string[] | undefined;
+		bus.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => {
+			grouped = payload;
+			runtimesAtPublication = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix) && !beforeRuntimes.has(entry));
+			const bundlePath = (payload as any)?.children?.[0]?.gitBundle?.path;
+			assert.ok(bundlePath && fs.existsSync(bundlePath), "publication observer must receive a readable bundle");
+		});
+		try {
+			mockPi.onCall({
+				output: "child output before artifact rejection",
+				blockArtifactOutput: true,
+				commands: ["printf 'recovered rejection\\n' > rejected.txt"],
+			});
+			const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })], { events: bus, getSessionName: () => "foreground-parent" });
+			let blockedOutput = false;
+			const result = await executor.execute("isolated-foreground-rejection", {
+				agent: "worker",
+				task: "Write then trigger the foreground rejection",
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+			}, new AbortController().signal, (update: any) => {
+				const outputPath = update.details?.results?.[0]?.artifactPaths?.outputPath;
+				if (blockedOutput || typeof outputPath !== "string") return;
+				blockedOutput = true;
+				fs.rmSync(outputPath, { force: true });
+				fs.mkdirSync(outputPath, { recursive: true });
+			}, makeMinimalCtx(repo));
+			const child = result.details.results[0] as any;
+			assert.equal(result.isError, true, JSON.stringify(result));
+			assert.match(result.content[0]?.text ?? "", /Foreground execution rejected/);
+			assert.match(child?.error ?? "", /Foreground execution rejected/);
+			assert.ok(child?.gitBundle?.path && fs.existsSync(child.gitBundle.path), "rejection bundle must be readable");
+			assert.equal(child?.gitBundle?.terminationState, "execution-rejected");
+			assert.ok(child?.gitBundle?.recovery, "dirty rejection must retain recovery metadata");
+			const persisted = [...executor.state.foregroundRuns.values()].at(-1);
+			assert.equal(persisted?.children.length, 1);
+			assert.match(persisted?.children[0]?.error ?? "", /Foreground execution rejected/);
+			assert.ok(persisted?.children[0]?.gitBundle?.path);
+			assert.equal(grouped?.children?.length, 1);
+			assert.match(grouped?.children?.[0]?.summary ?? "", /Foreground execution rejected/);
+			assert.ok(grouped?.children?.[0]?.gitBundle?.path);
+			assert.deepEqual(runtimesAtPublication, [], "runtime root and policy servers must be gone before grouped publication");
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves a foreground isolated rejection when bundle packaging fails", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("isolated-rejection-packaging-failure-repo");
+		const blockedArtifacts = path.join(tempDir, "subagent-artifacts");
+		fs.writeFileSync(blockedArtifacts, "not a directory", "utf8");
+		const parentSessionFile = path.join(tempDir, "parent-session.jsonl");
+		const ctx = { ...makeMinimalCtx(repo), sessionManager: { getSessionId: () => "session-123", getSessionFile: () => parentSessionFile } };
+		mockPi.onCall({ output: "child output before packaging failure", commands: ["printf 'packaging recovery\\n' > rejected.txt"] });
+		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
+		let blockedOutput = false;
+		const result = await executor.execute("isolated-foreground-packaging-failure", {
+			agent: "worker",
+			task: "Write then fail foreground bundle packaging",
+			sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+		}, new AbortController().signal, (update: any) => {
+			const outputPath = update.details?.results?.[0]?.artifactPaths?.outputPath;
+			if (blockedOutput || typeof outputPath !== "string") return;
+			blockedOutput = true;
+			const artifactsDir = path.dirname(outputPath);
+			fs.rmSync(artifactsDir, { recursive: true, force: true });
+			fs.writeFileSync(artifactsDir, "not a directory", "utf8");
+		}, ctx);
+		const child = result.details.results[0] as any;
+		assert.equal(result.isError, true, JSON.stringify(result));
+		assert.match(result.content[0]?.text ?? "", /Foreground execution rejected/);
+		assert.match(child?.error ?? "", /Foreground execution rejected/);
+		assert.match(child?.error ?? "", /bundle export failed|recover worktree/i);
+		assert.equal(child?.gitBundle, undefined);
+		const persisted = [...executor.state.foregroundRuns.values()].at(-1);
+		assert.match(persisted?.children[0]?.error ?? "", /recover worktree/i);
+	});
+
 	it("runs a positive foreground isolated Git execution through the executor and preserves the parent", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
 		const repo = path.join(tempDir, "isolated-executor-repo");
 		fs.mkdirSync(repo, { recursive: true });
@@ -2183,6 +2299,258 @@ process.exit(${exitCode});
 		assert.equal(child?.gitBundle?.base, spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim());
 		assert.ok(child?.gitBundle?.path && fs.existsSync(child.gitBundle.path));
 		assert.equal(spawnSync("git", ["-C", repo, "status", "--porcelain=v1"], { encoding: "utf8" }).stdout, before);
+	});
+
+	it("detached isolated parallel and chain terminal result is durably persisted and cleaned", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = path.join(tempDir, "isolated-detached-lifecycle-repo");
+		fs.mkdirSync(repo, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.name", "Lifecycle Parent"], ["config", "user.email", "lifecycle@example.invalid"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const beforeRuntimes = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-foreground-detached-intercom-agent-"));
+		const extensionDir = path.join(agentDir, "extensions", "pi-intercom");
+		fs.mkdirSync(extensionDir, { recursive: true });
+		fs.writeFileSync(path.join(extensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf8");
+		fs.writeFileSync(path.join(extensionDir, "extension.ts"), "export default function register() {}\n", "utf8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const isolatedSandbox = { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] };
+		const runModes: Array<{ label: string; params: Record<string, unknown> }> = [
+			{ label: "parallel", params: { tasks: [{ agent: "worker", task: "Detach and commit first sibling" }, { agent: "worker", task: "Finish second sibling" }], sandbox: isolatedSandbox } },
+			{ label: "chain", params: { chain: [{ parallel: [{ agent: "worker", task: "Detach and commit first chain sibling" }, { agent: "worker", task: "Finish second chain sibling" }] }], clarify: false, sandbox: isolatedSandbox } },
+		];
+		try {
+			for (const { label, params } of runModes) {
+			mockPi.onCall({ steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "handoff" })] }, { delay: 500, jsonl: [events.assistantMessage(`${label} detached terminal`)] }], commands: ["printf 'detached\n' > detached.txt && git add detached.txt && git commit -m detached"] });
+			mockPi.onCall({ output: `${label} sibling terminal`, commands: ["printf 'sibling\n' > sibling.txt && git add sibling.txt && git commit -m sibling"] });
+			const bus = createEventBus();
+			const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash", "contact_supervisor"], systemPrompt: "Intercom orchestration channel: test" })], { events: bus });
+			let detachSent = false;
+			let detachedChildIndex: number | undefined;
+			let terminalUpdate: any;
+			let groupedIntercom: any;
+			bus.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => { groupedIntercom = payload; });
+			const result = await executor.execute(`isolated-detached-${label}`, params, new AbortController().signal, (update: any) => {
+				if (detachedChildIndex === undefined) {
+					const activeProgress = update.details?.progress?.find((entry: any) => entry.currentTool === "contact_supervisor");
+					if (Number.isInteger(activeProgress?.index)) detachedChildIndex = activeProgress.index;
+					const detachedResultIndex = update.details?.results?.findIndex((child: any) => child.detached === true && /Detach and commit first/.test(child.task ?? ""));
+					if (detachedChildIndex === undefined && typeof detachedResultIndex === "number" && detachedResultIndex >= 0) detachedChildIndex = detachedResultIndex;
+				}
+				const terminalIndex = update.details?.results?.findIndex((child: any) => child.finalOutput === `${label} detached terminal` && child.detached !== true && child.gitBundle?.path);
+				if (typeof terminalIndex === "number" && terminalIndex >= 0 && detachedChildIndex === undefined) detachedChildIndex = terminalIndex;
+				if (detachedChildIndex !== undefined && update.details?.results?.[detachedChildIndex]?.finalOutput === `${label} detached terminal` && update.details.results[detachedChildIndex]?.detached !== true) terminalUpdate = update;
+				if (detachSent || !update.details?.progress?.some((entry: any) => entry.currentTool === "contact_supervisor")) return;
+				detachSent = true;
+				bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: `isolated-${label}` });
+			}, makeMinimalCtx(repo));
+			assert.equal(detachSent, true, `${label} must use production detach`);
+			assert.ok(detachedChildIndex !== undefined, `${label} must identify the detached child by index`);
+			assert.equal(result.details.results[detachedChildIndex!]?.detached, true, `${label} immediate result must retain detached status for the detached child`);
+			const deadline = Date.now() + 8_000;
+			let persisted: any;
+			while (Date.now() < deadline) {
+				persisted = [...executor.state.foregroundRuns.values()].at(-1);
+				if (terminalUpdate && persisted?.children.some((child: any) => child.index === detachedChildIndex && child.gitBundle?.path && child.exitCode === 0)) break;
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			assert.ok(terminalUpdate, `${label} should project eventual terminal update for detached child ${detachedChildIndex}`);
+			const terminalChild = terminalUpdate.details.results[detachedChildIndex!] as any;
+			assert.equal(terminalChild?.finalOutput, `${label} detached terminal`);
+			assert.ok(terminalChild?.gitBundle?.path && fs.existsSync(terminalChild.gitBundle.path), `${label} terminal update must retain the exact detached bundle`);
+			assert.ok(["success", "execution-rejected"].includes(terminalChild?.gitBundle?.terminationState), `${label} terminal bundle must retain termination state`);
+			assert.ok(groupedIntercom, `${label} must publish grouped terminal intercom`);
+			const groupedChild = groupedIntercom.children?.find((child: any) => child.index === detachedChildIndex);
+			assert.equal(groupedChild?.gitBundle?.path, terminalChild.gitBundle.path, `${label} grouped intercom must retain the exact bundle`);
+			assert.match(groupedIntercom.message ?? "", new RegExp(`Git bundle: ${String(terminalChild.gitBundle.path).replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`));
+			const persistedDetached = persisted?.children.find((child: any) => child.index === detachedChildIndex && child.finalOutput === `${label} detached terminal`);
+			assert.ok(persistedDetached?.gitBundle?.path && fs.existsSync(persistedDetached.gitBundle.path), `${label} detached child bundle must be durably remembered at its original index`);
+			assert.notEqual(persistedDetached?.detached, true, `${label} persisted detached child must be corrected at its original index`);
+			let afterRuntimes: string[] = [];
+			while (Date.now() < deadline) {
+				afterRuntimes = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !beforeRuntimes.has(entry));
+				if (afterRuntimes.length === 0) break;
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			assert.deepEqual(afterRuntimes, [], `${label} isolated runtime must be cleaned after sibling export`);
+			}
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("completed isolated sibling bundle is retained when another sibling rejects", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("isolated-sibling-rejection-repo");
+		mockPi.onCall({ output: "completed isolated sibling", commands: ["printf 'completed sibling\\n' > completed.txt && git add completed.txt && git commit -m 'completed sibling'"] });
+		mockPi.onCall({ output: "rejected isolated sibling", commands: ["printf 'rejected sibling\\n' > rejected.txt"] });
+		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
+		let rejectionArtifactBlocked = false;
+		const result = await executor.execute("isolated-sibling-rejection", { tasks: [{ agent: "worker", task: "Complete sibling" }, { agent: "worker", task: "Reject sibling" }], sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
+			const outputPath = update.details?.results?.find((candidate: any) => candidate?.artifactPaths?.outputPath?.includes("_1_output.md"))?.artifactPaths?.outputPath;
+			if (rejectionArtifactBlocked || typeof outputPath !== "string") return;
+			rejectionArtifactBlocked = true;
+			fs.rmSync(outputPath, { force: true });
+			fs.mkdirSync(outputPath, { recursive: true });
+		}, makeMinimalCtx(repo));
+		const children = result.details.results as any[];
+		assert.equal(result.isError, true, JSON.stringify(result));
+		assert.match(result.content[0]?.text ?? "", /Parallel execution failed unexpectedly/);
+		const completed = children.find((child) => child.task === "Complete sibling");
+		const rejected = children.find((child) => child.task === "Reject sibling");
+		assert.ok(completed?.gitBundle?.path && fs.existsSync(completed.gitBundle.path), "completed sibling bundle must survive callback rejection");
+		assert.equal(completed?.gitBundle?.terminationState, "success");
+		assert.equal(rejected?.exitCode, 1);
+		assert.match(rejected?.error ?? "", /Parallel execution failed unexpectedly/);
+		const persisted = [...executor.state.foregroundRuns.values()].at(-1);
+		assert.ok(persisted?.children.find((child: any) => child.index === 0)?.gitBundle?.path, "completed sibling bundle must persist in status projection");
+		assert.match(persisted?.children.find((child: any) => child.index === 1)?.error ?? "", /Parallel execution failed unexpectedly/);
+	});
+
+	it("isolated stop-fence refusal preserves the recovery worktree and terminal error", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = path.join(tempDir, "isolated-fence-refusal-repo");
+		fs.mkdirSync(repo, { recursive: true });
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.name", "Fence Parent"], ["config", "user.email", "fence@example.invalid"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+		for (const args of [["add", "base.txt"], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const runId = `isolated-fence-refusal-${Date.now().toString(36)}`;
+		const route = createNestedRoute(runId);
+		const envKeys = [SUBAGENT_PARENT_EVENT_SINK_ENV, SUBAGENT_PARENT_CONTROL_INBOX_ENV, SUBAGENT_PARENT_RUN_ID_ENV, SUBAGENT_PARENT_ROOT_RUN_ID_ENV, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV, SUBAGENT_PARENT_CHILD_INDEX_ENV, SUBAGENT_PARENT_DEPTH_ENV, SUBAGENT_PARENT_PATH_ENV];
+		const previousEnv = new Map<string, string | undefined>();
+		for (const key of envKeys) previousEnv.set(key, process.env[key]);
+		process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] = route.eventSink;
+		process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = route.controlInbox;
+		process.env[SUBAGENT_PARENT_RUN_ID_ENV] = runId;
+		process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = runId;
+		process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = route.capabilityToken;
+		process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "0";
+		process.env[SUBAGENT_PARENT_DEPTH_ENV] = "1";
+		process.env[SUBAGENT_PARENT_PATH_ENV] = JSON.stringify([{ runId, stepIndex: 0 }]);
+		let runtimePrefix = "";
+		try {
+			mockPi.onCall({ delay: 1500, output: "fence refusal terminal", commands: ["printf 'fence\\n' > fence.txt && git add fence.txt && git commit -m 'fence refusal'"] });
+			const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })], { nestedFenceTimeoutMs: 25 });
+			let seeded = false;
+			const result = await executor.execute(runId, { agent: "worker", task: "Commit the isolated fence refusal change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
+				const inputPath = update.details?.results?.[0]?.artifactPaths?.inputPath;
+				const childRunId = typeof inputPath === "string" ? path.basename(inputPath).split("_")[0] : undefined;
+				if (seeded || !childRunId) return;
+				seeded = true;
+				runtimePrefix = `pi-isolated-git-${childRunId}-`;
+				writeNestedEvent(route, {
+					type: "subagent.nested.started",
+					ts: Date.now(),
+					parentRunId: childRunId,
+					parentStepIndex: 0,
+					child: { id: "live-descendant", parentRunId: childRunId, parentStepIndex: 0, depth: 1, path: [{ runId: childRunId, stepIndex: 0 }], state: "running", mode: "single", agent: "nested" },
+				});
+			}, makeMinimalCtx(repo));
+			assert.equal(seeded, true, "production progress must expose the run before the child closes");
+			const child = result.details.results[0];
+			assert.equal(result.isError, true, JSON.stringify(result));
+			assert.match(child?.error ?? "", /export fence timed out|recover isolated worktree/i);
+			assert.equal(child?.gitBundle, undefined, "fence refusal must not claim an exported bundle");
+			const preserved = fs.readdirSync(os.tmpdir()).filter((entry) => runtimePrefix !== "" && entry.startsWith(runtimePrefix));
+			assert.ok(preserved.length > 0, "fence refusal must preserve the isolated runtime for recovery");
+			const runtimeRoot = path.join(os.tmpdir(), preserved[0]!);
+			assert.ok(fs.existsSync(path.join(runtimeRoot, "git-policy-host", "server.sock")), "fence refusal must keep the host policy server alive");
+			assert.ok(fs.existsSync(path.join(runtimeRoot, "git-policy-none", "server.sock")), "fence refusal must keep the no-network policy server alive");
+			const recoveryWorktree = path.join(runtimeRoot, "worktrees", "0");
+			const recoveryProbe = spawnSync("git", ["-C", recoveryWorktree, "status", "--porcelain=v1"], { encoding: "utf8" });
+			assert.equal(recoveryProbe.status, 0, recoveryProbe.stderr);
+			assert.equal(fs.existsSync(path.join(recoveryWorktree, "fence.txt")), true, "preserved worktree must remain safely recoverable");
+		} finally {
+			for (const entry of fs.readdirSync(os.tmpdir()).filter((candidate) => runtimePrefix !== "" && candidate.startsWith(runtimePrefix))) fs.rmSync(path.join(os.tmpdir(), entry), { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			for (const [key, value] of previousEnv) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
+	it("timeout bundle/recovery projection preserves timeout state and recovery metadata", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("isolated-timeout-projection-repo");
+		mockPi.onCall({ output: "timed out while committing", stderr: "operation timed out", exitCode: 1, commands: ["printf 'timeout recovery\\n' > timeout.txt"] });
+		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
+		const result = await executor.execute("isolated-timeout-projection", { agent: "worker", task: "Commit the timed-out isolated change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, undefined, makeMinimalCtx(repo));
+		const child = result.details.results[0] as any;
+		assert.equal(result.isError, true, JSON.stringify(result));
+		assert.match(child?.error ?? "", /timed out/i);
+		assert.equal(child?.gitBundle?.terminationState, "timeout");
+		assert.ok(child?.gitBundle?.path && fs.existsSync(child.gitBundle.path));
+		assert.ok(child?.gitBundle?.recovery, "timeout bundle should retain recovery metadata for dirty state");
+	});
+
+	it("cancellation projection exports cancelled isolated result and recovery", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("isolated-cancellation-projection-repo");
+		const runtimePrefixBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		mockPi.onCall({ delay: 2000, output: "cancelled after child work", commands: ["printf 'cancelled recovery\\n' > cancelled.txt"] });
+		const controller = new AbortController();
+		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
+		const pending = executor.execute("isolated-cancellation-projection", { agent: "worker", task: "Commit the cancelled isolated change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, controller.signal, undefined, makeMinimalCtx(repo));
+		setTimeout(() => controller.abort(), 200);
+		const result = await pending;
+		const child = result.details.results[0] as any;
+		assert.equal(result.isError, true, JSON.stringify(result));
+		assert.equal(child?.gitBundle?.terminationState, "cancelled");
+		assert.ok(child?.gitBundle?.path && fs.existsSync(child.gitBundle.path));
+		assert.ok(child?.gitBundle?.recovery, "cancellation must retain a recovery id for dirty state");
+		assert.match(child?.gitBundle?.portableMetadata ?? "", /"terminationState":"cancelled"/);
+		const persisted = [...executor.state.foregroundRuns.values()].at(-1);
+		assert.equal(persisted?.children[0]?.status, "cancelled");
+		assert.equal(persisted?.children[0]?.gitBundle?.recovery, child?.gitBundle?.recovery);
+		assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimePrefixBefore.has(entry)), [], "cancelled terminal export must clean the runtime");
+	});
+
+	it("interrupted acceptance-finalization projection exports interrupted recovery", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("isolated-interrupted-acceptance-repo");
+		const runId = "isolated-interrupted-acceptance";
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId, extraWritableMounts: [mockPi.dir] });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0, agent: "worker" });
+		const interrupt = new AbortController();
+		try {
+			mockPi.onCall({ output: acceptanceReport(), commands: ["printf 'accepted base\\n' > accepted.txt && git add accepted.txt && git commit -m 'accepted base'"] });
+			mockPi.onCall({ delay: 2000, output: acceptanceReport(), commands: ["printf 'dirty finalization state\\n' > dirty-finalization.txt"] });
+			const pending = runSync!(repo, [makeAgent("worker", { tools: ["read", "bash"] })], "worker", "Commit the isolated acceptance change", {
+				runId,
+				isolatedGit: worktree,
+				isolatedGitBundleDir: path.join(tempDir, "interrupted-acceptance-artifacts"),
+				isolatedGitCommitRequired: true,
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+				acceptance: { criteria: ["Commit the isolated acceptance change"], selfReview: true, maxFinalizationTurns: 1 },
+				interruptSignal: interrupt.signal,
+			});
+			setTimeout(() => interrupt.abort(), 250);
+			const result = await pending;
+			assert.equal(result.interrupted, true, JSON.stringify(result));
+			assert.equal(result.gitBundle?.terminationState, "interrupted");
+			assert.ok(result.gitBundle?.path && fs.existsSync(result.gitBundle.path));
+			assert.ok(result.gitBundle?.recovery, "interrupted finalization must retain a recovery ref for dirty state");
+			assert.equal(result.gitBundle?.incomplete, true);
+			assert.match(result.gitBundle?.portableMetadata ?? "", /"terminationState":"interrupted"/);
+			const bundleHeads = spawnSync("git", ["bundle", "list-heads", result.gitBundle!.path], { encoding: "utf8" });
+			assert.equal(bundleHeads.status, 0, bundleHeads.stderr);
+			assert.match(bundleHeads.stdout, /refs\/isolated\/recovery-0/);
+			assert.equal(result.acceptance?.finalization?.status, "failed");
+		} finally {
+			await cleanupIsolatedGitRuntime(runtime);
+			assert.equal(fs.existsSync(runtime.root), false, "interrupted verified export must clean the isolated runtime");
+		}
 	});
 
 	it("defaults an unconfigured writer to read-only Git metadata through the executor", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
@@ -2717,6 +3085,68 @@ process.exit(${exitCode});
 		assert.match(result.finalOutput ?? "", /Interrupted/);
 	});
 
+	it("detached nested route stays running until terminal callback and then publishes terminal truth", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const previousEnv = new Map<string, string | undefined>();
+		const envKeys = [SUBAGENT_PARENT_EVENT_SINK_ENV, SUBAGENT_PARENT_CONTROL_INBOX_ENV, SUBAGENT_PARENT_RUN_ID_ENV, SUBAGENT_PARENT_ROOT_RUN_ID_ENV, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV, SUBAGENT_PARENT_CHILD_INDEX_ENV, SUBAGENT_PARENT_DEPTH_ENV, SUBAGENT_PARENT_PATH_ENV];
+		const modes: Array<{ label: string; params: Record<string, unknown> }> = [
+			{ label: "foreground single", params: { agent: "bridge", task: "Task" } },
+			{ label: "top-level parallel", params: { tasks: [{ agent: "bridge", task: "Task" }] } },
+			{ label: "sequential chain", params: { chain: [{ agent: "bridge", task: "Task" }], clarify: false } },
+			{ label: "parallel chain", params: { chain: [{ parallel: [{ agent: "bridge", task: "Task" }] }], clarify: false } },
+		];
+		try {
+			for (const key of envKeys) previousEnv.set(key, process.env[key]);
+			for (const { label, params } of modes) {
+				const route = createNestedRoute(`detached-route-${label.replaceAll(/[^a-z]+/gi, "-")}`);
+				process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] = route.eventSink;
+				process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = route.controlInbox;
+				process.env[SUBAGENT_PARENT_RUN_ID_ENV] = route.rootRunId;
+				process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = route.rootRunId;
+				process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = route.capabilityToken;
+				process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "0";
+				process.env[SUBAGENT_PARENT_DEPTH_ENV] = "1";
+				process.env[SUBAGENT_PARENT_PATH_ENV] = JSON.stringify([{ runId: route.rootRunId, stepIndex: 0 }]);
+				mockPi.onCall({
+					steps: [
+						{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "handoff" })] },
+						{ delay: 1000, jsonl: [events.assistantMessage(`${label} terminal output`)] },
+					],
+				});
+				const bus = createEventBus();
+				const executor = makeExecutor([makeAgent("bridge", { tools: ["contact_supervisor"], systemPrompt: "Intercom orchestration channel: test" })], { events: bus });
+				let detached = false;
+				const run = executor.execute(`detached-route-${label}`, params, new AbortController().signal, (update: any) => {
+					if (detached || !update.details?.progress?.some((entry: any) => entry.currentTool === "contact_supervisor")) return;
+					detached = true;
+					bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: `route-${label}` });
+				}, makeMinimalCtx(tempDir));
+				const immediate = await run;
+				assert.equal(detached, true, `${label} should acknowledge detach`);
+				const immediateState = projectNestedEvents(route).children.find((child) => child.parentRunId === route.rootRunId)?.state;
+				assert.ok(immediateState === "running" || immediateState === "paused", `${label} detached acknowledgement must remain non-terminal, got ${immediateState}`);
+				assert.equal(immediateState === "complete", false, `${label} stop fence must not observe terminal while child is live`);
+				const deadline = Date.now() + 5_000;
+				let terminalState: string | undefined;
+				while (Date.now() < deadline) {
+					terminalState = projectNestedEvents(route).children.find((child) => child.parentRunId === route.rootRunId)?.state;
+					if (terminalState === "complete" || terminalState === "failed" || terminalState === "paused") break;
+					await new Promise((resolve) => setTimeout(resolve, 25));
+				}
+				assert.equal(terminalState, "complete", `${label} should publish terminal callback truth`);
+				const terminalChild = projectNestedEvents(route).children.find((child) => child.parentRunId === route.rootRunId);
+				assert.equal(terminalChild?.path?.[0]?.runId, route.rootRunId, `${label} terminal event must retain route identity`);
+				assert.match(terminalChild?.summary ?? "", new RegExp(`${label} terminal output`));
+				assert.match(JSON.stringify(immediate.details), /detached/i);
+				fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			}
+		} finally {
+			for (const [key, value] of previousEnv) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
 	for (const toolName of ["intercom", "contact_supervisor"]) {
 		it(`detaches cleanly on ${toolName} handoff without aborting the child process`, async () => {
 			const eventBus = createEventBus();
@@ -2738,10 +3168,14 @@ process.exit(${exitCode});
 			// `intercomStarted=true`. Using a fixed delay here races the mock's
 			// cold spawn and flakes under load.
 			let detachEmitted = false;
+			let terminalResult: any;
+			let resolveTerminal!: (result: any) => void;
+			const terminal = new Promise<any>((resolve) => { resolveTerminal = resolve; });
 			const runPromise = runSync(tempDir, agents, "echo", "Task", {
 				runId: `${toolName}-detach`,
 				allowIntercomDetach: true,
 				intercomEvents: eventBus,
+				onDetachedTerminal: (result) => { terminalResult = result; resolveTerminal(result); },
 				onUpdate: (update) => {
 					if (detachEmitted) return;
 					const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
@@ -2760,8 +3194,107 @@ process.exit(${exitCode});
 			assert.equal(result.finalOutput, "Detached for intercom coordination.");
 			assert.equal(result.progress?.status, "detached");
 			assert.equal(accepted, true);
+			terminalResult = await terminal;
+			assert.equal(terminalResult.exitCode, 0);
+			assert.equal(terminalResult.detached, undefined);
+			assert.match(terminalResult.finalOutput ?? "", /received pong/);
 		});
 	}
+
+	it("keeps the detached foreground process-group guard armed until a leaking grandchild is gone", { skip: process.platform === "win32" ? "POSIX process groups are unavailable" : undefined }, async () => {
+		const eventBus = createEventBus();
+		const pidFile = path.join(tempDir, `detached-grandchild-${Date.now()}-${process.pid}.pid`);
+		let detachEmitted = false;
+		let resolveTerminal!: (result: any) => void;
+		const terminal = new Promise<any>((resolve) => { resolveTerminal = resolve; });
+		mockPi.onCall({
+			commands: [`sleep 30 & echo $! > ${JSON.stringify(pidFile)}`],
+			steps: [
+				{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need a decision" })] },
+				{ delay: 100, jsonl: [events.assistantMessage("grandchild guard terminal")] },
+			],
+		});
+		try {
+			const immediate = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+				runId: "detached-grandchild-guard",
+				allowIntercomDetach: true,
+				intercomEvents: eventBus,
+				onDetachedTerminal: (result) => resolveTerminal(result),
+				onUpdate: (update) => {
+					if (detachEmitted) return;
+					const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+					if (!progress?.some((entry) => entry.currentTool === "contact_supervisor")) return;
+					detachEmitted = true;
+					eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "detached-grandchild-guard" });
+				},
+			});
+			assert.equal(immediate.detached, true);
+			assert.equal(immediate.finalOutput, "Detached for intercom coordination.");
+			const grandchildDeadline = Date.now() + 2_000;
+			while (!fs.existsSync(pidFile) && Date.now() < grandchildDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+			const grandchildPid = Number(fs.readFileSync(pidFile, "utf8"));
+			assert.ok(grandchildPid > 0, "detached child must create a stdio-retaining grandchild");
+			const terminalResult = await terminal;
+			assert.equal(terminalResult.detached, undefined);
+			assert.match(terminalResult.finalOutput ?? "", /grandchild guard terminal/);
+			const deadDeadline = Date.now() + 2_000;
+			while (Date.now() < deadDeadline) {
+				const state = spawnSync("ps", ["-o", "stat=", "-p", String(grandchildPid)], { encoding: "utf8" }).stdout.trim();
+				if (!state || state.startsWith("Z")) break;
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			const remainingState = spawnSync("ps", ["-o", "stat=", "-p", String(grandchildPid)], { encoding: "utf8" }).stdout.trim();
+			assert.ok(!remainingState || remainingState.startsWith("Z"), `grandchild ${grandchildPid} survived detached process-group cleanup: ${remainingState}`);
+		} finally {
+			try {
+				const grandchildPid = Number(fs.readFileSync(pidFile, "utf8"));
+				if (grandchildPid > 0) process.kill(grandchildPid, "SIGKILL");
+			} catch {}
+			fs.rmSync(pidFile, { force: true });
+		}
+	});
+
+	it("projects a detached child failure through the terminal callback", async () => {
+		const eventBus = createEventBus();
+		let accepted = false;
+		eventBus.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload) => {
+			if (!payload || typeof payload !== "object") return;
+			accepted = (payload as { accepted?: unknown }).accepted === true;
+		});
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need a decision" })] },
+				{ delay: 50, jsonl: [events.assistantMessage("failed after handoff")] },
+			],
+			exitCode: 1,
+			stderr: "child failed after handoff",
+		});
+		let detachEmitted = false;
+		let terminalResult: any;
+		let resolveTerminal!: (result: any) => void;
+		const terminal = new Promise<any>((resolve) => { resolveTerminal = resolve; });
+		const detached = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "detached-failure",
+			allowIntercomDetach: true,
+			intercomEvents: eventBus,
+			onDetachedTerminal: (result) => { terminalResult = result; resolveTerminal(result); },
+			onUpdate: (update) => {
+				if (detachEmitted) return;
+				const progress = (update as { details?: { progress?: Array<{ currentTool?: string }> } }).details?.progress;
+				if (!progress?.some((entry) => entry.currentTool === "contact_supervisor")) return;
+				detachEmitted = true;
+				eventBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "detached-failure" });
+			},
+		});
+
+		assert.equal(detached.detached, true);
+		assert.equal(accepted, true);
+		terminalResult = await terminal;
+		assert.equal(terminalResult.detached, undefined);
+		assert.equal(terminalResult.exitCode, 1);
+		assert.match(terminalResult.error ?? "", /child failed after handoff/);
+		assert.equal(terminalResult.progress?.status, "failed");
+	});
 
 	it("lets an active intercom child accept detach when another child is listening", async () => {
 		const eventBus = createEventBus();

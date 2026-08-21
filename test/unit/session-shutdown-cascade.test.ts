@@ -7,7 +7,7 @@ import { shutdownOwnedAsyncJobs, ASYNC_INTERRUPT_SIGNAL } from "../../src/runs/b
 import registerFanoutChildSubagentExtension from "../../src/extension/fanout-child.ts";
 import { TEMP_ROOT_DIR, SUBAGENT_ASYNC_STARTED_EVENT } from "../../src/shared/types.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
-import { createNestedRoute, readNestedControlRequests, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { createNestedRoute, projectNestedEvents, readNestedControlRequests, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import type { SubagentState, AsyncJobState, NestedRunSummary, NestedRouteInfo } from "../../src/shared/types.ts";
 
 function createState(): SubagentState {
@@ -59,6 +59,7 @@ describe("session-shutdown cascade", () => {
 		const killCalls: Array<{ pid: number; signal: string | number }> = [];
 		shutdownOwnedAsyncJobs(state, {
 			kill: (pid, signal) => { killCalls.push({ pid, signal: signal ?? 0 }); return true; },
+			isExpectedAsyncRunnerPid: () => true,
 		});
 
 		assert.equal(killCalls.length, 1);
@@ -85,6 +86,31 @@ describe("session-shutdown cascade", () => {
 		assert.equal(killCalls.length, 0);
 	});
 
+	it("does not signal when the persisted runner identity mismatches", () => {
+		const state = createState();
+		const asyncDir = tmpDir("pi-pid-mismatch-");
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			runId: "job-mismatch",
+			mode: "single",
+			state: "running",
+			pid: 12345,
+			startedAt: Date.now(),
+			runnerIdentity: "runner:/tmp/runner;config:/tmp/async-cfg-other-run.json;run:other-run",
+		}), "utf-8");
+		state.asyncJobs.set("job-mismatch", {
+			asyncId: "job-mismatch",
+			asyncDir,
+			status: "running",
+			pid: 12345,
+			startedAt: Date.now(),
+			updatedAt: Date.now(),
+		});
+
+		const killCalls: number[] = [];
+		shutdownOwnedAsyncJobs(state, { kill: (pid) => { killCalls.push(pid); return true; } });
+		assert.deepEqual(killCalls, []);
+	});
+
 	it("continues if kill throws (process already dead)", () => {
 		const state = createState();
 		state.asyncJobs.set("j1", {
@@ -103,6 +129,7 @@ describe("session-shutdown cascade", () => {
 				if (pid === 100) throw new Error("ESRCH");
 				return true;
 			},
+			isExpectedAsyncRunnerPid: () => true,
 		});
 
 		assert.deepEqual(killCalls, [100, 200]);
@@ -174,6 +201,7 @@ describe("session-shutdown cascade", () => {
 		const killCalls: Array<{ pid: number; signal: string | number }> = [];
 		shutdownOwnedAsyncJobs(state, {
 			kill: (pid, signal) => { killCalls.push({ pid, signal: signal ?? 0 }); return true; },
+			isExpectedAsyncRunnerPid: () => true,
 			readStatus: (asyncDir: string) => {
 				if (asyncDir === childAsyncDir) {
 					return {
@@ -209,6 +237,7 @@ describe("session-shutdown cascade", () => {
 		const killCalls: number[] = [];
 		shutdownOwnedAsyncJobs(state, {
 			kill: (pid) => { killCalls.push(pid); return true; },
+			isExpectedAsyncRunnerPid: () => true,
 		});
 
 		assert.deepEqual(killCalls, [77777]);
@@ -258,6 +287,7 @@ describe("session-shutdown cascade", () => {
 		const killCalls: Array<{ pid: number; signal: string | number }> = [];
 		shutdownOwnedAsyncJobs(state, {
 			kill: (pid, signal) => { killCalls.push({ pid, signal: signal ?? 0 }); return true; },
+			isExpectedAsyncRunnerPid: () => true,
 			readStatus: () => null,
 		});
 
@@ -270,13 +300,48 @@ describe("session-shutdown cascade", () => {
 		const interruptReq = requests.find((r) => r.targetRunId === childRunId && r.action === "interrupt");
 		assert.ok(interruptReq, "should write an interrupt control request for the foreground nested child");
 
-		// Should also have written a pause completion event for the child.
-		const eventsDir = nestedRoute.eventSink;
-		const eventFiles = fs.readdirSync(eventsDir).filter((f) => f.endsWith(".json"));
-		assert.ok(eventFiles.length >= 1, "should write at least one event file");
-		const eventsContent = eventFiles.map((f) => fs.readFileSync(path.join(eventsDir, f), "utf-8")).join("\n");
-		assert.ok(eventsContent.includes("subagent.nested.completed"), "should write pause completion event");
-		assert.ok(eventsContent.includes("paused"), "should mark nested run as paused");
+		// A foreground control request is not teardown proof. Until the owner
+		// publishes an explicit terminal/paused nested event, keep it actionable.
+		assert.equal(projectNestedEvents(nestedRoute).children.find((child) => child.id === childRunId)?.state, "running");
+	});
+
+	it("does not mark a nested runner paused when exact PID teardown is refused", () => {
+		const rootRunId = "root-refused-pid";
+		const nestedRoute = createNestedRoute(rootRunId);
+		const routeRoot = path.dirname(nestedRoute.eventSink);
+		tempDirs.push(routeRoot);
+		const childRunId = "refused-child";
+		const childAsyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootRunId, childRunId);
+		writeNestedEvent(nestedRoute, {
+			type: "subagent.nested.started",
+			ts: Date.now(),
+			parentRunId: rootRunId,
+			parentStepIndex: 0,
+			child: {
+				id: childRunId,
+				parentRunId: rootRunId,
+				parentStepIndex: 0,
+				depth: 1,
+				path: [{ runId: rootRunId, stepIndex: 0 }],
+				ownerState: "live",
+				mode: "single",
+				state: "running",
+				agent: "worker",
+				agents: ["worker"],
+				chainStepCount: 1,
+				asyncDir: childAsyncDir,
+				startedAt: Date.now(),
+				lastUpdate: Date.now(),
+			},
+		});
+		const state = createState();
+		state.asyncJobs.set(rootRunId, { asyncId: rootRunId, asyncDir: "/tmp/root", status: "running", nestedRoute, startedAt: Date.now(), updatedAt: Date.now() });
+		shutdownOwnedAsyncJobs(state, {
+			kill: () => false,
+			isExpectedAsyncRunnerPid: () => true,
+			readStatus: () => ({ runId: childRunId, state: "running", pid: 43210, startedAt: Date.now() } as any),
+		});
+		assert.equal(projectNestedEvents(nestedRoute).children.find((child) => child.id === childRunId)?.state, "running");
 	});
 
 	it("handles multiple jobs, each with different pids", () => {
@@ -295,6 +360,7 @@ describe("session-shutdown cascade", () => {
 		const killCalls: number[] = [];
 		shutdownOwnedAsyncJobs(state, {
 			kill: (pid) => { killCalls.push(pid); return true; },
+			isExpectedAsyncRunnerPid: () => true,
 		});
 
 		assert.equal(killCalls.length, 5);
@@ -327,6 +393,7 @@ describe("session-shutdown cascade", () => {
 			const killCalls: number[] = [];
 			shutdownOwnedAsyncJobs(state, {
 				kill: (pid) => { killCalls.push(pid); return true; },
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			assert.equal(killCalls.length, 1, "should only signal the live job");
@@ -392,6 +459,7 @@ describe("session-shutdown cascade", () => {
 		const killCalls: Array<{ pid: number; signal: string | number }> = [];
 		shutdownOwnedAsyncJobs(state, {
 			kill: (pid, signal) => { killCalls.push({ pid, signal: signal ?? 0 }); return true; },
+			isExpectedAsyncRunnerPid: () => true,
 			readStatus: () => ({ runId: childRunId, mode: "single", state: "running", pid: 55555 } as any),
 		});
 
@@ -438,7 +506,7 @@ describe("fanout-child session_shutdown cascade (issue #37 blocker 2)", () => {
 		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
 
 		try {
-			registerFanoutChildSubagentExtension(pi);
+			registerFanoutChildSubagentExtension(pi, { isExpectedAsyncRunnerPid: () => true });
 
 			// Inject an async job by emitting the started event.
 			pi.events.emit(SUBAGENT_ASYNC_STARTED_EVENT, {

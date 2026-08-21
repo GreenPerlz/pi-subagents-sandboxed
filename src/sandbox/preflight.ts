@@ -361,6 +361,7 @@ function defaultGitProbeDeps(cwd: string, options?: { requireGitWorktree?: boole
 				const result = child_process.spawnSync("git", ["-C", cwd, "rev-parse", "--git-dir"], {
 					encoding: "utf-8",
 					timeout: 10_000,
+					maxBuffer: 8 * 1024 * 1024,
 				});
 				return {
 					status: result.status ?? null,

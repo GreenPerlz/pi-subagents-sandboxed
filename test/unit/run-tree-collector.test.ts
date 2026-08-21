@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { collectRunTree, type OverlayRun } from "../../src/tui/run-tree-collector.ts";
+import { collectRunTree, projectPersistedResultForTests, type OverlayRun } from "../../src/tui/run-tree-collector.ts";
 import { resolveSessionPath } from "../../src/tui/session-reader.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import type { SubagentState, AsyncJobState, NestedRunSummary } from "../../src/shared/types.ts";
@@ -1977,5 +1977,36 @@ describe("deriveRunModelThinking with currentStep (issue #53)", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("keeps completed empty fanout diagnostics visible without creating a pending child", () => {
+		const run = projectPersistedResultForTests({
+			id: "run-empty-group-diagnostic",
+			mode: "chain",
+			state: "complete",
+			children: [
+				{ groupId: "dynamic-group-1", agent: "reviewer", state: "complete", finalOutput: "Dynamic fanout produced 0 results." },
+				{ index: 0, agent: "consumer", state: "complete" },
+			],
+		});
+		assert.deepEqual(run.steps.map((step) => step.agent), ["consumer"]);
+		assert.equal(run.groupDiagnostics?.[0]?.state, "complete");
+		assert.equal(run.groupDiagnostics?.[0]?.unindexed, true);
+	});
+
+	it("keeps group diagnostics unindexed while preserving canonical child order", () => {
+		const run = projectPersistedResultForTests({
+			id: "run-group-diagnostic",
+			mode: "parallel",
+			state: "failed",
+			children: [
+				{ index: 1, agent: "second", state: "complete" },
+				{ groupId: "dynamic-group-4", agent: "fanout", state: "failed", sessionFile: "/tmp/diagnostic.jsonl" },
+				{ index: 0, agent: "first", state: "complete" },
+			],
+		});
+		assert.deepEqual(run.steps.map((step) => step.agent), ["first", "second"]);
+		assert.equal(run.groupDiagnostics?.[0]?.groupId, "dynamic-group-4");
+		assert.equal(run.groupDiagnostics?.[0]?.unindexed, true);
 	});
 });

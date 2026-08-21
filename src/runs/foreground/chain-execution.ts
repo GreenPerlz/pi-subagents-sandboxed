@@ -8,7 +8,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { resolveSandboxConfig, resolveGitMode } from "../../sandbox/config.ts";
-import { createIsolatedGitRuntime, createIsolatedGitWorktree, cleanupIsolatedGitRuntime, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import {
@@ -16,6 +16,7 @@ import {
 	createChainDir,
 	removeChainDir,
 	resolveStepBehavior,
+	taskDisallowsFileUpdates,
 	resolveParallelBehaviors,
 	buildChainInstructions,
 	writeInitialProgressFile,
@@ -37,6 +38,7 @@ import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { runSync } from "./execution.ts";
 import { buildChainSummary } from "../../shared/formatters.ts";
 import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, resolveChildCwd } from "../../shared/utils.ts";
+import { MapConcurrentError } from "../shared/parallel-utils.ts";
 import { recordRun } from "../shared/run-history.ts";
 import {
 	cleanupWorktrees,
@@ -47,6 +49,7 @@ import {
 	formatWorktreeTaskCwdConflict,
 	formatRecoverableWorktreePaths,
 	WorktreeDiffCaptureError,
+	WorktreeSetupHookTeardownError,
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import {
@@ -58,10 +61,12 @@ import {
 	type Details,
 	type IntercomEventBus,
 	type NestedRouteInfo,
+	type NestedRunSummary,
 	type ResolvedControlConfig,
 	type SandboxIntercomBridge,
 	type SingleResult,
 	MAX_CONCURRENCY,
+	TEMP_ARTIFACTS_DIR,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
@@ -70,11 +75,15 @@ import { resolveModelCandidate } from "../shared/model-fallback.ts";
 import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { injectSingleOutputInstruction, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
+import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, outputEntryFromResult, resolveOutputReferences, validateChainOutputBindings } from "../shared/chain-outputs.ts";
+import { attachNestedChildrenToResultChildren, buildSubagentResultIntercomPayload, deliverSubagentResultIntercomEvent, resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { createStructuredOutputRuntime } from "../shared/structured-output.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection, type DynamicCollectedResult } from "../shared/dynamic-fanout.ts";
 import type { ChainOutputMap } from "../../shared/types.ts";
+import { waitForNestedDescendantsToStop } from "../shared/nested-events.ts";
+import { registerForegroundInterrupt } from "../shared/foreground-control.ts";
 
 interface ChainExecutionDetailsInput {
 	results: SingleResult[];
@@ -90,7 +99,7 @@ interface ChainExecutionDetailsInput {
 	outputs?: ChainOutputMap;
 	currentFlatIndex?: number;
 	dynamicChildren?: Record<number, Array<{ agent: string; label?: string; flatIndex: number; itemKey: string; outputName?: string; structured?: boolean; error?: string }>>;
-	dynamicGroupStatuses?: Record<number, { status: "pending" | "running" | "completed" | "failed" | "paused" | "detached"; error?: string; acceptance?: SingleResult["acceptance"] }>;
+	dynamicGroupStatuses?: Record<number, { status: "pending" | "running" | "completed" | "failed" | "paused" | "cancelled" | "detached"; error?: string; acceptance?: SingleResult["acceptance"] }>;
 }
 
 interface ParallelChainRunInput {
@@ -143,17 +152,30 @@ interface ParallelChainRunInput {
 	totalSteps: number;
 	dynamicChildren?: ChainExecutionDetailsInput["dynamicChildren"];
 	dynamicGroupStatuses?: ChainExecutionDetailsInput["dynamicGroupStatuses"];
+	teardownUnproven?: boolean;
 	worktreeSetup?: WorktreeSetup;
 	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[];
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
+	nestedFenceTimeoutMs?: number;
 	sandbox?: ResolvedSandboxConfig;
 	sandboxes?: (ResolvedSandboxConfig | undefined)[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	progressPaths?: string[];
+	onDetachedStarted?: (index: number, result: SingleResult) => void;
+	onDetachedTerminal?: (index: number, result: SingleResult) => void | Promise<void>;
 }
 
 function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details {
+	const groupDiagnostics = Object.entries(input.dynamicGroupStatuses ?? {})
+		.filter(([, diagnostic]) => diagnostic.status === "completed" || diagnostic.status === "failed" || diagnostic.status === "paused" || diagnostic.status === "cancelled")
+		.map(([stepIndex, diagnostic]) => ({
+			groupId: `dynamic-group-${stepIndex}`,
+			unindexed: true as const,
+			agent: input.chainSteps[Number(stepIndex)] && isDynamicParallelStep(input.chainSteps[Number(stepIndex)]!) ? input.chainSteps[Number(stepIndex)]!.parallel.agent : "dynamic-group",
+			status: diagnostic.status === "failed" ? "failed" as const : diagnostic.status === "completed" ? "complete" as const : diagnostic.status,
+			...(diagnostic.error ? { error: diagnostic.error, output: diagnostic.error, finalOutput: diagnostic.error } : {}),
+		}));
 	return compactForegroundDetails({
 		mode: "chain",
 		results: input.results,
@@ -163,7 +185,9 @@ function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details 
 		totalSteps: input.totalSteps,
 		currentStepIndex: input.currentStepIndex,
 		outputs: input.outputs,
-	workflowGraph: buildWorkflowGraphSnapshot({
+		groupDiagnostics: groupDiagnostics.length ? groupDiagnostics : undefined,
+		...(input.teardownUnproven ? { teardownUnproven: true } : {}),
+		workflowGraph: buildWorkflowGraphSnapshot({
 			runId: input.runId,
 			mode: "chain",
 			steps: input.chainSteps,
@@ -206,15 +230,45 @@ function captureParallelWorktreeSummary(
 	return formatWorktreeDiffSummary(diffs) || undefined;
 }
 
+function resolveParallelCleanTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number): string {
+	let cleanTask = resolveOutputReferences(input.parallelTemplates[taskIndex] ?? "{previous}", input.outputs);
+	cleanTask = cleanTask.replace(/\{task\}/g, input.originalTask);
+	cleanTask = cleanTask.replace(/\{previous\}/g, input.prev);
+	cleanTask = cleanTask.replace(/\{chain_dir\}/g, input.chainDir);
+	return cleanTask;
+}
+
+function commitRequiredForParallelTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined): boolean {
+	return !taskDisallowsFileUpdates(resolveParallelCleanTask(input, taskIndex))
+		&& inferSandboxCwdWritable({ agentName: agent?.name, tools: agent?.tools, sandbox });
+}
+
 async function runParallelChainTasks(input: ParallelChainRunInput): Promise<SingleResult[]> {
 	const concurrency = input.step.concurrency ?? MAX_CONCURRENCY;
 	const failFast = input.step.failFast ?? false;
 	let aborted = false;
 
-	const parallelResults = await mapConcurrent(
+	let parallelResults: SingleResult[];
+	try {
+	parallelResults = await mapConcurrent(
 		input.step.parallel,
 		concurrency,
 		async (task, taskIndex) => {
+			const flatIndex = input.globalTaskIndex + taskIndex;
+			if (input.signal?.aborted || input.foregroundControl?.interruptRequested) {
+				const cancelled = input.signal?.aborted && !input.foregroundControl?.interruptRequested;
+				return {
+					flatIndex,
+					agent: task.agent,
+					task: task.task,
+					exitCode: cancelled ? 1 : 0,
+					...(cancelled ? { cancelled: true } : { interrupted: true }),
+					success: false,
+					messages: [],
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+					error: cancelled ? "Cancelled before this task started." : "Interrupted before this task started.",
+				} as SingleResult;
+			}
 			if (aborted && failFast) {
 				return {
 					agent: task.agent,
@@ -236,12 +290,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				templateHasPrevious ? undefined : input.prev,
 			);
 
-			let taskStr = resolveOutputReferences(taskTemplate, input.outputs);
-			taskStr = taskStr.replace(/\{task\}/g, input.originalTask);
-			taskStr = taskStr.replace(/\{previous\}/g, input.prev);
-			taskStr = taskStr.replace(/\{chain_dir\}/g, input.chainDir);
-			const cleanTask = taskStr;
-			taskStr = prefix + taskStr + suffix;
+			const cleanTask = resolveParallelCleanTask(input, taskIndex);
+			let taskStr = prefix + cleanTask + suffix;
 
 			const taskAgentConfig = input.agents.find((agent) => agent.name === task.agent);
 			const effectiveModel =
@@ -271,6 +321,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			const instructionOutputPath = outputPath ?? (behavior.outputMode === "file-only" ? savedOutputPath : undefined);
 			taskStr = injectSingleOutputInstruction(taskStr, instructionOutputPath);
 			const interruptController = new AbortController();
+			let unregisterInterrupt: (() => void) | undefined;
 			if (input.foregroundControl) {
 				input.foregroundControl.currentAgent = task.agent;
 				input.foregroundControl.currentIndex = input.globalTaskIndex + taskIndex;
@@ -287,19 +338,28 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				if (input.sessionFileForIndex) {
 					input.foregroundControl.sessionFile = input.sessionFileForIndex(input.globalTaskIndex + taskIndex);
 				}
-				input.foregroundControl.interrupt = () => {
+				unregisterInterrupt = registerForegroundInterrupt(input.foregroundControl, () => {
 					if (interruptController.signal.aborted) return false;
 					interruptController.abort();
 					input.foregroundControl!.currentActivityState = undefined;
 					input.foregroundControl!.updatedAt = Date.now();
 					return true;
-				};
+				});
 			}
 
-			const structuredRuntime = task.outputSchema
-				? createStructuredOutputRuntime(task.outputSchema, path.join(input.chainDir, "structured-output"))
-				: undefined;
-			const result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
+			let structuredRuntime: ReturnType<typeof createStructuredOutputRuntime> | undefined;
+			try {
+				structuredRuntime = task.outputSchema
+					? createStructuredOutputRuntime(task.outputSchema, path.join(input.chainDir, "structured-output"))
+					: undefined;
+			} catch (error) {
+				unregisterInterrupt?.();
+				unregisterInterrupt = undefined;
+				throw error;
+			}
+			let result: SingleResult;
+			try {
+				result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
 				cwd: taskCwd,
 				signal: input.signal,
 				interruptSignal: interruptController.signal,
@@ -321,6 +381,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				intercomSessionName: input.childIntercomTarget?.(task.agent, input.globalTaskIndex + taskIndex),
 				orchestratorIntercomTarget: input.orchestratorIntercomTarget,
 				nestedRoute: input.nestedRoute,
+				nestedFenceTimeoutMs: input.nestedFenceTimeoutMs,
 				modelOverride: effectiveModel,
 				fastMode: behavior.fastMode,
 				availableModels: input.availableModels,
@@ -332,8 +393,17 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox,
 				isolatedGit,
 				isolatedGitBundleDir: input.artifactsDir,
+				isolatedGitCommitRequired: Boolean(isolatedGit) && !taskDisallowsFileUpdates(cleanTask) && inferSandboxCwdWritable({ agentName: task.agent, tools: taskAgentConfig?.tools, sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox }),
 				sandboxIntercomBridge: input.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? input.progressPaths : undefined,
+				onDetachedStarted: () => input.onDetachedStarted?.(input.globalTaskIndex + taskIndex, {
+					agent: task.agent,
+					task: cleanTask,
+					exitCode: 0,
+					messages: [],
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 },
+				}),
+				onDetachedTerminal: input.onDetachedTerminal ? (result) => input.onDetachedTerminal!(input.globalTaskIndex + taskIndex, result) : undefined,
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
 						const stepResults = progressUpdate.details?.results || [];
@@ -382,9 +452,13 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 						});
 					}
 					: undefined,
-			});
+				});
+			} finally {
+				unregisterInterrupt?.();
+				unregisterInterrupt = undefined;
+			}
+			if (result.detached) input.onDetachedStarted?.(input.globalTaskIndex + taskIndex, result);
 			if (input.foregroundControl?.currentIndex === input.globalTaskIndex + taskIndex) {
-				input.foregroundControl.interrupt = undefined;
 				input.foregroundControl.currentModel = result.model ?? effectiveModel;
 				input.foregroundControl.currentThinking = result.thinking;
 				input.foregroundControl.updatedAt = Date.now();
@@ -394,9 +468,46 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				aborted = true;
 			}
 			recordRun(task.agent, cleanTask, result.exitCode, result.progressSummary?.durationMs ?? 0);
-			return result;
+			return { ...result, flatIndex: input.globalTaskIndex + taskIndex };
 		},
 	);
+	} catch (error) {
+		const rejection = error instanceof MapConcurrentError ? error.reason : error;
+		const partialResults = error instanceof MapConcurrentError ? error.partialResults : [];
+		const rejectedIndex = error instanceof MapConcurrentError ? error.rejectionIndex : undefined;
+		const recoveryPath = formatRecoverableWorktreePaths(input.worktreeSetup);
+		const message = `Parallel execution failed unexpectedly: ${rejection instanceof Error ? rejection.message : String(rejection)}${recoveryPath ? `; ${recoveryPath}` : ""}`;
+		const fence = await waitForNestedDescendantsToStop(input.nestedRoute, input.runId, undefined, { timeoutMs: input.nestedFenceTimeoutMs });
+		parallelResults = input.step.parallel.map((task, taskIndex) => {
+			const flatIndex = input.globalTaskIndex + taskIndex;
+			const settled = partialResults[taskIndex];
+			if (settled) return { ...settled, flatIndex, ...(!fence.stopped ? { teardownUnproven: true } : {}) };
+			const worktree = input.isolatedGitWorktrees?.[taskIndex];
+			let gitBundle: SingleResult["gitBundle"];
+			if (worktree && fence.stopped && !worktree.runtime.isExported(worktree.index)) {
+			try {
+				const bundle = exportIsolatedGitBundle(worktree.runtime, {
+					outputDir: input.artifactsDir,
+					worktree,
+					syntheticPaths: worktree.syntheticPaths,
+					terminationState: input.signal?.aborted ? "cancelled" : "execution-rejected",
+					agent: task.agent,
+					commitRequired: commitRequiredForParallelTask(input, taskIndex, input.agents.find((agent) => agent.name === task.agent), input.sandboxes?.[taskIndex] ?? input.sandbox),
+				});
+				gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+			} catch (exportError) {
+				worktree.runtime.markExportFailed();
+				const packaging = `Isolated Git bundle export failed; recover isolated worktree at ${worktree.runtime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
+				return { flatIndex, agent: task.agent, task: task.task, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, error: `${message}; ${packaging}` };
+			}
+			}
+			if (!fence.stopped && worktree) worktree.runtime.markExportFenceFailed();
+			const fencedMessage = !fence.stopped
+				? `${message}; nested descendants did not reach a proven terminal state before export; recover isolated worktree at ${worktree?.runtime.root ?? "the runtime root"}`
+				: taskIndex === rejectedIndex ? message : `${message}; execution rejected before this task completed`;
+			return { flatIndex, agent: task.agent, task: task.task, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, error: fencedMessage, ...(!fence.stopped ? { teardownUnproven: true } : {}), ...(gitBundle ? { gitBundle } : {}) };
+		});
+	}
 
 	return parallelResults;
 }
@@ -418,6 +529,7 @@ interface ChainExecutionParams {
 	includeProgress?: boolean;
 	clarify?: boolean;
 	onUpdate?: (r: AgentToolResult<Details>) => void;
+	onDetachedTerminal?: (results: SingleResult[]) => void | Promise<void>;
 	onControlEvent?: (event: ControlEvent) => void;
 	controlConfig: ResolvedControlConfig;
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
@@ -437,12 +549,14 @@ interface ChainExecutionParams {
 		currentModel?: string;
 		sessionFile?: string;
 		interrupt?: () => boolean;
+		nestedChildren?: NestedRunSummary[];
 	};
 	chainSkills?: string[];
 	chainDir?: string;
 	dynamicFanoutMaxItems?: number;
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
+	nestedFenceTimeoutMs?: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	sandbox?: ResolvedSandboxConfig;
@@ -512,6 +626,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	const allProgress: AgentProgress[] = [];
 	const allArtifactPaths: ArtifactPaths[] = [];
 	const worktreeSummaries: string[] = [];
+	// Retain the current step cleanup in the outer lifecycle so synchronous
+	// setup/run exceptions cannot bypass the per-promise finally.
+	let activeInterruptCleanup: (() => void) | undefined;
 
 	const chainAgents: string[] = chainSteps.map((step) =>
 		isParallelStep(step)
@@ -521,6 +638,54 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			: (step as SequentialStep).agent,
 	);
 	const totalSteps = chainSteps.length;
+	let teardownUnproven = false;
+	// Worktree indexes are global materialized indexes, not source-chain indexes.
+	// Keep the actual item policy alongside each created checkout so fallback
+	// exports remain correct after dynamic/static expansion.
+	const isolatedWorktreePolicies = new Map<number, { agent: string; task: string; commitRequired: boolean }>();
+	const isolatedFallbackProjected = new Set<number>();
+	const detachedIndexes = new Set<number>();
+	const detachedTerminalIndexes = new Set<number>();
+	let chainExecutionSettled = false;
+	let detachedAggregatePublished = false;
+	const upsertChainResult = (index: number, result: SingleResult): SingleResult => {
+		// An export diagnostic is removable only after a bundle proves that the
+		// retry succeeded. Preserve the diagnostic on failed fallback projections.
+		// Group diagnostics are intentionally unindexed; assigning them a child
+		// slot would collide with a real materialized result.
+		const indexedResult = result.flatIndex === undefined && !result.groupId ? { ...result, flatIndex: index } : result;
+		const normalizedError = indexedResult.gitBundle ? stripIsolatedGitExportDiagnostics(indexedResult.error) : { error: indexedResult.error, onlyDiagnostics: false };
+		const normalized = indexedResult.gitBundle && normalizedError.onlyDiagnostics
+			? { ...indexedResult, error: undefined, success: true, exitCode: 0 }
+			: normalizedError.error !== indexedResult.error
+				? { ...indexedResult, ...(normalizedError.error ? { error: normalizedError.error } : { error: undefined }) }
+				: indexedResult;
+		const existingIndex = results.findIndex((candidate) => candidate.flatIndex === index);
+		const existing = existingIndex >= 0 ? results[existingIndex] : undefined;
+		let merged: SingleResult;
+		if (!existing) {
+			results.push(normalized);
+			merged = normalized;
+		} else {
+			// A detached acknowledgement is only a placeholder. If its terminal
+			// callback raced the acknowledgement merge, retain the already projected
+			// sibling failure/output instead of overwriting it with detached=true and
+			// an empty error.
+			const terminalAlreadyProjected = detachedTerminalIndexes.has(index) && normalized.detached === true;
+			merged = terminalAlreadyProjected
+				? { ...normalized, ...existing, gitBundle: normalized.gitBundle ?? existing.gitBundle }
+				: { ...existing, ...normalized, gitBundle: normalized.gitBundle ?? existing.gitBundle };
+			results[existingIndex] = merged;
+		}
+		// Detached callbacks may settle out of order. Keep indexed children in
+		// canonical flat-index order while retaining unindexed diagnostics.
+		results.sort((left, right) => {
+			if (left.flatIndex === undefined) return 1;
+			if (right.flatIndex === undefined) return -1;
+			return left.flatIndex - right.flatIndex;
+		});
+		return merged;
+	};
 
 	const makeDetailsInput = (overrides: Pick<Partial<ChainExecutionDetailsInput>, "currentStepIndex" | "currentFlatIndex"> = {}): ChainExecutionDetailsInput => ({
 		results,
@@ -535,8 +700,236 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		outputs,
 		dynamicChildren,
 		dynamicGroupStatuses,
+		teardownUnproven,
 		...overrides,
 	});
+	let isolatedCleanupFailure: string | undefined;
+	const noteIsolatedCleanupFailure = (target?: SingleResult, cause?: unknown): void => {
+		if (!isolatedGitRuntime) return;
+		if (cause === undefined && !isolatedGitRuntime.exportFailed && !fs.existsSync(isolatedGitRuntime.root)) return;
+		isolatedGitRuntime.markExportFailed();
+		const base = `Isolated Git cleanup failed after export; recover isolated worktrees at ${isolatedGitRuntime.root}.`;
+		const message = `${base}${cause instanceof Error ? ` ${cause.message}` : cause !== undefined ? ` ${String(cause)}` : ""}`;
+		isolatedCleanupFailure ??= message;
+		for (const worktree of isolatedGitRuntime.worktrees) {
+			const policy = isolatedWorktreePolicies.get(worktree.index);
+			const existing = results.find((result) => result.flatIndex === worktree.index);
+			const projected = existing ?? { flatIndex: worktree.index, agent: policy?.agent ?? `task-${worktree.index + 1}`, task: policy?.task ?? "chain execution", messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } };
+			projected.exitCode = projected.exitCode === 0 ? 1 : (projected.exitCode ?? 1);
+			projected.success = false;
+			// Cleanup failure has failure precedence over cancellation/interruption.
+			delete projected.cancelled;
+			delete projected.interrupted;
+			projected.error = projected.error?.includes(message) ? projected.error : projected.error ? `${projected.error}\n${message}` : message;
+			upsertChainResult(worktree.index, projected);
+		}
+		if (target && !target.error?.includes(message)) {
+			target.exitCode = target.exitCode === 0 ? 1 : (target.exitCode ?? 1);
+			target.success = false;
+			delete target.cancelled;
+			delete target.interrupted;
+			target.error = target.error ? `${target.error}\n${message}` : message;
+		}
+	};
+
+	const exportBundleWithRetry = (options: Parameters<typeof exportIsolatedGitBundle>[1]): { bundle: ReturnType<typeof exportIsolatedGitBundle>; earlierAttemptFailed: boolean } => {
+		let lastError: unknown;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try { return { bundle: exportIsolatedGitBundle(isolatedGitRuntime!, options), earlierAttemptFailed: attempt > 0 }; }
+			catch (error) { lastError = error; }
+		}
+		throw lastError;
+	};
+	const exportRemainingIsolated = async (terminationState: "success" | "failure" | "execution-rejected" | "interrupted" | "cancelled", reason = "Chain execution rejected", includeDetached = false): Promise<{ fenced: boolean }> => {
+		if (!isolatedGitRuntime) return { fenced: true };
+		// A teardown callback may have already fenced this runtime after refusing
+		// private-group proof. Never clear that fence and package/delete descendants.
+		if (isolatedGitRuntime.exportFenceFailed) return { fenced: false };
+		const effectiveTerminationFor = (index: number): "success" | "failure" | "execution-rejected" | "interrupted" | "cancelled" => {
+			const existing = results.find((result) => result.flatIndex === index);
+			if (!existing) return terminationState;
+			if (existing.cancelled) return "cancelled";
+			if (existing.interrupted) return "interrupted";
+			if (existing.success === true && existing.exitCode === 0) return "success";
+			if (existing.exitCode !== 0) return "failure";
+			return terminationState;
+		};
+		const fence = await waitForNestedDescendantsToStop(params.nestedRoute, runId, undefined, { timeoutMs: params.nestedFenceTimeoutMs });
+		if (!fence.stopped) {
+			isolatedGitRuntime.markExportFenceFailed();
+			teardownUnproven = true;
+			const message = `Nested descendants did not reach a proven terminal state before export; recover isolated worktrees at ${isolatedGitRuntime.root}`;
+			for (const worktree of isolatedGitRuntime.worktrees) {
+				if (isolatedGitRuntime.isExported(worktree.index) || isolatedFallbackProjected.has(worktree.index)) continue;
+				if (detachedIndexes.has(worktree.index) && (!includeDetached || !detachedTerminalIndexes.has(worktree.index))) continue;
+				const policy = isolatedWorktreePolicies.get(worktree.index);
+				isolatedFallbackProjected.add(worktree.index);
+				const existing = results.find((result) => result.flatIndex === worktree.index);
+				upsertChainResult(worktree.index, existing
+					? { ...existing, success: false, exitCode: 1, interrupted: undefined, cancelled: undefined, error: existing.error ? `${existing.error}\n${reason}; ${message}` : `${reason}; ${message}` }
+					: { flatIndex: worktree.index, agent: policy?.agent ?? `task-${worktree.index + 1}`, task: policy?.task ?? "chain execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 }, error: `${reason}; ${message}` });
+			}
+			return { fenced: false };
+		}
+		isolatedGitRuntime.markExportFenceResolved();
+		for (const worktree of isolatedGitRuntime.worktrees) {
+			if (isolatedGitRuntime.isExported(worktree.index) || isolatedFallbackProjected.has(worktree.index)) continue;
+			if (detachedIndexes.has(worktree.index) && (!includeDetached || !detachedTerminalIndexes.has(worktree.index))) continue;
+			const policy = isolatedWorktreePolicies.get(worktree.index);
+			try {
+				const retry = exportBundleWithRetry({
+					outputDir: artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
+					worktree,
+					syntheticPaths: worktree.syntheticPaths,
+					terminationState: effectiveTerminationFor(worktree.index),
+					agent: policy?.agent,
+					commitRequired: policy?.commitRequired,
+				});
+				const bundle = retry.bundle;
+				isolatedFallbackProjected.add(worktree.index);
+				const existing = results.find((result) => result.flatIndex === worktree.index);
+				const normalized = stripIsolatedGitExportDiagnostics(existing?.error);
+				const exportOnly = Boolean(existing && normalized.onlyDiagnostics);
+				const fallback = existing
+					? { ...existing, ...(normalized.error ? { error: normalized.error } : exportOnly ? { error: undefined } : {}), ...(exportOnly ? { success: true, exitCode: 0 } : {}) }
+					: { flatIndex: worktree.index, agent: policy?.agent ?? `task-${worktree.index + 1}`, task: policy?.task ?? "chain execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 }, error: `${reason}; isolated worktree exported for recovery`, gitBundle: { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata } };
+				const gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+				const effectiveFallback = bundle.incomplete && fallback.success === true
+					? { ...fallback, success: false, exitCode: fallback.exitCode === 0 ? 1 : fallback.exitCode, error: fallback.error ?? "Isolated writer completed without a required authored commit; recovery bundle is incomplete." }
+					: fallback;
+				upsertChainResult(worktree.index, { ...effectiveFallback, gitBundle });
+			} catch (error) {
+				isolatedGitRuntime.markExportFailed();
+				isolatedFallbackProjected.add(worktree.index);
+				upsertChainResult(worktree.index, { flatIndex: worktree.index, agent: policy?.agent ?? `task-${worktree.index + 1}`, task: policy?.task ?? "chain execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, error: `${reason}; Isolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}: ${error instanceof Error ? error.message : String(error)}` });
+			}
+		}
+		return { fenced: true };
+	};
+	const finalizeBeforePublication = async (terminationState: "execution-rejected" | "interrupted" | "cancelled"): Promise<void> => {
+		await exportRemainingIsolated(terminationState);
+		if (isolatedGitRuntime && detachedIndexes.size === 0 && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+			try { await cleanupIsolatedGitRuntime(isolatedGitRuntime); }
+			catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
+			noteIsolatedCleanupFailure();
+		}
+	};
+	const isolatedRecoveryNotice = (): string => isolatedCleanupFailure
+		? ` ${isolatedCleanupFailure}`
+		: isolatedGitRuntime && (isolatedGitRuntime.exportFailed || fs.existsSync(isolatedGitRuntime.root))
+			? ` Recover isolated worktrees at ${isolatedGitRuntime.root}; cleanup was not proven.`
+			: "";
+	const publishDetachedTerminal = async (index: number, result: SingleResult): Promise<void> => {
+		upsertChainResult(index, result);
+		// Detached callbacks may settle out of order. Wait until the chain and all
+		// detached siblings have settled before emitting one complete aggregate.
+		if (detachedAggregatePublished || !chainExecutionSettled || detachedIndexes.size === 0 || detachedTerminalIndexes.size < detachedIndexes.size) return;
+		detachedAggregatePublished = true;
+		const publicationDetails = buildChainExecutionDetails(makeDetailsInput());
+		params.onUpdate?.({
+			content: [{ type: "text", text: results.map((candidate) => candidate.error || getSingleResultOutput(candidate) || "(no output)").join("\n\n") }],
+			details: publicationDetails,
+		});
+		if (params.intercomEvents && params.orchestratorIntercomTarget) {
+			const publicationChildren = results.map((candidate, position) => ({
+				agent: candidate.agent,
+				status: resolveSubagentResultStatus({ exitCode: candidate.exitCode, interrupted: candidate.interrupted, cancelled: candidate.cancelled, detached: candidate.detached }),
+				summary: candidate.error || getSingleResultOutput(candidate) || "(no output)",
+				index: candidate.flatIndex ?? position,
+				...(candidate.gitBundle ? { gitBundle: candidate.gitBundle } : {}),
+			}));
+			const payload = buildSubagentResultIntercomPayload({
+				to: params.orchestratorIntercomTarget,
+				runId: params.runId,
+				mode: "chain",
+				source: "foreground",
+				chainSteps: totalSteps,
+				children: attachNestedChildrenToResultChildren(params.runId, publicationChildren, foregroundControl?.nestedChildren),
+			});
+			await deliverSubagentResultIntercomEvent(params.intercomEvents, payload);
+		}
+		await params.onDetachedTerminal?.(results.slice());
+	};
+	const onDetachedTerminal = async (index: number, result: SingleResult): Promise<void> => {
+		detachedIndexes.add(index);
+		if (result.teardownUnproven) {
+			teardownUnproven = true;
+			upsertChainResult(index, result);
+			params.onUpdate?.({ content: [{ type: "text", text: result.error ?? "Detached child teardown remains unproven." }], details: buildChainExecutionDetails(makeDetailsInput({ currentFlatIndex: index })) });
+			return;
+		}
+		// A detached child's stdio close is not enough even without an isolated
+		// runtime: fence nested descendants before any terminal publication.
+		const fence = await waitForNestedDescendantsToStop(params.nestedRoute, runId, index, { timeoutMs: params.nestedFenceTimeoutMs });
+		if (!fence.stopped) {
+			teardownUnproven = true;
+			result.teardownUnproven = true;
+			result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+			result.error = result.error
+				? `${result.error}\nNested descendants did not reach a proven terminal state before detached publication`
+				: "Nested descendants did not reach a proven terminal state before detached publication";
+			upsertChainResult(index, result);
+			params.onUpdate?.({ content: [{ type: "text", text: result.error }], details: buildChainExecutionDetails(makeDetailsInput({ currentFlatIndex: index })) });
+			return;
+		}
+		if (!isolatedGitRuntime || isolatedGitRuntime.isExported(index)) {
+			detachedTerminalIndexes.add(index);
+			await publishDetachedTerminal(index, result);
+			return;
+		}
+		const worktree = isolatedGitRuntime.worktrees.find((candidate) => candidate.index === index);
+		const policy = isolatedWorktreePolicies.get(index);
+		if (!worktree) {
+			detachedTerminalIndexes.add(index);
+			await publishDetachedTerminal(index, result);
+			return;
+		}
+		detachedTerminalIndexes.add(index);
+		try {
+			const retry = exportBundleWithRetry({
+				outputDir: artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
+				worktree,
+				syntheticPaths: worktree.syntheticPaths,
+				terminationState: result.cancelled ? "cancelled" : result.interrupted ? "interrupted" : result.exitCode === 0 ? "success" : "failure",
+				agent: policy?.agent ?? result.agent,
+				commitRequired: policy?.commitRequired,
+			});
+			const bundle = retry.bundle;
+			result.gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+			if (bundle.incomplete && policy?.commitRequired && !result.error) {
+				result.exitCode = 1;
+				result.error = "Isolated writer completed without a required authored commit; recovery bundle is incomplete.";
+			}
+		} catch (error) {
+			isolatedGitRuntime.markExportFailed();
+			result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+			result.error = result.error ? `${result.error}\nIsolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}: ${error instanceof Error ? error.message : String(error)}` : `Isolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		// Detached acknowledgements were already projected to the caller. Finish
+		// cleanup before publishing the eventual terminal object so no recovery
+		// truth changes after durable status/result/intercom publication.
+		if (isolatedGitRuntime.worktrees.length > 0 && isolatedGitRuntime.worktrees.every((candidate) => isolatedGitRuntime!.isExported(candidate.index)) && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+			try { await cleanupIsolatedGitRuntime(isolatedGitRuntime); }
+			catch (cleanupError) { noteIsolatedCleanupFailure(result, cleanupError); }
+			noteIsolatedCleanupFailure(result);
+		}
+		upsertChainResult(index, result);
+		await publishDetachedTerminal(index, result);
+	};
+	const buildIsolatedChainError = async (message: string, input: ChainExecutionDetailsInput): Promise<ChainExecutionResult> => {
+		await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected", message);
+		if (isolatedGitRuntime && detachedIndexes.size === 0 && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+			try { await cleanupIsolatedGitRuntime(isolatedGitRuntime); }
+			catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
+		}
+		const projectedFailures = results
+			.filter((result) => result.exitCode !== 0 && result.error)
+			.map((result) => `${result.agent}: ${result.error}`);
+		const visibleMessage = projectedFailures.length > 0
+			? `${message}\n\n${projectedFailures.join("\n")}${isolatedRecoveryNotice()}`
+			: `${message}${isolatedRecoveryNotice()}`;
+		return buildChainExecutionErrorResult(visibleMessage, input);
+	};
 
 	const firstStep = chainSteps[0]!;
 	const originalTask = params.task
@@ -576,12 +969,14 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			isolatedGitRuntime = createIsolatedGitRuntime({
 				cwd: path.resolve(cwd ?? ctx.cwd),
 				runId: `${runId}-isolated`,
+				ownerPid: process.pid,
 				provider: sandbox.provider,
 				network: sandbox.network,
 				profile: sandbox.profile,
 				fallback: sandbox.fallback,
 				extraReadOnlyMounts: sandbox.extraReadOnlyMounts,
 				extraWritableMounts: sandbox.extraWritableMounts,
+				worktreeSetupHook: params.worktreeSetupHook ? { hookPath: params.worktreeSetupHook, timeoutMs: params.worktreeSetupHookTimeoutMs } : undefined,
 			});
 		}
 		return isolatedGitRuntime;
@@ -684,6 +1079,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		const stepTemplates = templates[stepIndex]!;
 
 		if (isParallelStep(step)) {
+			// Capture the group's canonical base before globalTaskIndex advances;
+			// cleanup/recovery synthetic children must retain these flat identities.
+			const groupBaseIndex = globalTaskIndex;
 			const parallelTemplates = stepTemplates as string[];
 			const parallelCwd = resolveChildCwd(cwd ?? ctx.cwd, step.cwd);
 			const stepAgentConfigs = step.parallel
@@ -706,22 +1104,69 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
 				);
 			}
+			// File-only output is pure input validation; reject it before creating
+			// isolated runtimes/worktrees so a malformed chain cannot leak them.
+			const parallelBehaviors = resolveParallelBehaviors(step.parallel, agents, stepIndex, chainSkills)
+				.map((behavior, taskIndex) => suppressProgressForReadOnlyTask(behavior, parallelTemplates[taskIndex] ?? step.parallel[taskIndex]?.task, originalTask));
+			for (let taskIndex = 0; taskIndex < step.parallel.length; taskIndex++) {
+				const behavior = parallelBehaviors[taskIndex]!;
+				const task = step.parallel[taskIndex]!;
+				const taskAgentConfig = agents.find((agent) => agent.name === task.agent);
+				const taskCwd = resolveChildCwd(cwd ?? ctx.cwd, task.cwd);
+				const outputPath = typeof behavior.output === "string" ? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output)) : undefined;
+				const savedOutputPath = shouldPersistSavedOutput({ output: behavior.output, outputMode: behavior.outputMode, tools: taskAgentConfig?.tools })
+					? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId, index: globalTaskIndex + taskIndex }) : undefined;
+				const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath ?? savedOutputPath, `Parallel chain step ${stepIndex + 1} task ${taskIndex + 1} (${task.agent})`);
+				if (validationError) return buildChainExecutionErrorResult(validationError, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex + taskIndex }));
+			}
 			let worktreeSetup: WorktreeSetup | undefined;
 			let isolatedGitWorktrees: (IsolatedGitWorktree | undefined)[] | undefined;
 			if (isolatedGitRequested) {
+				let runtime: IsolatedGitRuntime | undefined;
 				try {
-					const runtime = ensureIsolatedGitRuntime(stepSandboxes.find((sandboxConfig) => resolveGitMode(sandboxConfig) === "isolated")!);
-					isolatedGitWorktrees = step.parallel.map((task, index) => stepSandboxes[index]?.gitMode === "isolated"
-						? createIsolatedGitWorktree(runtime, { index: globalTaskIndex + index })
-						: undefined);
+					runtime = ensureIsolatedGitRuntime(stepSandboxes.find((sandboxConfig) => resolveGitMode(sandboxConfig) === "isolated")!);
+					isolatedGitWorktrees = step.parallel.map((task, index) => {
+						if (stepSandboxes[index]?.gitMode !== "isolated") return undefined;
+						const materializedIndex = globalTaskIndex + index;
+						const policy = {
+							agent: task.agent,
+							task: resolveParallelCleanTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, index),
+							commitRequired: commitRequiredForParallelTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, index, agents.find((candidate) => candidate.name === task.agent), stepSandboxes[index]),
+						};
+						isolatedWorktreePolicies.set(materializedIndex, policy);
+						return createIsolatedGitWorktree(runtime, { index: materializedIndex, agent: task.agent });
+					});
 				} catch (error) {
-					return buildChainExecutionErrorResult(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+					let recoveryCreationError = "";
+					if (runtime) {
+						for (let index = 0; index < step.parallel.length; index++) {
+							if (stepSandboxes[index]?.gitMode !== "isolated") continue;
+							const materializedIndex = globalTaskIndex + index;
+							const task = step.parallel[index]!;
+							const taskText = resolveParallelCleanTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, index);
+							isolatedWorktreePolicies.set(materializedIndex, {
+								agent: task.agent,
+								task: taskText,
+								commitRequired: commitRequiredForParallelTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, index, agents.find((candidate) => candidate.name === task.agent), stepSandboxes[index]),
+							});
+							if (!runtime.worktrees.some((candidate) => candidate.index === materializedIndex)) {
+								try { runtime.createRecoveryWorktree({ index: materializedIndex, agent: task.agent }); }
+								catch (creationError) {
+									runtime.markExportFailed();
+									const detail = creationError instanceof Error ? creationError.message : String(creationError);
+									recoveryCreationError = `Recovery worktree creation failed for slot ${materializedIndex}: ${detail}. Recover isolated runtime at ${runtime.root}.`;
+									upsertChainResult(materializedIndex, { flatIndex: materializedIndex, agent: task.agent, task: taskText, success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 }, error: `${error instanceof Error ? error.message : String(error)}; ${recoveryCreationError}` });
+								}
+							}
+						}
+					}
+					return await buildIsolatedChainError(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
 				}
 			}
 			if (step.worktree) {
 				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(step.parallel, parallelCwd);
 				if (worktreeTaskCwdConflict) {
-					return buildChainExecutionErrorResult(
+					return await buildIsolatedChainError(
 						`parallel chain step ${stepIndex + 1}: ${formatWorktreeTaskCwdConflict(worktreeTaskCwdConflict, parallelCwd)}`,
 						makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
 					);
@@ -735,6 +1180,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					});
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
+					if (error instanceof WorktreeSetupHookTeardownError) teardownUnproven = true;
 					return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
 				}
 			}
@@ -742,8 +1188,6 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			let preserveWorktree = false;
 			try {
 				const agentNames = step.parallel.map((task) => task.agent);
-				const parallelBehaviors = resolveParallelBehaviors(step.parallel, agents, stepIndex, chainSkills)
-					.map((behavior, taskIndex) => suppressProgressForReadOnlyTask(behavior, parallelTemplates[taskIndex] ?? step.parallel[taskIndex]?.task, originalTask));
 				for (let taskIndex = 0; taskIndex < step.parallel.length; taskIndex++) {
 					const behavior = parallelBehaviors[taskIndex]!;
 					const task = step.parallel[taskIndex]!;
@@ -764,7 +1208,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId, index: globalTaskIndex + taskIndex })
 						: undefined;
 					const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath ?? savedOutputPath, `Parallel chain step ${stepIndex + 1} task ${taskIndex + 1} (${step.parallel[taskIndex]!.agent})`);
-					if (validationError) return buildChainExecutionErrorResult(validationError, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex + taskIndex }));
+					if (validationError) return await buildIsolatedChainError(validationError, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex + taskIndex }));
 				}
 				progressCreated = ensureParallelProgressFile(chainDir, progressCreated, parallelBehaviors);
 				createParallelDirs(chainDir, stepIndex, step.parallel.length, agentNames);
@@ -807,6 +1251,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					orchestratorIntercomTarget,
 					foregroundControl,
 					nestedRoute: params.nestedRoute,
+					nestedFenceTimeoutMs: params.nestedFenceTimeoutMs,
 					worktreeSetup,
 					isolatedGitWorktrees,
 					maxSubagentDepth: params.maxSubagentDepth,
@@ -814,18 +1259,24 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					sandboxes: stepSandboxes,
 					sandboxIntercomBridge: params.sandboxIntercomBridge,
 					progressPaths: [path.join(chainDir, "progress.md")],
+					onDetachedStarted: (index) => detachedIndexes.add(index),
+					onDetachedTerminal,
 				});
 				globalTaskIndex += step.parallel.length;
 
-				for (const result of parallelResults) {
-					results.push(result);
+				for (let resultIndex = 0; resultIndex < parallelResults.length; resultIndex++) {
+					const result = parallelResults[resultIndex]!;
+					const materializedIndex = globalTaskIndex - step.parallel.length + resultIndex;
+					if (result.detached) detachedIndexes.add(materializedIndex);
+					upsertChainResult(materializedIndex, { ...result, flatIndex: materializedIndex });
 					if (result.progress) allProgress.push(result.progress);
 					if (result.artifactPaths) allArtifactPaths.push(result.artifactPaths);
 				}
+				if (detachedIndexes.size > 0) preserveWorktree = true;
 
 				let worktreeSummaryForStep: string | undefined;
 				try {
-					worktreeSummaryForStep = captureParallelWorktreeSummary(
+					if (detachedIndexes.size === 0) worktreeSummaryForStep = captureParallelWorktreeSummary(
 						worktreeSetup,
 						path.join(chainDir, "worktree-diffs", `step-${stepIndex}`),
 						agentNames,
@@ -846,8 +1297,10 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				const interrupted = interruptedIndexInStep >= 0 ? parallelResults[interruptedIndexInStep] : undefined;
 				if (interrupted) {
 					const message = `Chain paused after interrupt at step ${stepIndex + 1} (${interrupted.agent}). Waiting for explicit next action.`;
+					await finalizeBeforePublication("interrupted");
 					return {
 						content: [{ type: "text", text: worktreeSummaryForResult ? `${message}\n\n${worktreeSummaryForResult}` : message }],
+						isError: teardownUnproven || Boolean(isolatedCleanupFailure),
 						details: buildChainExecutionDetails(makeDetailsInput({
 							currentStepIndex: stepIndex,
 							currentFlatIndex: globalTaskIndex - step.parallel.length + interruptedIndexInStep,
@@ -855,10 +1308,22 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						...(worktreeSummaryForResult ? { worktreeSummary: worktreeSummaryForResult } : {}),
 					};
 				}
-				const detachedIndexInStep = parallelResults.findIndex((result) => result.detached);
+				const detachedIndexInStep = parallelResults.findIndex((result, resultIndex) => result.detached || detachedIndexes.has(globalTaskIndex - step.parallel.length + resultIndex));
 				const detached = detachedIndexInStep >= 0 ? parallelResults[detachedIndexInStep] : undefined;
-				if (detached) {
-					const message = `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.`;
+				// A detached sibling must not hide a MapConcurrentError from another
+				// started sibling; preserve failure propagation while detached workers
+				// continue through their terminal callbacks.
+				const hasSiblingFailure = parallelResults.some((candidate) => !candidate.cancelled && !candidate.interrupted && candidate.exitCode !== 0 && candidate.exitCode !== -1);
+				if (detached && !hasSiblingFailure) {
+					chainExecutionSettled = true;
+					for (const detachedIndex of detachedIndexes) {
+						if (detachedTerminalIndexes.has(detachedIndex)) {
+							const terminal = results.find((candidate) => candidate.flatIndex === detachedIndex);
+							if (terminal) await publishDetachedTerminal(detachedIndex, terminal);
+						}
+					}
+					const detachedPath = isolatedGitRuntime ? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.` : formatRecoverableWorktreePaths(worktreeSetup);
+					const message = `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child reaches terminal state, the preserved worktree can be exported or recovered.${detachedPath ? `\n${detachedPath}` : ""}`;
 					return {
 						content: [{ type: "text", text: worktreeSummaryForResult ? `${message}\n\n${worktreeSummaryForResult}` : message }],
 						details: buildChainExecutionDetails(makeDetailsInput({
@@ -873,17 +1338,24 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					.map((result, originalIndex) => ({ ...result, originalIndex }))
 					.filter((result) => result.exitCode !== 0 && result.exitCode !== -1);
 				if (failures.length > 0) {
+					if (worktreeSetup && failures.some((failure) => failure.error?.includes("Parallel execution failed unexpectedly"))) preserveWorktree = true;
 					const failureSummary = failures
 						.map((failure) => `- Task ${failure.originalIndex + 1} (${failure.agent}): ${failure.error || "failed"}`)
 						.join("\n");
-					const errorMsg = `Parallel step ${stepIndex + 1} failed:\n${failureSummary}`;
-					const summary = buildChainSummary(chainSteps, results, chainDir, "failed", {
+					const aggregate = resolveAggregateState(parallelResults.map((result) => ({
+						state: result.teardownUnproven ? "running" : result.cancelled ? "cancelled" : result.interrupted ? "paused" : result.exitCode === 0 ? "completed" : "failed",
+						teardownUnproven: result.teardownUnproven,
+					})));
+					const cancelled = aggregate === "cancelled" || (aggregate !== "failed" && Boolean(signal?.aborted && !foregroundControl?.interruptRequested));
+					const errorMsg = `Parallel step ${stepIndex + 1} ${cancelled ? "cancelled" : "failed"}:\n${failureSummary}`;
+					const summary = buildChainSummary(chainSteps, results, chainDir, cancelled ? "cancelled" : "failed", {
 						index: stepIndex,
 						error: errorMsg,
 					});
+					await finalizeBeforePublication(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected");
 					return {
 						content: [{ type: "text", text: worktreeSummaryForResult ? `${summary}\n\n${worktreeSummaryForResult}` : summary }],
-						isError: true,
+						isError: !cancelled || teardownUnproven || Boolean(isolatedCleanupFailure),
 						details: buildChainExecutionDetails(makeDetailsInput({
 							currentStepIndex: stepIndex,
 							currentFlatIndex: globalTaskIndex - step.parallel.length + failures[0]!.originalIndex,
@@ -942,6 +1414,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					currentStepIndex: stepIndex,
 					currentFlatIndex: globalTaskIndex,
 				}));
+				await finalizeBeforePublication(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected");
 				return {
 					...captureResult,
 					...(worktreeSummary ? { worktreeSummary } : {}),
@@ -949,12 +1422,43 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					...(captureFailed ? { worktreeCaptureFailed: true } : {}),
 				};
 			} finally {
-				if (worktreeSetup) cleanupWorktrees(worktreeSetup, { preserve: preserveWorktree });
+				if (worktreeSetup && !preserveWorktree) {
+					const fence = await waitForNestedDescendantsToStop(params.nestedRoute, runId, undefined, { timeoutMs: params.nestedFenceTimeoutMs });
+					if (!fence.stopped) {
+						teardownUnproven = true;
+						preserveWorktree = true;
+						const message = `Nested descendants did not reach a proven terminal state before worktree cleanup; ${formatRecoverableWorktreePaths(worktreeSetup)}`;
+						for (let taskIndex = 0; taskIndex < step.parallel.length; taskIndex++) {
+							const index = groupBaseIndex + taskIndex;
+							const existing = results.find((result) => result.flatIndex === index);
+							upsertChainResult(index, existing
+								? { ...existing, success: false, exitCode: existing.exitCode === 0 ? 1 : (existing.exitCode ?? 1), error: existing.error ? `${existing.error}\\n${message}` : message }
+								: { flatIndex: index, agent: step.parallel[taskIndex]?.agent ?? `task-${taskIndex + 1}`, task: step.parallel[taskIndex]?.task ?? "parallel execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 }, error: message });
+						}
+						throw new Error(message);
+					}
+				}
+				if (worktreeSetup) {
+					try { cleanupWorktrees(worktreeSetup, { preserve: preserveWorktree }); }
+					catch (cleanupError) {
+						teardownUnproven = true;
+						preserveWorktree = true;
+						const message = `Worktree cleanup failed; recover worktrees at ${worktreeSetup.worktrees.map((worktree) => worktree.path).join(", ")}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+						for (let taskIndex = 0; taskIndex < step.parallel.length; taskIndex++) {
+							const index = groupBaseIndex + taskIndex;
+							const existing = results.find((result) => result.flatIndex === index);
+							upsertChainResult(index, existing
+								? { ...existing, success: false, exitCode: existing.exitCode === 0 ? 1 : (existing.exitCode ?? 1), error: existing.error ? `${existing.error}\n${message}` : message }
+								: { flatIndex: index, agent: step.parallel[taskIndex]?.agent ?? `task-${taskIndex + 1}`, task: step.parallel[taskIndex]?.task ?? "parallel execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, error: message });
+						}
+						throw new Error(message);
+					}
+				}
 			}
 		} else if (isDynamicParallelStep(step)) {
 			const dynamicAgentConfig = agents.find((agent) => agent.name === step.parallel.agent);
 			const dynamicSandbox = dynamicAgentConfig ? resolveStepSandbox(dynamicAgentConfig) : undefined;
-			if (dynamicAgentConfig && hasSandboxWritableAgent({ agents: [{ agentName: dynamicAgentConfig.name, tools: dynamicAgentConfig.tools, sandbox: dynamicSandbox }] })) {
+			if (dynamicAgentConfig && dynamicSandbox?.gitMode !== "isolated" && hasSandboxWritableAgent({ agents: [{ agentName: dynamicAgentConfig.name, tools: dynamicAgentConfig.tools, sandbox: dynamicSandbox }] })) {
 				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
 				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
@@ -996,6 +1500,34 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					agent: step.parallel.agent,
 					stepIndex,
 				};
+				// Cancellation can race materialization. An empty fanout must not
+				// manufacture a successful completion after the caller already asked
+				// this chain to stop.
+				if (signal?.aborted || foregroundControl?.interruptRequested) {
+					const interrupted = Boolean(foregroundControl?.interruptRequested);
+					const cancelledMessage = interrupted ? "Interrupted before dynamic fanout completion." : "Cancelled before dynamic fanout completion.";
+					dynamicGroupStatuses[stepIndex] = { status: interrupted ? "paused" : "cancelled", error: cancelledMessage };
+					// Project cancellation/interrupt as a terminal child state instead of
+					// an empty isError result, so nested parents retain paused/cancelled
+					// semantics rather than coercing this group to failed.
+					upsertChainResult(globalTaskIndex, {
+						flatIndex: globalTaskIndex,
+						agent: step.parallel.agent,
+						task: step.parallel.task,
+						exitCode: interrupted ? 0 : 1,
+						success: false,
+						...(interrupted ? { interrupted: true } : { cancelled: true }),
+						messages: [],
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 },
+						error: cancelledMessage,
+					});
+					await finalizeBeforePublication(interrupted ? "interrupted" : "cancelled");
+					return {
+						content: [{ type: "text", text: cancelledMessage }],
+						isError: teardownUnproven || Boolean(isolatedCleanupFailure),
+						details: buildChainExecutionDetails(makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex })),
+					};
+				}
 				dynamicGroupStatuses[stepIndex] = { status: "completed" };
 				prev = "Dynamic fanout produced 0 results.";
 				continue;
@@ -1009,28 +1541,63 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const parallelTemplates = materialized.parallel.map((task) => task.task ?? "{previous}");
 			const parallelBehaviors = resolveParallelBehaviors(dynamicParallelStep.parallel, agents, stepIndex, chainSkills)
 				.map((behavior, taskIndex) => suppressProgressForReadOnlyTask(behavior, parallelTemplates[taskIndex] ?? dynamicParallelStep.parallel[taskIndex]?.task, originalTask));
-
+			// Validate expanded output bindings before acquiring this group's resources.
 			for (let taskIndex = 0; taskIndex < dynamicParallelStep.parallel.length; taskIndex++) {
 				const behavior = parallelBehaviors[taskIndex]!;
 				const task = dynamicParallelStep.parallel[taskIndex]!;
 				const taskAgentConfig = agents.find((agent) => agent.name === task.agent);
 				const taskCwd = resolveChildCwd(cwd ?? ctx.cwd, task.cwd);
-				const outputPath = typeof behavior.output === "string"
-					? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
-					: undefined;
-				const savedOutputPath = shouldPersistSavedOutput({
-					output: behavior.output,
-					outputMode: behavior.outputMode,
-					tools: taskAgentConfig?.tools,
-				})
-					? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId, index: globalTaskIndex + taskIndex })
-					: undefined;
-				const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath ?? savedOutputPath, `Dynamic chain step ${stepIndex + 1} item ${taskIndex + 1} (${dynamicParallelStep.parallel[taskIndex]!.agent})`);
+				const outputPath = typeof behavior.output === "string" ? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output)) : undefined;
+				const savedOutputPath = shouldPersistSavedOutput({ output: behavior.output, outputMode: behavior.outputMode, tools: taskAgentConfig?.tools })
+					? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId, index: globalTaskIndex + taskIndex }) : undefined;
+				const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath ?? savedOutputPath, `Dynamic chain step ${stepIndex + 1} item ${taskIndex + 1} (${task.agent})`);
 				if (validationError) {
 					dynamicGroupStatuses[stepIndex] = { status: "failed", error: validationError };
 					return buildChainExecutionErrorResult(validationError, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex + taskIndex }));
 				}
 			}
+			let dynamicIsolatedGitWorktrees: (IsolatedGitWorktree | undefined)[] | undefined;
+			if (dynamicSandbox?.gitMode === "isolated") {
+				let runtime: IsolatedGitRuntime | undefined;
+				try {
+					runtime = ensureIsolatedGitRuntime(dynamicSandbox);
+					dynamicIsolatedGitWorktrees = dynamicParallelStep.parallel.map((task, taskIndex) => {
+						const materializedIndex = globalTaskIndex + taskIndex;
+						const policy = {
+							agent: task.agent,
+							task: resolveParallelCleanTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, taskIndex),
+							commitRequired: commitRequiredForParallelTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, taskIndex, agents.find((candidate) => candidate.name === task.agent), dynamicSandbox),
+						};
+						isolatedWorktreePolicies.set(materializedIndex, policy);
+						return createIsolatedGitWorktree(runtime, { index: materializedIndex, agent: task.agent });
+					});
+				} catch (error) {
+					let recoveryCreationError = "";
+					if (runtime) {
+						for (let taskIndex = 0; taskIndex < dynamicParallelStep.parallel.length; taskIndex++) {
+							const task = dynamicParallelStep.parallel[taskIndex]!;
+							const materializedIndex = globalTaskIndex + taskIndex;
+							const taskText = resolveParallelCleanTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, taskIndex);
+							isolatedWorktreePolicies.set(materializedIndex, {
+								agent: task.agent,
+								task: taskText,
+								commitRequired: commitRequiredForParallelTask({ parallelTemplates, outputs, originalTask, prev, chainDir }, taskIndex, agents.find((candidate) => candidate.name === task.agent), dynamicSandbox),
+							});
+							if (!runtime.worktrees.some((candidate) => candidate.index === materializedIndex)) {
+								try { runtime.createRecoveryWorktree({ index: materializedIndex, agent: task.agent }); }
+								catch (creationError) {
+									runtime.markExportFailed();
+									const detail = creationError instanceof Error ? creationError.message : String(creationError);
+									recoveryCreationError = `Recovery worktree creation failed for slot ${materializedIndex}: ${detail}. Recover isolated runtime at ${runtime.root}.`;
+									upsertChainResult(materializedIndex, { flatIndex: materializedIndex, agent: task.agent, task: taskText, success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 }, error: `${error instanceof Error ? error.message : String(error)}; ${recoveryCreationError}` });
+								}
+							}
+						}
+					}
+					return await buildIsolatedChainError(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+				}
+			}
+
 
 			progressCreated = ensureParallelProgressFile(chainDir, progressCreated, parallelBehaviors);
 			createParallelDirs(chainDir, stepIndex, dynamicParallelStep.parallel.length, dynamicParallelStep.parallel.map((task) => task.agent));
@@ -1070,16 +1637,23 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				orchestratorIntercomTarget,
 				foregroundControl,
 				nestedRoute: params.nestedRoute,
+				nestedFenceTimeoutMs: params.nestedFenceTimeoutMs,
 				maxSubagentDepth: params.maxSubagentDepth,
 				sandbox: sharedSandbox,
 				sandboxes: dynamicParallelStep.parallel.map(() => dynamicSandbox),
+				isolatedGitWorktrees: dynamicIsolatedGitWorktrees,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				progressPaths: [path.join(chainDir, "progress.md")],
+				onDetachedStarted: (index) => detachedIndexes.add(index),
+				onDetachedTerminal,
 			});
 			globalTaskIndex += dynamicParallelStep.parallel.length;
 
-			for (const result of parallelResults) {
-				results.push(result);
+			for (let resultIndex = 0; resultIndex < parallelResults.length; resultIndex++) {
+				const result = parallelResults[resultIndex]!;
+				const materializedIndex = globalTaskIndex - dynamicParallelStep.parallel.length + resultIndex;
+				if (result.detached) detachedIndexes.add(materializedIndex);
+				upsertChainResult(materializedIndex, { ...result, flatIndex: materializedIndex });
 				if (result.progress) allProgress.push(result.progress);
 				if (result.artifactPaths) allArtifactPaths.push(result.artifactPaths);
 			}
@@ -1087,6 +1661,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const interruptedIndexInStep = parallelResults.findIndex((result) => result.interrupted);
 			const interrupted = interruptedIndexInStep >= 0 ? parallelResults[interruptedIndexInStep] : undefined;
 			if (interrupted) {
+				await finalizeBeforePublication("interrupted");
 				return {
 					content: [{ type: "text", text: `Chain paused after interrupt at step ${stepIndex + 1} (${interrupted.agent}). Waiting for explicit next action.` }],
 					details: buildChainExecutionDetails(makeDetailsInput({
@@ -1095,11 +1670,23 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					})),
 				};
 			}
-			const detachedIndexInStep = parallelResults.findIndex((result) => result.detached);
+			const detachedIndexInStep = parallelResults.findIndex((result, resultIndex) => result.detached || detachedIndexes.has(globalTaskIndex - dynamicParallelStep.parallel.length + resultIndex));
 			const detached = detachedIndexInStep >= 0 ? parallelResults[detachedIndexInStep] : undefined;
-			if (detached) {
+			const hasSiblingFailure = parallelResults.some((candidate) => !candidate.cancelled && !candidate.interrupted && candidate.exitCode !== 0 && candidate.exitCode !== -1);
+			if (detached && !hasSiblingFailure) {
+				// Dynamic fanout detachment settles the chain acknowledgement now;
+				// terminal callbacks still gate aggregate publication later. A failed
+				// sibling keeps the chain on its failure path, matching static groups.
+				chainExecutionSettled = true;
+				for (const detachedIndex of detachedIndexes) {
+					if (detachedTerminalIndexes.has(detachedIndex)) {
+						const terminal = results.find((candidate) => candidate.flatIndex === detachedIndex);
+						if (terminal) await publishDetachedTerminal(detachedIndex, terminal);
+					}
+				}
+				const detachedPath = isolatedGitRuntime ? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.` : "";
 				return {
-					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
+					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child reaches terminal state, the preserved worktree can be exported or recovered.${detachedPath ? `\n${detachedPath}` : ""}` }],
 					details: buildChainExecutionDetails(makeDetailsInput({
 						currentStepIndex: stepIndex,
 						currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length + detachedIndexInStep,
@@ -1114,14 +1701,22 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					.map((failure) => `- Item ${failure.originalIndex + 1} (${failure.agent}, key ${materialized.items[failure.originalIndex]?.key ?? failure.originalIndex}): ${failure.error || "failed"}`)
 					.join("\n");
 				const errorMsg = `Dynamic step ${stepIndex + 1} failed:\n${failureSummary}`;
-				dynamicGroupStatuses[stepIndex] = { status: "failed", error: errorMsg };
-				const summary = buildChainSummary(chainSteps, results, chainDir, "failed", {
+				const aggregate = resolveAggregateState(parallelResults.map((result) => ({
+					state: result.teardownUnproven ? "running" : result.cancelled ? "cancelled" : result.interrupted ? "paused" : result.exitCode === 0 ? "completed" : "failed",
+					teardownUnproven: result.teardownUnproven,
+				})));
+				const cancelled = aggregate === "cancelled" || (aggregate !== "failed" && Boolean(signal?.aborted && !foregroundControl?.interruptRequested));
+				dynamicGroupStatuses[stepIndex] = { status: aggregate === "failed" ? "failed" : cancelled ? "cancelled" : "paused", error: errorMsg };
+				const summary = buildChainSummary(chainSteps, results, chainDir, cancelled ? "cancelled" : "failed", {
 					index: stepIndex,
 					error: errorMsg,
 				});
+				await finalizeBeforePublication(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected");
 				return {
-					content: [{ type: "text", text: summary }],
-					isError: true,
+					content: [{ type: "text", text: `${summary}${isolatedRecoveryNotice()}` }],
+					// Cancellation is a truthful terminal state, not a generic tool
+					// failure. Static parallel cancellation uses the same projection.
+					isError: !cancelled || teardownUnproven || Boolean(isolatedCleanupFailure),
 					details: buildChainExecutionDetails(makeDetailsInput({
 						currentStepIndex: stepIndex,
 						currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length + failures[0]!.originalIndex,
@@ -1133,6 +1728,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			} catch (error) {
 				const message = error instanceof DynamicFanoutError ? error.message : error instanceof Error ? error.message : String(error);
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
+				await finalizeBeforePublication(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected");
 				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length }));
 			}
 			outputs[step.collect.as] = {
@@ -1223,6 +1819,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			}
 			const maxSubagentDepth = resolveChildMaxSubagentDepth(params.maxSubagentDepth, agentConfig.maxSubagentDepth);
 			const interruptController = new AbortController();
+			let unregisterInterrupt: (() => void) | undefined;
+			const unregisterForegroundInterrupt = (): void => {
+				unregisterInterrupt?.();
+				unregisterInterrupt = undefined;
+			};
 			if (foregroundControl) {
 				foregroundControl.currentAgent = seqStep.agent;
 				foregroundControl.currentIndex = globalTaskIndex;
@@ -1239,26 +1840,41 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				if (params.sessionFileForIndex) {
 					foregroundControl.sessionFile = params.sessionFileForIndex(globalTaskIndex);
 				}
-				foregroundControl.interrupt = () => {
+				unregisterInterrupt = registerForegroundInterrupt(foregroundControl, () => {
 					if (interruptController.signal.aborted) return false;
 					interruptController.abort();
 					foregroundControl.currentActivityState = undefined;
 					foregroundControl.updatedAt = Date.now();
 					return true;
-				};
+				});
+				activeInterruptCleanup = unregisterForegroundInterrupt;
 			}
 
-			const structuredRuntime = seqStep.outputSchema
-				? createStructuredOutputRuntime(seqStep.outputSchema, path.join(chainDir, "structured-output"))
+			let structuredRuntime: ReturnType<typeof createStructuredOutputRuntime> | undefined;
+			try {
+				structuredRuntime = seqStep.outputSchema
+					? createStructuredOutputRuntime(seqStep.outputSchema, path.join(chainDir, "structured-output"))
 				: undefined;
+			} catch (error) {
+				unregisterForegroundInterrupt();
+				throw error;
+			}
 			let isolatedWorktree: IsolatedGitWorktree | undefined;
 			if (stepSandbox && resolveGitMode(stepSandbox) === "isolated") {
 				try {
-					isolatedWorktree = createIsolatedGitWorktree(ensureIsolatedGitRuntime(stepSandbox), { index: globalTaskIndex });
+					const policy = {
+						agent: seqStep.agent,
+						task: seqStep.task,
+						commitRequired: !taskDisallowsFileUpdates(stepTask) && inferSandboxCwdWritable({ agentName: seqStep.agent, tools: agentConfig.tools, sandbox: stepSandbox }),
+					};
+					isolatedWorktreePolicies.set(globalTaskIndex, policy);
+					isolatedWorktree = createIsolatedGitWorktree(ensureIsolatedGitRuntime(stepSandbox), { index: globalTaskIndex, agent: seqStep.agent });
 				} catch (error) {
-					return buildChainExecutionErrorResult(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+					unregisterForegroundInterrupt();
+					return await buildIsolatedChainError(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
 				}
 			}
+			const detachedTerminalIndex = globalTaskIndex;
 			const r = await runSync(ctx.cwd, agents, seqStep.agent, stepTask, {
 				// runSingleAttempt maps the exact requested repository/subdirectory cwd.
 				cwd: stepCwd,
@@ -1282,6 +1898,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				intercomSessionName: childIntercomTarget?.(seqStep.agent, globalTaskIndex),
 				orchestratorIntercomTarget,
 				nestedRoute: params.nestedRoute,
+				nestedFenceTimeoutMs: params.nestedFenceTimeoutMs,
 				modelOverride: effectiveModel,
 				fastMode: behavior.fastMode,
 				availableModels,
@@ -1293,8 +1910,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				sandbox: stepSandbox,
 				isolatedGit: isolatedWorktree,
 				isolatedGitBundleDir: artifactsDir,
+				isolatedGitCommitRequired: Boolean(isolatedWorktree) && !taskDisallowsFileUpdates(stepTask) && inferSandboxCwdWritable({ agentName: seqStep.agent, tools: agentConfig?.tools, sandbox: stepSandbox }),
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? [path.join(chainDir, "progress.md")] : undefined,
+				onDetachedStarted: () => detachedIndexes.add(detachedTerminalIndex),
+				onDetachedTerminal: (result) => onDetachedTerminal(detachedTerminalIndex, result),
 				onUpdate: onUpdate
 					? (p) => {
 						const stepResults = p.details?.results || [];
@@ -1344,9 +1964,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						});
 					}
 					: undefined,
+			}).finally(() => {
+				unregisterForegroundInterrupt();
+				if (activeInterruptCleanup === unregisterForegroundInterrupt) activeInterruptCleanup = undefined;
 			});
 			if (foregroundControl?.currentIndex === globalTaskIndex) {
-				foregroundControl.interrupt = undefined;
 				foregroundControl.currentModel = r.model ?? effectiveModel;
 				foregroundControl.currentThinking = r.thinking;
 				foregroundControl.currentFastMode = r.fastMode ?? foregroundControl.currentFastMode;
@@ -1355,32 +1977,53 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			recordRun(seqStep.agent, cleanTask, r.exitCode, r.progressSummary?.durationMs ?? 0);
 
 			globalTaskIndex++;
-			results.push(r);
+			// Detached terminal callbacks may have inserted/enriched this slot before
+			// the acknowledgement path resumes. Merge idempotently instead of
+			// appending a duplicate child.
+			if (results[globalTaskIndex - 1] !== r) upsertChainResult(globalTaskIndex - 1, r);
 			if (r.progress) allProgress.push(r.progress);
 			if (r.artifactPaths) allArtifactPaths.push(r.artifactPaths);
 
-			if (r.interrupted) {
+			const singleAggregate = resolveAggregateState([
+				{ state: r.cancelled ? "cancelled" : r.interrupted ? "paused" : r.exitCode === 0 ? "completed" : "failed", teardownUnproven: r.teardownUnproven },
+				...(r.exitCode !== 0 && !r.cancelled ? [{ state: "failed" }] : []),
+			]);
+			if (r.interrupted && singleAggregate === "paused") {
+				await finalizeBeforePublication("interrupted");
 				return {
-					content: [{ type: "text", text: `Chain paused after interrupt at step ${stepIndex + 1} (${r.agent}). Waiting for explicit next action.` }],
+					content: [{ type: "text", text: `Chain paused after interrupt at step ${stepIndex + 1} (${r.agent}). Waiting for explicit next action.${isolatedRecoveryNotice()}` }],
+					isError: teardownUnproven || Boolean(isolatedCleanupFailure),
 					details: buildChainExecutionDetails(makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - 1 })),
 				};
 			}
-			if (r.detached) {
+			if (r.detached || detachedIndexes.has(globalTaskIndex - 1)) {
+				detachedIndexes.add(globalTaskIndex - 1);
+				chainExecutionSettled = true;
+				if (detachedTerminalIndexes.has(globalTaskIndex - 1)) await publishDetachedTerminal(globalTaskIndex - 1, r);
+				const detachedPath = isolatedGitRuntime ? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.` : "";
 				return {
-					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${r.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
+					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${r.agent}). Reply to the supervisor request first. After the child reaches terminal state, the preserved worktree can be exported or recovered.${detachedPath ? `\n${detachedPath}` : ""}` }],
 					details: buildChainExecutionDetails(makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - 1 })),
 				};
 			}
 
 			if (r.exitCode !== 0) {
-				const summary = buildChainSummary(chainSteps, results, chainDir, "failed", {
+				await finalizeBeforePublication(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected");
+				if (isolatedGitRuntime?.exportFailed) {
+					const recovery = `Isolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}`;
+					const current = results[globalTaskIndex - 1];
+					if (current && !current.error?.includes("Isolated Git bundle export failed;")) current.error = current.error ? `${current.error}\n${recovery}` : recovery;
+				}
+				const cancelled = singleAggregate === "cancelled" || (singleAggregate !== "failed" && Boolean(signal?.aborted && !foregroundControl?.interruptRequested));
+				const summary = buildChainSummary(chainSteps, results, chainDir, cancelled ? "cancelled" : "failed", {
 					index: stepIndex,
-					error: r.error || "Chain failed",
+					error: r.error || (cancelled ? "Chain cancelled" : "Chain failed"),
 				});
+				await finalizeBeforePublication(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected");
 				return {
-					content: [{ type: "text", text: summary }],
+					content: [{ type: "text", text: `${summary}${isolatedRecoveryNotice()}` }],
 					details: buildChainExecutionDetails(makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - 1 })),
-					isError: true,
+					isError: !cancelled || teardownUnproven || Boolean(isolatedCleanupFailure),
 				};
 			}
 
@@ -1407,15 +2050,82 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		}
 	}
 
+	chainExecutionSettled = true;
+	if (detachedIndexes.size > 0) {
+		for (const index of detachedIndexes) {
+			if (!detachedTerminalIndexes.has(index)) continue;
+			const settled = results.find((candidate) => candidate.flatIndex === index);
+			if (settled) await publishDetachedTerminal(index, settled);
+		}
+	}
 	const summary = buildChainSummary(chainSteps, results, chainDir, "completed");
 	const worktreeSummary = worktreeSummaries.join("\n\n");
+	if (isolatedGitRuntime && detachedIndexes.size === 0) {
+		const exportOutcome = await exportRemainingIsolated("execution-rejected", "Chain completed but isolated Git export failed");
+		if (!exportOutcome.fenced || isolatedGitRuntime.exportFailed || isolatedGitRuntime.exportFenceFailed) {
+			const packaging = !exportOutcome.fenced
+				? `Nested descendants did not reach a proven terminal state before export; recover isolated worktrees at ${isolatedGitRuntime.root}.`
+				: `Isolated Git bundle export failed; recover isolated worktrees at ${isolatedGitRuntime.root}.`;
+			return {
+				...buildChainExecutionErrorResult(`${summary}\n\n${packaging}`, makeDetailsInput()),
+				...(worktreeSummary ? { worktreeSummary } : {}),
+				worktreePreserved: true,
+			};
+		}
+		if (isolatedGitRuntime && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+			const cleanupError = `Isolated Git cleanup failed after export; recover isolated worktrees at ${isolatedGitRuntime.root}.`;
+			try {
+				await cleanupIsolatedGitRuntime(isolatedGitRuntime);
+			} catch (error) {
+				// A refusal may surface as either a retained root or a filesystem
+				// exception. Both are terminal recovery state, not a successful child.
+				isolatedGitRuntime.markExportFailed();
+				isolatedCleanupFailure = `${cleanupError} ${error instanceof Error ? error.message : String(error)}`;
+			}
+			if (isolatedGitRuntime.exportFailed || fs.existsSync(isolatedGitRuntime.root)) {
+				// Cleanup refusal is a terminal child failure, not merely a top-level
+				// tool error. Project it before building details so foreground observers
+				// persist failed/incomplete status while retaining the exported bundle.
+				noteIsolatedCleanupFailure();
+				return {
+					...buildChainExecutionErrorResult(`${summary}\n\n${isolatedCleanupFailure ?? cleanupError}`, makeDetailsInput()),
+					...(worktreeSummary ? { worktreeSummary } : {}),
+					worktreePreserved: true,
+				};
+			}
+		}
+	}
 
 	return {
 		content: [{ type: "text", text: worktreeSummary ? `${summary}\n\n${worktreeSummary}` : summary }],
 		details: buildChainExecutionDetails(makeDetailsInput()),
 		...(worktreeSummary ? { worktreeSummary } : {}),
 	};
-	} finally {
-		if (isolatedGitRuntime) cleanupIsolatedGitRuntime(isolatedGitRuntime);
+	} catch (error) {
+		activeInterruptCleanup?.();
+		activeInterruptCleanup = undefined;
+		const executionMessage = `Chain execution rejected: ${error instanceof Error ? error.message : String(error)}`;
+		const exportOutcome = await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected", executionMessage);
+		if (isolatedGitRuntime && exportOutcome.fenced && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+			try {
+				await cleanupIsolatedGitRuntime(isolatedGitRuntime);
+			} catch (cleanupError) {
+				isolatedGitRuntime.markExportFailed();
+				isolatedCleanupFailure ??= `Isolated Git cleanup failed after export; recover isolated worktrees at ${isolatedGitRuntime.root}. ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+				noteIsolatedCleanupFailure();
+			}
+		}
+		const recovery = !exportOutcome.fenced && isolatedGitRuntime
+			? `\nNested descendants did not reach a proven terminal state before export; recover isolated worktrees at ${isolatedGitRuntime.root}.`
+			: isolatedGitRuntime && (isolatedGitRuntime.exportFailed || fs.existsSync(isolatedGitRuntime.root))
+				? `\nIsolated Git cleanup/export failed; recover isolated worktrees at ${isolatedGitRuntime.root}.`
+				: "";
+		const projectedFailures = results.filter((result) => result.exitCode !== 0 && result.error).map((result) => `${result.agent}: ${result.error}`);
+		const projectedError = projectedFailures.length > 0 ? `\n\n${projectedFailures.join("\n")}` : "";
+		return {
+			content: [{ type: "text", text: `${executionMessage}${projectedError}${recovery}` }],
+			isError: true,
+			details: buildChainExecutionDetails(makeDetailsInput()),
+		};
 	}
 }

@@ -1,6 +1,7 @@
 import type { ActivityState, AsyncJobStep } from "./types.ts";
+import { resolveAggregateState } from "./aggregate-state.ts";
 
-type StepStatusLike = Pick<AsyncJobStep, "status">;
+type StepStatusLike = Pick<AsyncJobStep, "status"> & { teardownUnproven?: boolean };
 
 function formatActivityAge(ms: number): string {
 	if (ms < 1000) return "now";
@@ -25,11 +26,8 @@ function isCompletedStepStatus(status: AsyncJobStep["status"]): boolean {
 }
 
 export function aggregateStepStatus(steps: StepStatusLike[]): AsyncJobStep["status"] {
-	if (steps.some((step) => step.status === "running")) return "running";
-	if (steps.some((step) => step.status === "failed")) return "failed";
-	if (steps.some((step) => step.status === "paused")) return "paused";
-	if (steps.length > 0 && steps.every((step) => isCompletedStepStatus(step.status))) return "complete";
-	return "pending";
+	const state = resolveAggregateState(steps.map((step) => ({ state: step.status, teardownUnproven: step.teardownUnproven })));
+	return state === "completed" ? "complete" : state;
 }
 
 export function formatAgentRunningLabel(count: number): string {
@@ -41,9 +39,11 @@ export function formatParallelOutcome(steps: StepStatusLike[], total: number, op
 	const done = steps.filter((step) => isCompletedStepStatus(step.status)).length;
 	const failed = steps.filter((step) => step.status === "failed").length;
 	const paused = steps.filter((step) => step.status === "paused").length;
+	const cancelled = steps.filter((step) => step.status === "cancelled").length;
 	const parts = [`${done}/${total} done`];
 	if (options.showRunning !== false && running > 0) parts.unshift(formatAgentRunningLabel(running));
 	if (failed > 0) parts.push(`${failed} failed`);
 	if (paused > 0) parts.push(`${paused} paused`);
+	if (cancelled > 0) parts.push(`${cancelled} cancelled`);
 	return parts.join(" · ");
 }

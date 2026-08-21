@@ -136,6 +136,10 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		for (const source of HOST_TOOLCHAIN_READONLY_PATHS) {
 			if (this.pathExists(source)) addMount(args, { source, mode: "ro" }, seenMounts, diagnosticMounts);
 		}
+		// Ensure the wrapped command dies if the runner or Bubblewrap wrapper
+		// disappears. Without this, a killed runner can leave its Pi/tool tree
+		// orphaned on the host.
+		args.push("--die-with-parent");
 		if (this.unsharePid) args.push("--unshare-pid");
 		args.push("--proc", "/proc");
 		args.push("--dev", "/dev");

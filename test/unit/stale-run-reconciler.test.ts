@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import { describe, it } from "node:test";
 import { checkPidLiveness, reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
+import { formatAsyncRunnerIdentity, readProcessStartToken } from "../../src/runs/background/pid-identity.ts";
 
 function tempRoot(prefix: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -71,6 +73,98 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("preserves paused interrupted children when stale result success is false", () => {
+		const root = tempRoot("pi-stale-paused-");
+		try {
+			const asyncDir = path.join(root, "run-paused");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-paused", mode: "single", state: "running", pid: 12345,
+				startedAt: 1000, lastUpdate: 1000, currentStep: 0,
+				steps: [{ agent: "worker", status: "running", interrupted: true, startedAt: 1000 }],
+			});
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(path.join(resultsDir, "run-paused.json"), JSON.stringify({ id: "run-paused", success: false, state: "paused", results: [{ agent: "worker", success: false, interrupted: true }] }), "utf8");
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 2000 });
+			assert.equal(result.status?.state, "paused");
+			assert.equal(result.status?.steps?.[0]?.status, "paused");
+			assert.equal(result.repaired, true);
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("derives mixed child failure independently of a paused aggregate", () => {
+		const root = tempRoot("pi-stale-mixed-paused-");
+		try {
+			const asyncDir = path.join(root, "run-mixed-paused");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-mixed-paused", mode: "parallel", state: "running", pid: 12345,
+				startedAt: 1000, lastUpdate: 1000,
+				steps: [{ agent: "paused", status: "running" }, { agent: "failed", status: "running" }],
+			});
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(path.join(resultsDir, "run-mixed-paused.json"), JSON.stringify({
+				id: "run-mixed-paused", success: false, state: "paused",
+				results: [{ agent: "paused", success: false, interrupted: true, exitCode: 0 }, { agent: "failed", success: false, exitCode: 1, error: "boom" }],
+			}), "utf8");
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 2000 });
+			assert.equal(result.status?.state, "failed");
+			assert.equal(result.status?.steps?.[0]?.status, "paused");
+			assert.equal(result.status?.steps?.[1]?.status, "failed");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("recognizes every retained isolated runtime diagnostic form", () => {
+		for (const phrase of ["runtime retained at", "recover worktree at", "recover worktrees at", "recover isolated runtime at", "recover isolated worktree at", "recover isolated worktrees at"]) {
+			const root = tempRoot("pi-stale-evidence-");
+			try {
+				const runtime = path.join(root, "retained runtime");
+				fs.mkdirSync(runtime, { recursive: true });
+				const asyncDir = path.join(root, "run-evidence");
+				writeStatus(asyncDir, { runId: "run-evidence", mode: "single", state: "running", pid: 12345, startedAt: 1000, lastUpdate: 1000, error: `${phrase} ${runtime}: cleanup failed`, steps: [{ agent: "worker", status: "running", sandbox: { gitMode: "isolated" } }] });
+				const result = reconcileAsyncRun(asyncDir, { resultsDir: path.join(root, "results"), kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+				assert.equal(result.status?.state, "failed");
+				assert.equal(result.status?.incomplete, undefined);
+			} finally { fs.rmSync(root, { recursive: true, force: true }); }
+		}
+	});
+
+	it("does not treat a missing referenced recovery path as actionable evidence", () => {
+		const root = tempRoot("pi-stale-missing-evidence-");
+		try {
+			const asyncDir = path.join(root, "run-missing");
+			writeStatus(asyncDir, { runId: "run-missing", mode: "single", state: "running", pid: 12345, startedAt: 1000, lastUpdate: 1000, error: `recover isolated runtime at ${path.join(root, "missing runtime")}: unavailable`, steps: [{ agent: "worker", status: "running", sandbox: { gitMode: "isolated" } }] });
+			const result = reconcileAsyncRun(asyncDir, { resultsDir: path.join(root, "results"), kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+			assert.equal(result.status?.state, "running");
+			assert.equal(result.status?.incomplete, true);
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("keeps stale isolated runs incomplete without bundle or retained runtime evidence", () => {
+		const root = tempRoot("pi-stale-isolated-incomplete-");
+		try {
+			const asyncDir = path.join(root, "run-isolated");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-isolated",
+				mode: "parallel",
+				state: "running",
+				pid: 12345,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [{ agent: "worker", status: "running", startedAt: 1000, sandbox: { gitMode: "isolated" } }],
+			});
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "running");
+			assert.equal(result.status?.incomplete, true);
+			assert.equal(fs.existsSync(path.join(resultsDir, "run-isolated.json")), false);
+			assert.match(fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf8"), /repaired_incomplete/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("repairs stale status with per-child result outcomes", () => {
 		const root = tempRoot("pi-stale-mixed-result-");
 		try {
@@ -123,6 +217,69 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("maps stale repair results by canonical flat index past group diagnostics", () => {
+		const root = tempRoot("pi-stale-group-diagnostic-");
+		try {
+			const asyncDir = path.join(root, "run-group");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, { runId: "run-group", mode: "chain", state: "running", pid: 12345, startedAt: 1000, lastUpdate: 1000, steps: [{ agent: "a", status: "running", startedAt: 1000 }, { agent: "b", status: "running", startedAt: 1000 }] });
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(path.join(resultsDir, "run-group.json"), JSON.stringify({ id: "run-group", success: false, state: "failed", results: [
+				{ groupId: "g1", unindexed: true, agent: "group", success: false, error: "group" },
+				{ flatIndex: 0, agent: "a", success: true },
+				{ flatIndex: 1, agent: "b", success: false, error: "b failed" },
+			] }), "utf8");
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+			assert.equal(result.status?.steps?.[0]?.status, "complete");
+			assert.equal(result.status?.steps?.[1]?.error, "b failed");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("keeps a live runner with an exact persisted identity active", async () => {
+		if (process.platform !== "linux") return;
+		const root = tempRoot("pi-stale-exact-identity-");
+		const runId = "run-exact-identity";
+		const runnerPath = path.join(root, "runner.mjs");
+		const configPath = path.join(root, `async-cfg-${runId}.json`);
+		fs.mkdirSync(root, { recursive: true });
+		fs.writeFileSync(runnerPath, "setTimeout(() => {}, 30_000);\\n", "utf8");
+		fs.writeFileSync(configPath, "{}", "utf8");
+		const child = spawn(process.execPath, [runnerPath, configPath], { stdio: "ignore" });
+		try {
+			// Wait for /proc to expose the exact launcher argv before reconciling.
+			await new Promise<void>((resolve, reject) => {
+				const deadline = Date.now() + 2000;
+				const poll = () => {
+					if (readProcessStartToken(child.pid!)) return resolve();
+					if (Date.now() >= deadline) return reject(new Error("runner process did not start"));
+					setTimeout(poll, 5);
+				};
+				poll();
+			});
+			const identity = formatAsyncRunnerIdentity(runnerPath, configPath, runId, readProcessStartToken(child.pid!), process.getuid?.(), [process.execPath, runnerPath, configPath]);
+			const asyncDir = path.join(root, runId);
+			writeStatus(asyncDir, { runId, mode: "single", state: "running", pid: child.pid, runnerIdentity: identity, startedAt: 1000, lastUpdate: 2000, steps: [{ agent: "worker", status: "running" }] });
+			const result = reconcileAsyncRun(asyncDir, { resultsDir: path.join(root, "results"), now: () => 2500, staleAlivePidMs: 10_000 });
+			assert.equal(result.repaired, false);
+			assert.equal(result.status?.state, "running");
+		} finally {
+			child.kill("SIGTERM");
+			await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("repairs a live PID when its persisted runner identity mismatches", () => {
+		const root = tempRoot("pi-stale-mismatched-identity-");
+		try {
+			const asyncDir = path.join(root, "run-mismatch");
+			writeStatus(asyncDir, { runId: "run-mismatch", mode: "single", state: "running", pid: process.pid, runnerIdentity: "runner:/wrong;config:/wrong;run:other;argv:bad;start:wrong;uid:0", startedAt: 1000, lastUpdate: 1000, steps: [{ agent: "worker", status: "running" }] });
+			const result = reconcileAsyncRun(asyncDir, { resultsDir: path.join(root, "results"), kill: () => { throw new Error("must not probe mismatched identity"); }, now: () => 2000 });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("fails a stale run when a live pid has not updated beyond the stale threshold", () => {
 		const root = tempRoot("pi-stale-live-pid-");
 		try {
@@ -147,7 +304,7 @@ describe("async stale-run reconciliation", () => {
 
 			assert.equal(result.repaired, true);
 			assert.equal(result.status?.state, "failed");
-			assert.match(result.message ?? "", /live PID, but status has not updated/);
+			assert.match(result.message ?? "", /identity|exited|disappeared/i);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -185,7 +342,7 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
-	it("marks a live-runner run as orphaned when the owner pid is dead", () => {
+	it("fails closed when a live-runner record has no exact runner identity", () => {
 		const root = tempRoot("pi-orphan-owner-dead-");
 		try {
 			const asyncDir = path.join(root, "run-orphan");
@@ -217,20 +374,18 @@ describe("async stale-run reconciliation", () => {
 
 			assert.equal(result.repaired, true);
 			assert.equal(result.status?.state, "failed");
-			assert.match(result.message ?? '', /orphaned/);
-			assert.match(result.message ?? '', new RegExp(String(ownerPid)));
-			// Runner PID and owner PID should both have been checked.
-			assert.ok(killCalls.some((c) => c.pid === runnerPid && c.signal === 0));
-			assert.ok(killCalls.some((c) => c.pid === ownerPid && c.signal === 0));
+			assert.match(result.message ?? '', /identity|exited|disappeared/i);
+			// Missing runner identity is untrusted; no PID liveness probe can rescue it.
+			assert.equal(killCalls.length, 0);
 			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
 			assert.equal(status.state, "failed");
-			assert.match(status.steps[0].error, /orphaned/);
+			assert.match(status.steps[0].error, /identity|exited|disappeared/i);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
-	it("does not mark run as orphaned when owner pid is still alive", () => {
+	it("does not trust a live PID when the runner identity is missing", () => {
 		const root = tempRoot("pi-orphan-owner-alive-");
 		try {
 			const asyncDir = path.join(root, "run-alive");
@@ -254,8 +409,8 @@ describe("async stale-run reconciliation", () => {
 				now: () => 2000,
 			});
 
-			assert.equal(result.repaired, false);
-			assert.equal(result.status?.state, "running");
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

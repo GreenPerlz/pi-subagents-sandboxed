@@ -939,6 +939,8 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		assert.equal(payload.status, "failed");
 		assert.match(String(payload.summary ?? ""), /1 completed, 1 failed/);
 		assert.match(String(payload.message ?? ""), /Status: failed/);
+		assert.match(String(payload.message ?? ""), /Parallel child failure/);
 		assert.match(result.content[0]?.text ?? "", /Children: 1 completed, 1 failed/);
+		assert.match(result.content[0]?.text ?? "", /Parallel child failure/);
 	});
 });

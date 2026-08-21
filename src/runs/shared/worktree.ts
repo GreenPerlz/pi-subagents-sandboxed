@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { processControlUnsupported } from "../../shared/post-exit-stdio-guard.ts";
 
 export interface WorktreeSetup {
 	cwd: string;
@@ -75,6 +76,17 @@ export function formatRecoverableWorktreePaths(setup: WorktreeSetup | undefined)
 	return `Recoverable worktree path${paths.length === 1 ? "" : "s"}: ${paths.join(", ")}.`;
 }
 
+export class WorktreeCleanupError extends Error {
+	readonly failures: string[];
+	readonly recoverableWorktreePaths: string[];
+	constructor(failures: string[], recoverableWorktreePaths: string[]) {
+		super(`Worktree cleanup was not proven: ${failures.join("; ")}. ${recoverableWorktreePaths.length ? `Recoverable worktree paths: ${recoverableWorktreePaths.join(", ")}.` : "Inspect git worktree state before retrying."}`);
+		this.name = "WorktreeCleanupError";
+		this.failures = [...failures];
+		this.recoverableWorktreePaths = [...recoverableWorktreePaths];
+	}
+}
+
 interface WorktreeDiff {
 	index: number;
 	agent: string;
@@ -92,22 +104,29 @@ interface WorktreeTaskCwdConflict {
 	cwd: string;
 }
 
-interface WorktreeSetupHookConfig {
+export interface WorktreeSetupHookConfig {
 	hookPath: string;
 	timeoutMs?: number;
 }
 
-interface CreateWorktreesOptions {
-	agents?: string[];
-	setupHook?: WorktreeSetupHookConfig;
+/** Setup failed while descendants could still write; callers must retain the worktree. */
+export class WorktreeSetupHookTeardownError extends Error {
+	readonly handoffPath: string;
+	readonly worktreePath: string;
+	constructor(message: string, handoffPath: string, worktreePath: string) {
+		super(message);
+		this.name = "WorktreeSetupHookTeardownError";
+		this.handoffPath = handoffPath;
+		this.worktreePath = worktreePath;
+	}
 }
 
-interface ResolvedWorktreeSetupHook {
+export interface ResolvedWorktreeSetupHook {
 	hookPath: string;
 	timeoutMs: number;
 }
 
-interface WorktreeSetupHookInput {
+export interface WorktreeSetupHookInput {
 	version: 1;
 	repoRoot: string;
 	worktreePath: string;
@@ -117,6 +136,16 @@ interface WorktreeSetupHookInput {
 	runId: string;
 	baseCommit: string;
 	agent?: string;
+}
+
+/** Internal runner override used to exercise fail-closed supervisor handling. */
+export interface WorktreeSetupHookRunOptions {
+	supervisorSpawn?: typeof spawnSync;
+}
+
+interface CreateWorktreesOptions {
+	agents?: string[];
+	setupHook?: WorktreeSetupHookConfig;
 }
 
 interface WorktreeSetupHookOutput {
@@ -136,12 +165,18 @@ interface RepoState {
 }
 
 const DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS = 30000;
+const WORKTREE_GIT_TIMEOUT_MS = 15_000;
+const WORKTREE_GIT_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
 function runGit(cwd: string, args: string[]): GitResult {
-	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8" });
+	const result = spawnSync("git", ["-C", cwd, ...args], {
+		encoding: "utf-8",
+		timeout: WORKTREE_GIT_TIMEOUT_MS,
+		maxBuffer: WORKTREE_GIT_MAX_BUFFER_BYTES,
+	});
 	return {
 		stdout: result.stdout ?? "",
-		stderr: result.stderr ?? "",
+		stderr: result.error?.message || (result.stderr ?? ""),
 		status: result.status,
 	};
 }
@@ -252,7 +287,7 @@ function parseHookTimeout(timeoutMs: number | undefined): number {
 	return timeoutMs;
 }
 
-function resolveWorktreeSetupHook(
+export function resolveWorktreeSetupHook(
 	repoRoot: string,
 	config: WorktreeSetupHookConfig | undefined,
 ): ResolvedWorktreeSetupHook | undefined {
@@ -306,6 +341,40 @@ function hasTrackedEntries(worktreePath: string, relativePath: string): boolean 
 	return result.status === 0 && result.stdout.trim().length > 0;
 }
 
+const WORKTREE_HOOK_SUPERVISOR = String.raw`
+import { spawn } from "node:child_process";
+import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
+const hook = process.argv[1];
+const timeout = Number(process.argv[2]);
+const max = Number(process.argv[3]);
+const handoff = process.argv[4];
+const identity = pid => { if (process.platform !== "linux" || !pid) return undefined; try { const stat = readFileSync("/proc/" + pid + "/stat", "utf8"); const close = stat.lastIndexOf(")"); const fields = stat.slice(close + 2).trim().split(/\s+/u); return { startToken: fields[19], pgid: Number(fields[2]), uid: (() => { try { return statSync("/proc/" + pid).uid; } catch { return undefined; } })() }; } catch { return undefined; } };
+const startToken = pid => identity(pid)?.startToken;
+let out = "", err = "", overflow = false, done = false;
+const child = spawn(hook, [], { detached: true, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+const childPid = child.pid;
+const childIdentity = childPid ? identity(childPid) : undefined;
+const childStartToken = childIdentity?.startToken;
+const memberSnapshot = () => { if (process.platform !== "linux" || !childPid) return []; const members = []; try { for (const entry of readdirSync("/proc")) { if (!/^\\d+$/u.test(entry)) continue; const candidate = Number(entry); const current = identity(candidate); if (current?.pgid === childPid && current.startToken && current.uid !== undefined) members.push({ pid: candidate, startToken: current.startToken, uid: current.uid, pgid: current.pgid }); } } catch {} return members; };
+let knownMembers = memberSnapshot();
+if (handoff && childPid) writeFileSync(handoff, JSON.stringify({ supervisorPid: process.pid, supervisorStartToken: startToken(process.pid), hookPid: childPid, hookStartToken: childStartToken, hookUid: childIdentity?.uid, hookPgid: childIdentity?.pgid, members: knownMembers }), { mode: 0o600 });
+const gone = () => { if (process.platform === "win32" || !childPid) return child.exitCode !== null; try { process.kill(-childPid, 0); return false; } catch (e) { return e?.code === "ESRCH"; } };
+const identityMatches = () => process.platform === "linux" && childPid !== undefined && childStartToken !== undefined && childIdentity?.uid !== undefined && identity(childPid)?.startToken === childStartToken && identity(childPid)?.uid === childIdentity.uid && identity(childPid)?.pgid === childIdentity.pgid && childIdentity.pgid === childPid;
+const continuityMatches = () => { if (process.platform !== "linux" || !childPid) return false; knownMembers = [...knownMembers, ...memberSnapshot()].filter((member, index, all) => all.findIndex(candidate => candidate.pid === member.pid && candidate.startToken === member.startToken) === index); return knownMembers.some(member => { const current = identity(member.pid); return current?.startToken === member.startToken && current.uid === member.uid && current.pgid === childPid; }); };
+// POSIX teardown is group-only. A failed group probe must never degrade to a
+// direct-child kill, which could target a reused PID and orphan descendants.
+const terminate = signal => { if (!childPid || gone()) return; if (process.platform === "win32") { try { child.kill(signal); } catch (e) { err += String(e); } return; } if ((!identityMatches() && !continuityMatches())) return; try { process.kill(-childPid, signal); } catch (e) { if (e?.code !== "ESRCH") err += String(e); } };
+let hardKillTimer;
+const scheduleHardKill = () => { if (hardKillTimer) return; hardKillTimer = setTimeout(() => { hardKillTimer = undefined; if (!done) terminate("SIGKILL"); }, 1000); hardKillTimer.unref?.(); };
+const append = (target, chunk) => { const text = chunk.toString(); if (Buffer.byteLength(out) + Buffer.byteLength(err) + Buffer.byteLength(text) > max) { overflow = true; terminate("SIGTERM"); scheduleHardKill(); return; } if (target === "out") out += text; else err += text; };
+child.stdout.on("data", c => append("out", c)); child.stderr.on("data", c => append("err", c));
+const waitGone = async (ms) => { const until = Date.now() + ms; while (!gone() && Date.now() < until) await new Promise(r => setTimeout(r, 20)); return gone(); };
+const finish = async code => { if (done) return; done = true; clearTimeout(timer); if (hardKillTimer) { clearTimeout(hardKillTimer); hardKillTimer = undefined; } if (!gone()) { terminate("SIGTERM"); if (!await waitGone(1000)) { terminate("SIGKILL"); await waitGone(2000); } } process.stdout.write(JSON.stringify({ code, out, err, overflow, gone: gone() })); };
+const timer = setTimeout(() => { terminate("SIGTERM"); scheduleHardKill(); }, timeout); timer.unref?.();
+child.on("close", code => finish(code)); child.on("error", e => { err += String(e); finish(1); });
+process.stdin.pipe(child.stdin);
+`;
+
 function parseWorktreeSetupHookOutput(rawStdout: string): WorktreeSetupHookOutput {
 	const trimmed = rawStdout.trim();
 	if (!trimmed) {
@@ -324,32 +393,157 @@ function parseWorktreeSetupHookOutput(rawStdout: string): WorktreeSetupHookOutpu
 	return parsed as WorktreeSetupHookOutput;
 }
 
-function runWorktreeSetupHook(
+interface WorktreeHookHandoff {
+	supervisorPid?: number;
+	supervisorStartToken?: string;
+	hookPid?: number;
+	hookStartToken?: string;
+	hookPgid?: number;
+	hookUid?: number;
+	members?: Array<{ pid: number; startToken: string; uid: number; pgid: number }>;
+}
+
+function parseWorktreeHookHandoff(raw: string): WorktreeHookHandoff {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new Error(`invalid setup-hook handoff JSON: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("setup-hook handoff must be a JSON object");
+	}
+	const handoff = parsed as WorktreeHookHandoff;
+	if (process.platform !== "win32" && (!Number.isInteger(handoff.hookPid) || handoff.hookPid <= 0 || typeof handoff.hookStartToken !== "string" || !handoff.hookStartToken || handoff.hookPgid !== handoff.hookPid)) {
+		throw new Error("setup-hook handoff is missing the hook process identity");
+	}
+	if (handoff.members !== undefined && (!Array.isArray(handoff.members) || handoff.members.some((member) => !member || !Number.isInteger(member.pid) || typeof member.startToken !== "string" || !Number.isInteger(member.uid) || !Number.isInteger(member.pgid)))) {
+		throw new Error("setup-hook handoff has invalid process-group members");
+	}
+	return handoff;
+}
+
+function processIdentity(pid: number): { startToken: string; uid: number; pgid: number } | undefined {
+	if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return undefined;
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const closeParen = stat.lastIndexOf(")");
+		const fields = stat.slice(closeParen + 2).trim().split(/\s+/u);
+		const uid = fs.statSync(`/proc/${pid}`).uid;
+		return fields[19] && Number.isInteger(uid) ? { startToken: fields[19], uid, pgid: Number(fields[2]) } : undefined;
+	} catch { return undefined; }
+}
+
+
+function hookGroupGone(pid: number): boolean {
+	if (process.platform === "win32") return true;
+	try { process.kill(-pid, 0); return false; }
+	catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+}
+
+function waitHookGroupGone(pid: number, timeoutMs: number): boolean {
+	const deadline = Date.now() + timeoutMs;
+	while (!hookGroupGone(pid) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+	return hookGroupGone(pid);
+}
+
+/** Clean up only the handoff-identified private hook group. */
+function teardownHookHandoff(handoff: WorktreeHookHandoff): boolean {
+	if (process.platform === "win32" || !handoff.hookPid || !handoff.hookStartToken || handoff.hookPgid !== handoff.hookPid) return process.platform === "win32";
+	const leader = processIdentity(handoff.hookPid);
+	const exactLeader = Boolean(leader && leader.startToken === handoff.hookStartToken && leader.uid === handoff.hookUid && leader.pgid === handoff.hookPgid);
+	const exactMember = (handoff.members ?? []).some((member) => { const current = processIdentity(member.pid); return Boolean(current && current.startToken === member.startToken && current.uid === member.uid && current.pgid === handoff.hookPgid); });
+	if (!exactLeader && !exactMember) return false;
+	if (hookGroupGone(handoff.hookPid)) return true;
+	try { process.kill(-handoff.hookPid, "SIGTERM"); } catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+	}
+	if (waitHookGroupGone(handoff.hookPid, 1_000)) return true;
+	const stillLeader = (() => { const current = processIdentity(handoff.hookPid!); return Boolean(current && current.startToken === handoff.hookStartToken && current.uid === handoff.hookUid && current.pgid === handoff.hookPgid); })();
+	const stillMember = (handoff.members ?? []).some((member) => { const current = processIdentity(member.pid); return Boolean(current && current.startToken === member.startToken && current.uid === member.uid && current.pgid === handoff.hookPgid); });
+	const stillExact = stillLeader || stillMember;
+	if (!stillExact) return false;
+	try { process.kill(-handoff.hookPid, "SIGKILL"); } catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+	}
+	return waitHookGroupGone(handoff.hookPid, 2_000);
+}
+
+export function runWorktreeSetupHook(
 	hook: ResolvedWorktreeSetupHook,
 	input: WorktreeSetupHookInput,
+	options?: WorktreeSetupHookRunOptions,
 ): string[] {
-	const result = spawnSync(hook.hookPath, [], {
-		cwd: input.worktreePath,
-		encoding: "utf-8",
-		input: JSON.stringify(input),
-		timeout: hook.timeoutMs,
-		shell: false,
-	});
-
-	if (result.error) {
-		const code = "code" in result.error ? result.error.code : undefined;
-		if (code === "ETIMEDOUT") {
-			throw new Error(`worktree setup hook timed out after ${hook.timeoutMs}ms`);
+	const processControlError = processControlUnsupported();
+	if (processControlError) throw new Error(`Worktree setup hooks unavailable: ${processControlError}`);
+	const handoffPath = path.join(os.tmpdir(), `pi-worktree-hook-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+	let handoff: WorktreeHookHandoff | undefined;
+	let handoffRaw: string | undefined;
+	let preserveHandoffEvidence = false;
+	const teardownUnproven = (message: string): WorktreeSetupHookTeardownError => {
+		preserveHandoffEvidence = true;
+		// A missing handoff is itself evidence: retain a durable record next to the
+		// worktree so recovery never depends on the transient supervisor error.
+		try {
+			if (!fs.existsSync(handoffPath)) {
+				fs.writeFileSync(handoffPath, handoffRaw ?? JSON.stringify({ type: "setup-hook-teardown-unproven", worktreePath: input.worktreePath, message }), { mode: 0o600 });
+			}
+		} catch {
+			// The typed error below still identifies the worktree and intended evidence
+			// path when the filesystem itself refuses evidence creation.
 		}
-		throw new Error(`worktree setup hook failed: ${result.error.message}`);
-	}
+		return new WorktreeSetupHookTeardownError(`${message} Handoff evidence retained at ${handoffPath}. Worktree retained at ${input.worktreePath}.`, handoffPath, input.worktreePath);
+	};
+	let result: ReturnType<typeof spawnSync>;
+	try {
+		result = (options?.supervisorSpawn ?? spawnSync)(process.execPath, ["--input-type=module", "--eval", WORKTREE_HOOK_SUPERVISOR, hook.hookPath, String(hook.timeoutMs), String(WORKTREE_GIT_MAX_BUFFER_BYTES), handoffPath], {
+			cwd: input.worktreePath,
+			encoding: "utf-8",
+			input: JSON.stringify(input),
+			maxBuffer: WORKTREE_GIT_MAX_BUFFER_BYTES + 1024 * 1024,
+			shell: false,
+			detached: true,
+			// The supervisor's internal deadline performs TERM -> KILL and group
+			// proof. This larger outer bound is only a catastrophic escape hatch.
+			timeout: hook.timeoutMs + 5_000,
+		});
+		try {
+			if (fs.existsSync(handoffPath)) {
+				handoffRaw = fs.readFileSync(handoffPath, "utf8");
+				handoff = parseWorktreeHookHandoff(handoffRaw);
+			}
+		} catch (error) {
+			// Invalid handoff data cannot prove a safe process-group teardown. Keep it
+			// as recovery evidence rather than allowing createSingleWorktree to remove
+			// a checkout whose descendants may still be writing.
+			handoff = undefined;
+			if (result.error || handoffRaw !== undefined) throw teardownUnproven(`worktree setup hook supervisor failed and its handoff could not be validated (${error instanceof Error ? error.message : String(error)}); preserving worktree for recovery`);
+		}
+		if (result.error) {
+			if (!handoff) throw teardownUnproven("worktree setup hook supervisor failed without a valid process-group handoff; preserving worktree for recovery");
+			if (!teardownHookHandoff(handoff)) throw teardownUnproven("worktree setup hook supervisor timed out and hook process-group teardown was not proven; preserving worktree for recovery");
+			throw new Error(`worktree setup hook failed: ${result.error.message}`);
+		}
+		let envelope: { code: number | null; out: string; err: string; overflow: boolean; gone: boolean };
+		try { envelope = JSON.parse(result.stdout.trim()); } catch {
+			// Invalid supervisor output is not evidence that the hook group is gone.
+			// When the supervisor failed before publishing a handoff, there is no
+			// identity-safe teardown path at all; retain typed worktree/evidence rather
+			// than allowing createSingleWorktree to roll the checkout back.
+			if (!handoff) throw teardownUnproven("worktree setup hook supervisor returned invalid output without a valid process-group handoff; preserving worktree for recovery");
+			if (!teardownHookHandoff(handoff)) throw teardownUnproven("worktree setup hook supervisor returned invalid output and hook process-group teardown was not proven; preserving worktree for recovery");
+			throw new Error("worktree setup hook supervisor returned invalid bounded output");
+		}
+		if (!envelope.gone && handoff && !teardownHookHandoff(handoff)) throw teardownUnproven("worktree setup hook process group teardown was not proven; preserving worktree for recovery");
+		if (!envelope.gone) throw teardownUnproven("worktree setup hook process group teardown was not proven; preserving worktree for recovery");
+		if (envelope.overflow) throw new Error(`worktree setup hook exceeded the ${WORKTREE_GIT_MAX_BUFFER_BYTES} byte output limit`);
+		if (envelope.code === null) throw new Error(`worktree setup hook timed out after ${hook.timeoutMs}ms`);
+		if (envelope.code !== 0) {
+			const details = envelope.err.trim() || envelope.out.trim() || "no output";
+			throw new Error(`worktree setup hook failed with exit code ${envelope.code}: ${details}`);
+		}
 
-	if (result.status !== 0) {
-		const details = result.stderr.trim() || result.stdout.trim() || "no output";
-		throw new Error(`worktree setup hook failed with exit code ${result.status}: ${details}`);
-	}
-
-	const output = parseWorktreeSetupHookOutput(result.stdout);
+	const output = parseWorktreeSetupHookOutput(envelope.out);
 	if (output.syntheticPaths === undefined) return [];
 	if (!Array.isArray(output.syntheticPaths)) {
 		throw new Error("worktree setup hook output field 'syntheticPaths' must be an array of relative paths");
@@ -366,7 +560,17 @@ function runWorktreeSetupHook(
 		}
 		uniquePaths.add(normalizedPath);
 	}
-	return [...uniquePaths];
+		return [...uniquePaths];
+	} finally {
+		// The handoff is a narrow, one-shot identity capability; never leave it
+		// behind where a later run could mistake it for a live hook. If teardown
+		// was unproven, retain it alongside the worktree as recovery evidence.
+		if (!preserveHandoffEvidence) {
+			try { fs.unlinkSync(handoffPath); } catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+	}
 }
 
 function createSingleWorktree(
@@ -415,6 +619,9 @@ function createSingleWorktree(
 			syntheticPaths,
 		};
 	} catch (error) {
+		// An unproven hook teardown may still have descendants writing into this
+		// worktree. Never remove either the worktree or its handoff evidence.
+		if (error instanceof WorktreeSetupHookTeardownError) throw error;
 		try { runGitChecked(toplevel, ["worktree", "remove", "--force", worktreePath]); } catch {
 			// Best-effort rollback; preserve the original setup failure.
 		}
@@ -525,12 +732,12 @@ function captureWorktreeDiff(
 	};
 }
 
-function cleanupSingleWorktree(repoCwd: string, worktree: WorktreeInfo): void {
-	try { runGitChecked(repoCwd, ["worktree", "remove", "--force", worktree.path]); } catch {
-		// Cleanup is best-effort to avoid masking caller errors.
+function cleanupSingleWorktree(repoCwd: string, worktree: WorktreeInfo, failures: string[]): void {
+	try { runGitChecked(repoCwd, ["worktree", "remove", "--force", worktree.path]); } catch (error) {
+		failures.push(`${worktree.path}: worktree removal failed (${error instanceof Error ? error.message : String(error)})`);
 	}
-	try { runGitChecked(repoCwd, ["branch", "-D", worktree.branch]); } catch {
-		// Cleanup is best-effort to avoid masking caller errors.
+	try { runGitChecked(repoCwd, ["branch", "-D", worktree.branch]); } catch (error) {
+		failures.push(`${worktree.path}: branch ${worktree.branch} removal failed (${error instanceof Error ? error.message : String(error)})`);
 	}
 }
 
@@ -556,11 +763,23 @@ export function createWorktrees(cwd: string, runId: string, count: number, optio
 			));
 		}
 	} catch (error) {
-		cleanupWorktrees({
-			cwd: repo.toplevel,
-			worktrees,
-			baseCommit: repo.baseCommit,
-		});
+		// A hook process-group teardown refusal means descendants may still be
+		// writing into the checkout. Removing it here would publish false cleanup
+		// and destroy the only actionable recovery path; preserve every materialized
+		// worktree until an explicit recovery attempt proves teardown.
+		if (error instanceof WorktreeSetupHookTeardownError) throw error;
+		try {
+			cleanupWorktrees({
+				cwd: repo.toplevel,
+				worktrees,
+				baseCommit: repo.baseCommit,
+			});
+		} catch (cleanupError) {
+			if (cleanupError instanceof WorktreeCleanupError && error instanceof Error) {
+				throw new WorktreeCleanupError([...cleanupError.failures, `setup failed (${error.message})`], cleanupError.recoverableWorktreePaths);
+			}
+			throw cleanupError;
+		}
 		throw error;
 	}
 
@@ -611,12 +830,14 @@ export interface CleanupWorktreesOptions {
 
 export function cleanupWorktrees(setup: WorktreeSetup, options?: CleanupWorktreesOptions): void {
 	if (options?.preserve) return;
+	const failures: string[] = [];
 	for (let index = setup.worktrees.length - 1; index >= 0; index--) {
-		cleanupSingleWorktree(setup.cwd, setup.worktrees[index]!);
+		cleanupSingleWorktree(setup.cwd, setup.worktrees[index]!, failures);
 	}
-	try { runGitChecked(setup.cwd, ["worktree", "prune"]); } catch {
-		// Pruning is best-effort cleanup.
+	try { runGitChecked(setup.cwd, ["worktree", "prune"]); } catch (error) {
+		failures.push(`worktree prune failed (${error instanceof Error ? error.message : String(error)})`);
 	}
+	if (failures.length > 0) throw new WorktreeCleanupError(failures, setup.worktrees.map((worktree) => worktree.path));
 }
 
 export function formatWorktreeDiffSummary(diffs: WorktreeDiff[]): string {

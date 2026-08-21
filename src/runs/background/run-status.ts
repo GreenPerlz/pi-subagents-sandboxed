@@ -5,11 +5,13 @@ import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLab
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { formatModelThinking } from "../../shared/formatters.ts";
 import { formatActivityLabel } from "../../shared/status-format.ts";
+import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 import { ASYNC_DIR, RESULTS_DIR, type AsyncStatus, type Details, type NestedRunSummary, type SubagentState } from "../../shared/types.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
 import { resolveAsyncRunLocation } from "./async-resume.ts";
 import { resolveSubagentRunId } from "./run-id-resolver.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
+import { isExpectedAsyncRunnerPid } from "./pid-identity.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedRegistryForRoot, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 
@@ -25,6 +27,8 @@ interface RunStatusDeps {
 	resultsDir?: string;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
+	/** Override exact runner identity checks for trusted fixture/test environments. */
+	isExpectedAsyncRunnerPid?: typeof isExpectedAsyncRunnerPid;
 	state?: SubagentState;
 	nested?: NestedRunResolutionScope;
 }
@@ -33,13 +37,13 @@ function hasExistingSessionFile(value: unknown): value is string {
 	return typeof value === "string" && fs.existsSync(value);
 }
 
-function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown }>, fallbackSessionFile?: unknown): string {
+function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown; flatIndex?: unknown; groupId?: unknown; unindexed?: unknown }>, fallbackSessionFile?: unknown): string {
 	const knownChildren = children
-		.map((child, index) => ({ child, index }))
-		.filter(({ child }) => typeof child.agent === "string");
+		.map((child, position) => ({ child, index: typeof child.flatIndex === "number" ? child.flatIndex : position }))
+		.filter(({ child }) => !child.groupId && child.unindexed !== true && typeof child.agent === "string");
 	if (!runId || knownChildren.length === 0) return "Resume: unavailable; no child session file was persisted.";
 	const singleSessionFile = knownChildren[0]?.child.sessionFile ?? fallbackSessionFile;
-	if (children.length === 1 && knownChildren.length === 1 && hasExistingSessionFile(singleSessionFile)) {
+	if (knownChildren.length === 1 && knownChildren[0]?.index === 0 && hasExistingSessionFile(singleSessionFile)) {
 		return `Revive: subagent({ action: "resume", id: "${runId}", message: "..." })`;
 	}
 	const childWithSession = knownChildren.find(({ child }) => hasExistingSessionFile(child.sessionFile));
@@ -115,8 +119,14 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			};
 		}
 		try {
-			const runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], resultsDir, kill: deps.kill, now: deps.now });
-			const orphanedRuns = listAsyncRuns(asyncDirRoot, { states: ["paused", "failed"], resultsDir, kill: deps.kill, now: deps.now, reconcile: false });
+			const runs = listAsyncRuns(asyncDirRoot, {
+				states: ["queued", "running"],
+				resultsDir,
+				kill: deps.kill,
+				now: deps.now,
+				isExpectedAsyncRunnerPid: deps.isExpectedAsyncRunnerPid,
+			});
+			const orphanedRuns = listAsyncRuns(asyncDirRoot, { states: ["complete", "paused", "failed", "cancelled"], resultsDir, kill: deps.kill, now: deps.now, reconcile: false });
 			let text = formatAsyncRunList(runs);
 			if (orphanedRuns.length > 0) {
 				text += "\n\n" + formatAsyncRunList(orphanedRuns, "Recently stopped/orphaned runs");
@@ -141,7 +151,12 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		if (!params.dir && requestedId) {
 			const resolved = resolveSubagentRunId(requestedId, { asyncDirRoot, resultsDir, state: deps.state, nested: deps.nested });
 			if (resolved?.kind === "nested") {
-				reconcileNestedAsyncDescendants(resolved.match.route, { resultsDir, kill: deps.kill, now: deps.now });
+				reconcileNestedAsyncDescendants(resolved.match.route, {
+					resultsDir,
+					kill: deps.kill,
+					now: deps.now,
+					isExpectedAsyncRunnerPid: deps.isExpectedAsyncRunnerPid,
+				});
 				const refreshed = resolveSubagentRunId(requestedId, { asyncDirRoot, resultsDir, state: deps.state, nested: deps.nested });
 				const nested = refreshed?.kind === "nested" ? refreshed : resolved;
 				return { content: [{ type: "text", text: formatNestedExactStatus(nested.match.rootRunId, nested.match.run) }], details: { mode: "single", results: [] } };
@@ -172,7 +187,12 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 	if (asyncDir) {
 		let reconciliation;
 		try {
-			reconciliation = reconcileAsyncRun(asyncDir, { resultsDir, kill: deps.kill, now: deps.now });
+			reconciliation = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: deps.kill,
+				now: deps.now,
+				isExpectedAsyncRunnerPid: deps.isExpectedAsyncRunnerPid,
+			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return {
@@ -190,7 +210,12 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			let nestedWarning: string | undefined;
 			try {
 				const nestedRoute = findNestedRouteForRootId(status.runId);
-				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir, kill: deps.kill, now: deps.now });
+				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, {
+					resultsDir,
+					kill: deps.kill,
+					now: deps.now,
+					isExpectedAsyncRunnerPid: deps.isExpectedAsyncRunnerPid,
+				});
 				nestedChildren = projectNestedRegistryForRoot(status.runId)?.children ?? [];
 				attachRootChildrenToSteps(status.runId, status.steps, nestedChildren);
 			} catch (error) {
@@ -203,7 +228,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				currentStep: status.currentStep,
 				chainStepCount: status.chainStepCount,
 				parallelGroups: status.parallelGroups,
-				steps: (status.steps ?? []).map((step, index) => ({ index, agent: step.agent, status: step.status })),
+				steps: (status.steps ?? []).map((step, index) => ({ flatIndex: step.flatIndex ?? index, agent: step.agent, status: step.status, groupId: step.groupId })),
 			});
 			const started = new Date(status.startedAt).toISOString();
 			const updated = status.lastUpdate ? new Date(status.lastUpdate).toISOString() : "n/a";
@@ -240,6 +265,10 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 					lines.push(`  Intercom target: ${resolveSubagentIntercomTarget(status.runId, step.agent, index)} (if registered)`);
 				}
 			}
+			for (const diagnostic of status.groupDiagnostics ?? []) {
+				lines.push(`Group ${diagnostic.groupId}: ${diagnostic.agent} ${diagnostic.status}${diagnostic.error ? `, error: ${diagnostic.error}` : ""}`);
+				if (diagnostic.finalOutput !== undefined) lines.push(`  Final output: ${diagnostic.finalOutput}`);
+			}
 			const attached = new Set((status.steps ?? []).flatMap((step) => step.children?.map((child) => child.id) ?? []));
 			const unattached = nestedChildren.filter((child) => !attached.has(child.id));
 			lines.push(...formatNestedRunStatusLines(unattached, { indent: "", commandHints: true, maxLines: 20 }));
@@ -258,14 +287,16 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 	if (resultPath) {
 		try {
 			const raw = fs.readFileSync(resultPath, "utf-8");
-			const data = JSON.parse(raw) as { id?: string; runId?: string; agent?: string; success?: boolean; summary?: string; worktreeExecutionError?: string; exitCode?: number; state?: string; sessionFile?: string; results?: Array<{ agent?: string; sessionFile?: string }> };
-			const status = data.worktreeExecutionError
-				? "failed"
-				: data.state === "paused"
-					? "paused"
-					: data.state === "failed" || data.success === false
-						? "failed"
-						: data.success || data.exitCode === 0 ? "complete" : "failed";
+			const data = JSON.parse(raw) as { id?: string; runId?: string; agent?: string; success?: boolean; summary?: string; worktreeExecutionError?: string; exitCode?: number; state?: string; sessionFile?: string; cancelled?: boolean; teardownUnproven?: boolean; results?: Array<{ agent?: string; sessionFile?: string; flatIndex?: number; groupId?: string; unindexed?: boolean; status?: string; success?: boolean; exitCode?: number; interrupted?: boolean; cancelled?: boolean; teardownUnproven?: boolean }> };
+			const aggregate = resolveAggregateState([
+				{ state: data.state ?? (data.success ? "complete" : data.cancelled ? "cancelled" : data.success === false ? "failed" : "pending"), teardownUnproven: data.teardownUnproven },
+				...(data.worktreeExecutionError ? [{ state: "failed" }] : []),
+				...(data.results ?? []).map((child) => ({
+					state: child.status ?? (child.cancelled ? "cancelled" : child.interrupted ? "paused" : child.success === true || child.exitCode === 0 ? "complete" : child.success === false || (child.exitCode !== undefined && child.exitCode !== 0) ? "failed" : "pending"),
+					teardownUnproven: child.teardownUnproven,
+				})),
+			]);
+			const status = aggregate === "running" ? "running" : aggregate === "cancelled" ? "cancelled" : aggregate === "paused" ? "paused" : aggregate === "failed" ? "failed" : "complete";
 			const runId = data.runId ?? data.id ?? resolvedId;
 			const lines = [`Run: ${runId}`, `State: ${status}`, `Result: ${resultPath}`];
 			const children = Array.isArray(data.results) ? data.results : data.agent ? [{ agent: data.agent, sessionFile: data.sessionFile }] : [];

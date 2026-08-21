@@ -136,6 +136,7 @@ function stateGlyph(state: OverlayRun | OverlayStep | OverlayNestedChild["state"
 		case "running": return theme.fg("accent", "●");
 		case "complete": return theme.fg("success", "✓");
 		case "failed": return theme.fg("error", "✗");
+		case "cancelled": return theme.fg("warning", "⊘");
 		case "paused": return theme.fg("warning", "■");
 		case "queued": return theme.fg("muted", "◦");
 	}
@@ -146,6 +147,7 @@ function stateLabel(state: string, theme: Theme): string {
 		case "running": return theme.fg("accent", "running");
 		case "complete": return theme.fg("success", "complete");
 		case "failed": return theme.fg("error", "failed");
+		case "cancelled": return theme.fg("warning", "cancelled");
 		case "paused": return theme.fg("warning", "paused");
 		case "queued": return theme.fg("dim", "queued");
 		default: return theme.fg("dim", state);
@@ -299,7 +301,7 @@ function renderStep(step: OverlayStep, stepIndex: number, parentMode: OverlayRun
 }
 
 function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[], selectedRowIndex: number, counter: RowCounter): void {
-	if (isSoloAsyncRunHeaderRedundant(run)) {
+	if (isSoloAsyncRunHeaderRedundant(run) && !(run.groupDiagnostics?.length)) {
 		renderStep(run.steps[0]!, 0, run.mode, theme, width, 0, lines, selectedRowIndex, counter);
 		return;
 	}
@@ -327,6 +329,13 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 			continue;
 		}
 		renderStep(step, stepIndex, run.mode, theme, width, 1, lines, selectedRowIndex, counter);
+	}
+	// Group diagnostics are intentionally outside the positional child list;
+	// preserve their identity instead of displaying them as a synthetic step.
+	for (const diagnostic of run.groupDiagnostics ?? []) {
+		const diagnosticSelector = counter.index === selectedRowIndex ? theme.fg("accent", "> ") : "  ";
+		lines.push(truncateToWidth(`${diagnosticSelector}  ${theme.fg("warning", "⊘")} group ${diagnostic.groupId}: ${diagnostic.agent} ${stateLabel(diagnostic.state, theme)}${diagnostic.error ? ` · ${diagnostic.error}` : ""}`, width));
+		counter.index++;
 	}
 }
 
@@ -504,6 +513,16 @@ function buildDetailTargets(run: OverlayRun): DetailPaneTarget[] {
 		});
 		addNestedChildren(step.children, `${step.agent}`, targets);
 	}
+	for (const diagnostic of run.groupDiagnostics ?? []) {
+		targets.push({
+			id: `${run.id}:group:${diagnostic.groupId}`,
+			label: `group ${diagnostic.groupId}: ${diagnostic.agent}`,
+			sessionFile: run.sessionFile,
+			logPath: run.logPath,
+			artifactPath: run.artifactPath,
+			asyncDir: run.asyncDir,
+		});
+	}
 	function addNestedChildren(children: OverlayNestedChild[], prefix: string, acc: DetailPaneTarget[]): void {
 		for (const child of children) {
 			acc.push({
@@ -539,7 +558,7 @@ function buildDetailTargets(run: OverlayRun): DetailPaneTarget[] {
 // ---------------------------------------------------------------------------
 
 export interface FlattenedRow {
-	type: "run" | "step" | "nested";
+	type: "run" | "step" | "nested" | "diagnostic";
 	run: OverlayRun;
 	target: DetailPaneTarget;
 	stepIndex?: number;
@@ -589,6 +608,20 @@ export function flattenRows(runs: OverlayRun[]): FlattenedRow[] {
 				},
 			});
 			flattenNestedChildren(step.children, run, rows, step.agent);
+		}
+		for (const diagnostic of run.groupDiagnostics ?? []) {
+			rows.push({
+				type: "diagnostic",
+				run,
+				target: {
+					id: `${run.id}:group:${diagnostic.groupId}`,
+					label: `group ${diagnostic.groupId}: ${diagnostic.agent}`,
+					sessionFile: run.sessionFile,
+					logPath: run.logPath,
+					artifactPath: run.artifactPath,
+					asyncDir: run.asyncDir,
+				},
+			});
 		}
 	}
 	return rows;

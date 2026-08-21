@@ -265,6 +265,43 @@ describe("async resume lookup", () => {
 		}
 	});
 
+	it("rejects aggregate or child teardown that is not proven", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-teardown-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "worker.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(resultsDir, "aggregate.json"), { id: "aggregate", state: "complete", success: true, teardownUnproven: true, agent: "worker", sessionFile });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "aggregate" }, { asyncDirRoot: path.join(root, "runs"), resultsDir }), /unproven teardown/);
+			writeJson(path.join(resultsDir, "child.json"), { id: "child", state: "complete", success: true, results: [{ flatIndex: 0, agent: "worker", success: true, sessionFile, teardownUnproven: true }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "child", index: 0 }, { asyncDirRoot: path.join(root, "runs"), resultsDir }), /child with unproven teardown/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses canonical flat indexes when result diagnostics are interleaved", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-diagnostic-index-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "worker.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(resultsDir, "indexed.json"), {
+				id: "indexed", state: "complete", success: true,
+				results: [
+					{ groupId: "dynamic-group-0", unindexed: true, agent: "fanout", success: false },
+					{ flatIndex: 0, agent: "first", success: true },
+					{ flatIndex: 1, agent: "second", success: true, sessionFile },
+				],
+			});
+			const target = resolveAsyncResumeTarget({ id: "indexed", index: 1 }, { asyncDirRoot: path.join(root, "runs"), resultsDir });
+			assert.equal(target.agent, "second");
+			assert.equal(target.index, 1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("frames the revived follow-up with original run context", () => {
 		const task = buildRevivedAsyncTask({
 			kind: "revive",

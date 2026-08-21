@@ -54,18 +54,25 @@ export function cleanupOldArtifacts(dir: string, maxAgeDays: number): void {
 	const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
 	const cutoff = now - maxAgeMs;
 
-	for (const file of fs.readdirSync(dir)) {
-		if (file === CLEANUP_MARKER_FILE) continue;
-		const filePath = path.join(dir, file);
+	const cleanupEntry = (filePath: string): void => {
 		try {
-			const stat = fs.statSync(filePath);
-			if (stat.mtimeMs < cutoff) {
+			const stat = fs.lstatSync(filePath);
+			if (stat.isDirectory()) {
+				for (const child of fs.readdirSync(filePath)) cleanupEntry(path.join(filePath, child));
+				// Export directories are nested below artifact directories. Remove an
+				// empty stale directory only after its bundle files were considered.
+				if (fs.readdirSync(filePath).length === 0 && stat.mtimeMs < cutoff) fs.rmdirSync(filePath);
+			} else if (stat.mtimeMs < cutoff) {
 				fs.unlinkSync(filePath);
 			}
 		} catch {
 			// Artifact cleanup is best-effort housekeeping. Skip files that disappear
 			// or become unreadable while scanning so one bad entry does not block the rest.
 		}
+	};
+	for (const file of fs.readdirSync(dir)) {
+		if (file === CLEANUP_MARKER_FILE) continue;
+		cleanupEntry(path.join(dir, file));
 	}
 
 	fs.writeFileSync(markerPath, String(now));

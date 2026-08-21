@@ -27,6 +27,7 @@ import {
 	type SingleResult,
 	type Usage,
 	DEFAULT_MAX_OUTPUT,
+	TEMP_ARTIFACTS_DIR,
 	INTERCOM_DETACH_REQUEST_EVENT,
 	INTERCOM_DETACH_RESPONSE_EVENT,
 	truncateOutput,
@@ -57,7 +58,7 @@ import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable } from "../../sandbox/write-inference.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
-import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
+import { attachPostExitStdioGuard, isChildProcessGroupGone, processControlUnsupported, signalChildProcessGroup } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { resolveCandidateLaunchThinking, resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { resolveFastModeStatus, shouldRequestFastMode } from "../../shared/fast-mode.ts";
@@ -65,7 +66,7 @@ import { readStructuredOutput } from "../shared/structured-output.ts";
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { appendSavedOutputSystemPrompt, captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import { writeSavedOutput } from "../../shared/output-paths.ts";
-import { hasLiveNestedDescendantsForParent, projectNestedEvents } from "../shared/nested-events.ts";
+import { hasLiveNestedDescendantsForParent, projectNestedEvents, waitForNestedDescendantsToStop } from "../shared/nested-events.ts";
 import {
 	buildModelCandidates,
 	formatModelAttemptNote,
@@ -410,27 +411,75 @@ async function runSingleAttempt(
 		return result;
 	}
 
+	let detachedTerminalPromise: Promise<void> | undefined;
 	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn(spawnSpec.command, spawnSpec.args, {
-			cwd: spawnSpec.cwd ?? childCwd,
-			env: spawnSpec.env ?? spawnEnv,
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-		});
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(spawnSpec.command, spawnSpec.args, {
+				cwd: spawnSpec.cwd ?? childCwd,
+				env: spawnSpec.env ?? spawnEnv,
+				stdio: ["ignore", "pipe", "pipe"],
+				// Keep the child tree in a private process group so interrupts do not
+				// leave shells or tool workers behind.
+				detached: process.platform === "linux",
+				windowsHide: true,
+			});
+		} catch (error) {
+			cleanupTempDir(tempDir);
+			result.exitCode = 1;
+			result.error = error instanceof Error ? error.message : String(error);
+			progress.status = "failed";
+			progress.error = result.error;
+			progress.durationMs = Date.now() - startTime;
+			result.progressSummary = { toolCount: 0, tokens: 0, durationMs: progress.durationMs };
+			resolve(1);
+			return;
+		}
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let buf = "";
 		let processClosed = false;
 		let settled = false;
 		let detached = false;
+		let detachedTerminalNotified = false;
 		let intercomStarted = false;
 		let assistantError: string | undefined;
 		let removeAbortListener: (() => void) | undefined;
 		let removeInterruptListener: (() => void) | undefined;
 		let activityTimer: NodeJS.Timeout | undefined;
 
+		const notifyDetachedTerminal = () => {
+			if (!detached || detachedTerminalNotified) return;
+			detachedTerminalNotified = true;
+			detachedTerminalPromise = Promise.resolve(options.onDetachedTerminal?.(result)).catch((error) => {
+				// A terminal projection/export failure is part of the child result, not
+				// an ignorable detached callback failure. Keep the runtime recoverable
+				// and make the original caller-visible terminal error durable.
+				const message = `Detached terminal projection failed: ${error instanceof Error ? error.message : String(error)}`;
+				result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+				result.error = result.error ? `${result.error}\n${message}` : message;
+				progress.status = "failed";
+				progress.error = result.error;
+				result.progress = progress;
+				options.onUpdate?.({
+					content: [{ type: "text", text: result.error }],
+					details: { mode: "single", results: [snapshotResult(result, snapshotProgress(progress))], progress: [snapshotProgress(progress)] },
+				});
+			});
+		};
+
+		const resolveAcknowledgement = (code: number) => {
+			if (settled) return;
+			// A detached acknowledgement settles the caller-facing promise, but it
+			// deliberately does not tear down the child streams or post-exit guard.
+			settled = true;
+			resolve(code);
+		};
+
 		const detachForIntercom = () => {
 			detached = true;
-			processClosed = true;
+			// The acknowledgement resolves the foreground request immediately, but
+			// the child remains attached to its stdio listeners until close. This is
+			// what lets the terminal callback receive the actual output/exit/error.
 			result.detached = true;
 			result.detachedReason = "intercom coordination";
 			progress.status = "detached";
@@ -440,7 +489,8 @@ async function runSingleAttempt(
 				tokens: progress.tokens,
 				durationMs: progress.durationMs,
 			};
-			finish(-2);
+			options.onDetachedStarted?.(result);
+			resolveAcknowledgement(-2);
 		};
 
 		// If the child emits a terminal assistant stop but never exits,
@@ -452,6 +502,22 @@ async function runSingleAttempt(
 		let cleanTerminalAssistantStopReceived = false;
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardKillTimer: NodeJS.Timeout | undefined;
+		let abortKillTimer: NodeJS.Timeout | undefined;
+		let interruptTermTimer: NodeJS.Timeout | undefined;
+		let interruptKillTimer: NodeJS.Timeout | undefined;
+		let interruptKillExecuted = false;
+		let mandatoryKillExecuted = false;
+		let terminalCloseHandled = false;
+		let pendingTerminalClose: { code: number | null; signal?: NodeJS.Signals } | undefined;
+		let teardownReady = process.platform !== "linux";
+		let teardownFailureReason: string | undefined;
+		const releaseTeardown = () => {
+			teardownReady = true;
+			if (!pendingTerminalClose || terminalCloseHandled) return;
+			const pending = pendingTerminalClose;
+			pendingTerminalClose = undefined;
+			queueMicrotask(() => proc.emit("close", pending.code, pending.signal));
+		};
 		const clearFinalDrainTimers = () => {
 			if (finalDrainTimer) {
 				clearTimeout(finalDrainTimer);
@@ -461,22 +527,34 @@ async function runSingleAttempt(
 				clearTimeout(finalHardKillTimer);
 				finalHardKillTimer = undefined;
 			}
+			if (abortKillTimer) {
+				clearTimeout(abortKillTimer);
+				abortKillTimer = undefined;
+			}
+			if (interruptTermTimer) {
+				clearTimeout(interruptTermTimer);
+				interruptTermTimer = undefined;
+			}
+			if (interruptKillTimer) {
+				clearTimeout(interruptKillTimer);
+				interruptKillTimer = undefined;
+			}
 		};
 		const startFinalDrain = () => {
 			if (childExited || finalDrainTimer || settled || processClosed || detached) return;
 			finalDrainTimer = setTimeout(() => {
-				if (settled || processClosed || detached) return;
-				const termSent = trySignalChild(proc, "SIGTERM");
+				if (processClosed) return;
+				const termSent = signalChildProcessGroup(proc, "SIGTERM");
 				if (!termSent) return;
 				forcedTerminationSignal = true;
 				if (!cleanTerminalAssistantStopReceived && !assistantError) {
 					result.error = result.error ?? `Subagent process did not exit within ${FINAL_STOP_GRACE_MS}ms after its final message. Forcing termination.`;
 				}
 				finalHardKillTimer = setTimeout(() => {
-					if (settled || processClosed || detached) return;
-					forcedTerminationSignal = trySignalChild(proc, "SIGKILL") || forcedTerminationSignal;
+					if (isChildProcessGroupGone(proc)) return;
+					mandatoryKillExecuted = true;
+					forcedTerminationSignal = signalChildProcessGroup(proc, "SIGKILL") || forcedTerminationSignal;
 				}, HARD_KILL_MS);
-				finalHardKillTimer.unref?.();
 			}, FINAL_STOP_GRACE_MS);
 			finalDrainTimer.unref?.();
 		};
@@ -490,9 +568,10 @@ async function runSingleAttempt(
 			detachForIntercom();
 		});
 
-		const finish = (code: number) => {
-			if (settled) return;
-			settled = true;
+		let resourcesCleaned = false;
+		const cleanupResources = () => {
+			if (resourcesCleaned) return;
+			resourcesCleaned = true;
 			clearFinalDrainTimers();
 			clearStdioGuard();
 			if (activityTimer) {
@@ -502,7 +581,12 @@ async function runSingleAttempt(
 			unsubscribeIntercomDetach?.();
 			removeAbortListener?.();
 			removeInterruptListener?.();
-			resolve(code);
+		};
+
+		const finish = (code: number) => {
+			if (settled) return;
+			resolveAcknowledgement(code);
+			cleanupResources();
 		};
 
 		const drainPendingControlEvents = (): ControlEvent[] | undefined => {
@@ -757,7 +841,29 @@ async function runSingleAttempt(
 
 		let stderrBuf = "";
 
-		const clearStdioGuard = attachPostExitStdioGuard(proc, { idleMs: 2000, hardMs: 8000 });
+		const clearStdioGuard = attachPostExitStdioGuard(proc, {
+			idleMs: 2000,
+			// Detached terminal publication is bounded independently from the
+			// wrapper's close event; three seconds matches the child escalation
+			// deadline while retaining identity-checked TERM -> KILL teardown.
+			hardMs: 3000,
+			killProcessGroupOnCutoff: process.platform === "linux",
+			onHardCutoff: () => { mandatoryKillExecuted = true; },
+			onTeardownComplete: releaseTeardown,
+			onTeardownFailure: (reason) => {
+				teardownFailureReason = reason;
+				result.teardownUnproven = true;
+				if (options.isolatedGit) {
+					// A refused/unknown group is not terminal proof. Fence the isolated
+					// runtime before synthetic close can unlock export or cleanup.
+					options.isolatedGit.runtime.markExportFenceFailed();
+					const recovery = `Teardown failed before isolated Git cleanup could be proven; recover isolated worktree at ${options.isolatedGit.runtime.root}`;
+					result.error = result.error ? `${result.error}\n${recovery}` : recovery;
+					result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+				}
+				releaseTeardown();
+			},
+		});
 		proc.stdout.on("data", (d) => {
 			buf += d.toString();
 			const lines = buf.split("\n");
@@ -769,7 +875,9 @@ async function runSingleAttempt(
 		});
 		proc.on("exit", () => {
 			childExited = true;
-			clearFinalDrainTimers();
+			// Preserve owed interrupt/final-drain escalation; wrapper exit is not
+			// proof that the detached process group has disappeared.
+			if (!interruptedByControl && !finalDrainTimer && !finalHardKillTimer) clearFinalDrainTimers();
 		});
 		const attachFailureDiagnostics = (message?: string): void => {
 			if (!result.sandbox || !options.sandbox) return;
@@ -787,32 +895,77 @@ async function runSingleAttempt(
 		};
 
 		proc.on("close", (code, signal) => {
+			if (terminalCloseHandled) return;
+			if (!teardownReady) {
+				pendingTerminalClose ??= { code, signal: signal ?? undefined };
+				return;
+			}
+			terminalCloseHandled = true;
 			clearFinalDrainTimers();
-			clearStdioGuard();
 			void jsonlWriter.close().catch(() => {
 				// JSONL artifact flush is best effort.
 			});
 			cleanupTempDir(tempDir);
 			if (detached) {
-				finish(-2);
+				// Unlike the immediate acknowledgement path, this is the durable
+				// terminal projection. Drain the final buffered event and preserve the
+				// real process outcome before notifying the owning orchestrator.
+				if (buf.trim()) processLine(buf);
+				if (teardownFailureReason) result.error = result.error ? `${result.error}\nTeardown failed: ${teardownFailureReason}` : `Teardown failed: ${teardownFailureReason}`;
+				if (!result.error && assistantError) result.error = assistantError;
+				const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !result.error;
+				if (code !== 0 && stderrBuf.trim() && !result.error && !forcedDrainAfterFinalSuccess) {
+					result.error = stderrBuf.trim();
+				}
+				const finalCode = teardownFailureReason ? 1 : forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
+				if (finalCode === 0 && !result.error) {
+					const errInfo = detectSubagentError(result.messages);
+					if (errInfo.hasError) {
+						result.error = errInfo.details
+							? `${errInfo.errorType} failed (exit ${errInfo.exitCode}): ${errInfo.details}`
+							: `${errInfo.errorType} failed with exit code ${errInfo.exitCode}`;
+					}
+				}
+			result.exitCode = result.error ? (finalCode === 0 ? 1 : finalCode) : finalCode;
+			if ((result.exitCode !== 0 || result.error) && options.sandbox) attachFailureDiagnostics(result.error);
+				result.detached = undefined;
+				result.detachedReason = undefined;
+				result.finalOutput = getFinalOutput(result.messages) || (result.error ? "" : result.finalOutput);
+				progress.status = result.exitCode === 0 ? "completed" : "failed";
+				progress.error = result.error;
+				progress.durationMs = Date.now() - startTime;
+				result.progressSummary = {
+					toolCount: progress.toolCount,
+					tokens: progress.tokens,
+					durationMs: progress.durationMs,
+				};
+				processClosed = true;
+				cleanupResources();
+				notifyDetachedTerminal();
 				return;
 			}
 			processClosed = true;
 			if (buf.trim()) processLine(buf);
+			if (teardownFailureReason) result.error = result.error ? `${result.error}\nTeardown failed: ${teardownFailureReason}` : `Teardown failed: ${teardownFailureReason}`;
 			if (!result.error && assistantError) result.error = assistantError;
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !result.error;
 			if (code !== 0 && stderrBuf.trim() && !result.error && !forcedDrainAfterFinalSuccess) {
 				result.error = stderrBuf.trim();
 			}
-			const finalCode = forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
+			const finalCode = teardownFailureReason ? 1 : forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
 			if ((finalCode !== 0 || result.error) && options.sandbox) {
 				attachFailureDiagnostics(result.error);
 			}
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {
+			if (terminalCloseHandled) return;
+			if (!teardownReady) {
+				pendingTerminalClose ??= { code: 1, signal: undefined };
+				return;
+			}
+			terminalCloseHandled = true;
 			clearFinalDrainTimers();
-			clearStdioGuard();
 			void jsonlWriter.close().catch(() => {
 				// JSONL artifact flush is best effort.
 			});
@@ -821,6 +974,17 @@ async function runSingleAttempt(
 				result.error = error instanceof Error ? error.message : String(error);
 			}
 			attachFailureDiagnostics(result.error);
+			if (detached) {
+				result.detached = undefined;
+				result.detachedReason = undefined;
+				result.exitCode = 1;
+				progress.status = "failed";
+				progress.error = result.error;
+				processClosed = true;
+				cleanupResources();
+				notifyDetachedTerminal();
+				return;
+			}
 			finish(1);
 		});
 
@@ -831,8 +995,14 @@ async function runSingleAttempt(
 					detachForIntercom();
 					return;
 				}
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				const termSent = signalChildProcessGroup(proc, "SIGTERM");
+				if (!termSent) return;
+				abortKillTimer = setTimeout(() => {
+					abortKillTimer = undefined;
+					if (isChildProcessGroupGone(proc)) return;
+					mandatoryKillExecuted = true;
+					signalChildProcessGroup(proc, "SIGKILL");
+				}, 3000);
 			};
 			if (options.signal.aborted) kill();
 			else {
@@ -851,11 +1021,20 @@ async function runSingleAttempt(
 				result.finalOutput = "Interrupted. Waiting for explicit next action.";
 				progress.activityState = undefined;
 				fireUpdate();
-				trySignalChild(proc, "SIGINT");
-				setTimeout(() => {
-					if (settled || processClosed || detached) return;
-					trySignalChild(proc, "SIGTERM");
-				}, 1000).unref?.();
+				signalChildProcessGroup(proc, "SIGINT");
+				interruptTermTimer = setTimeout(() => {
+					interruptTermTimer = undefined;
+					if (processClosed) return;
+					const termSent = signalChildProcessGroup(proc, "SIGTERM");
+					if (!termSent) return;
+					interruptKillTimer = setTimeout(() => {
+						interruptKillTimer = undefined;
+						if (processClosed) return;
+						interruptKillExecuted = true;
+						mandatoryKillExecuted = true;
+						signalChildProcessGroup(proc, "SIGKILL");
+					}, 3000);
+				}, 1000);
 			};
 			if (options.interruptSignal.aborted) interrupt();
 			else {
@@ -865,7 +1044,8 @@ async function runSingleAttempt(
 		}
 	});
 	result.exitCode = exitCode;
-	if (interruptedByControl) {
+	if (detachedTerminalPromise) await detachedTerminalPromise;
+	if (interruptedByControl && !result.teardownUnproven) {
 		result.exitCode = 0;
 		result.interrupted = true;
 		result.error = undefined;
@@ -1080,6 +1260,15 @@ async function runAcceptanceFinalizationLoop(input: {
 			input.result.controlEvents = [...(input.result.controlEvents ?? []), ...finalizationResult.controlEvents];
 		}
 		const rawOutput = acceptanceOutputByResult.get(finalizationResult) ?? getFinalOutput(finalizationResult.messages) ?? finalizationResult.finalOutput ?? "";
+		if (finalizationResult.interrupted) {
+			input.result.interrupted = true;
+			input.result.exitCode = finalizationResult.exitCode;
+			input.result.error = finalizationResult.error ?? "Acceptance finalization interrupted.";
+			if (input.result.progress) {
+				input.result.progress.status = "paused";
+				input.result.progress.error = input.result.error;
+			}
+		}
 		if (finalizationResult.error || finalizationResult.interrupted || finalizationResult.detached || (finalizationResult.exitCode !== 0 && !rawOutput.trim())) {
 			const message = finalizationResult.error ?? "Acceptance finalization turn did not complete successfully.";
 			turns.push(createFinalizationProcessFailureTurn({ turn, prompt, rawOutput, message }));
@@ -1127,6 +1316,17 @@ export async function runSync(
 			messages: [],
 			usage: emptyUsage(),
 			error: `Unknown agent: ${agentName}`,
+		};
+	}
+	const processControlError = processControlUnsupported();
+	if (processControlError) {
+		return {
+			agent: agentName,
+			task,
+			exitCode: 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: processControlError,
 		};
 	}
 	const implicitSavedOutputPath = options.savedOutputPath
@@ -1235,6 +1435,7 @@ export async function runSync(
 			outputSnapshot,
 			originalTask: task,
 		});
+		if (options.signal?.aborted && !result.interrupted) result.cancelled = true;
 		lastResult = result;
 		sumUsage(aggregateUsage, result.usage);
 		totalToolCount += result.progressSummary?.toolCount ?? 0;
@@ -1359,26 +1560,91 @@ export async function runSync(
 			result.progress.error = result.error;
 		}
 	}
+	// Abort is a terminal non-success gate even when the child happened to emit
+	// a successful stop before the cancellation callback was observed.
+	if (result.cancelled || (options.signal?.aborted && !result.interrupted)) {
+		result.cancelled = true;
+		if (result.exitCode === 0) result.exitCode = 1;
+		result.error = result.error ?? "Subagent execution cancelled.";
+		if (result.progress) {
+			result.progress.status = "failed";
+			result.progress.error = result.error;
+		}
+	}
 
-	if (options.isolatedGit && result.exitCode === 0 && !result.error && !result.detached && !result.interrupted) {
-		try {
-			const bundle = exportIsolatedGitBundle(options.isolatedGit.runtime, {
-				outputDir: options.isolatedGitBundleDir ?? path.join(options.artifactsDir ?? os.tmpdir(), "isolated-git-bundles"),
-				worktree: options.isolatedGit,
-			});
+	if (options.isolatedGit && options.exportIsolatedGitBundle !== false && !result.detached) {
+		// Process close/stdio drain only proves the direct child stopped. Wait for
+		// nested descendants to publish terminal events before packaging or cleanup.
+		const nestedFence = await waitForNestedDescendantsToStop(options.nestedRoute, options.runId, options.index ?? 0, {
+			timeoutMs: options.nestedFenceTimeoutMs,
+		});
+		if (!nestedFence.stopped) {
+			result.teardownUnproven = true;
+			options.isolatedGit.runtime.markExportFenceFailed();
+			const recovery = `Nested descendants did not reach a proven terminal state before the export fence timed out; recover isolated worktree at ${options.isolatedGit.runtime.root}`;
+			result.error = result.error ? `${result.error}\n${recovery}` : recovery;
+			result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+			if (result.progress) {
+				result.progress.status = "failed";
+				result.progress.error = result.error;
+			}
+		}
+		const terminationState = result.interrupted
+			? "interrupted"
+			: options.signal?.aborted
+				? "cancelled"
+				: result.exitCode === 0 && !result.error
+				? "success"
+				: /timeout|timed out/i.test(result.error ?? "") ? "timeout" : "failure";
+		if (nestedFence.stopped && !options.isolatedGit.runtime.exportFenceFailed) {
+			let bundle: ReturnType<typeof exportIsolatedGitBundle> | undefined;
+			let exportError: unknown;
+			for (let attempt = 0; attempt < 2 && !bundle; attempt++) try {
+				bundle = exportIsolatedGitBundle(options.isolatedGit.runtime, {
+					outputDir: options.isolatedGitBundleDir ?? path.join(options.artifactsDir ?? TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
+					worktree: options.isolatedGit,
+					syntheticPaths: options.isolatedGit.syntheticPaths,
+					terminationState,
+					agent: agent.name,
+					commitRequired: options.isolatedGitCommitRequired,
+				});
+			} catch (error) {
+				exportError = error;
+			}
+			if (bundle) {
 			result.gitBundle = {
 				path: bundle.path,
 				checksum: bundle.checksum,
 				base: bundle.base,
 				head: bundle.head,
 				commitSummary: bundle.commitSummary,
+				...(bundle.recovery ? { recovery: bundle.recovery } : {}),
+				...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
+				...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}),
+				...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}),
+				terminationState: bundle.terminationState,
+				incomplete: bundle.incomplete,
+				dirtySummary: bundle.dirtySummary,
+				bundleSize: bundle.bundleSize,
+				payloadChecksum: bundle.payloadChecksum,
+				payloadSize: bundle.payloadSize,
+				canonicalPayloadChecksum: bundle.canonicalPayloadChecksum,
+				canonicalPayloadSize: bundle.canonicalPayloadSize,
+				portableMetadata: bundle.portableMetadata,
 			};
-		} catch (error) {
-			result.exitCode = 1;
-			result.error = `Isolated Git bundle export failed: ${error instanceof Error ? error.message : String(error)}`;
-			if (result.progress) {
-				result.progress.status = "failed";
-				result.progress.error = result.error;
+			if (bundle.incomplete && options.isolatedGitCommitRequired && !result.error) {
+				result.exitCode = 1;
+				result.error = "Isolated writer completed without a required authored commit; recovery bundle is incomplete.";
+			}
+			} else {
+				options.isolatedGit.runtime.markExportFailed();
+				const exportMessage = `Isolated Git bundle export failed; recover isolated worktree at ${options.isolatedGit.runtime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
+				result.error = result.error ? `${result.error}\n${exportMessage}` : exportMessage;
+				if (result.exitCode === 0) result.exitCode = 1;
+				if (result.progress) {
+					result.progress.status = "failed";
+					result.progress.error = result.error;
+				}
 			}
 		}
 	}

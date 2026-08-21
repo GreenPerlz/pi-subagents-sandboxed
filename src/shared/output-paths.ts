@@ -15,7 +15,11 @@ function resolveBaseCwd(runtimeCwd: string, requestedCwd?: string): string {
 }
 
 function resolveGitTopLevel(cwd: string): string | undefined {
-	const result = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf-8" });
+	const result = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+		encoding: "utf-8",
+		timeout: 15_000,
+		maxBuffer: 8 * 1024 * 1024,
+	});
 	if (result.status !== 0) return undefined;
 	const toplevel = result.stdout.trim();
 	return toplevel || undefined;

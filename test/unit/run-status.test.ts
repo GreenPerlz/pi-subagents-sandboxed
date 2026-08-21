@@ -96,6 +96,7 @@ describe("async run status inspection", () => {
 				resultsDir: path.join(root, "results"),
 				kill: () => true,
 				now: () => 200,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const text = textContent(result);
@@ -196,6 +197,7 @@ describe("async run status inspection", () => {
 				resultsDir: path.join(root, "results"),
 				kill: () => true,
 				now: () => 200,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const text = textContent(result);
@@ -466,6 +468,7 @@ describe("async run status inspection", () => {
 				resultsDir: path.join(root, "results"),
 				kill: () => true,
 				now: () => 200,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const text = textContent(result);
@@ -499,6 +502,7 @@ describe("async run status inspection", () => {
 				resultsDir: path.join(root, "results"),
 				kill: () => true,
 				now: () => 200,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const text = textContent(result);
@@ -636,6 +640,7 @@ describe("async run header model/thinking display (issue #53)", () => {
 				resultsDir: path.join(root, "results"),
 				kill: () => true,
 				now: () => 200,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const header = asyncHeaderLine(textContent(result));
@@ -737,6 +742,7 @@ describe("async run header model/thinking display (issue #53)", () => {
 				resultsDir: path.join(root, "results"),
 				kill: () => true,
 				now: () => 200,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const header = asyncHeaderLine(textContent(result));
@@ -956,6 +962,7 @@ describe("default status listing includes orphaned paused/failed runs (issue #37
 				resultsDir,
 				kill: () => true,
 				now: () => 500,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const text = textContent(result);
@@ -995,6 +1002,7 @@ describe("default status listing includes orphaned paused/failed runs (issue #37
 				resultsDir,
 				kill: () => true,
 				now: () => 500,
+				isExpectedAsyncRunnerPid: () => true,
 			});
 
 			const text = textContent(result);

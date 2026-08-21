@@ -2,7 +2,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,7 +14,32 @@ import {
 	createIsolatedGitWorktree,
 	exportIsolatedGitBundle,
 	cleanupIsolatedGitRuntime,
+	teardownIsolatedGitRuntimeForTests,
 } from "../../src/sandbox/isolated-git.ts";
+
+function policyProcessesForRuntime(root: string): string[] {
+	return spawnSync("ps", ["-eo", "pid,ppid,pgid,sid,stat,args"], { encoding: "utf8" }).stdout
+		.split("\n")
+		.filter((line) => line.includes(root));
+}
+
+async function cleanupTestRuntime(runtime: { root: string; cwd: string }): Promise<void> {
+	const runtimeHandle = runtime as Parameters<typeof cleanupIsolatedGitRuntime>[0];
+	const root = runtime.root;
+	const beforeProcesses = policyProcessesForRuntime(root);
+	await cleanupIsolatedGitRuntime(runtimeHandle);
+	await teardownIsolatedGitRuntimeForTests(runtimeHandle);
+	assert.equal(fs.existsSync(root), false, "test runtime root must be removed after policy teardown");
+	const deadline = Date.now() + 2_000;
+	let afterProcesses = policyProcessesForRuntime(root);
+	while (afterProcesses.length > 0 && Date.now() < deadline) {
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+		afterProcesses = policyProcessesForRuntime(root);
+	}
+	assert.deepEqual(afterProcesses, [], `policy process leaked after test teardown (before=${JSON.stringify(beforeProcesses)})`);
+	const fixtureRoot = path.dirname(runtime.cwd);
+	if (path.basename(fixtureRoot).startsWith("pi-isolated-git-")) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+}
 
 const hasBubblewrap = process.platform === "linux" && spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status === 0;
 
@@ -63,7 +88,51 @@ function snapshot(cwd: string): string {
 }
 
 describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
-	it("protects ordinary checkout metadata when Git mode is omitted or explicitly read-only", () => {
+	it("refuses bundle export after a failed teardown fence and retains recovery root", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-fence-test-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\\n");
+		git(repo, ["add", "base.txt"]);
+		git(repo, ["commit", "-m", "base"]);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "fence" });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0 });
+		try {
+			runtime.markHookTeardownFailed();
+			assert.throws(() => exportIsolatedGitBundle(runtime, { outputDir: path.join(root, "bundles"), worktree }), /export refused.*recover isolated (?:runtime\/)?worktrees/iu);
+			assert.equal(fs.existsSync(runtime.root), true);
+		} finally {
+			await teardownIsolatedGitRuntimeForTests(runtime);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("policy server exits after its disposable owner is SIGKILLed", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-policy-owner-death-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\\n");
+		git(repo, ["add", "base.txt"]);
+		git(repo, ["commit", "-m", "base"]);
+		const owner = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		assert.ok(owner.pid);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "owner-death", ownerPid: owner.pid });
+		const sockets = [path.join(runtime.root, "git-policy-host", "server.sock"), path.join(runtime.root, "git-policy-none", "server.sock")];
+		assert.ok(sockets.every((socket) => fs.existsSync(socket)));
+		process.kill(owner.pid, "SIGKILL");
+		const deadline = Date.now() + 3_000;
+		while (sockets.some((socket) => fs.existsSync(socket)) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+		assert.ok(sockets.every((socket) => !fs.existsSync(socket)), "owner death must close policy sockets");
+		await cleanupTestRuntime(runtime);
+	});
+
+	it("protects ordinary checkout metadata when Git mode is omitted or explicitly read-only", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-read-only-git-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -86,7 +155,7 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 		}
 	});
 
-	it("rejects difftool external callbacks before they can bypass Git policy", () => {
+	it("rejects difftool external callbacks before they can bypass Git policy", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-difftool-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -122,11 +191,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			assert.equal(fs.existsSync(hookMarker), false, "difftool callback reached a commit hook");
 			assert.equal(git(worktree.worktreePath, ["rev-parse", "HEAD"]), before, "difftool callback changed isolated history");
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("rejects web browsing and help web callbacks before helper invocation", () => {
+	it("rejects web browsing and help web callbacks before helper invocation", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-web-callback-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -159,11 +228,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 				assert.match(help.stderr, /isolated Git policy rejects external Git callbacks/i, args.join(" "));
 			}
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("rejects local Git callback commands before execution while preserving normal history commands", () => {
+	it("rejects local Git callback commands before execution while preserving normal history commands", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-local-callback-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -207,11 +276,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			assert.equal(run(["log", "-1", "--format=%s"]).stdout.trim(), "normal local commit");
 			assert.equal(run(["rev-parse", "HEAD"]).status, 0);
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("keeps isolated Git security policy immutable while allowing normal commits", () => {
+	it("keeps isolated Git security policy immutable while allowing normal commits", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-policy-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -314,11 +383,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			assert.equal(committed.status, 0, committed.stderr);
 			assert.equal(fs.existsSync(hookMarker), false, "the normal commit unexpectedly ran the hook");
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("rejects signing controls across local history operations while preserving safe commands", () => {
+	it("rejects signing controls across local history operations while preserving safe commands", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-signing-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -352,11 +421,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			const normal = run(["status", "--porcelain"]);
 			assert.equal(normal.status, 0, normal.stderr);
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("denies every visible Git protocol route, including mount and fd aliases", () => {
+	it("denies every visible Git protocol route, including mount and fd aliases", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-routes-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -411,13 +480,14 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			assert.equal(fdLeak.status, 0, `Git helper leaked through /proc/*/fd: ${fdLeak.stdout}`);
 
 			for (const helper of ["upload-pack", "receive-pack", "upload-archive"]) {
-				const socketProbe = `const net=require('node:net'); const socket=net.createConnection('/tmp/pi-isolated-git-runtime/server.sock'); let data=''; socket.setEncoding('utf8'); socket.on('data', chunk => data += chunk); socket.on('end', () => { const response=JSON.parse(data); if (response.ok) { process.stdout.write(data); process.exitCode=1; } }); socket.on('error', error => { process.stderr.write(String(error)); process.exitCode=1; }); socket.end(JSON.stringify({cwd:process.cwd(),args:${JSON.stringify([helper, worktree.worktreePath])},env:{}})+'\\n');`;
+				const socketPath = path.join(runtime.gitPolicy.policyRootTarget, "server.sock");
+				const socketProbe = `const net=require('node:net'); const socket=net.createConnection(${JSON.stringify(socketPath)}); let data=''; socket.setEncoding('utf8'); socket.on('data', chunk => data += chunk); socket.on('end', () => { const response=JSON.parse(data); if (response.ok) { process.stdout.write(data); process.exitCode=1; } }); socket.on('error', error => { process.stderr.write(String(error)); process.exitCode=1; }); socket.end(JSON.stringify({cwd:process.cwd(),args:${JSON.stringify([helper, worktree.worktreePath])},env:{}})+'\\n');`;
 				const direct = run(process.execPath, ["-e", socketProbe]);
 				assert.equal(direct.status, 0, `direct policy socket request for ${helper} was accepted: ${direct.stdout}${direct.stderr}`);
 			}
 			assert.equal(git(worktree.worktreePath, ["for-each-ref", "--format=%(refname)=%(objectname)"]), refsBefore, "a denied helper route altered isolated refs");
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
@@ -484,11 +554,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			assert.equal(normal.result?.status, 0, Buffer.from(normal.result?.stderr ?? "", "base64").toString("utf8"));
 			assert.equal(Buffer.from(normal.result?.stdout ?? "", "base64").toString("utf8").trim(), worktree.baseCommit);
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("copies Git identities with punctuation faithfully into isolated commits", () => {
+	it("copies Git identities with punctuation faithfully into isolated commits", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-identity-test-"));
 		const repo = path.join(root, "parent");
 		fs.mkdirSync(repo);
@@ -511,11 +581,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			}
 			assert.equal(git(worktree.worktreePath, ["show", "-s", "--format=%an%x09%ae"]), "A # B\ta+b@example.invalid");
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("lets a Bubblewrap child commit and exports one compact portable bundle without changing the parent", () => {
+	it("lets a Bubblewrap child commit and exports one compact portable bundle without changing the parent", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-test-"));
 		const repo = path.join(root, "parent");
 		const bundleDir = path.join(root, "bundles");
@@ -570,7 +640,7 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			assert.equal(commit.status, 0, commit.stderr);
 			const committed = spawnSync("bwrap", runtime.wrapInvocation(worktree, {
 				command: "git",
-				args: ["-C", worktree.worktreePath, "commit", "-m", "isolated child"],
+				args: ["-C", worktree.worktreePath, "commit", "-m", "isolated child /tmp/personal-secret"],
 			}).args, { encoding: "utf8" });
 			assert.equal(committed.status, 0, committed.stderr);
 			const head = git(worktree.worktreePath, ["rev-parse", "HEAD"]);
@@ -598,14 +668,393 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 			assert.ok(bundleBytes < 16 * 1024, `incremental bundle unexpectedly large: ${bundleBytes}`);
 			assert.equal(snapshot(repo), before);
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupIsolatedGitRuntime(runtime);
 		}
 		assert.equal(fs.existsSync(runtime.root), false);
 		assert.equal(snapshot(repo), before);
+		fs.rmSync(root, { recursive: true, force: true });
 		void dangling;
 	});
 
-	it("keeps bundle paths collision-proof across runtimes sharing run metadata", () => {
+	it("preserves distinct staged and worktree projections in one portable bundle", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-staged-worktree-test-"));
+		const repo = path.join(root, "parent");
+		const bundles = path.join(root, "bundles");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "same.txt"), "A\n");
+		fs.writeFileSync(path.join(repo, "delete.txt"), "delete\n");
+		fs.writeFileSync(path.join(repo, "mode.sh"), "#!/bin/sh\n");
+		fs.writeFileSync(path.join(repo, "binary.bin"), Buffer.from([0, 1, 2, 3]));
+		fs.writeFileSync(path.join(repo, "target"), "target\n");
+		fs.symlinkSync("target", path.join(repo, "link"));
+		git(repo, ["add", "."]);
+		git(repo, ["commit", "-m", "base"]);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "staged-worktree" });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0, agent: "writer" });
+		try {
+			fs.writeFileSync(path.join(worktree.worktreePath, "same.txt"), "B\n");
+			fs.rmSync(path.join(worktree.worktreePath, "delete.txt"));
+			fs.chmodSync(path.join(worktree.worktreePath, "mode.sh"), 0o755);
+			fs.writeFileSync(path.join(worktree.worktreePath, "binary.bin"), Buffer.from([255, 4, 5, 6]));
+			fs.rmSync(path.join(worktree.worktreePath, "link"));
+			fs.symlinkSync("target", path.join(worktree.worktreePath, "link"));
+			git(worktree.worktreePath, ["add", "-A"]);
+			fs.writeFileSync(path.join(worktree.worktreePath, "same.txt"), "C\n");
+			fs.writeFileSync(path.join(worktree.worktreePath, "untracked.txt"), "untracked\n");
+			const exported = exportIsolatedGitBundle(runtime, { outputDir: bundles, worktree, agent: "writer", commitRequired: true });
+			assert.ok(exported.stagedSnapshot);
+			assert.ok(exported.recovery);
+			const metadata = JSON.parse(exported.portableMetadata) as { stagedSnapshot?: string; stagedTree?: string; recovery?: string; recoveryTree?: string; payloadRefs: string[]; commits: Array<{ id: string; subject: string }> };
+			assert.equal(metadata.stagedSnapshot, exported.stagedSnapshot);
+			assert.equal(metadata.recovery, exported.recovery);
+			assert.equal(metadata.stagedTree, git(worktree.worktreePath, ["rev-parse", `${exported.stagedSnapshot}^{tree}`]));
+			assert.equal(metadata.recoveryTree, git(worktree.worktreePath, ["rev-parse", `${exported.recovery}^{tree}`]));
+			assert.ok(metadata.payloadRefs.includes("refs/isolated/staged-0"));
+			assert.ok(metadata.payloadRefs.includes("refs/isolated/recovery-0"));
+			assert.equal(metadata.commits.some((commit) => /packaging|snapshot/i.test(commit.subject)), false);
+			const staged = spawnSync("git", ["-C", worktree.worktreePath, "cat-file", "blob", `${exported.stagedSnapshot}:same.txt`], { encoding: "utf8" });
+			const final = spawnSync("git", ["-C", worktree.worktreePath, "cat-file", "blob", `${exported.recovery}:same.txt`], { encoding: "utf8" });
+			assert.equal(staged.stdout, "B\n");
+			assert.equal(final.stdout, "C\n");
+			const stagedBinary = spawnSync("git", ["-C", worktree.worktreePath, "cat-file", "blob", `${exported.stagedSnapshot}:binary.bin`], { encoding: null });
+			assert.deepEqual(stagedBinary.stdout, Buffer.from([255, 4, 5, 6]));
+			assert.equal(git(worktree.worktreePath, ["cat-file", "-t", `${exported.recovery}:link`]), "blob");
+			const verify = spawnSync("git", ["bundle", "verify", exported.path], { cwd: repo, encoding: "utf8" });
+			assert.equal(verify.status, 0, verify.stderr || verify.stdout);
+			const reconstructed = path.join(root, "reconstructed");
+			assert.equal(spawnSync("git", ["clone", repo, reconstructed], { encoding: "utf8" }).status, 0);
+			assert.equal(spawnSync("git", ["-C", reconstructed, "fetch", exported.path, "refs/isolated/staged-0:refs/reconstructed/staged", "refs/isolated/recovery-0:refs/reconstructed/worktree"], { encoding: "utf8" }).status, 0);
+			assert.equal(git(reconstructed, ["cat-file", "blob", "refs/reconstructed/staged:same.txt"]), "B");
+			assert.equal(git(reconstructed, ["cat-file", "blob", "refs/reconstructed/worktree:same.txt"]), "C");
+		} finally {
+			await cleanupTestRuntime(runtime);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("packages dirty Git-visible state as an internal recovery snapshot while excluding ignored and synthetic files", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-recovery-test-"));
+		const repo = path.join(root, "parent");
+		const bundleDir = path.join(root, "bundles");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "binary.bin"), Buffer.from([0, 1, 2, 255]));
+		fs.writeFileSync(path.join(repo, "executable.sh"), "#!/bin/sh\nexit 0\n");
+		fs.chmodSync(path.join(repo, "executable.sh"), 0o755);
+		fs.writeFileSync(path.join(repo, "deleted.txt"), "delete me\n");
+		fs.writeFileSync(path.join(repo, "staged.txt"), "staged base\n");
+		fs.writeFileSync(path.join(repo, "link-target"), "target\n");
+		fs.symlinkSync("link-target", path.join(repo, "tracked-link"));
+		fs.writeFileSync(path.join(repo, ".gitignore"), "ignored.txt\n");
+		git(repo, ["add", "."]);
+		git(repo, ["commit", "-m", "base"]);
+
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "recovery" });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0 });
+		try {
+			fs.writeFileSync(path.join(worktree.worktreePath, "binary.bin"), Buffer.from([255, 0, 3, 4]));
+			fs.chmodSync(path.join(worktree.worktreePath, "executable.sh"), 0o644);
+			fs.rmSync(path.join(worktree.worktreePath, "deleted.txt"));
+			fs.writeFileSync(path.join(worktree.worktreePath, "untracked.txt"), "authored\n");
+			fs.writeFileSync(path.join(worktree.worktreePath, "new-executable.sh"), "#!/bin/sh\nexit 0\n");
+			fs.chmodSync(path.join(worktree.worktreePath, "new-executable.sh"), 0o755);
+			fs.writeFileSync(path.join(worktree.worktreePath, "staged.txt"), "staged replacement\n");
+			git(worktree.worktreePath, ["add", "staged.txt"]);
+			fs.writeFileSync(path.join(worktree.worktreePath, "ignored.txt"), "runtime cache\n");
+			fs.writeFileSync(path.join(worktree.worktreePath, "synthetic.txt"), "setup output\n");
+			worktree.syntheticPaths.push("synthetic.txt");
+			git(worktree.worktreePath, ["add", "--force", "synthetic.txt"]);
+			const liveIndexBeforeExport = gitRaw(worktree.worktreePath, ["ls-files", "--stage"]);
+			fs.writeFileSync(path.join(worktree.worktreePath, "new-link-target"), "new target\n");
+			fs.rmSync(path.join(worktree.worktreePath, "tracked-link"));
+			fs.symlinkSync("new-link-target", path.join(worktree.worktreePath, "tracked-link"));
+			const exported = exportIsolatedGitBundle(runtime, {
+				outputDir: bundleDir,
+				worktree,
+				terminationState: "failure",
+				agent: "writer",
+				commitRequired: true,
+			});
+			assert.ok(exported.recovery, "dirty state should have an internal recovery commit");
+			assert.equal(exported.terminationState, "failure");
+			assert.equal(exported.incomplete, true, "dirty state without authored commit is incomplete");
+			assert.equal(fs.statSync(bundleDir).mode & 0o077, 0, "bundle directory must be owner-only");
+			assert.equal(fs.statSync(exported.path).mode & 0o077, 0, "bundle must be owner-only");
+			const metadata = JSON.parse(exported.portableMetadata) as { recovery?: string; stagedSnapshot?: string; dirtySummary: string; bundle: { checksumScope: string; canonicalChecksum: string; canonicalSize: number }; payloadRefs: string[]; canonicalPayloadChecksum: string; canonicalPayloadSize: number; bundleSize: number; payloadSize: number; payloadChecksum: string; terminationState: string };
+			assert.equal(metadata.recovery, exported.recovery);
+			assert.ok(metadata.stagedSnapshot, "legitimate staged state should remain reconstructable");
+			assert.equal(gitRaw(worktree.worktreePath, ["ls-files", "--stage"]), liveIndexBeforeExport, "packaging must not mutate the live child index");
+			assert.equal(metadata.payloadSize, metadata.bundleSize);
+			assert.equal(metadata.payloadChecksum, metadata.bundle.checksum);
+			assert.equal(metadata.bundle.checksumScope, "payload");
+			const canonical = metadata.payloadRefs.slice().sort().map((ref) => `${ref}\0${git(worktree.worktreePath, ["rev-parse", ref])}\n`).join("");
+			assert.equal(metadata.canonicalPayloadChecksum, createHash("sha256").update(canonical).digest("hex"));
+			assert.equal(metadata.canonicalPayloadSize, Buffer.byteLength(canonical));
+			assert.equal(metadata.bundle.canonicalChecksum, metadata.canonicalPayloadChecksum);
+			assert.equal(metadata.bundle.canonicalSize, metadata.canonicalPayloadSize);
+			assert.equal(metadata.terminationState, "failure");
+			assert.match(metadata.dirtySummary, /binary\.bin/);
+			assert.doesNotMatch(metadata.dirtySummary, /ignored|synthetic/);
+			const stagedTree = git(worktree.worktreePath, ["ls-tree", "-r", "--name-only", exported.stagedSnapshot!]).split("\n").filter(Boolean);
+			assert.equal(stagedTree.includes("synthetic.txt"), false);
+			const recoveryTree = git(worktree.worktreePath, ["ls-tree", "-r", "--name-only", exported.recovery!]).split("\n").filter(Boolean);
+			assert.ok(recoveryTree.includes("untracked.txt"));
+			assert.ok(recoveryTree.includes("staged.txt"));
+			assert.ok(recoveryTree.includes("new-executable.sh"));
+			assert.ok(recoveryTree.includes("tracked-link"));
+			assert.equal(git(worktree.worktreePath, ["ls-tree", exported.recovery!, "executable.sh"]).split(" ")[0], "100644");
+			assert.equal(git(worktree.worktreePath, ["ls-tree", exported.recovery!, "new-executable.sh"]).split(" ")[0], "100755");
+			assert.equal(git(worktree.worktreePath, ["ls-tree", exported.recovery!, "tracked-link"]).split(" ")[0], "120000");
+			assert.equal(git(worktree.worktreePath, ["cat-file", "blob", `${exported.recovery}:tracked-link`]), "new-link-target");
+			assert.ok(!recoveryTree.includes("ignored.txt"));
+			assert.ok(!recoveryTree.includes("synthetic.txt"));
+			const recoveredBinary = spawnSync("git", ["-C", worktree.worktreePath, "cat-file", "blob", `${exported.recovery}:binary.bin`], { encoding: null });
+			assert.equal(recoveredBinary.status, 0, recoveredBinary.stderr?.toString());
+			assert.deepEqual(recoveredBinary.stdout, Buffer.from([255, 0, 3, 4]));
+			assert.equal(spawnSync("git", ["bundle", "verify", exported.path], { cwd: repo, encoding: "utf8" }).status, 0);
+		} finally {
+			await cleanupTestRuntime(runtime);
+		}
+	});
+
+	it("treats wildcard-like synthetic filenames literally in staged and recovery refs", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-literal-synthetic-test-"));
+		const repo = path.join(root, "parent");
+		const bundleDir = path.join(root, "bundles");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\\n");
+		git(repo, ["add", "base.txt"]);
+		git(repo, ["commit", "-m", "base"]);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "literal-synthetic" });
+		const synthetic = "cache[*].txt";
+		const sibling = "cache-a.txt";
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0, agent: "writer" });
+		try {
+			fs.writeFileSync(path.join(worktree.worktreePath, synthetic), "synthetic\\n");
+			fs.writeFileSync(path.join(worktree.worktreePath, sibling), "user\\n");
+			fs.writeFileSync(path.join(worktree.worktreePath, "recovery-only.txt"), "recovery\\n");
+			git(worktree.worktreePath, ["--literal-pathspecs", "add", "--force", "--", synthetic, sibling]);
+			worktree.syntheticPaths.push(synthetic);
+			const exported = exportIsolatedGitBundle(runtime, { outputDir: bundleDir, worktree, terminationState: "failure" });
+			const staged = exported.stagedSnapshot ? git(worktree.worktreePath, ["ls-tree", "-r", "--name-only", exported.stagedSnapshot]).split("\n").filter(Boolean) : [];
+			const recovery = exported.recovery ? git(worktree.worktreePath, ["ls-tree", "-r", "--name-only", exported.recovery]).split("\n").filter(Boolean) : [];
+			assert.equal(staged.includes(synthetic), false);
+			assert.equal(recovery.includes(synthetic), false);
+			assert.equal(recovery.includes(sibling), true, "literal filtering must not over-exclude the sibling filename");
+		} finally {
+			await cleanupTestRuntime(runtime);
+		}
+	});
+
+	it("wires production setup-hook synthetic paths into isolated recovery export", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-hook-test-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\\n");
+		git(repo, ["add", "."]);
+		git(repo, ["commit", "-m", "base"]);
+		const hookPath = path.join(root, "setup-hook.mjs");
+		fs.writeFileSync(hookPath, [
+			'#!/usr/bin/env node',
+			'import * as fs from "node:fs";',
+			'const input = JSON.parse(fs.readFileSync(0, "utf8"));',
+		'fs.writeFileSync(`${input.worktreePath}/.runtime-cache`, "generated\\n");',
+		'process.stdout.write(JSON.stringify({ syntheticPaths: [".runtime-cache"] }));',
+		].join("\n"));
+		fs.chmodSync(hookPath, 0o755);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "hook-synthetic", worktreeSetupHook: { hookPath } });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0, agent: "writer" });
+		try {
+			assert.deepEqual(worktree.syntheticPaths, [".runtime-cache"]);
+			const exported = exportIsolatedGitBundle(runtime, { outputDir: path.join(root, "bundles"), worktree, terminationState: "failure", commitRequired: true });
+			assert.equal(exported.dirtySummary, "");
+			assert.equal(exported.recovery, undefined);
+		} finally {
+			await cleanupTestRuntime(runtime);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("materializes hook-failure recovery slots without rerunning the hook", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-recovery-slots-test-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+		git(repo, ["add", "."]);
+		git(repo, ["commit", "-m", "base"]);
+		const hookPath = path.join(root, "setup-hook.mjs");
+		const hookLog = path.join(root, "hook.log");
+		fs.writeFileSync(hookPath, [
+			"#!/usr/bin/env node",
+			'import * as fs from "node:fs";',
+			"const input = JSON.parse(fs.readFileSync(0, 'utf8'));",
+			`fs.appendFileSync(${JSON.stringify(hookLog)}, String(input.index) + "\\n");`,
+			"if (input.index === 1) { fs.writeFileSync(input.worktreePath + '/hook-edit.txt', 'partial\\n'); process.exit(23); }",
+			"process.stdout.write(JSON.stringify({ syntheticPaths: [] }));",
+		].join("\n"));
+		fs.chmodSync(hookPath, 0o755);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "recovery-slots", worktreeSetupHook: { hookPath } });
+		try {
+			const slotA = createIsolatedGitWorktree(runtime, { index: 0, agent: "a" });
+			assert.throws(() => createIsolatedGitWorktree(runtime, { index: 1, agent: "b" }), /exit code 23/);
+			const slotB = runtime.worktrees.find((worktree) => worktree.index === 1);
+			assert.ok(slotB, "failed hook slot must remain registered for recovery");
+			const slotC = runtime.createRecoveryWorktree({ index: 2, agent: "c" });
+			assert.deepEqual(fs.readFileSync(hookLog, "utf8").trim().split("\n"), ["0", "1"]);
+			const outputDir = path.join(root, "bundles");
+			const bundles = [slotA, slotB, slotC].map((worktree) => exportIsolatedGitBundle(runtime, {
+				outputDir,
+				worktree,
+				terminationState: "execution-rejected",
+				agent: worktree.index === 0 ? "a" : worktree.index === 1 ? "b" : "c",
+				commitRequired: true,
+			}));
+			assert.deepEqual(bundles.map((bundle) => bundle.terminationState), ["execution-rejected", "execution-rejected", "execution-rejected"]);
+			assert.equal(bundles[0]?.incomplete, true);
+			assert.equal(bundles[2]?.incomplete, true);
+			assert.ok(bundles[1]?.recovery, "partial hook edits must be retained in B recovery");
+			assert.match(git(slotB!.worktreePath, ["ls-tree", "-r", "--name-only", bundles[1]!.recovery!]), /hook-edit\.txt/);
+		} finally {
+			await cleanupTestRuntime(runtime);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("marks a commit-required clean no-change export incomplete without discarding the bundle", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-no-change-test-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+		git(repo, ["add", "."]);
+		git(repo, ["commit", "-m", "base"]);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "no-change" });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0 });
+		try {
+			const exported = exportIsolatedGitBundle(runtime, { outputDir: path.join(root, "bundles"), worktree, terminationState: "success", agent: "writer", commitRequired: true });
+			assert.equal(exported.incomplete, true);
+			assert.equal(JSON.parse(exported.portableMetadata).incomplete, true);
+		} finally {
+			await cleanupTestRuntime(runtime);
+		}
+	});
+
+	it("does not mark non-commit-required dirty recovery incomplete", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-review-dirty-test-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+		git(repo, ["add", "."]);
+		git(repo, ["commit", "-m", "base"]);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "review-dirty" });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0, agent: "reviewer" });
+		try {
+			fs.writeFileSync(path.join(worktree.worktreePath, "review.txt"), "review recovery\n");
+			const bundle = exportIsolatedGitBundle(runtime, { outputDir: path.join(root, "bundles"), worktree, agent: "reviewer" });
+			assert.ok(bundle.recovery);
+			assert.equal(bundle.incomplete, false);
+			assert.equal(JSON.parse(bundle.portableMetadata).incomplete, false);
+		} finally {
+			await cleanupTestRuntime(runtime);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves the isolated runtime when bundle creation fails", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-export-failure-test-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+		git(repo, ["add", "."]);
+		git(repo, ["commit", "-m", "base"]);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "export-failure" });
+		const worktree = createIsolatedGitWorktree(runtime, { index: 0 });
+		const outputFile = path.join(root, "not-a-directory");
+		fs.writeFileSync(outputFile, "occupied");
+		try {
+			assert.throws(() => exportIsolatedGitBundle(runtime, { outputDir: outputFile, worktree, terminationState: "failure" }));
+			assert.equal(runtime.exportFailed, true);
+			await cleanupIsolatedGitRuntime(runtime);
+			assert.equal(fs.existsSync(runtime.root), true, "failed export must preserve an actionable runtime path");
+		} finally {
+			await cleanupTestRuntime(runtime);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not clean up an unexported runtime worktree", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-cleanup-gate-test-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Parent Author"]);
+		git(repo, ["config", "user.email", "parent@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+		git(repo, ["add", "base.txt"]);
+		git(repo, ["commit", "-m", "base"]);
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId: "cleanup-gate" });
+		createIsolatedGitWorktree(runtime, { index: 0 });
+		try {
+			await cleanupIsolatedGitRuntime(runtime);
+			assert.equal(fs.existsSync(runtime.root), true);
+		} finally {
+			await cleanupTestRuntime(runtime);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolated Git termination matrix preserves every terminal state in portable metadata", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-termination-matrix-"));
+		const repo = path.join(root, "parent");
+		fs.mkdirSync(repo);
+		git(repo, ["init", "--initial-branch=main"]);
+		git(repo, ["config", "user.name", "Matrix Parent"]);
+		git(repo, ["config", "user.email", "matrix@example.invalid"]);
+		fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+		git(repo, ["add", "base.txt"]);
+		git(repo, ["commit", "-m", "base"]);
+		const states = ["success", "failure", "timeout", "cancelled", "execution-rejected", "interrupted", "unknown"] as const;
+		for (const state of states) {
+			const runtime = createIsolatedGitRuntime({ cwd: repo, runId: `termination-${state}` });
+			const worktree = createIsolatedGitWorktree(runtime, { index: 0, agent: "matrix" });
+			try {
+				const bundle = exportIsolatedGitBundle(runtime, {
+					outputDir: path.join(root, "bundles", state),
+					worktree,
+					terminationState: state,
+					agent: "matrix",
+				});
+				assert.equal(bundle.terminationState, state);
+				assert.equal(JSON.parse(bundle.portableMetadata).terminationState, state);
+			} finally {
+				await cleanupTestRuntime(runtime);
+			}
+		}
+	});
+
+	it("keeps bundle paths collision-proof across runtimes sharing run metadata", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-collision-test-"));
 		const repo = path.join(root, "parent");
 		const bundleDir = path.join(root, "bundles");
@@ -637,11 +1086,11 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 				assert.equal(verify.status, 0, verify.stderr || verify.stdout);
 			}
 		} finally {
-			for (const runtime of runtimes) cleanupIsolatedGitRuntime(runtime);
+			for (const runtime of runtimes) await cleanupTestRuntime(runtime);
 		}
 	});
 
-	it("exports distinct bundles for multiple isolated worktrees in one runtime", () => {
+	it("exports distinct bundles for multiple isolated worktrees in one runtime", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-isolated-git-multi-test-"));
 		const repo = path.join(root, "parent");
 		const bundleDir = path.join(root, "bundles");
@@ -671,7 +1120,7 @@ describe("isolated Git commits", { skip: !hasBubblewrap }, () => {
 				assert.equal(createHash("sha256").update(fs.readFileSync(bundle.path)).digest("hex"), bundle.checksum);
 			}
 		} finally {
-			cleanupIsolatedGitRuntime(runtime);
+			await cleanupTestRuntime(runtime);
 		}
 	});
 });

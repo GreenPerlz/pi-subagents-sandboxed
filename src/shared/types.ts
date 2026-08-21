@@ -32,7 +32,7 @@ export interface ChainOutputMapEntry {
 
 export type ChainOutputMap = Record<string, ChainOutputMapEntry>;
 
-export type WorkflowNodeStatus = "pending" | "running" | "completed" | "failed" | "paused" | "detached";
+export type WorkflowNodeStatus = "pending" | "running" | "completed" | "failed" | "paused" | "cancelled" | "detached";
 
 export interface WorkflowGraphNode {
 	id: string;
@@ -144,7 +144,7 @@ export interface ControlEvent {
 	recentFailureSummary?: string;
 }
 
-export type SubagentResultStatus = "completed" | "failed" | "paused" | "detached";
+export type SubagentResultStatus = "completed" | "failed" | "paused" | "cancelled" | "detached";
 export type SubagentRunMode = "single" | "parallel" | "chain";
 
 export type PublicNestedStepSummary = Pick<
@@ -156,7 +156,7 @@ export type PublicNestedStepSummary = Pick<
 
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "model" | "fastMode" | "totalTokens" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "summary"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "model" | "fastMode" | "totalTokens" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "summary" | "teardownUnproven"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -172,6 +172,11 @@ export interface SubagentResultIntercomChild {
 	gitBundle?: GitBundleResult;
 	sessionPath?: string;
 	intercomTarget?: string;
+	/** Identity for an unindexed group diagnostic. */
+	groupId?: string;
+	unindexed?: boolean;
+	/** Process-group teardown was not proven; this child remains actionable. */
+	teardownUnproven?: boolean;
 	children?: PublicNestedRunSummary[];
 }
 
@@ -203,7 +208,7 @@ export interface SubagentResultIntercomPayload {
 export interface AgentProgress {
 	index: number;
 	agent: string;
-	status: "pending" | "running" | "completed" | "failed" | "detached";
+	status: "pending" | "running" | "completed" | "failed" | "cancelled" | "detached";
 	activityState?: ActivityState;
 	task: string;
 	skills?: string[];
@@ -423,15 +428,33 @@ export interface GitBundleResult {
 	base: string;
 	head: string;
 	commitSummary: string;
+	recovery?: string;
+	stagedSnapshot?: string;
+	stagedTree?: string;
+	recoveryTree?: string;
+	terminationState?: "success" | "failure" | "timeout" | "cancelled" | "execution-rejected" | "interrupted" | "unknown";
+	incomplete?: boolean;
+	dirtySummary?: string;
+	bundleSize?: number;
+	payloadChecksum?: string;
+	payloadSize?: number;
+	canonicalPayloadChecksum?: string;
+	canonicalPayloadSize?: number;
+	portableMetadata?: string;
 }
 
 export interface SingleResult {
+	/** Final materialized workflow position; stable across completion order. */
+	flatIndex?: number;
+	/** Identity for an unindexed group diagnostic (never a child slot). */
+	groupId?: string;
 	agent: string;
 	task: string;
 	exitCode: number;
 	detached?: boolean;
 	detachedReason?: string;
 	interrupted?: boolean;
+	cancelled?: boolean;
 	messages?: Message[];
 	usage: Usage;
 	model?: string;
@@ -461,6 +484,8 @@ export interface SingleResult {
 	acceptance?: AcceptanceLedger;
 	sandbox?: SandboxResultDetails;
 	gitBundle?: GitBundleResult;
+	/** Process-group teardown was not proven; do not publish a terminal nested event. */
+	teardownUnproven?: boolean;
 }
 
 export interface Details {
@@ -489,6 +514,10 @@ export interface Details {
 	currentStepIndex?: number;   // 0-indexed current step (for running chains)
 	workflowGraph?: WorkflowGraphSnapshot;
 	outputs?: ChainOutputMap;
+	/** Unindexed dynamic aggregate diagnostics for foreground/status consumers. */
+	groupDiagnostics?: Array<{ groupId: string; unindexed: true; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string; finalOutput?: string }>;
+	/** Cleanup/teardown could not be proven; nested projection must remain live. */
+	teardownUnproven?: boolean;
 }
 
 // ============================================================================
@@ -521,7 +550,7 @@ export interface AsyncParallelGroupStatus {
 	stepIndex: number;
 }
 
-export type NestedRunState = "queued" | "running" | "complete" | "failed" | "paused";
+export type NestedRunState = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
 export type NestedOwnerState = "live" | "gone" | "unknown";
 
 export interface NestedRunAddress {
@@ -535,7 +564,7 @@ export interface NestedRunAddress {
 
 export interface NestedStepSummary {
 	agent: string;
-	status: "pending" | "running" | "complete" | "completed" | "failed" | "paused";
+	status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "cancelled";
 	sessionFile?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
@@ -551,6 +580,7 @@ export interface NestedStepSummary {
 	startedAt?: number;
 	endedAt?: number;
 	error?: string;
+	teardownUnproven?: boolean;
 	children?: NestedRunSummary[];
 }
 
@@ -590,6 +620,8 @@ export interface NestedRunSummary extends NestedRunAddress {
 	lastUpdate?: number;
 	error?: string;
 	summary?: string;
+	/** Teardown/fence was not proven; this child must remain nonterminal. */
+	teardownUnproven?: boolean;
 }
 
 export interface NestedRouteInfo {
@@ -603,6 +635,10 @@ export interface AsyncStartedEvent {
 	id?: string;
 	asyncDir?: string;
 	pid?: number;
+	/** Exact persisted runner identity is captured before this event is emitted. */
+	runnerIdentity?: string;
+	runnerStartToken?: string;
+	runnerUid?: number;
 	sessionId?: string;
 	mode?: SubagentRunMode;
 	agent?: string;
@@ -610,6 +646,7 @@ export interface AsyncStartedEvent {
 	chain?: string[];
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
+	groupDiagnostics?: NonNullable<AsyncStatus["groupDiagnostics"]>;
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
 }
@@ -618,10 +655,16 @@ export interface AsyncStatus {
 	runId: string;
 	sessionId?: string;
 	mode: SubagentRunMode;
-	state: "queued" | "running" | "complete" | "failed" | "paused";
+	state: "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
+	/** Stale reconciliation could not prove a terminal isolated outcome; recovery remains incomplete. */
+	incomplete?: boolean;
 	error?: string;
 	/** Unexpected async worktree execution/lifecycle failures that must override child success. */
 	worktreeExecutionError?: string;
+	/** Canonical top-level final output persisted by the runner. */
+	finalOutput?: string;
+	/** Process-group teardown was not proven; keep nested projection live. */
+	teardownUnproven?: boolean;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -634,18 +677,30 @@ export interface AsyncStatus {
 	lastUpdate?: number;
 	pid?: number;
 	ownerPid?: number;
+	/** Stable runner identity used to reject reused persisted PIDs. */
+	runnerIdentity?: string;
+	/** Exact Linux process start token and UID captured for persisted PID checks. */
+	runnerStartToken?: string;
+	runnerUid?: number;
+	/** Owner identity used by the detached runner's direct-parent liveness gate. */
+	ownerStartToken?: string;
 	cwd?: string;
 	currentStep?: number;
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
+	/** Unindexed dynamic aggregate diagnostics; never consume child slots. */
+	groupDiagnostics?: Array<{ groupId: string; unindexed: true; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string; finalOutput?: string }>;
 	workflowGraph?: WorkflowGraphSnapshot;
 	steps?: Array<{
+		/** Canonical indexed child identity; diagnostics must not consume slots. */
+		flatIndex?: number;
+		groupId?: string;
 		agent: string;
 		phase?: string;
 		label?: string;
 		outputName?: string;
 		structured?: boolean;
-		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused";
+		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "cancelled";
 		children?: NestedRunSummary[];
 		sessionFile?: string;
 		activityState?: ActivityState;
@@ -670,12 +725,17 @@ export interface AsyncStatus {
 		attemptedModels?: string[];
 		modelAttempts?: ModelAttempt[];
 		error?: string;
+		success?: boolean;
+		finalOutput?: string;
+		interrupted?: boolean;
+		cancelled?: boolean;
 		structuredOutput?: unknown;
 		structuredOutputPath?: string;
 		structuredOutputSchemaPath?: string;
 		acceptance?: AcceptanceLedger;
 		sandbox?: SandboxResultDetails;
 		gitBundle?: GitBundleResult;
+		teardownUnproven?: boolean;
 	}>;
 	sessionDir?: string;
 	outputFile?: string;
@@ -691,7 +751,8 @@ export type AsyncJobStep = NonNullable<AsyncStatus["steps"]>[number] & {
 export interface AsyncJobState {
 	asyncId: string;
 	asyncDir: string;
-	status: "queued" | "running" | "complete" | "failed" | "paused";
+	status: "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
+	teardownUnproven?: boolean;
 	pid?: number;
 	sessionId?: string;
 	activityState?: ActivityState;
@@ -706,6 +767,8 @@ export interface AsyncJobState {
 	currentStep?: number;
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
+	/** Completed/failed logical fanout groups remain visible without child slots. */
+	groupDiagnostics?: NonNullable<AsyncStatus["groupDiagnostics"]>;
 	steps?: AsyncJobStep[];
 	stepsTotal?: number;
 	runningSteps?: number;
@@ -726,9 +789,19 @@ export interface AsyncJobState {
 export interface ForegroundResumeChild {
 	agent: string;
 	index: number;
+	/** Group diagnostics are unindexed and must never be a resume slot. */
+	groupId?: string;
+	unindexed?: boolean;
 	sessionFile?: string;
 	artifactPath?: string;
 	status: SubagentResultStatus;
+	exitCode?: number;
+	success?: boolean;
+	error?: string;
+	finalOutput?: string;
+	interrupted?: boolean;
+	cancelled?: boolean;
+	gitBundle?: GitBundleResult;
 	model?: string;
 	thinking?: string;
 	fastMode?: FastModeStatus;
@@ -742,6 +815,7 @@ export interface ForegroundResumeRun {
 	startedAt?: number;
 	updatedAt: number;
 	children: ForegroundResumeChild[];
+	teardownUnproven?: boolean;
 	nestedChildren?: NestedRunSummary[];
 }
 
@@ -772,6 +846,9 @@ export interface SubagentState {
 		nestedRoute?: NestedRouteInfo;
 		nestedChildren?: NestedRunSummary[];
 		interrupt?: () => boolean;
+		interruptRequested?: boolean;
+		/** Internal active-child registrations; interrupt remains the public dispatcher. */
+		interruptHandlers?: Set<() => boolean>;
 	}>;
 	lastForegroundControlId: string | null;
 	pendingForegroundControlNotices?: Map<string, ReturnType<typeof setTimeout>>;
@@ -835,6 +912,10 @@ export interface RunSyncOptions {
 	signal?: AbortSignal;
 	interruptSignal?: AbortSignal;
 	allowIntercomDetach?: boolean;
+	/** Called when intercom detachment is explicitly acknowledged, before the result promise settles. */
+	onDetachedStarted?: (result: SingleResult) => void;
+	/** Called after a detached child process actually reaches terminal close. */
+	onDetachedTerminal?: (result: SingleResult) => void | Promise<void>;
 	intercomEvents?: IntercomEventBus;
 	onUpdate?: (r: import("@earendil-works/pi-agent-core").AgentToolResult<Details>) => void;
 	onControlEvent?: (event: ControlEvent) => void;
@@ -854,14 +935,18 @@ export interface RunSyncOptions {
 	outputMode?: OutputMode;
 	maxSubagentDepth?: number;
 	nestedRoute?: NestedRouteInfo;
+	/** Internal lifecycle test seam; production callers leave this unset. */
+	nestedFenceTimeoutMs?: number;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
 	/** Request the provider priority service tier; eligibility is evaluated per candidate. */
 	fastMode?: boolean;
 	/** Runtime-managed isolated Git worktree. Isolated mode never infers this from a path. */
 	isolatedGit?: import("../sandbox/isolated-git.ts").IsolatedGitWorktree;
-	/** Destination for the single successful-run isolated Git bundle. */
+	/** Destination for the terminal isolated Git bundle. */
 	isolatedGitBundleDir?: string;
+	/** Isolated writer semantics require an authored child commit. */
+	isolatedGitCommitRequired?: boolean;
 	/** Internal continuation guard: finalization turns must not export twice. */
 	exportIsolatedGitBundle?: boolean;
 	/** Registry models available for heuristic bare-model resolution and provider trust checks. */

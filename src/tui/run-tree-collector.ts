@@ -24,12 +24,13 @@ import {
 	type TokenUsage,
 } from "../shared/types.ts";
 import type { FastModeStatus } from "../shared/fast-mode.ts";
+import { resolveAggregateState } from "../shared/aggregate-state.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-export type OverlayRunState = "running" | "complete" | "failed" | "paused" | "queued";
+export type OverlayRunState = "running" | "complete" | "failed" | "paused" | "cancelled" | "queued";
 
 export interface OverlayNestedChild {
 	id: string;
@@ -49,23 +50,45 @@ export interface OverlayNestedChild {
 	asyncDir?: string;
 	children: OverlayNestedChild[];
 	steps?: OverlayStep[];
+	teardownUnproven?: boolean;
 }
 
 export interface OverlayStep {
 	agent: string;
 	state: OverlayRunState;
+	/** Set only for non-positional group diagnostics; never a child index. */
+	groupId?: string;
+	unindexed?: boolean;
 	currentTool?: string;
 	elapsed?: string;
 	startedAt?: number;
 	model?: string;
 	thinking?: string;
 	fastMode?: FastModeStatus;
+	error?: string;
+	success?: boolean;
+	finalOutput?: string;
+	interrupted?: boolean;
+	cancelled?: boolean;
+	gitBundle?: unknown;
 	tokens?: TokenUsage;
 	sessionFile?: string;
 	logPath?: string;
 	artifactPath?: string;
 	asyncDir?: string;
 	children: OverlayNestedChild[];
+}
+
+/** A group-level failure/diagnostic has identity but deliberately no child index. */
+export interface OverlayGroupDiagnostic {
+	groupId: string;
+	unindexed: true;
+	agent: string;
+	state: OverlayRunState;
+	error?: string;
+	finalOutput?: string;
+	gitBundle?: unknown;
+	teardownUnproven?: boolean;
 }
 
 export interface OverlayRun {
@@ -88,6 +111,7 @@ export interface OverlayRun {
 	artifactPath?: string;
 	asyncDir?: string;
 	steps: OverlayStep[];
+	groupDiagnostics?: OverlayGroupDiagnostic[];
 }
 
 export interface CollectRunTreeOptions {
@@ -107,8 +131,19 @@ const DEFAULT_PERSISTED_ASYNC_LIMIT = 25;
 const DEFAULT_PERSISTED_FOREGROUND_LIMIT = 25;
 
 interface PersistedResultChild {
+	groupId?: string;
+	index?: number;
 	agent?: string;
 	state: OverlayRunState;
+	status?: string;
+	error?: string;
+	success?: boolean;
+	finalOutput?: string;
+	/** Legacy result files used output; canonical persisted field is finalOutput. */
+	output?: string;
+	interrupted?: boolean;
+	cancelled?: boolean;
+	gitBundle?: unknown;
 	sessionFile?: string;
 	artifactPath?: string;
 	model?: string;
@@ -129,27 +164,41 @@ interface PersistedResultRecord {
 	children: PersistedResultChild[];
 }
 
+function mapGroupDiagnostic(child: { groupId?: string; agent?: string; state?: string; status?: string; error?: string; finalOutput?: string; gitBundle?: unknown }): OverlayGroupDiagnostic | undefined {
+	if (!child.groupId) return undefined;
+	return {
+		groupId: child.groupId,
+		unindexed: true,
+		agent: child.agent ?? child.groupId,
+		state: mapState(child.state ?? child.status ?? "failed"),
+		error: child.error,
+		finalOutput: child.finalOutput,
+		gitBundle: child.gitBundle,
+	};
+}
+
 function mapState(state: string): OverlayRunState {
 	if (state === "running" || state === "queued") return state as OverlayRunState;
 	if (state === "complete" || state === "completed") return "complete";
 	if (state === "paused") return "paused";
+	if (state === "cancelled") return "cancelled";
 	if (state === "failed") return "failed";
 	if (state === "pending") return "queued";
 	return "complete";
 }
 
-function deriveRunState(topLevel: OverlayRunState, steps: OverlayStep[], nestedChildren: OverlayNestedChild[] = []): OverlayRunState {
-	const allStates = new Set<OverlayRunState>([
-		topLevel,
-		...steps.map((s) => s.state),
-		...steps.flatMap((s) => s.children).map((c) => c.state),
-		...nestedChildren.map((c) => c.state),
-	]);
-	if (allStates.has("running")) return "running";
-	if (allStates.has("failed")) return "failed";
-	if (allStates.has("paused")) return "paused";
-	if (allStates.has("queued")) return "queued";
-	return topLevel;
+function deriveRunState(topLevel: OverlayRunState, steps: OverlayStep[], nestedChildren: OverlayNestedChild[] = [], teardownUnproven = false): OverlayRunState {
+	const values = [
+		{ state: topLevel, teardownUnproven },
+		...steps.map((step) => ({ state: step.state, teardownUnproven: step.teardownUnproven })),
+		...steps.flatMap((s) => s.children).map((child) => ({ state: child.state, teardownUnproven: child.teardownUnproven })),
+		...nestedChildren.map((child) => ({ state: child.state, teardownUnproven: child.teardownUnproven })),
+	];
+	const state = resolveAggregateState(values);
+	if (state === "failed" || state === "cancelled" || state === "paused") return state;
+	if (values.some((value) => value.state === "running")) return "running";
+	if (values.some((value) => value.state === "queued" || value.state === "pending")) return "queued";
+	return state === "completed" ? "complete" : state;
 }
 
 function elapsedFromMs(ms: number | undefined): string | undefined {
@@ -227,7 +276,7 @@ function mapNestedRunWithStaleState(run: NestedRunSummary, fallbackState?: Overl
 		};
 	});
 	const directChildren: OverlayNestedChild[] = (run.children ?? []).map((child) => mapNestedRunWithStaleState(child, fallbackState, freezeAt));
-	const derivedState = deriveRunState(runMappedState, steps, directChildren);
+	const derivedState = deriveRunState(runMappedState, steps, directChildren, run.teardownUnproven === true);
 	return {
 		id: run.id,
 		agent: run.agent ?? run.agents?.join(", ") ?? run.id,
@@ -244,6 +293,7 @@ function mapNestedRunWithStaleState(run: NestedRunSummary, fallbackState?: Overl
 		asyncDir: run.asyncDir,
 		children: directChildren,
 		steps: steps.length ? steps : undefined,
+		...(run.teardownUnproven ? { teardownUnproven: true } : {}),
 	};
 }
 
@@ -311,16 +361,19 @@ function modeValue(value: unknown, childCount: number): SubagentRunMode {
 }
 
 function resultStateValue(state: unknown, success: unknown): OverlayRunState {
-	if (state === "queued" || state === "running" || state === "paused" || state === "failed" || state === "complete" || state === "completed") {
+	if (state === "queued" || state === "running" || state === "paused" || state === "cancelled" || state === "failed" || state === "complete" || state === "completed") {
 		return mapState(state);
 	}
 	if (typeof success === "boolean") return success ? "complete" : "failed";
 	return "complete";
 }
 
-function childResultStateValue(parentState: unknown, success: unknown): OverlayRunState {
-	if (parentState === "paused" || typeof success !== "boolean") return resultStateValue(parentState, success);
-	return success ? "complete" : "failed";
+function childResultStateValue(parentState: unknown, success: unknown, cancelled: unknown): OverlayRunState {
+	// Child-local terminal truth wins over a cancelled aggregate parent; a
+	// completed sibling must remain completed in a mixed group.
+	if (cancelled === true) return "cancelled";
+	if (typeof success === "boolean") return success ? "complete" : "failed";
+	return resultStateValue(parentState, success);
 }
 
 function matchesPersistedScope(entry: { sessionId?: string; cwd?: string }, state: Pick<SubagentState, "currentSessionId" | "baseCwd">): boolean {
@@ -342,9 +395,20 @@ function readPersistedResultRecord(resultPath: string): PersistedResultRecord | 
 			const child = objectValue(entry) ?? {};
 			const artifactPaths = objectValue(child.artifactPaths);
 			const childSuccess = booleanValue(child.success);
+			const childCancelled = child.cancelled === true || child.status === "cancelled";
+			const childInterrupted = child.interrupted === true || child.status === "paused" || child.status === "interrupted";
 			return {
+				groupId: stringValue(child.groupId),
+				index: typeof child.flatIndex === "number" ? child.flatIndex : typeof child.index === "number" ? child.index : undefined,
 				agent: stringValue(child.agent),
-				state: childResultStateValue(raw.state, childSuccess),
+				state: childInterrupted ? "paused" : childResultStateValue(raw.state, childSuccess, childCancelled),
+				success: childSuccess,
+				status: stringValue(child.status),
+				error: stringValue(child.error),
+				finalOutput: stringValue(child.finalOutput ?? child.output),
+				interrupted: childInterrupted,
+				cancelled: childCancelled,
+				gitBundle: child.gitBundle,
 				sessionFile: stringValue(child.sessionFile),
 				artifactPath: stringValue(artifactPaths?.outputPath),
 				model: stringValue(child.model),
@@ -358,7 +422,7 @@ function readPersistedResultRecord(resultPath: string): PersistedResultRecord | 
 			sessionId: stringValue(raw.sessionId),
 			cwd: stringValue(raw.cwd),
 			mode: modeValue(raw.mode, children.length),
-			state: resultStateValue(raw.state, raw.success),
+			state: raw.cancelled === true ? "cancelled" : resultStateValue(raw.state, raw.success),
 			sessionFile: stringValue(raw.sessionFile),
 			asyncDir: stringValue(raw.asyncDir),
 			agent: stringValue(raw.agent),
@@ -415,6 +479,12 @@ function deriveRunModelThinking(steps: Array<{ model?: string; thinking?: string
 }
 
 function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedResultRecord | undefined, now: number): OverlayRun {
+	const groupDiagnosticsById = new Map<string, OverlayGroupDiagnostic>();
+	for (const source of [...(result?.children ?? []), ...(run.groupDiagnostics ?? [])]) {
+		const diagnostic = mapGroupDiagnostic(source);
+		if (diagnostic) groupDiagnosticsById.set(diagnostic.groupId, diagnostic);
+	}
+	const groupDiagnostics = [...groupDiagnosticsById.values()];
 	const agents = agentsLabel(run.steps.map((step) => step.agent));
 	if (!agents.length) {
 		const fallbackAgents = result?.children.map((child) => child.agent).filter((agent): agent is string => Boolean(agent))
@@ -424,10 +494,12 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 	const elapsed = elapsedFromRange(run.startedAt, run.endedAt ?? run.lastUpdate, now);
 	const mappedNestedChildren = (run.nestedChildren ?? []).map(mapNestedRun);
 	const steps: OverlayStep[] = run.steps.map((step) => {
-		const resultChild = result?.children[step.index];
+		const resultChild = result?.children.find((child) => child.index === step.index)
+			?? (result?.children.some((child) => child.index !== undefined) ? undefined : result?.children[step.index]);
 		return {
 			agent: step.agent,
 			state: mapState(step.status),
+			groupId: step.groupId,
 			currentTool: step.currentTool,
 			elapsed: elapsedFromMs(step.durationMs),
 			startedAt: step.startedAt,
@@ -435,6 +507,12 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 			thinking: step.thinking,
 			fastMode: step.fastMode,
 			tokens: step.tokens,
+			error: step.error ?? resultChild?.error,
+			success: step.success ?? resultChild?.success,
+			finalOutput: step.finalOutput ?? resultChild?.finalOutput,
+			interrupted: step.interrupted ?? resultChild?.interrupted,
+			cancelled: step.cancelled ?? resultChild?.cancelled,
+			gitBundle: step.gitBundle ?? resultChild?.gitBundle,
 			sessionFile: step.sessionFile ?? resultChild?.sessionFile,
 			logPath: logPathForStep(run.asyncDir, step.index),
 			artifactPath: resultChild?.artifactPath,
@@ -463,18 +541,27 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 		artifactPath: artifactPathFromResult(result),
 		asyncDir: run.asyncDir,
 		steps,
+		...(groupDiagnostics.length ? { groupDiagnostics } : {}),
 	};
 }
 
 function overlayRunFromPersistedResult(result: PersistedResultRecord): OverlayRun {
-	const steps: OverlayStep[] = (result.children.length ? result.children : [{ agent: result.agent, state: result.state }]).map((child, index) => ({
+	const groupDiagnostics = result.children.map(mapGroupDiagnostic).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
+	const indexedChildren = result.children.filter((child) => !child.groupId).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+	const steps: OverlayStep[] = (indexedChildren.length ? indexedChildren : [{ agent: result.agent, state: result.state }]).map((child, index) => ({
 		agent: child.agent ?? `step-${index + 1}`,
 		state: child.state,
+		success: child.success,
 		sessionFile: child.sessionFile,
 		artifactPath: child.artifactPath,
 		model: child.model,
 		thinking: child.thinking,
 		fastMode: child.fastMode,
+		error: child.error,
+		finalOutput: child.finalOutput,
+		interrupted: child.interrupted,
+		cancelled: child.cancelled,
+		gitBundle: child.gitBundle,
 		children: [],
 	}));
 	const agents = agentsLabel(steps.map((step) => step.agent));
@@ -496,7 +583,13 @@ function overlayRunFromPersistedResult(result: PersistedResultRecord): OverlayRu
 		artifactPath: artifactPathFromResult(result),
 		asyncDir: result.asyncDir,
 		steps,
+		...(groupDiagnostics.length ? { groupDiagnostics } : {}),
 	};
+}
+
+/** Narrow serial seam for persisted group-diagnostic projection tests. */
+export function projectPersistedResultForTests(result: { id: string; mode: SubagentRunMode; state: OverlayRunState; children: Array<{ groupId?: string; index?: number; agent?: string; state: OverlayRunState; sessionFile?: string; artifactPath?: string; model?: string; thinking?: string; fastMode?: FastModeStatus }>; sessionFile?: string; asyncDir?: string; updatedAt?: number; agent?: string }): OverlayRun {
+	return overlayRunFromPersistedResult(result);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,19 +604,21 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 		updateForegroundNestedProjection(ctrl);
 		const fgRuns = state.foregroundRuns?.get(id);
 		const childInfo = fgRuns?.children ?? [];
-		const agents = childInfo.map((c) => c.agent);
+		const groupDiagnostics = childInfo.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
+		const indexedChildInfo = childInfo.filter((child) => !("groupId" in child && child.groupId)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+		const agents = indexedChildInfo.map((c) => c.agent);
 		if (!agents.length && ctrl.currentAgent) agents.push(ctrl.currentAgent);
 
 		const elapsed = elapsedFromRange(ctrl.startedAt, ctrl.updatedAt, now);
 		const rememberedState = childInfo.length > 0 ? resolveForegroundRunState(childInfo) : undefined;
-		const finalizedNestedState = rememberedState === "complete" || rememberedState === "failed" || rememberedState === "paused" ? rememberedState : undefined;
+		const finalizedNestedState = rememberedState === "complete" || rememberedState === "failed" || rememberedState === "paused" || rememberedState === "cancelled" ? rememberedState : undefined;
 		const finalizedNestedFreezeAt = finalizedNestedState ? fgRuns?.updatedAt ?? ctrl.updatedAt : undefined;
 
-		const steps: OverlayStep[] = childInfo.map((child, index) => {
+		const steps: OverlayStep[] = indexedChildInfo.map((child, index) => {
 			const stepElapsed = elapsedFromRange(ctrl.startedAt, ctrl.updatedAt, now);
 			const nestedChildren = ctrl.nestedChildren ?? [];
 			const stepNested = nestedChildren.filter((nc) => nc.parentStepIndex === index);
-			const stepState = mapState(child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" ? child.status : "running");
+			const stepState = mapState(child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" || child.status === "cancelled" ? child.status : "running");
 			return {
 				agent: child.agent,
 				state: stepState,
@@ -534,6 +629,11 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 				thinking: ctrl.currentIndex === index ? (ctrl.currentThinking ?? child.thinking) : child.thinking,
 				fastMode: ctrl.currentIndex === index ? (ctrl.currentFastMode ?? child.fastMode) : child.fastMode,
 				tokens: ctrl.currentIndex === index ? approximateTokenUsage(ctrl.tokens) ?? child.totalTokens : child.totalTokens,
+				error: child.error,
+				finalOutput: child.finalOutput,
+				interrupted: child.interrupted,
+				cancelled: child.cancelled,
+				gitBundle: child.gitBundle,
 				sessionFile: child.sessionFile,
 				artifactPath: child.artifactPath,
 				children: stepNested.map((nested) => mapNestedRunWithStaleState(nested, finalizedNestedState, finalizedNestedFreezeAt)),
@@ -589,6 +689,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 			artifactPath: childInfo.find((child) => child.artifactPath)?.artifactPath,
 			asyncDir: nestedAsyncDir,
 			steps,
+			...(groupDiagnostics.length ? { groupDiagnostics } : {}),
 		});
 	}
 	return runs;
@@ -598,11 +699,13 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 // Finished foreground run collection
 // ---------------------------------------------------------------------------
 
-function resolveForegroundRunState(children: { status: string }[]): OverlayRunState {
-	const statuses = children.map((c) => c.status);
-	if (statuses.some((s) => s === "failed")) return "failed";
-	if (statuses.some((s) => s === "paused")) return "paused";
-	if (statuses.some((s) => s === "pending")) return "queued";
+function resolveForegroundRunState(children: { status: string; teardownUnproven?: boolean }[]): OverlayRunState {
+	const state = resolveAggregateState(children.map((child) => ({ state: child.status, teardownUnproven: child.teardownUnproven })));
+	if (state === "running") return "running";
+	if (state === "failed") return "failed";
+	if (state === "cancelled") return "cancelled";
+	if (state === "paused") return "paused";
+	if (state === "pending") return "queued";
 	return "complete";
 }
 
@@ -615,22 +718,29 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 	for (const [id, run] of state.foregroundRuns) {
 		if (liveIds.has(id)) continue;
 
-		const agents = run.children.map((c) => c.agent);
+		const groupDiagnostics = run.children.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
+		const indexedChildren = run.children.filter((child) => !("groupId" in child && child.groupId)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+		const agents = indexedChildren.map((c) => c.agent);
 		const elapsed = elapsedFromRange(run.startedAt, run.updatedAt, now);
 		const runState = resolveForegroundRunState(run.children);
 
 		const nestedChildren = (run.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, runState, run.updatedAt));
-		const sourceChild = run.children.find((child) => child.model);
+		const sourceChild = indexedChildren.find((child) => child.model);
 		const runModel = sourceChild?.model;
 		const runThinking = sourceChild?.thinking;
-		const runFastMode = run.mode === "single" && run.children.length === 1 ? run.children[0]?.fastMode : undefined;
-		const steps: OverlayStep[] = run.children.map((child, index) => ({
+		const runFastMode = run.mode === "single" && indexedChildren.length === 1 ? indexedChildren[0]?.fastMode : undefined;
+		const steps: OverlayStep[] = indexedChildren.map((child, index) => ({
 			agent: child.agent,
 			state: mapState(child.status),
 			model: child.model,
 			thinking: child.thinking,
 			fastMode: child.fastMode,
 			tokens: child.totalTokens,
+			error: child.error,
+			finalOutput: child.finalOutput,
+			interrupted: child.interrupted,
+			cancelled: child.cancelled,
+			gitBundle: child.gitBundle,
 			sessionFile: child.sessionFile,
 			artifactPath: child.artifactPath,
 			children: nestedChildren.filter((nested) => run.nestedChildren?.find((raw) => raw.id === nested.id)?.parentStepIndex === index),
@@ -652,10 +762,11 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 			model: runModel,
 			thinking: runThinking,
 			fastMode: runFastMode,
-			tokens: sumTokenUsage(run.children.map((child) => child.totalTokens)),
-			sessionFile: run.children.find((c) => c.sessionFile)?.sessionFile,
-			artifactPath: run.children.find((c) => c.artifactPath)?.artifactPath,
+			tokens: sumTokenUsage(indexedChildren.map((child) => child.totalTokens)),
+			sessionFile: indexedChildren.find((c) => c.sessionFile)?.sessionFile,
+			artifactPath: indexedChildren.find((c) => c.artifactPath)?.artifactPath,
 			steps,
+			...(groupDiagnostics.length ? { groupDiagnostics } : {}),
 		});
 	}
 	return runs;
@@ -672,18 +783,26 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		: status.currentAgent
 			? [{ agent: status.currentAgent, index: status.currentIndex ?? 0, status: status.state, sessionFile: status.sessionFile }]
 			: [];
+	const groupDiagnostics = children.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
+	const indexedChildren = children.filter((child) => !("groupId" in child && child.groupId)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
 	const nestedChildren = (status.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, staleState, status.updatedAt));
-	const sourceChild = children.find((child) => child.model);
+	const sourceChild = indexedChildren.find((child) => child.model);
 	const runModel = sourceChild?.model;
 	const runThinking = sourceChild?.thinking;
-	const runFastMode = status.mode === "single" && children.length === 1 ? children[0]?.fastMode : undefined;
-	const steps: OverlayStep[] = children.map((child, index) => ({
+	const runFastMode = status.mode === "single" && indexedChildren.length === 1 ? indexedChildren[0]?.fastMode : undefined;
+	const steps: OverlayStep[] = indexedChildren.map((child, index) => ({
 		agent: child.agent,
 		state: staleForegroundState(mapState(child.status)),
+		groupId: child.groupId,
 		model: child.model,
 		thinking: child.thinking,
 		fastMode: child.fastMode,
 		tokens: child.totalTokens,
+		error: child.error,
+		finalOutput: child.finalOutput,
+		interrupted: child.interrupted,
+		cancelled: child.cancelled,
+		gitBundle: child.gitBundle,
 		sessionFile: child.sessionFile,
 		artifactPath: child.artifactPath,
 		children: nestedChildren.filter((nested) => status.nestedChildren?.find((raw) => raw.id === nested.id)?.parentStepIndex === index),
@@ -707,10 +826,11 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		model: runModel,
 		thinking: runThinking,
 		fastMode: runFastMode,
-		tokens: sumTokenUsage(children.map((child) => child.totalTokens)),
-		sessionFile: status.sessionFile ?? children.find((child) => child.sessionFile)?.sessionFile,
-		artifactPath: children.find((child) => child.artifactPath)?.artifactPath,
+		tokens: sumTokenUsage(indexedChildren.map((child) => child.totalTokens)),
+		sessionFile: status.sessionFile ?? indexedChildren.find((child) => child.sessionFile)?.sessionFile,
+		artifactPath: indexedChildren.find((child) => child.artifactPath)?.artifactPath,
 		steps,
+		...(groupDiagnostics.length ? { groupDiagnostics } : {}),
 	};
 }
 
@@ -757,6 +877,12 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 				thinking: step.thinking,
 				fastMode: step.fastMode,
 				tokens: step.tokens,
+				error: step.error,
+				success: step.success,
+				finalOutput: step.finalOutput,
+				interrupted: step.interrupted,
+				cancelled: step.cancelled,
+				gitBundle: step.gitBundle,
 				sessionFile: step.sessionFile,
 				logPath: logPathForStep(job.asyncDir, step.index),
 				children: (step.children ?? []).map(mapNestedRun),
@@ -792,6 +918,7 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 			logPath: logPathForRun(job.asyncDir, job.outputFile),
 			asyncDir: job.asyncDir,
 			steps,
+			...(job.groupDiagnostics?.length ? { groupDiagnostics: job.groupDiagnostics.map(mapGroupDiagnostic).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic)) } : {}),
 		});
 	}
 	return runs;
@@ -803,7 +930,7 @@ function collectPersistedAsyncRuns(state: SubagentState, now: number, options: C
 	const limit = options.persistedAsyncLimit ?? DEFAULT_PERSISTED_ASYNC_LIMIT;
 	// Include non-terminal states so that runs interrupted by a parent Ctrl-C
 	// (still "running" or "queued" on disk) are recovered on resume.
-	const persistedStates: Array<AsyncRunSummary["state"]> = ["complete", "failed", "paused", "running", "queued"];
+	const persistedStates: Array<AsyncRunSummary["state"]> = ["complete", "failed", "paused", "cancelled", "running", "queued"];
 	const liveIds = new Set(state.asyncJobs.keys());
 	const runs: OverlayRun[] = [];
 	const seenIds = new Set<string>();

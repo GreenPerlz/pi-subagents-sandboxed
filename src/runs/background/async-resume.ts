@@ -30,6 +30,17 @@ export type AsyncResumeTarget = {
 	sessionFile?: string;
 };
 
+interface AsyncResultChild {
+	agent?: string;
+	success?: boolean;
+	sessionFile?: string;
+	intercomTarget?: string;
+	flatIndex?: number;
+	groupId?: string;
+	unindexed?: boolean;
+	teardownUnproven?: boolean;
+}
+
 interface AsyncResultFile {
 	id?: string;
 	runId?: string;
@@ -37,10 +48,11 @@ interface AsyncResultFile {
 	mode?: string;
 	state?: string;
 	success?: boolean;
+	teardownUnproven?: boolean;
 	worktreeExecutionError?: string;
 	cwd?: string;
 	sessionFile?: string;
-	results?: Array<{ agent?: string; success?: boolean; sessionFile?: string; intercomTarget?: string }>;
+	results?: AsyncResultChild[];
 }
 
 export interface AsyncRunLocation {
@@ -80,7 +92,20 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 			const intercomTarget = validateOptionalString(child, "intercomTarget", resultPath, `results[${index}].intercomTarget`);
 			const success = child.success;
 			if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': results[${index}].success must be a boolean.`);
-			return { agent, sessionFile, intercomTarget, ...(typeof success === "boolean" ? { success } : {}) };
+			for (const field of ["flatIndex", "groupId", "unindexed", "teardownUnproven"] as const) {
+				if (child[field] !== undefined && typeof child[field] !== (field === "flatIndex" ? "number" : "boolean")) {
+					if (field !== "groupId" || typeof child[field] !== "string") throw new Error(`Invalid async result file '${resultPath}': results[${index}].${field} has an invalid type.`);
+				}
+			}
+			if (child.flatIndex !== undefined && (!Number.isInteger(child.flatIndex) || child.flatIndex < 0)) throw new Error(`Invalid async result file '${resultPath}': results[${index}].flatIndex must be a non-negative integer.`);
+			return {
+				agent, sessionFile, intercomTarget,
+				...(typeof success === "boolean" ? { success } : {}),
+				...(typeof child.flatIndex === "number" ? { flatIndex: child.flatIndex } : {}),
+				...(typeof child.groupId === "string" ? { groupId: child.groupId } : {}),
+				...(child.unindexed === true ? { unindexed: true } : {}),
+				...(child.teardownUnproven === true ? { teardownUnproven: true } : {}),
+			};
 		});
 	}
 	const success = data.success;
@@ -95,6 +120,7 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 		cwd: validateOptionalString(data, "cwd", resultPath),
 		sessionFile: validateOptionalString(data, "sessionFile", resultPath),
 		...(typeof success === "boolean" ? { success } : {}),
+		...(data.teardownUnproven === true ? { teardownUnproven: true } : {}),
 		...(worktreeExecutionError ? { worktreeExecutionError } : {}),
 		...(results ? { results } : {}),
 	};
@@ -210,7 +236,7 @@ export function resolveAsyncRunLocation(params: AsyncResumeParams, asyncDirRoot:
 }
 
 function resultState(result: AsyncResultFile): AsyncStatus["state"] {
-	if (result.state === "complete" || result.state === "failed" || result.state === "paused" || result.state === "running" || result.state === "queued") {
+	if (result.state === "complete" || result.state === "failed" || result.state === "paused" || result.state === "cancelled" || result.state === "running" || result.state === "queued") {
 		return result.state;
 	}
 	return result.success ? "complete" : "failed";
@@ -256,18 +282,27 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const runId = status?.runId ?? result?.runId ?? result?.id ?? location.resolvedId ?? (location.asyncDir ? path.basename(location.asyncDir) : "unknown");
 	const state = status?.state ?? (result ? resultState(result) : undefined);
 	if (!state) throw new Error(`Status file not found for async run '${runId}'.`);
+	if (status?.teardownUnproven === true || result?.teardownUnproven === true) {
+		throw new Error(`Async run '${runId}' has unproven teardown and cannot be resumed safely.`);
+	}
+	if (status?.steps?.some((step) => step.teardownUnproven === true) || result?.results?.some((step) => step.teardownUnproven === true)) {
+		throw new Error(`Async run '${runId}' has a child with unproven teardown and cannot be resumed safely.`);
+	}
 
-	const statusSteps = status?.steps ?? [];
-	const resultSteps = result?.results ?? [];
-	const stepCount = statusSteps.length || resultSteps.length || (result?.agent ? 1 : 0);
+	// Diagnostics are deliberately unindexed. Resolve resume targets from the
+	// canonical flat indexes, never from raw array positions.
+	const statusSteps = (status?.steps ?? []).filter((step) => !step.groupId && !(step as { unindexed?: boolean }).unindexed).map((step, position) => ({ step, index: step.flatIndex ?? position }));
+	const resultSteps = (result?.results ?? []).filter((step) => !(step as { groupId?: string; unindexed?: boolean }).groupId && !(step as { unindexed?: boolean }).unindexed).map((step, position) => ({ step, index: (step as { flatIndex?: number }).flatIndex ?? position }));
+	const stepCount = Math.max(statusSteps.length ? Math.max(...statusSteps.map(({ index }) => index + 1)) : 0, resultSteps.length ? Math.max(...resultSteps.map(({ index }) => index + 1)) : 0, result?.agent ? 1 : 0);
 	const requestedIndex = params.index;
 	if (requestedIndex !== undefined && !Number.isInteger(requestedIndex)) throw new Error(`Async run '${runId}' index must be an integer.`);
-	const terminalStepStatuses = new Set(["complete", "completed", "failed", "paused"]);
+	const terminalStepStatuses = new Set(["complete", "completed", "failed", "paused", "cancelled"]);
 
 	if (state === "running") {
 		if (requestedIndex !== undefined) {
 			if (requestedIndex < 0 || requestedIndex >= stepCount) throw new Error(`Async run '${runId}' has ${stepCount} children. Index ${requestedIndex} is out of range.`);
-			const selectedStep = statusSteps[requestedIndex];
+			const selectedEntry = statusSteps.find(({ index }) => index === requestedIndex);
+			const selectedStep = selectedEntry?.step;
 			if (selectedStep?.status === "running") {
 				return {
 					kind: "live",
@@ -284,9 +319,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 			if (selectedStep?.status === "pending") throw new Error(`Async run '${runId}' child ${requestedIndex} is pending and has not started yet. Wait for it to run or complete before resuming.`);
 			if (selectedStep && !terminalStepStatuses.has(selectedStep.status)) throw new Error(`Async run '${runId}' child ${requestedIndex} is ${selectedStep.status} and cannot be revived yet.`);
 		} else {
-			const running = statusSteps
-				.map((step, index) => ({ step, index }))
-				.filter(({ step }) => step.status === "running");
+			const running = statusSteps.filter(({ step }) => step.status === "running");
 			const selected = running.length === 1 ? running[0] : undefined;
 			if (!selected) {
 				throw new Error(`Async run '${runId}' has ${running.length} running children. Provide index to choose one.`);
@@ -311,10 +344,12 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const index = requestedIndex ?? 0;
 	if (!Number.isInteger(index)) throw new Error(`Async run '${runId}' index must be an integer.`);
 	if (index < 0 || index >= stepCount) throw new Error(`Async run '${runId}' has ${stepCount} children. Index ${index} is out of range.`);
-	const agent = statusSteps[index]?.agent ?? resultSteps[index]?.agent ?? result?.agent;
+	const statusStep = statusSteps.find(({ index: flatIndex }) => flatIndex === index)?.step;
+	const resultStep = resultSteps.find(({ index: flatIndex }) => flatIndex === index)?.step;
+	const agent = statusStep?.agent ?? resultStep?.agent ?? result?.agent;
 	if (!agent) throw new Error(`Could not determine child agent for async run '${runId}'.`);
-	const sessionFile = statusSteps[index]?.sessionFile
-		?? resultSteps[index]?.sessionFile
+	const sessionFile = statusStep?.sessionFile
+		?? resultStep?.sessionFile
 		?? (stepCount === 1 ? status?.sessionFile ?? result?.sessionFile : undefined);
 	if (!sessionFile) throw new Error(`Async run '${runId}' child ${index} does not have a persisted session file to resume from.`);
 	const resolvedSessionFile = validateResumeSessionFile(runId, sessionFile);

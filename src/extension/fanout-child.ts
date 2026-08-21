@@ -12,7 +12,7 @@ import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
 import { loadConfig } from "./config.ts";
-import { shutdownOwnedAsyncJobs } from "../runs/background/session-shutdown-cascade.ts";
+import { shutdownOwnedAsyncJobs, type ShutdownCascadeDeps } from "../runs/background/session-shutdown-cascade.ts";
 import {
 	ASYNC_DIR,
 	SUBAGENT_ASYNC_STARTED_EVENT,
@@ -133,7 +133,7 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 	return timer;
 }
 
-export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): void {
+export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, internalDeps: Pick<ShutdownCascadeDeps, "isExpectedAsyncRunnerPid"> = {}): void {
 	if (process.env[SUBAGENT_CHILD_ENV] !== "1" || process.env[SUBAGENT_FANOUT_CHILD_ENV] !== "1") return;
 
 	const globalStore = globalThis as Record<string, unknown>;
@@ -185,7 +185,7 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 
 	if (typeof pi.on === "function") {
 		pi.on("session_shutdown", () => {
-			shutdownOwnedAsyncJobs(state);
+			shutdownOwnedAsyncJobs(state, internalDeps);
 			for (const unsubscribe of eventUnsubscribes) {
 				try { unsubscribe(); } catch { /* best effort */ }
 			}

@@ -80,26 +80,72 @@ export function flattenSteps(steps: RunnerStep[]): RunnerSubagentStep[] {
 	return flat;
 }
 
+/**
+ * A callback rejection which retains the results that already settled.  The
+ * public rejection reason remains available as `reason`; callers that need to
+ * project a partial parallel run can use `partialResults` without replacing
+ * successful siblings with synthetic failures.
+ */
+export class MapConcurrentError<R> extends Error {
+	readonly reason: unknown;
+	readonly cause: unknown;
+	readonly partialResults: Array<R | undefined>;
+	readonly rejectionIndex?: number;
+
+	constructor(reason: unknown, partialResults: Array<R | undefined>, rejectionIndex?: number) {
+		super(reason instanceof Error ? reason.message : String(reason));
+		this.name = "MapConcurrentError";
+		this.reason = reason;
+		this.cause = reason;
+		this.partialResults = partialResults;
+		this.rejectionIndex = rejectionIndex;
+		if (reason instanceof Error && reason.stack) this.stack = reason.stack;
+	}
+}
+
 export async function mapConcurrent<T, R>(
 	items: T[],
 	limit: number,
 	fn: (item: T, i: number) => Promise<R>,
 ): Promise<R[]> {
 	const safeLimit = Math.max(1, Math.floor(limit) || 1);
-	const results: R[] = new Array(items.length);
+	const results: Array<R | undefined> = new Array(items.length);
 	let next = 0;
 
+	let firstError: unknown;
+	let firstErrorIndex: number | undefined;
+	let hasFirstError = false;
+	let rejected = false;
 	async function worker(_workerIndex: number): Promise<void> {
-		while (next < items.length) {
+		while (!rejected && next < items.length) {
 			const i = next++;
-			results[i] = await fn(items[i], i);
+			try {
+				results[i] = await fn(items[i], i);
+			} catch (error) {
+				// Stop assigning queued work as soon as one callback rejects. Already
+				// started children still settle before the caller can export or clean
+				// an isolated runtime. Preserve the first rejection, including an
+				// intentionally rejected undefined value.
+				if (!hasFirstError) {
+					firstError = error;
+					firstErrorIndex = i;
+					hasFirstError = true;
+				}
+				rejected = true;
+			}
 		}
 	}
 
 	await Promise.all(
 		Array.from({ length: Math.min(safeLimit, items.length) }, (_, wi) => worker(wi)),
 	);
-	return results;
+	if (rejected) {
+		// Always wrap, including primitive/undefined rejections. The original value
+		// remains available by identity as both `reason` and `cause`, alongside all
+		// callbacks that settled before the rejection became visible.
+		throw new MapConcurrentError(firstError, results, firstErrorIndex);
+	}
+	return results as R[];
 }
 
 export interface ParallelTaskResult {

@@ -263,6 +263,28 @@ describe("acceptance gates", () => {
 		assert.equal(failLedger.verifyRuns[0]?.status, "failed");
 	}));
 
+	it("tears down a surviving detached verification descendant after leader exit", async () => withTempRepo(async (cwd) => {
+		const acceptance = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Patch bug",
+			explicit: { criteria: ["Patch bug"], verify: [{ id: "survivor", command: "node -e \\\"const {spawn}=require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], {stdio:'ignore'}); setTimeout(()=>{},10000)\\\"", timeoutMs: 30 }] },
+		});
+		const ledger = await evaluateAcceptance({ acceptance, output: report(), cwd });
+		assert.equal(ledger.status, "rejected");
+		assert.equal(ledger.verifyRuns[0]?.status, "timed-out");
+	}));
+
+	it("times out verification commands while retaining bounded process-group teardown", async () => withTempRepo(async (cwd) => {
+		const acceptance = resolveEffectiveAcceptance({
+			agentName: "worker",
+			task: "Patch bug",
+			explicit: { criteria: ["Patch bug"], verify: [{ id: "timeout", command: "node -e \\\"setTimeout(() => {}, 1000)\\\"", timeoutMs: 20 }] },
+		});
+		const ledger = await evaluateAcceptance({ acceptance, output: report(), cwd });
+		assert.equal(ledger.status, "rejected");
+		assert.equal(ledger.verifyRuns[0]?.status, "timed-out");
+	}));
+
 	it("review gates require independent reviewer provenance", async () => withTempRepo(async (cwd) => {
 		const acceptance = resolveEffectiveAcceptance({
 			agentName: "worker",

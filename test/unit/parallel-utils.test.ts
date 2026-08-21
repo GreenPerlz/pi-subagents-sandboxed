@@ -4,6 +4,7 @@ import {
 	isParallelGroup,
 	flattenSteps,
 	mapConcurrent,
+	MapConcurrentError,
 	aggregateParallelOutputs,
 	MAX_PARALLEL_CONCURRENCY,
 	type RunnerSubagentStep,
@@ -133,6 +134,58 @@ describe("mapConcurrent", () => {
 			return item * 10;
 		});
 		assert.equal(maxRunning, 1, "should run sequentially with limit=-1");
+	});
+
+	it("preserves an undefined first rejection and lets started callbacks settle", async () => {
+		const started: number[] = [];
+		let settledLater = false;
+		let rejection: unknown = Symbol("unset");
+		try {
+			await mapConcurrent([0, 1, 2], 2, async (_item, index) => {
+				started.push(index);
+				if (index === 0) {
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					throw undefined;
+				}
+				if (index === 1) {
+					await new Promise((resolve) => setTimeout(resolve, 15));
+					settledLater = true;
+					throw new Error("later rejection");
+				}
+				return index;
+			});
+		} catch (error) {
+			rejection = error;
+		}
+		assert.ok(rejection instanceof MapConcurrentError);
+		assert.equal((rejection as MapConcurrentError<unknown>).reason, undefined);
+		assert.equal((rejection as MapConcurrentError<unknown>).cause, undefined);
+		assert.deepEqual(started.sort(), [0, 1]);
+		assert.equal(settledLater, true);
+	});
+
+	it("retains settled sibling results when a started callback rejects", async () => {
+		let settledSibling = false;
+		await assert.rejects(
+			mapConcurrent(["settled", "rejected"], 2, async (item) => {
+				if (item === "rejected") throw new Error("execution rejected");
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				settledSibling = true;
+				return { item, gitBundle: { path: "bundle", checksum: "checksum" } };
+			}),
+			(error: unknown) => {
+				// The rejection reaches the caller only after terminal callbacks have
+				// settled, allowing detached export cleanup to run exactly once.
+				assert.ok(error instanceof MapConcurrentError);
+				assert.equal(settledSibling, true);
+				assert.equal((error as MapConcurrentError<{ item: string }>).reason instanceof Error, true);
+				assert.deepEqual((error as MapConcurrentError<{ item: string }>).partialResults[0], {
+					item: "settled",
+					gitBundle: { path: "bundle", checksum: "checksum" },
+				});
+				return true;
+			},
+		);
 	});
 
 	it("does not stagger by default", async () => {

@@ -23,6 +23,7 @@ import { resolveChildCwd } from "../../shared/utils.ts";
 import { buildModelCandidates, type AvailableModelInfo } from "../shared/model-fallback.ts";
 import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { resolveCandidateLaunchThinking } from "../../shared/model-info.ts";
+import { readProcessStartToken } from "./pid-identity.ts";
 import { resolveExpectedWorktreeAgentCwd } from "../shared/worktree.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
@@ -45,6 +46,9 @@ import {
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
 import { nestedResultsPath, resolveInheritedNestedRouteFromEnv, resolveNestedParentAddressFromEnv, writeNestedEvent } from "../shared/nested-events.ts";
+import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { formatAsyncRunnerIdentity } from "./pid-identity.ts";
+import { isChildProcessGroupGone, processControlUnsupported, signalChildProcessGroup, type ChildProcessIdentity } from "../../shared/post-exit-stdio-guard.ts";
 
 const require = createRequire(import.meta.url);
 const hostPiPackageRoot = resolvePiPackageRoot();
@@ -199,7 +203,9 @@ export function isAsyncAvailable(): boolean {
 /**
  * Spawn the async runner process
  */
-function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; error?: string } {
+function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; error?: string; runnerIdentity?: string; runnerStartToken?: string; runnerUid?: number } {
+	const processControlError = processControlUnsupported();
+	if (processControlError) return { error: processControlError };
 	if (!jitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
 	}
@@ -222,6 +228,38 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 	fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 
+	const removeConfigIfPresent = () => {
+		try { fs.unlinkSync(cfgPath); } catch {}
+	};
+	const retainOrReapOwnedRunner = (identity: ChildProcessIdentity | undefined): void => {
+		// A live detached handle is ownership proof only until it exits. Never
+		// signal a reused PID after reaping; if identity is unavailable, retain the
+		// config as actionable evidence for reconciliation.
+		if (proc.exitCode != null || proc.signalCode != null) return;
+		const strictIdentity = Boolean(identity?.startToken && identity.pgid === proc.pid);
+		let signalled = strictIdentity ? signalChildProcessGroup(proc, "SIGTERM", { identity }) : false;
+		if (!signalled) {
+			// Missing or strict-invalid /proc identity is recoverable only through
+			// the still-live ChildProcess handle created by detached spawn. Never
+			// turn that proof into a bare PID/PGID signal, and never retry after the
+			// handle has been reaped; the launch config remains evidence then.
+			try { signalled = proc.exitCode == null && proc.signalCode == null && proc.kill("SIGTERM"); } catch { signalled = false; }
+		}
+		if (!signalled) return;
+		const deadline = Date.now() + 3_000;
+		const reap = () => {
+			if (proc.exitCode == null && proc.signalCode == null && Date.now() < deadline) return;
+			if (proc.exitCode != null || proc.signalCode != null) {
+				if (isChildProcessGroupGone(proc)) removeConfigIfPresent();
+			}
+		};
+		proc.once("close", reap);
+		const timer = setInterval(() => {
+			reap();
+			if (Date.now() >= deadline || proc.exitCode != null || proc.signalCode != null) clearInterval(timer);
+		}, 50);
+		timer.unref?.();
+	};
 	const proc = spawn(runtimePath, [jitiCliPath, runner, cfgPath], {
 		cwd,
 		detached: true,
@@ -229,13 +267,83 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 		windowsHide: true,
 	});
 	proc.on("error", (error) => {
-		console.error(`[pi-subagents] async spawn failed: ${error.message}`);
+		// Once a PID has been published, never delete the launch evidence merely
+		// because identity capture or status publication failed: the detached
+		// runner may still be alive and an unknown PID is not a safe signal target.
+		console.error(`[pi-subagents] async spawn failed: ${error.message}${proc.pid ? `; launch config retained at ${cfgPath}` : ""}`);
 	});
 	if (typeof proc.pid !== "number") {
+		removeConfigIfPresent();
 		return { error: `async runner did not produce a pid for cwd: ${cwd}` };
 	}
+	let startToken: string | undefined;
+	let pgid: number | undefined;
+	let uid: number | undefined;
+	if (process.platform === "linux") {
+		const deadline = Date.now() + 250;
+		while ((!startToken || pgid !== proc.pid || uid === undefined) && Date.now() < deadline) {
+			try {
+				const stat = fs.readFileSync(`/proc/${proc.pid}/stat`, "utf8");
+				const closeParen = stat.lastIndexOf(")");
+				const fields = stat.slice(closeParen + 2).trim().split(/\s+/u);
+				startToken = fields[19] || undefined;
+				pgid = Number(fields[2]);
+				uid = fs.statSync(`/proc/${proc.pid}`).uid;
+			} catch { /* retry spawn publication race */ }
+			if (!startToken || pgid !== proc.pid || uid === undefined) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+		}
+		if (!startToken || pgid !== proc.pid || uid === undefined) {
+			retainOrReapOwnedRunner(startToken && uid !== undefined ? { pid: proc.pid, startToken, pgid, uid } : undefined);
+			return { error: `async runner private process-group identity could not be captured safely; launch config retained at ${cfgPath} and active runner teardown was not proven` };
+		}
+	} else {
+		removeConfigIfPresent();
+		return { error: "async runner identity cannot be verified safely on this platform" };
+	}
+	const config = cfg as { id?: string; asyncDir?: string; resultMode?: string; steps?: unknown[]; parallelGroups?: unknown; workflowGraph?: unknown; sessionDir?: string; artifactsDir?: string };
+	const runnerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
+	const expectedArgv = [runtimePath, jitiCliPath, runnerPath, cfgPath];
+	const runnerIdentity = formatAsyncRunnerIdentity(runnerPath, cfgPath, config.id ?? suffix, startToken, uid, expectedArgv);
+	if (config.asyncDir && config.id) {
+		try {
+			const statusPath = path.join(config.asyncDir, "status.json");
+			let existing: Record<string, unknown> = {};
+			try { existing = JSON.parse(fs.readFileSync(statusPath, "utf8")) as Record<string, unknown>; } catch { /* runner has not written its full status yet */ }
+			const configuredSteps = (config.steps ?? []).flatMap((step: any, index) => Array.isArray(step?.parallel)
+				? step.parallel.map((child: any, childIndex: number) => ({ agent: child.agent, model: child.model, thinking: child.thinking, fastMode: child.fastModeCandidates?.[0] ?? child.fastMode, status: "running", flatIndex: child.flatIndex ?? childIndex }))
+				: step?.expand && step?.parallel ? [{ agent: `expand:${step.parallel.agent}`, model: step.parallel.model, thinking: step.parallel.thinking, fastMode: step.parallel.fastModeCandidates?.[0] ?? step.parallel.fastMode, label: step.parallel.label, outputName: step.collect?.as, status: "running", flatIndex: index }]
+				: [{ agent: step?.agent ?? `step-${index + 1}`, model: step?.model, thinking: step?.thinking, fastMode: step?.fastModeCandidates?.[0] ?? step?.fastMode, status: "running", flatIndex: step?.flatIndex ?? index }]);
+			let configuredFlatIndex = 0;
+			const configuredParallelGroups = (config.steps ?? []).flatMap((step: any, stepIndex: number) => {
+				if (Array.isArray(step?.parallel)) { const group = { start: configuredFlatIndex, count: step.parallel.length, stepIndex }; configuredFlatIndex += step.parallel.length; return [group]; }
+				if (step?.expand && step?.parallel) { const group = { start: configuredFlatIndex, count: 1, stepIndex }; configuredFlatIndex++; return [group]; }
+				configuredFlatIndex++;
+				return [];
+			});
+			writeAtomicJson(statusPath, {
+				...existing,
+				runId: config.id,
+				mode: existing.mode ?? config.resultMode ?? "single",
+				state: existing.state ?? "running",
+				pid: proc.pid,
+				runnerIdentity,
+				runnerStartToken: startToken,
+				runnerUid: uid,
+				startedAt: existing.startedAt ?? Date.now(),
+				lastUpdate: Date.now(),
+				...(existing.steps ? {} : { steps: configuredSteps }),
+				...(config.parallelGroups ?? configuredParallelGroups.length ? { parallelGroups: config.parallelGroups ?? configuredParallelGroups } : {}),
+				...(config.workflowGraph ? { workflowGraph: config.workflowGraph } : {}),
+				...(config.sessionDir ? { sessionDir: config.sessionDir } : {}),
+				...(config.artifactsDir ? { artifactsDir: config.artifactsDir } : {}),
+			});
+		} catch (error) {
+			retainOrReapOwnedRunner({ pid: proc.pid, startToken, pgid: proc.pid, uid });
+			return { error: `async runner identity could not be persisted safely: ${error instanceof Error ? error.message : String(error)}; launch config retained at ${cfgPath} while runner ownership is re-established` };
+		}
+	}
 	proc.unref();
-	return { pid: proc.pid };
+	return { pid: proc.pid, runnerIdentity, runnerStartToken: startToken, runnerUid: uid };
 }
 
 function formatAsyncStartError(mode: SubagentRunMode, message: string): AsyncExecutionResult {
@@ -344,7 +452,8 @@ export function executeAsyncChain(
 		}
 		if (isDynamicParallelStep(s)) {
 			const agent = agents.find((candidate) => candidate.name === s.parallel.agent);
-			if (agent && hasSandboxWritableAgent({ agents: [{ agentName: agent.name, tools: agent.tools, sandbox: resolveStepSandbox(agent) }] })) {
+			const dynamicSandbox = agent ? resolveStepSandbox(agent) : undefined;
+			if (agent && dynamicSandbox?.gitMode !== "isolated" && hasSandboxWritableAgent({ agents: [{ agentName: agent.name, tools: agent.tools, sandbox: dynamicSandbox }] })) {
 				return formatAsyncStartError(resultMode, sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`));
 			}
 		}
@@ -570,6 +679,7 @@ export function executeAsyncChain(
 				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				ownerPid: process.pid,
+				...(readProcessStartToken(process.pid) ? { ownerStartToken: readProcessStartToken(process.pid) } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
@@ -652,6 +762,9 @@ export function executeAsyncChain(
 		ctx.pi.events.emit(SUBAGENT_ASYNC_STARTED_EVENT, {
 			id,
 			pid: spawnResult.pid,
+			...(spawnResult.runnerIdentity ? { runnerIdentity: spawnResult.runnerIdentity } : {}),
+			...(spawnResult.runnerStartToken ? { runnerStartToken: spawnResult.runnerStartToken } : {}),
+			...(spawnResult.runnerUid !== undefined ? { runnerUid: spawnResult.runnerUid } : {}),
 			sessionId: ctx.currentSessionId,
 			mode: resultMode,
 			agent: firstAgents[0],
@@ -829,6 +942,7 @@ export function executeAsyncSingle(
 				sandbox,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				ownerPid: process.pid,
+				...(readProcessStartToken(process.pid) ? { ownerStartToken: readProcessStartToken(process.pid) } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
@@ -886,6 +1000,9 @@ export function executeAsyncSingle(
 		ctx.pi.events.emit(SUBAGENT_ASYNC_STARTED_EVENT, {
 			id,
 			pid: spawnResult.pid,
+			...(spawnResult.runnerIdentity ? { runnerIdentity: spawnResult.runnerIdentity } : {}),
+			...(spawnResult.runnerStartToken ? { runnerStartToken: spawnResult.runnerStartToken } : {}),
+			...(spawnResult.runnerUid !== undefined ? { runnerUid: spawnResult.runnerUid } : {}),
 			sessionId: ctx.currentSessionId,
 			mode: "single",
 			agent,

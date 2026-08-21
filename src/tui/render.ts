@@ -23,6 +23,7 @@ import { getDisplayItems, getSingleResultOutput } from "../shared/utils.ts";
 import { flatToLogicalStepIndex } from "../runs/background/parallel-groups.ts";
 import { formatNestedAggregate } from "../runs/shared/nested-render.ts";
 import { aggregateStepStatus, formatActivityLabel, formatAgentRunningLabel, formatParallelOutcome } from "../shared/status-format.ts";
+import { resolveAggregateState } from "../shared/aggregate-state.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
 
@@ -235,6 +236,7 @@ function formatAcceptanceStatus(result: Details["results"][number]): string | un
 
 function resultStatusLine(result: Details["results"][number], output: string): string {
 	if (result.detached) return result.detachedReason ? `Detached: ${result.detachedReason}` : "Detached";
+	if (result.cancelled) return "Cancelled";
 	if (result.interrupted) return "Paused";
 	if (result.exitCode !== 0) return `Error: ${result.error ?? (firstOutputLine(output) || `exit ${result.exitCode}`)}`;
 	const acceptance = formatAcceptanceStatus(result);
@@ -246,6 +248,7 @@ function resultStatusLine(result: Details["results"][number], output: string): s
 function resultGlyph(result: Details["results"][number], output: string, theme: Theme, running = result.progress?.status === "running", seed = progressRunningSeed(result.progress ?? result.progressSummary)): string {
 	if (running) return theme.fg("accent", runningGlyph(seed));
 	if (result.detached) return theme.fg("warning", "■");
+	if (result.cancelled) return theme.fg("warning", "⊘");
 	if (result.interrupted) return theme.fg("warning", "■");
 	if (result.exitCode !== 0) return theme.fg("error", "✗");
 	if (hasEmptyTextOutputWithoutOutputTarget(result.task, output)) return theme.fg("warning", "✓");
@@ -273,6 +276,7 @@ export function widgetRenderKey(job: AsyncJobState): string {
 		currentStep: job.currentStep,
 		chainStepCount: job.chainStepCount,
 		parallelGroups: job.parallelGroups,
+		groupDiagnostics: job.groupDiagnostics,
 		steps: job.steps,
 		nestedChildren: job.nestedChildren,
 		stepsTotal: job.stepsTotal,
@@ -301,6 +305,7 @@ function widgetJobName(job: AsyncJobState): string {
 }
 
 function widgetActivity(job: AsyncJobState): string {
+	if (job.status === "cancelled") return "Cancelled";
 	const facts: string[] = [];
 	if (job.currentTool && job.currentToolStartedAt !== undefined && job.updatedAt !== undefined) facts.push(`${job.currentTool} ${formatDuration(Math.max(0, job.updatedAt - job.currentToolStartedAt))}`);
 	else if (job.currentTool) facts.push(job.currentTool);
@@ -361,6 +366,7 @@ function widgetStatusGlyph(job: AsyncJobState, theme: Theme): string {
 	if (job.status === "running") return theme.fg("accent", runningGlyph(widgetJobRunningSeed(job)));
 	if (job.status === "queued") return theme.fg("muted", "◦");
 	if (job.status === "complete") return theme.fg("success", "✓");
+	if (job.status === "cancelled") return theme.fg("warning", "⊘");
 	if (job.status === "paused") return theme.fg("warning", "■");
 	return theme.fg("error", "✗");
 }
@@ -369,6 +375,7 @@ function widgetStepGlyph(status: AsyncJobStep["status"], theme: Theme, seed?: nu
 	if (status === "running") return theme.fg("accent", runningGlyph(seed));
 	if (status === "complete" || status === "completed") return theme.fg("success", "✓");
 	if (status === "failed") return theme.fg("error", "✗");
+	if (status === "cancelled") return theme.fg("warning", "⊘");
 	if (status === "paused") return theme.fg("warning", "■");
 	return theme.fg("muted", "◦");
 }
@@ -377,6 +384,7 @@ function widgetStepStatus(status: AsyncJobStep["status"], theme: Theme): string 
 	if (status === "running") return theme.fg("accent", "running");
 	if (status === "complete" || status === "completed") return theme.fg("success", "complete");
 	if (status === "failed") return theme.fg("error", "failed");
+	if (status === "cancelled") return theme.fg("warning", "cancelled");
 	if (status === "paused") return theme.fg("warning", "paused");
 	return theme.fg("dim", status);
 }
@@ -514,7 +522,15 @@ function isDoneResult(result: Details["results"][number]): boolean {
 	if (status === "completed") return true;
 	if (status === "running" || status === "pending") return false;
 	if (result.interrupted || result.detached) return false;
-	return result.exitCode === 0;
+	return result.cancelled === true || result.exitCode === 0;
+}
+
+function renderResultAggregateValue(result: Details["results"][number]): { state: string; teardownUnproven?: boolean } {
+	if (result.teardownUnproven === true) return { state: "running", teardownUnproven: true };
+	if (result.progress?.status === "running" || result.progress?.status === "pending") return { state: result.progress.status };
+	if (result.cancelled) return { state: "cancelled" };
+	if (result.interrupted || result.detached) return { state: "paused" };
+	return { state: result.exitCode === 0 ? "completed" : "failed" };
 }
 
 function workflowGraphHasStatus(details: Pick<Details, "workflowGraph">, statuses: WorkflowNodeStatus[]): boolean {
@@ -585,7 +601,7 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 
 	if (details.mode === "parallel") {
 		const totalCount = details.totalSteps ?? details.results.length;
-		const statuses = new Array(totalCount).fill("pending") as Array<"pending" | "running" | "completed" | "failed" | "detached">;
+		const statuses = new Array(totalCount).fill("pending") as Array<"pending" | "running" | "completed" | "failed" | "cancelled" | "detached">;
 		for (const progress of details.progress ?? []) {
 			if (progress.index >= 0 && progress.index < totalCount) statuses[progress.index] = progress.status;
 		}
@@ -598,9 +614,11 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 			const status = result.progress?.status
 				?? (result.interrupted || result.detached
 					? "detached"
-					: result.exitCode === 0
-						? "completed"
-						: "failed");
+					: result.cancelled
+						? "cancelled"
+						: result.exitCode === 0
+							? "completed"
+							: "failed");
 			statuses[index] = status;
 		}
 		const running = statuses.filter((status) => status === "running").length;
@@ -752,6 +770,7 @@ function nestedStatusGlyph(state: NestedRunSummary["state"] | NestedStepSummary[
 	if (state === "running") return theme.fg("accent", runningGlyph(seed));
 	if (state === "complete" || state === "completed") return theme.fg("success", "✓");
 	if (state === "failed") return theme.fg("error", "✗");
+	if (state === "cancelled") return theme.fg("warning", "⊘");
 	if (state === "paused") return theme.fg("warning", "■");
 	return theme.fg("muted", "◦");
 }
@@ -774,6 +793,7 @@ function nestedActivity(input: Pick<NestedRunSummary | NestedStepSummary, "activ
 	if (state === "running") return "thinking…";
 	if (state === "queued" || state === "pending") return "queued…";
 	if (state === "paused") return "Paused";
+	if (state === "cancelled") return "Cancelled";
 	if (state === "failed") return "Failed";
 	return "Done";
 }
@@ -861,9 +881,17 @@ function foregroundStyleWidgetStepLines(
 	return lines;
 }
 
+function widgetGroupDiagnosticLines(job: AsyncJobState, theme: Theme, width: number): string[] {
+	return (job.groupDiagnostics ?? []).map((diagnostic) => {
+		const details = [diagnostic.error ? `error: ${diagnostic.error}` : "", diagnostic.finalOutput !== undefined ? `final: ${diagnostic.finalOutput}` : ""].filter(Boolean).join(" · ");
+		return truncLine(`  ${theme.fg("warning", "⊘")} ${theme.bold(`Group ${diagnostic.groupId}`)} · ${diagnostic.agent} · ${diagnostic.status}${details ? ` · ${details}` : ""}`, width);
+	});
+}
+
 function foregroundStyleWidgetDetails(job: AsyncJobState, theme: Theme, expanded: boolean, width: number): string[] {
 	if (!job.steps?.length) return [
 		`  ${theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
+		...widgetGroupDiagnosticLines(job, theme, width),
 		...formatNestedWidgetLines(job.nestedChildren, theme, width, expanded, job.updatedAt).map((line) => `  ${line}`),
 	];
 	if (job.mode === "chain" && !job.activeParallelGroup && job.parallelGroups?.length) return widgetChainDetails(job, theme, expanded, width);
@@ -878,6 +906,7 @@ function foregroundStyleWidgetDetails(job: AsyncJobState, theme: Theme, expanded
 	for (const nestedLine of formatNestedWidgetLines(unattached, theme, width, expanded, job.updatedAt)) {
 		lines.push(`  ${nestedLine}`);
 	}
+	lines.push(...widgetGroupDiagnosticLines(job, theme, width));
 	return lines;
 }
 
@@ -909,6 +938,7 @@ function compactSingleWidgetLines(job: AsyncJobState, theme: Theme, width: numbe
 		lines.push(`  ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index))} ${itemTitle} ${index + 1}/${total}: ${themeBold(theme, step.agent)} ${theme.fg("dim", "·")} ${status}${modelDisplay}${activitySuffix}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}`);
 		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, false, job.updatedAt)) lines.push(`    ${nestedLine}`);
 	}
+	lines.push(...widgetGroupDiagnosticLines(job, theme, width));
 	if (job.steps.some((step) => step.status === "running")) lines.push(theme.fg("accent", "  Press Ctrl+O for live detail"));
 	return lines.map((line) => truncLine(line, width));
 }
@@ -1060,13 +1090,14 @@ function renderSingleCompact(d: Details, r: Details["results"][number], theme: T
 }
 
 function renderMultiCompact(d: Details, theme: Theme): Component {
-	const hasRunning = d.progress?.some((p) => p.status === "running")
-		|| d.results.some((r) => r.progress?.status === "running")
-		|| workflowGraphHasStatus(d, ["running"]);
-	const failed = d.results.some((r) => r.exitCode !== 0 && r.progress?.status !== "running")
-		|| workflowGraphHasStatus(d, ["failed"]);
-	const paused = d.results.some((r) => (r.interrupted || r.detached) && r.progress?.status !== "running")
-		|| workflowGraphHasStatus(d, ["paused", "detached"]);
+	const aggregate = resolveAggregateState([
+		...d.results.map(renderResultAggregateValue),
+		...(d.workflowGraph?.nodes ?? []).map((node) => ({ state: node.status })),
+	]);
+	const hasRunning = aggregate === "running";
+	const failed = aggregate === "failed";
+	const cancelled = aggregate === "cancelled";
+	const paused = aggregate === "paused";
 	let totalSummary = d.progressSummary;
 	if (!totalSummary) {
 		let sawProgress = false;
@@ -1088,7 +1119,9 @@ function renderMultiCompact(d: Details, theme: Theme): Component {
 		? theme.fg("accent", runningGlyph(runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex)))
 		: failed
 			? theme.fg("error", "✗")
-			: paused
+			: cancelled
+				? theme.fg("warning", "⊘")
+				: paused
 				? theme.fg("warning", "■")
 				: theme.fg("success", "✓");
 	const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";
@@ -1140,8 +1173,8 @@ function renderMultiCompact(d: Details, theme: Theme): Component {
 			const activity = compactCurrentActivity(rProg);
 			c.addChild(new Text(truncLine(theme.fg("dim", `    ⎿  ${activity}`), width), 0, 0));
 			c.addChild(new Text(truncLine(theme.fg("accent", "    Press Ctrl+O for live detail"), width), 0, 0));
-		} else if (!rPending && (r.exitCode !== 0 || r.interrupted || r.detached || hasEmptyTextOutputWithoutOutputTarget(r.task, output))) {
-			c.addChild(new Text(truncLine(theme.fg(r.exitCode !== 0 ? "error" : "dim", `    ⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
+		} else if (!rPending && (r.exitCode !== 0 || r.interrupted || r.cancelled || r.detached || hasEmptyTextOutputWithoutOutputTarget(r.task, output))) {
+			c.addChild(new Text(truncLine(theme.fg(r.cancelled ? "warning" : r.exitCode !== 0 ? "error" : "dim", `    ⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
 		}
 		const outputTarget = extractOutputTarget(r.task);
 		if (outputTarget) c.addChild(new Text(truncLine(theme.fg("dim", `    output: ${outputTarget}`), width), 0, 0));
@@ -1176,9 +1209,13 @@ export function renderSubagentResult(
 		const isRunning = r.progress?.status === "running";
 		const icon = isRunning
 			? theme.fg("warning", "running")
-			: r.detached
-				? theme.fg("warning", "detached")
-				: r.exitCode === 0
+			: r.cancelled
+				? theme.fg("warning", "cancelled")
+				: r.interrupted
+					? theme.fg("warning", "paused")
+					: r.detached
+						? theme.fg("warning", "detached")
+						: r.exitCode === 0
 					? theme.fg("success", "ok")
 					: theme.fg("error", "failed");
 		const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";
@@ -1268,24 +1305,29 @@ export function renderSubagentResult(
 
 	if (!expanded) return renderMultiCompact(d, theme);
 
-	const hasRunning = d.progress?.some((p) => p.status === "running") 
-		|| d.results.some((r) => r.progress?.status === "running")
-		|| workflowGraphHasStatus(d, ["running"]);
+	const aggregate = resolveAggregateState([
+		...d.results.map(renderResultAggregateValue),
+		...(d.workflowGraph?.nodes ?? []).map((node) => ({ state: node.status })),
+	]);
+	const hasRunning = aggregate === "running";
 	const ok = d.results.filter((r) => r.progress?.status === "completed" || (r.exitCode === 0 && r.progress?.status !== "running")).length;
 	const hasEmptyWithoutTarget = d.results.some((r) =>
 		r.exitCode === 0
 		&& r.progress?.status !== "running"
 		&& hasEmptyTextOutputWithoutOutputTarget(r.task, getSingleResultOutput(r)),
 	);
-	const hasWorkflowFailure = workflowGraphHasStatus(d, ["failed"]);
-	const hasWorkflowPause = workflowGraphHasStatus(d, ["paused", "detached"]);
+	const hasWorkflowFailure = aggregate === "failed";
+	const hasWorkflowPause = aggregate === "paused";
+	const hasCancelled = aggregate === "cancelled";
 	const icon = hasRunning
 		? theme.fg("warning", "running")
 		: hasEmptyWithoutTarget
 			? theme.fg("warning", "warning")
 			: hasWorkflowFailure
 				? theme.fg("error", "failed")
-				: hasWorkflowPause
+				: hasCancelled
+					? theme.fg("warning", "cancelled")
+					: hasWorkflowPause
 					? theme.fg("warning", "paused")
 					: ok === d.results.length
 						? theme.fg("success", "ok")
@@ -1323,14 +1365,17 @@ export function renderSubagentResult(
 		? d.chainAgents
 				.map((agent, i) => {
 					const result = d.results[i];
-					const isFailed = result && result.exitCode !== 0 && result.progress?.status !== "running";
-					const isComplete = result && result.exitCode === 0 && result.progress?.status !== "running";
+							const isCancelled = Boolean(result?.cancelled || result?.progress?.status === "cancelled");
+					const isFailed = result && !isCancelled && !result.interrupted && result.exitCode !== 0 && result.progress?.status !== "running";
+					const isComplete = result && !isCancelled && !result.interrupted && result.exitCode === 0 && result.progress?.status !== "running";
 					const isEmptyWithoutTarget = Boolean(result)
 						&& Boolean(isComplete)
 						&& hasEmptyTextOutputWithoutOutputTarget(result.task, getSingleResultOutput(result));
 					const isCurrent = i === (d.currentStepIndex ?? d.results.length);
-					const stepIcon = isFailed
-						? theme.fg("error", "failed")
+					const stepIcon = isCancelled
+						? theme.fg("warning", "cancelled")
+						: isFailed
+							? theme.fg("error", "failed")
 						: isEmptyWithoutTarget
 							? theme.fg("warning", "warning")
 							: isComplete
@@ -1401,8 +1446,12 @@ export function renderSubagentResult(
 		const resultOutput = getSingleResultOutput(r);
 		const statusIcon = rRunning
 			? theme.fg("warning", "running")
-			: r.exitCode !== 0
-				? theme.fg("error", "failed")
+			: r.cancelled
+				? theme.fg("warning", "cancelled")
+				: r.interrupted
+					? theme.fg("warning", "paused")
+					: r.exitCode !== 0
+						? theme.fg("error", "failed")
 				: hasEmptyTextOutputWithoutOutputTarget(r.task, resultOutput)
 					? theme.fg("warning", "warning")
 					: theme.fg("success", "done");

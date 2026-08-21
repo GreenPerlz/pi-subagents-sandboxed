@@ -264,7 +264,7 @@ Use `~/.pi/agent/subagents.json` for a user override or `.pi/subagents.json` for
 
 Foreground runs stream progress in the conversation while they run.
 
-Background runs keep working after control returns to you. Inspect active runs with `subagent({ action: "status" })`, or a specific run with `subagent({ action: "status", id: "..." })`.
+Background runs keep working after control returns to you. Inspect active runs with `subagent({ action: "status" })`, or a specific run with `subagent({ action: "status", id: "..." })`. Detached async runs have no public cancellation producer today: `subagent({ action: "interrupt" })` is a pause-only control. `cancelled` is emitted by foreground `AbortSignal` paths and may appear in persisted/reconciled projections; it is not an async cancellation API.
 
 They also show a compact async widget and send completion notifications. Parallel background runs show per-agent progress instead of fake chain steps. Chains with parallel groups keep their grouped shape in progress and results, so failed or paused agents stay visible next to completed ones. When a child is explicitly allowed to fan out with `tools: subagent`, its nested runs appear under that parent child in the main status tree instead of being hidden inside the child process.
 
@@ -1035,6 +1035,23 @@ if (bundle) {
 ```
 
 The bundle is returned for the caller to inspect or verify; isolated mode does not promise parent-checkout integration.
+
+#### Recovery bundle contract
+
+Isolated Git exports one compact owner-only recovery bundle on every terminal outcome, including child failure, timeout, cancellation, interruption, acceptance-finalization failure, and orchestration rejection. A dirty checkout is preserved in an internal recovery snapshot containing staged, modified, deleted, binary, executable, symlink, and non-ignored untracked state; ignored files and runtime-synthetic paths are excluded. The snapshot commit is packaging metadata authored by the runtime, not by the child.
+
+Result details, async result/status, and grouped intercom projections carry the agent identity, termination state, bundle path/checksum/size, base/head, recovery ref, optional `stagedSnapshot` ref/tree, dirty summary, incomplete flag, raw payload checksum/size, and deterministic canonical payload checksum/size. When index B and worktree C differ, `stagedSnapshot` is an internal packaging parent for B and `recovery` remains the final worktree-result tip for C; both are reachable from the same bundle and can be inspected/fetched with ordinary Git. Authored commit summaries exclude these packaging commits. The returned bundle checksum/size covers the exported bundle file; portable metadata's `bundleChecksum`/`bundleSize` (also exposed as `payloadChecksum`/`payloadSize`) cover the raw Git payload generated before metadata embedding; canonical fields cover the sorted refs/object-ID manifest. `incomplete` means a commit-required isolated writer did not produce its required child-authored commit or left residual staged/worktree changes; non-commit-required read-only/reviewer dirty recovery is not incomplete solely because it is dirty. These checksums cover bytes or refs only, never paths or presentation metadata. Portable metadata redacts selected local roots (`/tmp`, `/var/tmp`, `/private/tmp`, `/home`, `/Users`, drive-letter, and UNC paths) at filesystem boundaries while preserving route-like prose such as `/api/v1` and other ordinary non-path commit text.
+
+Consume bundles with ordinary Git tooling (`git bundle verify`, then inspect/fetch the exported refs). Do not mistake the internal recovery commit for child-authored history. Bundle files and directories are owner-only and are retained for seven days by default; cleanup is startup-gated, best-effort, and at most daily. `artifacts: false` disables ordinary input/output artifacts but recovery export remains enabled. If packaging fails, the original child/execution error is preserved and the result includes an actionable preserved worktree path; valid export removes the private worktree and branch.
+
+#### Orchestration behavior matrix
+
+| Lifecycle | Result/status projection | Isolated runtime and cleanup |
+|---|---|---|
+| Foreground sequential, static parallel, or dynamic fanout reaches a terminal outcome | Every started child result remains ordered with its bundle reference; grouped intercom delivery includes the same children when enabled | Export each worktree after the terminal fence, then remove the private worktree and branch |
+| Background sequential, static parallel, or dynamic fanout reaches a terminal outcome | Persisted result/status and watcher projection retain completed, failed, interrupted, and skipped child outcomes with bundles | Export each terminal worktree before publishing completion; cleanup is skipped for failed export |
+| Any parallel orchestration rejects after siblings settle | Preserve the original rejection, all settled sibling results, and any fallback bundles in result, status, and grouped projections | Wait for nested terminal proof; package remaining worktrees, or preserve an actionable runtime path when fencing/packaging fails |
+| A child detaches for intercom coordination | Return detached status immediately without claiming terminal cleanup | Keep the runtime alive; a terminal callback fences descendants, exports the bundle, and cleans only after verified export |
 
 Isolated mode has separate constraints:
 

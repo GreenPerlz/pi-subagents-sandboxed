@@ -186,7 +186,7 @@ function sanitizeTokenUsage(value: unknown): NestedRunSummary["totalTokens"] | u
 }
 
 function sanitizeState(value: unknown, fallback: NestedRunState): NestedRunState {
-	return value === "queued" || value === "running" || value === "complete" || value === "failed" || value === "paused"
+	return value === "queued" || value === "running" || value === "complete" || value === "failed" || value === "paused" || value === "cancelled"
 		? value
 		: fallback;
 }
@@ -205,7 +205,7 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 	const raw = input as Record<string, unknown>;
 	const agent = stringValue(raw.agent, 128);
 	if (!agent) return undefined;
-	const status = raw.status === "pending" || raw.status === "running" || raw.status === "complete" || raw.status === "completed" || raw.status === "failed" || raw.status === "paused"
+	const status = raw.status === "pending" || raw.status === "running" || raw.status === "complete" || raw.status === "completed" || raw.status === "failed" || raw.status === "paused" || raw.status === "cancelled"
 		? raw.status
 		: "pending";
 	return {
@@ -226,6 +226,7 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
 		...(clampNumber(raw.endedAt) !== undefined ? { endedAt: clampNumber(raw.endedAt) } : {}),
 		...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
+		...(raw.teardownUnproven === true ? { teardownUnproven: true } : {}),
 		...(depth < MAX_DEPTH && Array.isArray(raw.children) ? { children: raw.children.map((child) => sanitizeSummary(child, depth + 1)).filter((child): child is NestedRunSummary => Boolean(child)).slice(0, MAX_CHILDREN) } : {}),
 	};
 }
@@ -278,6 +279,7 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.lastUpdate) !== undefined ? { lastUpdate: clampNumber(raw.lastUpdate) } : {}),
 		...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
 		...(stringValue(raw.summary, 4096) ? { summary: stringValue(raw.summary, 4096) } : {}),
+		...(raw.teardownUnproven === true ? { teardownUnproven: true } : {}),
 		...(steps && steps.length > 0 ? { steps } : {}),
 		...(depth < MAX_DEPTH && Array.isArray(raw.children) ? { children: raw.children.map((child) => sanitizeSummary(child, depth + 1)).filter((child): child is NestedRunSummary => Boolean(child)).slice(0, MAX_CHILDREN) } : {}),
 	};
@@ -328,19 +330,34 @@ export function parseNestedEventRecords(content: string, route: NestedRoute): Ne
 		.filter((event): event is NestedEventRecord => Boolean(event));
 }
 
-function terminal(state: NestedRunState): boolean {
-	return state === "complete" || state === "failed" || state === "paused";
+function terminal(state: NestedRunState, teardownUnproven = false): boolean {
+	return !teardownUnproven && (state === "complete" || state === "failed" || state === "paused" || state === "cancelled");
 }
 
 function mergeSummary(existing: NestedRunSummary | undefined, event: NestedEventRecord): NestedRunSummary {
-	const incomingState = event.type === "subagent.nested.completed" && event.child.state === "running" ? "complete" : event.child.state;
-	const incoming = { ...event.child, state: incomingState, lastUpdate: event.child.lastUpdate ?? event.ts };
+	// A detached acknowledgement is an update, not terminal truth. The owning
+	// process emits a later completed event after its process and descendants stop.
+	// Never coerce a running acknowledgement into a terminal state here: doing so
+	// makes the stop fence trust an acknowledgement while the child is still live.
+	const incomingSteps = event.child.steps?.map((step, index) => {
+		const previous = existing?.steps?.[index] ?? existing?.steps?.find((candidate) => candidate.agent === step.agent);
+		return previous?.teardownUnproven ? { ...step, teardownUnproven: true } : step;
+	});
+	const incoming = {
+		...event.child,
+		...(incomingSteps ? { steps: incomingSteps } : {}),
+		...(existing?.teardownUnproven || event.child.teardownUnproven ? { teardownUnproven: true } : {}),
+		lastUpdate: event.child.lastUpdate ?? event.ts,
+	};
 	if (!existing) return incoming;
 	const existingUpdate = existing.lastUpdate ?? 0;
 	const incomingUpdate = incoming.lastUpdate ?? event.ts;
 	if (incomingUpdate < existingUpdate) return existing;
-	if (terminal(existing.state) && !terminal(incoming.state)) return existing;
-	if (terminal(existing.state) && terminal(incoming.state) && incomingUpdate === existingUpdate) return existing;
+	// An explicit teardown failure is a newer nonterminal truth even if an older
+	// terminal event was already projected. Never let that terminal snapshot win.
+	if (incoming.teardownUnproven) return { ...existing, ...incoming, lastUpdate: Math.max(existingUpdate, incomingUpdate) };
+	if (terminal(existing.state, existing.teardownUnproven) && !terminal(incoming.state, incoming.teardownUnproven)) return existing;
+	if (terminal(existing.state, existing.teardownUnproven) && terminal(incoming.state, incoming.teardownUnproven) && incomingUpdate === existingUpdate) return existing;
 	return { ...existing, ...incoming, state: incoming.state, lastUpdate: Math.max(existingUpdate, incomingUpdate) };
 }
 
@@ -767,7 +784,8 @@ export function updateForegroundNestedProjection(control: SubagentState["foregro
 export function hasLiveNestedDescendants(children: NestedRunSummary[] | undefined): boolean {
 	if (!children?.length) return false;
 	for (const child of children) {
-		if (!terminal(child.state)) return true;
+		if (!terminal(child.state, child.teardownUnproven)) return true;
+		if (child.steps?.some((step) => step.teardownUnproven === true)) return true;
 		if (hasLiveNestedDescendants(child.children)) return true;
 		if (hasLiveNestedDescendants(child.steps?.flatMap((step) => step.children ?? []))) return true;
 	}
@@ -783,7 +801,7 @@ export function selectNestedChildrenForParent(
 	const matches: NestedRunSummary[] = [];
 	const walk = (items: NestedRunSummary[] | undefined): void => {
 		for (const child of items ?? []) {
-			if (child.parentRunId === parentRunId && child.parentStepIndex === parentStepIndex) {
+			if (child.parentRunId === parentRunId && (parentStepIndex === undefined || child.parentStepIndex === parentStepIndex)) {
 				matches.push(child);
 			}
 			walk(child.children);
@@ -800,6 +818,40 @@ export function hasLiveNestedDescendantsForParent(
 	parentStepIndex?: number,
 ): boolean {
 	return hasLiveNestedDescendants(selectNestedChildrenForParent(children, parentRunId, parentStepIndex));
+}
+
+/**
+ * Fence terminal parent cleanup/export on the nested route's terminal events.
+ * Activity snapshots are useful for UI, but are not proof that a descendant has
+ * stopped. This deliberately waits for the descendant projection to become
+ * terminal before callers remove a runtime-managed checkout.
+ */
+export async function waitForNestedDescendantsToStop(
+	route: NestedRouteInfo | undefined,
+	parentRunId: string,
+	parentStepIndex?: number,
+	options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<{ observed: boolean; stopped: boolean }> {
+	if (!route) return { observed: false, stopped: true };
+	const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs !== undefined && options.timeoutMs >= 0 ? options.timeoutMs : 30_000;
+	const pollMs = Number.isFinite(options.pollMs) && options.pollMs !== undefined && options.pollMs > 0 ? options.pollMs : 25;
+	const deadline = Date.now() + timeoutMs;
+	let observed = false;
+	while (true) {
+		let live = false;
+		try {
+			const registry = projectNestedEvents(route);
+			live = hasLiveNestedDescendantsForParent(registry.children, parentRunId, parentStepIndex);
+		} catch {
+			// A malformed or unavailable route cannot prove termination. Keep the
+			// fence active until its bounded deadline rather than exporting early.
+			live = true;
+		}
+		if (live) observed = true;
+		else return { observed, stopped: true };
+		if (Date.now() >= deadline) return { observed, stopped: false };
+		await new Promise((resolve) => setTimeout(resolve, pollMs));
+	}
 }
 
 export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: string, fallback: { id: string; parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }>; mode?: SubagentRunMode; ts: number }): NestedRunSummary {
@@ -833,6 +885,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		...(status.startedAt !== undefined ? { startedAt: status.startedAt } : { startedAt: fallback.ts }),
 		...(status.endedAt !== undefined ? { endedAt: status.endedAt } : {}),
 		lastUpdate: status.lastUpdate ?? fallback.ts,
+		...(status.teardownUnproven ? { teardownUnproven: true } : {}),
 		...(status.sessionFile ? { sessionFile: status.sessionFile } : {}),
 		...(status.steps?.length ? { steps: status.steps.map((step) => ({
 			agent: step.agent,
@@ -852,6 +905,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 			...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
 			...(step.endedAt !== undefined ? { endedAt: step.endedAt } : {}),
 			...(step.error ? { error: step.error } : {}),
+			...(step.teardownUnproven ? { teardownUnproven: true } : {}),
 		})).slice(0, MAX_STEPS) } : {}),
 	};
 }

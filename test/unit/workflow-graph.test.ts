@@ -78,6 +78,17 @@ describe("workflow graph snapshots", () => {
 		assert.equal(pausedThenFailed.nodes[0]?.status, "failed");
 	});
 
+	it("preserves cancelled child state and completed siblings in mixed groups", () => {
+		const graph = buildWorkflowGraphSnapshot({
+			runId: "run-cancelled",
+			steps: [{ parallel: [{ agent: "done" }, { agent: "stopped" }] }],
+			results: [{ exitCode: 0 }, { exitCode: 1, cancelled: true }],
+		});
+		assert.equal(graph.nodes[0]?.children?.[0]?.status, "completed");
+		assert.equal(graph.nodes[0]?.children?.[1]?.status, "cancelled");
+		assert.equal(graph.nodes[0]?.status, "cancelled");
+	});
+
 	it("uses dynamic group status overrides for empty or aggregate-failure fanout states", () => {
 		const steps = [{
 			expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },

@@ -159,6 +159,43 @@ describe("subagents settings overlay", () => {
 		assert.equal(lines[0]?.length, 160);
 	});
 
+	it("keeps long settings and picker selections visible inside the terminal-height viewport", () => {
+		const agents = Array.from({ length: 8 }, (_, index) => agent({
+			name: `worker-${index}`,
+			filePath: `/tmp/worker-${index}.md`,
+			model: `openai/model-${index}`,
+		}));
+		const rows = buildSettingsRows(agents);
+		const settingsLines = renderSubagentsSettingsOverlay({
+			view: "user",
+			rows,
+			selected: rows.length - 1,
+			theme: theme as never,
+			width: 100,
+			height: 10,
+		});
+		assert.equal(settingsLines.length, 10);
+		assert.match(settingsLines.join("\n"), /› Thinking level/);
+		assert.match(settingsLines.join("\n"), /↑ \d+ more/);
+
+		const pickerLines = renderSubagentsSettingsOverlay({
+			view: "user",
+			rows,
+			selected: 0,
+			theme: theme as never,
+			width: 100,
+			height: 9,
+			picker: {
+				title: "Choose default model",
+				selected: 19,
+				multi: false,
+				choices: Array.from({ length: 20 }, (_, index) => ({ label: `model-${index}` })),
+			},
+		});
+		assert.equal(pickerLines.length, 9);
+		assert.match(pickerLines.join("\n"), /›\s+model-19/);
+	});
+
 	it("uses shared thinking choices including minimal, xhigh, and max", () => {
 		assert.deepEqual(THINKING_CHOICES, [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 	});

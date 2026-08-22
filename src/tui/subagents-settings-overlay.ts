@@ -20,6 +20,14 @@ const OVERLAY_OPTIONS = {
 	maxHeight: "80%" as const,
 };
 
+function resolveOverlayRenderHeight(terminalRows: number): number {
+	const rows = Number.isFinite(terminalRows) && terminalRows > 0 ? terminalRows : 24;
+	const percent = Number.parseFloat(OVERLAY_OPTIONS.maxHeight);
+	return Number.isFinite(percent) && percent > 0
+		? Math.max(2, Math.floor(rows * percent / 100))
+		: Math.max(2, rows);
+}
+
 type Theme = ExtensionContext["ui"]["theme"];
 type SettingsView = "user" | "builtin";
 type FieldKey = "model" | "fallbackModels" | "thinking" | "fastMode";
@@ -195,9 +203,11 @@ export function renderSubagentsSettingsOverlay(input: {
 	shadowingAgents?: Map<string, ShadowingAgentInfo>;
 	builtinAgentNames?: Set<string>;
 	picker?: { title: string; choices: Array<{ label: string; selected?: boolean }>; selected: number; multi: boolean };
+	height?: number;
 }): string[] {
 	const innerWidth = Math.max(40, input.width - 4);
 	const lines: string[] = [];
+	let selectedLine = 0;
 	const tabUser = input.view === "user" ? input.theme.bold("User/local agents") : "User/local agents";
 	const tabBuiltin = input.view === "builtin" ? input.theme.bold("Builtin agents") : "Builtin agents";
 	lines.push(`Subagent settings  [${tabUser}] [${tabBuiltin}]`);
@@ -211,6 +221,7 @@ export function renderSubagentsSettingsOverlay(input: {
 			const choice = input.picker.choices[i]!;
 			const cursor = i === input.picker.selected ? "›" : " ";
 			const mark = input.picker.multi ? (choice.selected ? "[x]" : "[ ]") : "";
+			if (i === input.picker.selected) selectedLine = lines.length;
 			lines.push(`${cursor} ${mark} ${choice.label}`.trimEnd());
 		}
 	} else if (input.rows.length === 0) {
@@ -240,10 +251,27 @@ export function renderSubagentsSettingsOverlay(input: {
 				}
 			}
 			const cursor = i === input.selected ? "›" : " ";
+			if (i === input.selected) selectedLine = lines.length;
 			lines.push(`${cursor} ${row.label.padEnd(16)} ${row.value}`);
 		}
 	}
-	const clipped = lines.map((line) => truncateToWidth(line, innerWidth));
+
+	let visibleLines = lines;
+	const requestedHeight = input.height !== undefined && Number.isFinite(input.height)
+		? Math.max(2, Math.floor(input.height))
+		: undefined;
+	if (requestedHeight !== undefined && lines.length + 2 > requestedHeight) {
+		const showScrollInfo = requestedHeight >= 4;
+		const viewportSize = Math.max(0, requestedHeight - 2 - (showScrollInfo ? 1 : 0));
+		const maxOffset = Math.max(0, lines.length - viewportSize);
+		const offset = Math.min(maxOffset, Math.max(0, selectedLine - Math.floor(viewportSize / 2)));
+		visibleLines = lines.slice(offset, offset + viewportSize);
+		if (showScrollInfo) {
+			const below = Math.max(0, lines.length - offset - viewportSize);
+			visibleLines.push(input.theme.fg("dim", `↑ ${offset} more · ↓ ${below} more`));
+		}
+	}
+	const clipped = visibleLines.map((line) => truncateToWidth(line, innerWidth));
 	const borderTop = `╭${"─".repeat(innerWidth + 2)}╮`;
 	const borderBottom = `╰${"─".repeat(innerWidth + 2)}╯`;
 	return [borderTop, ...clipped.map((line) => `│ ${line}${" ".repeat(Math.max(0, innerWidth - visibleWidth(line)))} │`), borderBottom];
@@ -486,6 +514,7 @@ class SubagentsSettingsOverlay {
 
 	render(width: number): string[] {
 		return renderSubagentsSettingsOverlay({
+			height: resolveOverlayRenderHeight(process.stdout.rows || 24),
 			view: this.view,
 			rows: this.rows(),
 			selected: this.selected,

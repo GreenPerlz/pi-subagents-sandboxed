@@ -28,9 +28,8 @@ import {
 	tryImport,
 } from "../support/helpers.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
-import { createNestedRoute, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
-import { cleanupIsolatedGitRuntime, createIsolatedGitRuntime, createIsolatedGitWorktree } from "../../src/sandbox/isolated-git.ts";
-import {
+import { createNestedRoute, NESTED_EVENTS_DIR, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { createScopedGitEndpoint } from "../../src/sandbox/scoped-git-endpoint.ts";import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
 	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
@@ -180,6 +179,7 @@ function writePackageSkill(packageRoot: string, skillName: string): void {
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
+	let nestedRoutesBefore: Set<string>;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -192,11 +192,15 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 	beforeEach(() => {
 		tempDir = createTempDir();
+		nestedRoutesBefore = fs.existsSync(NESTED_EVENTS_DIR) ? new Set(fs.readdirSync(NESTED_EVENTS_DIR)) : new Set();
 		mockPi.reset();
 	});
 
 	afterEach(() => {
 		removeTempDir(tempDir);
+		if (fs.existsSync(NESTED_EVENTS_DIR)) {
+			for (const entry of fs.readdirSync(NESTED_EVENTS_DIR)) if (!nestedRoutesBefore.has(entry)) fs.rmSync(path.join(NESTED_EVENTS_DIR, entry), { recursive: true, force: true });
+		}
 	});
 
 	function readCallArgs(): string[] {
@@ -230,7 +234,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		fs.mkdirSync(recordDir, { recursive: true });
 		const scriptPath = path.join(binDir, "fake-bwrap.mjs");
 		fs.writeFileSync(scriptPath, `
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -251,16 +255,16 @@ if (separator === -1 || !args[separator + 1]) {
   console.error("fake bwrap expected -- followed by a command");
   process.exit(98);
 }
-const child = spawnSync(args[separator + 1], args.slice(separator + 2), {
+const child = spawn(args[separator + 1], args.slice(separator + 2), {
   stdio: "inherit",
   env: process.env,
   cwd: process.cwd(),
 });
-if (child.error) {
-  console.error(child.error.message);
+child.on("error", (error) => {
+  console.error(error.message);
   process.exit(99);
-}
-process.exit(child.status ?? 0);
+});
+child.on("close", (status) => process.exit(status ?? 0));
 `, "utf-8");
 		const bwrapPath = path.join(binDir, "bwrap");
 		fs.writeFileSync(bwrapPath, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`, "utf-8");
@@ -403,9 +407,10 @@ process.exit(${exitCode});
 			getSessionName?: () => string | undefined;
 			events?: ReturnType<typeof createEventBus>;
 			nestedFenceTimeoutMs?: number;
+			teardownHooks?: Record<string, unknown>;
 		} = {},
 	) {
-		const state = { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null };
+		const state = { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), foregroundRuns: new Map(), lastForegroundControlId: null };
 		const baseExecutor = createSubagentExecutor!({
 			pi: { events: overrides.events ?? createEventBus(), getSessionName: overrides.getSessionName ?? (() => undefined) },
 			state,
@@ -416,6 +421,7 @@ process.exit(${exitCode});
 			expandTilde: (value: string) => value,
 			discoverAgents: () => ({ agents }),
 			nestedFenceTimeoutMs: overrides.nestedFenceTimeoutMs,
+			teardownHooks: overrides.teardownHooks,
 		});
 		return {
 			...baseExecutor,
@@ -427,6 +433,17 @@ process.exit(${exitCode});
 						? { sandbox: { provider: "none" } } : {}),
 				}, signal, onUpdate as never, ctx as never),
 		};
+	}
+
+	function removeNestedRoutesForRun(runId: string | undefined): void {
+		if (!runId || !fs.existsSync(NESTED_EVENTS_DIR)) return;
+		for (const entry of fs.readdirSync(NESTED_EVENTS_DIR)) {
+			const routeRoot = path.join(NESTED_EVENTS_DIR, entry);
+			try {
+				const metadata = JSON.parse(fs.readFileSync(path.join(routeRoot, "route.json"), "utf8")) as { rootRunId?: unknown };
+				if (metadata.rootRunId === runId) fs.rmSync(routeRoot, { recursive: true, force: true });
+			} catch { /* Ignore unrelated or concurrently incomplete durable routes. */ }
+		}
 	}
 
 	function makeLifecycleRepo(name: string): string {
@@ -1551,6 +1568,100 @@ process.exit(${exitCode});
 		assert.equal(result.skillsWarning, undefined);
 	});
 
+	it("rejects isolated cwd escapes before runSync output, session, skill, and artifact side effects", { skip: !runSync ? "execution module unavailable" : undefined }, async () => {
+		const outside = path.join(os.tmpdir(), `pi-subagent-cwd-outside-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+		const alias = path.join(tempDir, "outside-alias");
+		const marker = path.join(tempDir, "cwd-escape-marker");
+		const nested = path.join(tempDir, "nested");
+		fs.mkdirSync(nested, { recursive: true });
+		fs.writeFileSync(path.join(nested, ".keep"), "nested\\n");
+		fs.writeFileSync(path.join(tempDir, "base.txt"), "base\\n");
+		for (const args of [["init", "--initial-branch=main"], ["config", "user.name", "Cwd Test"], ["config", "user.email", "cwd@example.invalid"], ["add", "."], ["commit", "-m", "base"]]) {
+			const setup = spawnSync("git", ["-C", tempDir, ...args], { encoding: "utf8" });
+			assert.equal(setup.status, 0, setup.stderr);
+		}
+		const endpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cwd-gates-endpoint-"));
+		const owner = createScopedGitEndpoint({ runtimeRoot: endpointRoot, worktree: tempDir, cwd: tempDir, rights: "writer" });
+		const sessionDir = path.join(tempDir, "cwd-escape-session");
+		const artifactsDir = path.join(tempDir, "cwd-escape-artifacts");
+		const sideEffectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cwd-gates-side-effects-"));
+		const nestedAlias = path.join(tempDir, "nested-alias");
+		fs.mkdirSync(outside, { recursive: true });
+		fs.symlinkSync(outside, alias, "dir");
+		fs.symlinkSync(nested, nestedAlias, "dir");
+		const fakeBwrap = installFakeBwrap();
+		const isolatedSandbox = { provider: "bubblewrap", gitMode: "isolated", fallback: "fail", extraWritableMounts: [mockPi.dir] };
+		try {
+			const cases = [
+				{ name: "equal", cwd: tempDir, allowed: true },
+				{ name: "real descendant", cwd: nested, allowed: true },
+				{ name: "ancestor", cwd: path.join(tempDir, ".."), allowed: false },
+				{ name: "sibling", cwd: path.join(path.dirname(tempDir), "sibling"), allowed: false },
+				{ name: "dotdot escape", cwd: path.join(tempDir, "nested", "..", ".."), allowed: false },
+				{ name: "symlink alias escape", cwd: alias, allowed: false },
+				{ name: "symlink alias descendant", cwd: nestedAlias, allowed: true },
+			] as const;
+			for (const testCase of cases) {
+				const caseMarker = path.join(sideEffectRoot, `${testCase.name.replace(/\\s+/gu, "-")}-marker`);
+				const caseSession = path.join(sideEffectRoot, `${testCase.name.replace(/\\s+/gu, "-")}-session`);
+				const caseArtifacts = path.join(sideEffectRoot, `${testCase.name.replace(/\\s+/gu, "-")}-artifacts`);
+				if (testCase.allowed) mockPi.onCall({ output: "allowed" });
+				let result: RunSyncResult | undefined;
+				if (testCase.allowed) {
+					result = await runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "allowed cwd", { cwd: testCase.cwd, isolatedGitEndpoint: owner.descriptor, isolatedGitRights: "writer", outputPath: caseMarker, sessionDir: caseSession, artifactsDir: caseArtifacts, sandbox: isolatedSandbox, exportIsolatedGitBundle: false });
+				} else {
+					assert.throws(() => owner.reserveChild({ cwd: testCase.cwd, rights: "read-only" }), /widens|escapes/);
+					await assert.rejects(
+						() => runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "rejected cwd", { cwd: testCase.cwd, isolatedGitEndpoint: owner.descriptor, isolatedGitRights: "writer", outputPath: caseMarker, sessionDir: caseSession, artifactsDir: caseArtifacts, sandbox: isolatedSandbox, exportIsolatedGitBundle: false }),
+						/widens|escapes/,
+					);
+				}
+				if (testCase.allowed) {
+					assert.equal((result as RunSyncResult).exitCode, 0, `${testCase.name}: ${JSON.stringify(result)}`);
+					assert.equal(mockPi.callCount(), cases.filter((candidate) => candidate.allowed && cases.indexOf(candidate) <= cases.indexOf(testCase)).length, testCase.name);
+				} else {
+					assert.equal(result, undefined, testCase.name);
+					assert.equal(fs.existsSync(caseMarker), false, `${testCase.name}: output marker`);
+					assert.equal(fs.existsSync(caseSession), false, `${testCase.name}: session directory`);
+					assert.equal(fs.existsSync(caseArtifacts), false, `${testCase.name}: artifacts/discovery directory`);
+				}
+			}
+			assert.equal(mockPi.callCount(), cases.filter((candidate) => candidate.allowed).length);
+			const invalidDescriptorMarker = path.join(sideEffectRoot, "invalid-descriptor-marker");
+			const invalidDescriptorSession = path.join(sideEffectRoot, "invalid-descriptor-session");
+			const invalidDescriptorArtifacts = path.join(sideEffectRoot, "invalid-descriptor-artifacts");
+			await assert.rejects(
+				() => runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "rejected descriptor", { cwd: tempDir, isolatedGitEndpoint: { relativeSubtree: ".." }, isolatedGitRights: "writer", outputPath: invalidDescriptorMarker, sessionDir: invalidDescriptorSession, artifactsDir: invalidDescriptorArtifacts, sandbox: isolatedSandbox, exportIsolatedGitBundle: false }),
+				/escapes/,
+			);
+			assert.equal(fs.existsSync(invalidDescriptorMarker), false);
+			assert.equal(fs.existsSync(invalidDescriptorSession), false);
+			assert.equal(fs.existsSync(invalidDescriptorArtifacts), false);
+			const executor = makeExecutor([makeAgent("fixture.pkg.review", { tools: ["read"] })]);
+			const parallel = await executor.execute("cwd-top-level-parallel", {
+				tasks: [{ agent: "fixture.pkg.review", task: "must not spawn", cwd: path.join(tempDir, "..") }],
+				cwd: tempDir,
+				sandbox: isolatedSandbox,
+				isolatedGitEndpoint: owner.descriptor,
+				isolatedGitRights: "writer",
+			}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(parallel.isError, true, "top-level foreground parallel must reject an unauthorized task cwd");
+			assert.match(parallel.content[0]?.text ?? "", /cwd authorization failed closed|widens|escapes|setup failed/i);
+			assert.equal(mockPi.callCount(), cases.filter((candidate) => candidate.allowed).length, "top-level parallel must not spawn");
+			assert.equal(fs.existsSync(marker), false);
+			assert.equal(fs.existsSync(sessionDir), false);
+			assert.equal(fs.existsSync(artifactsDir), false);
+		} finally {
+			fakeBwrap.restore();
+			await owner.close();
+			fs.rmSync(alias, { force: true });
+			fs.rmSync(nestedAlias, { force: true });
+			fs.rmSync(outside, { recursive: true, force: true });
+			fs.rmSync(sideEffectRoot, { recursive: true, force: true });
+			fs.rmSync(endpointRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("fails foreground runs on explicit unavailable pi-subagents skill requests without spawning", async () => {
 		const agents = [makeAgent("worker")];
 
@@ -2207,7 +2318,7 @@ process.exit(${exitCode});
 			const result = await executor.execute("isolated-foreground-rejection", {
 				agent: "worker",
 				task: "Write then trigger the foreground rejection",
-				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] },
 			}, new AbortController().signal, (update: any) => {
 				const outputPath = update.details?.results?.[0]?.artifactPaths?.outputPath;
 				if (blockedOutput || typeof outputPath !== "string") return;
@@ -2229,7 +2340,7 @@ process.exit(${exitCode});
 			assert.equal(grouped?.children?.length, 1);
 			assert.match(grouped?.children?.[0]?.summary ?? "", /Foreground execution rejected/);
 			assert.ok(grouped?.children?.[0]?.gitBundle?.path);
-			assert.deepEqual(runtimesAtPublication, [], "runtime root and policy servers must be gone before grouped publication");
+			assert.deepEqual(runtimesAtPublication, [], "runtime root and endpoint owners must be gone before grouped publication");
 		} finally {
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -2249,7 +2360,7 @@ process.exit(${exitCode});
 		const result = await executor.execute("isolated-foreground-packaging-failure", {
 			agent: "worker",
 			task: "Write then fail foreground bundle packaging",
-			sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+			sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] },
 		}, new AbortController().signal, (update: any) => {
 			const outputPath = update.details?.results?.[0]?.artifactPaths?.outputPath;
 			if (blockedOutput || typeof outputPath !== "string") return;
@@ -2288,7 +2399,7 @@ process.exit(${exitCode});
 		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
 		const result = await executor.execute(
 			"isolated-foreground-executor",
-			{ agent: "worker", task: "Commit the isolated child change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } },
+			{ agent: "worker", task: "Commit the isolated child change", sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] } },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(repo),
@@ -2321,7 +2432,7 @@ process.exit(${exitCode});
 		fs.writeFileSync(path.join(extensionDir, "extension.ts"), "export default function register() {}\n", "utf8");
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = agentDir;
-		const isolatedSandbox = { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] };
+		const isolatedSandbox = { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] };
 		const runModes: Array<{ label: string; params: Record<string, unknown> }> = [
 			{ label: "parallel", params: { tasks: [{ agent: "worker", task: "Detach and commit first sibling" }, { agent: "worker", task: "Finish second sibling" }], sandbox: isolatedSandbox } },
 			{ label: "chain", params: { chain: [{ parallel: [{ agent: "worker", task: "Detach and commit first chain sibling" }, { agent: "worker", task: "Finish second chain sibling" }] }], clarify: false, sandbox: isolatedSandbox } },
@@ -2388,13 +2499,160 @@ process.exit(${exitCode});
 		}
 	});
 
+	it("retains endpoint recovery when foreground cleanup is unproven", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const modes = [
+			{ name: "top-level parallel", params: { tasks: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }] } },
+			{ name: "parallel chain", params: { chain: [{ parallel: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }] }], clarify: false } },
+			{ name: "sequential chain", params: { chain: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }], clarify: false } },
+		] as const;
+		for (const mode of modes) {
+			const repo = makeLifecycleRepo(`release-failure-${mode.name.replace(/\\W+/gu, "-")}`);
+			const endpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-release-failure-endpoint-"));
+			const owner = createScopedGitEndpoint({ runtimeRoot: endpointRoot, worktree: repo, cwd: repo, rights: "writer" });
+			let nestedRunId: string | undefined;
+			const bus = createEventBus();
+			const publications: unknown[] = [];
+			bus.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => publications.push(payload));
+			let detachSent = false;
+			const updates: any[] = [];
+			mockPi.onCall({ steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "endpoint cleanup" })] }, { delay: 300, jsonl: [events.assistantMessage("terminal output")] }] });
+			try {
+				const releaseAttempts: unknown[] = [];
+				const executor = makeExecutor([makeAgent("fixture.pkg.work", { tools: ["read", "edit", "bash", "contact_supervisor"], systemPrompt: "Intercom orchestration channel: test" })], {
+					events: bus,
+					teardownHooks: {
+						waitForNestedDescendantsToStop: async () => ({ observed: false, stopped: true }),
+					},
+				});
+				const result = await executor.execute(`release-failure-${mode.name}`, { ...mode.params, isolatedGitEndpoint: owner.descriptor, isolatedGitRights: "writer", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
+					updates.push(update);
+					const progress = update.details?.progress?.some((entry: any) => entry.currentTool === "contact_supervisor");
+					if (progress && !detachSent) {
+						detachSent = true;
+						bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: `release-failure-${mode.name}` });
+					}
+				}, makeMinimalCtx(repo));
+				nestedRunId = result.details.runId;
+				assert.equal(detachSent, true, `${mode.name}: production detach must start the terminal path`);
+				const releaseDeadline = Date.now() + 4_000;
+				while (releaseAttempts.length === 0 && Date.now() < releaseDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+				assert.equal(releaseAttempts.length, 0, `${mode.name}: endpoint cleanup has no bearer release hook`);
+				const teardownDeadline = Date.now() + 4_000;
+				while (!updates.some((update) => update.details?.results?.some((child: any) => child.teardownUnproven === true)) && Date.now() < teardownDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+				assert.equal(result.details.results[0]?.detached, true, `${mode.name}: retain detached acknowledgement`);
+				assert.match(result.content[0]?.text ?? "", /Recover retained isolated worktree evidence through the owning parent run/, `${mode.name}: retain actionable recovery guidance without exposing host paths`);
+				assert.equal(fs.existsSync(owner.scope.endpointRoot), true, `${mode.name}: endpoint owner remains available for recovery`);
+				assert.equal(publications.length, 0, `${mode.name}: suppress terminal publication while endpoint cleanup is unproven`);
+				assert.equal(updates.some((update) => update.details?.results?.some((child: any) => child.teardownUnproven === true)), true, `${mode.name}: unproven endpoint cleanup projects actionable teardownUnproven state`);
+				assert.equal(fs.existsSync(owner.scope.endpointRoot), true, `${mode.name}: retain endpoint root for recovery`);
+			} finally {
+				await owner.close();
+				removeNestedRoutesForRun(nestedRunId);
+				fs.rmSync(endpointRoot, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("suppresses terminal publication when the descendant fence is unproven", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const modes = [
+			{ name: "top-level parallel", params: { tasks: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }] } },
+			{ name: "parallel chain", params: { chain: [{ parallel: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }] }], clarify: false } },
+			{ name: "sequential chain", params: { chain: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }], clarify: false } },
+		] as const;
+		for (const mode of modes) {
+			const repo = makeLifecycleRepo(`fence-failure-${mode.name.replace(/\\W+/gu, "-")}`);
+			const endpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fence-failure-endpoint-"));
+			const owner = createScopedGitEndpoint({ runtimeRoot: endpointRoot, worktree: repo, cwd: repo, rights: "writer" });
+			const bus = createEventBus();
+			const publications: unknown[] = [];
+			bus.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => publications.push(payload));
+			const releaseAttempts: unknown[] = [];
+			let nestedRunId: string | undefined;
+			let detachSent = false;
+			const updates: any[] = [];
+			mockPi.onCall({ steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "endpoint fence" })] }, { delay: 300, jsonl: [events.assistantMessage("terminal output")] }] });
+			try {
+				const executor = makeExecutor([makeAgent("fixture.pkg.work", { tools: ["read", "edit", "bash", "contact_supervisor"], systemPrompt: "Intercom orchestration channel: test" })], {
+					events: bus,
+					teardownHooks: {
+						waitForNestedDescendantsToStop: async () => ({ observed: true, stopped: false }),
+
+					},
+				});
+				const result = await executor.execute(`fence-failure-${mode.name}`, { ...mode.params, isolatedGitEndpoint: owner.descriptor, isolatedGitRights: "writer", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
+					updates.push(update);
+					if (detachSent || !update.details?.progress?.some((entry: any) => entry.currentTool === "contact_supervisor")) return;
+					detachSent = true;
+					bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: `fence-failure-${mode.name}` });
+				}, makeMinimalCtx(repo));
+				nestedRunId = result.details.runId;
+				assert.equal(detachSent, true, `${mode.name}: production detach must start the terminal path`);
+				const teardownDeadline = Date.now() + 4_000;
+				while (!updates.some((update) => update.details?.results?.some((child: any) => child.teardownUnproven === true)) && Date.now() < teardownDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+				assert.equal(result.details.results[0]?.detached, true, `${mode.name}: retain detached acknowledgement`);
+				assert.match(result.content[0]?.text ?? "", /Recover retained isolated worktree evidence through the owning parent run/, `${mode.name}: retain actionable recovery guidance without exposing host paths`);
+				assert.equal(releaseAttempts.length, 0, `${mode.name}: unproven fence must not attempt release`);
+				assert.equal(publications.length, 0, `${mode.name}: suppress terminal intercom publication`);
+				assert.equal(updates.some((update) => update.details?.results?.some((child: any) => child.detached !== true && child.finalOutput === "terminal output")), false, `${mode.name}: suppress detached terminal callback projection`);
+				assert.equal(updates.some((update) => update.details?.results?.some((child: any) => child.teardownUnproven === true)), true, `${mode.name}: project actionable teardownUnproven state`);
+				assert.equal(fs.existsSync(owner.scope.endpointRoot), true, `${mode.name}: retain endpoint root for recovery`);
+			} finally {
+				await owner.close();
+				removeNestedRoutesForRun(nestedRunId);
+				fs.rmSync(endpointRoot, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("publishes exactly one terminal callback after a proven endpoint fence", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const modes = [
+			{ name: "top-level parallel", params: { tasks: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }] } },
+			{ name: "parallel chain", params: { chain: [{ parallel: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }] }], clarify: false } },
+			{ name: "sequential chain", params: { chain: [{ agent: "fixture.pkg.work", task: "Modify files and commit after handoff" }], clarify: false } },
+		] as const;
+		for (const mode of modes) {
+			const repo = makeLifecycleRepo(`fence-success-${mode.name.replace(/\\W+/gu, "-")}`);
+			const endpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fence-success-endpoint-"));
+			const owner = createScopedGitEndpoint({ runtimeRoot: endpointRoot, worktree: repo, cwd: repo, rights: "writer" });
+			const bus = createEventBus();
+			let detachSent = false;
+			let terminalUpdates = 0;
+			mockPi.onCall({ steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "endpoint fence" })] }, { delay: 300, jsonl: [events.assistantMessage("terminal output")] }] });
+			try {
+				const executor = makeExecutor([makeAgent("fixture.pkg.work", { tools: ["read", "edit", "bash", "contact_supervisor"], systemPrompt: "Intercom orchestration channel: test" })], {
+					events: bus,
+					teardownHooks: {
+						waitForNestedDescendantsToStop: async () => ({ observed: true, stopped: true }),
+					},
+				});
+				const result = await executor.execute(`fence-success-${mode.name}`, { ...mode.params, isolatedGitEndpoint: owner.descriptor, isolatedGitRights: "writer", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
+					if (update.details?.results?.some((child: any) => child.detached !== true && child.finalOutput === "terminal output")) terminalUpdates++;
+					if (detachSent || !update.details?.progress?.some((entry: any) => entry.currentTool === "contact_supervisor")) return;
+					detachSent = true;
+					bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: `fence-success-${mode.name}` });
+				}, makeMinimalCtx(repo));
+				const deadline = Date.now() + 4_000;
+				while (terminalUpdates === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+				assert.equal(detachSent, true, `${mode.name}: production detach must start the terminal path`);
+				assert.equal(fs.existsSync(owner.scope.endpointRoot), true, `${mode.name}: endpoint remains live through publication`);
+				assert.equal(terminalUpdates, 1, `${mode.name}: terminal callback must publish exactly once after endpoint cleanup`);
+				assert.equal(result.details.results[0]?.detached, true, `${mode.name}: immediate result retains detached acknowledgement`);
+				assert.equal(fs.existsSync(owner.scope.endpointRoot), true, `${mode.name}: endpoint remains live until publication completes`);
+				assert.equal(/cleanup failed after export|bundle export failed/i.test(result.content[0]?.text ?? ""), false, `${mode.name}: successful endpoint cleanup must not add diagnostics`);
+			} finally {
+				await owner.close();
+				fs.rmSync(endpointRoot, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("completed isolated sibling bundle is retained when another sibling rejects", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
 		const repo = makeLifecycleRepo("isolated-sibling-rejection-repo");
 		mockPi.onCall({ output: "completed isolated sibling", commands: ["printf 'completed sibling\\n' > completed.txt && git add completed.txt && git commit -m 'completed sibling'"] });
 		mockPi.onCall({ output: "rejected isolated sibling", commands: ["printf 'rejected sibling\\n' > rejected.txt"] });
 		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
 		let rejectionArtifactBlocked = false;
-		const result = await executor.execute("isolated-sibling-rejection", { tasks: [{ agent: "worker", task: "Complete sibling" }, { agent: "worker", task: "Reject sibling" }], sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
+		const result = await executor.execute("isolated-sibling-rejection", { tasks: [{ agent: "worker", task: "Complete sibling" }, { agent: "worker", task: "Reject sibling" }], sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
 			const outputPath = update.details?.results?.find((candidate: any) => candidate?.artifactPaths?.outputPath?.includes("_1_output.md"))?.artifactPaths?.outputPath;
 			if (rejectionArtifactBlocked || typeof outputPath !== "string") return;
 			rejectionArtifactBlocked = true;
@@ -2445,7 +2703,7 @@ process.exit(${exitCode});
 			mockPi.onCall({ delay: 1500, output: "fence refusal terminal", commands: ["printf 'fence\\n' > fence.txt && git add fence.txt && git commit -m 'fence refusal'"] });
 			const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })], { nestedFenceTimeoutMs: 25 });
 			let seeded = false;
-			const result = await executor.execute(runId, { agent: "worker", task: "Commit the isolated fence refusal change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
+			const result = await executor.execute(runId, { agent: "worker", task: "Commit the isolated fence refusal change", sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, (update: any) => {
 				const inputPath = update.details?.results?.[0]?.artifactPaths?.inputPath;
 				const childRunId = typeof inputPath === "string" ? path.basename(inputPath).split("_")[0] : undefined;
 				if (seeded || !childRunId) return;
@@ -2467,8 +2725,8 @@ process.exit(${exitCode});
 			const preserved = fs.readdirSync(os.tmpdir()).filter((entry) => runtimePrefix !== "" && entry.startsWith(runtimePrefix));
 			assert.ok(preserved.length > 0, "fence refusal must preserve the isolated runtime for recovery");
 			const runtimeRoot = path.join(os.tmpdir(), preserved[0]!);
-			assert.ok(fs.existsSync(path.join(runtimeRoot, "git-policy-host", "server.sock")), "fence refusal must keep the host policy server alive");
-			assert.ok(fs.existsSync(path.join(runtimeRoot, "git-policy-none", "server.sock")), "fence refusal must keep the no-network policy server alive");
+			// Fence refusal retains the runtime but never creates detached authority artifacts.
+			assert.equal(fs.existsSync(path.join(runtimeRoot, "authority")), false);
 			const recoveryWorktree = path.join(runtimeRoot, "worktrees", "0");
 			const recoveryProbe = spawnSync("git", ["-C", recoveryWorktree, "status", "--porcelain=v1"], { encoding: "utf8" });
 			assert.equal(recoveryProbe.status, 0, recoveryProbe.stderr);
@@ -2487,7 +2745,7 @@ process.exit(${exitCode});
 		const repo = makeLifecycleRepo("isolated-timeout-projection-repo");
 		mockPi.onCall({ output: "timed out while committing", stderr: "operation timed out", exitCode: 1, commands: ["printf 'timeout recovery\\n' > timeout.txt"] });
 		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
-		const result = await executor.execute("isolated-timeout-projection", { agent: "worker", task: "Commit the timed-out isolated change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, undefined, makeMinimalCtx(repo));
+		const result = await executor.execute("isolated-timeout-projection", { agent: "worker", task: "Commit the timed-out isolated change", sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] } }, new AbortController().signal, undefined, makeMinimalCtx(repo));
 		const child = result.details.results[0] as any;
 		assert.equal(result.isError, true, JSON.stringify(result));
 		assert.match(child?.error ?? "", /timed out/i);
@@ -2502,8 +2760,11 @@ process.exit(${exitCode});
 		mockPi.onCall({ delay: 2000, output: "cancelled after child work", commands: ["printf 'cancelled recovery\\n' > cancelled.txt"] });
 		const controller = new AbortController();
 		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
-		const pending = executor.execute("isolated-cancellation-projection", { agent: "worker", task: "Commit the cancelled isolated change", sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } }, controller.signal, undefined, makeMinimalCtx(repo));
-		setTimeout(() => controller.abort(), 200);
+		const pending = executor.execute("isolated-cancellation-projection", { agent: "worker", task: "Commit the cancelled isolated change", sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] } }, controller.signal, undefined, makeMinimalCtx(repo));
+		const startedDeadline = Date.now() + 5_000;
+		while (mockPi.callCount() < 1 && Date.now() < startedDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(mockPi.callCount(), 1, "cancellation begins only after the child has created its dirty worktree state");
+		controller.abort();
 		const result = await pending;
 		const child = result.details.results[0] as any;
 		assert.equal(result.isError, true, JSON.stringify(result));
@@ -2517,39 +2778,34 @@ process.exit(${exitCode});
 		assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimePrefixBefore.has(entry)), [], "cancelled terminal export must clean the runtime");
 	});
 
-	it("interrupted acceptance-finalization projection exports interrupted recovery", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+	it("interrupted endpoint cleanup preserves dirty foreground recovery", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
 		const repo = makeLifecycleRepo("isolated-interrupted-acceptance-repo");
 		const runId = "isolated-interrupted-acceptance";
-		const runtime = createIsolatedGitRuntime({ cwd: repo, runId, extraWritableMounts: [mockPi.dir] });
-		const worktree = createIsolatedGitWorktree(runtime, { index: 0, agent: "worker" });
+		const endpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-interrupted-acceptance-endpoint-"));
+		const owner = createScopedGitEndpoint({ runtimeRoot: endpointRoot, worktree: repo, cwd: repo, rights: "writer" });
 		const interrupt = new AbortController();
 		try {
-			mockPi.onCall({ output: acceptanceReport(), commands: ["printf 'accepted base\\n' > accepted.txt && git add accepted.txt && git commit -m 'accepted base'"] });
-			mockPi.onCall({ delay: 2000, output: acceptanceReport(), commands: ["printf 'dirty finalization state\\n' > dirty-finalization.txt"] });
+			mockPi.onCall({ output: acceptanceReport(), commands: [] });
+			mockPi.onCall({ delay: 2000, output: acceptanceReport(), commands: [] });
+			const dirtyFinalizationPath = path.join(repo, "dirty-finalization.txt");
+			fs.writeFileSync(dirtyFinalizationPath, "recoverable dirty state\\n");
 			const pending = runSync!(repo, [makeAgent("worker", { tools: ["read", "bash"] })], "worker", "Commit the isolated acceptance change", {
 				runId,
-				isolatedGit: worktree,
+				isolatedGitEndpoint: owner.descriptor,
+				isolatedGitRights: "writer",
 				isolatedGitBundleDir: path.join(tempDir, "interrupted-acceptance-artifacts"),
 				isolatedGitCommitRequired: true,
-				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] },
 				acceptance: { criteria: ["Commit the isolated acceptance change"], selfReview: true, maxFinalizationTurns: 1 },
 				interruptSignal: interrupt.signal,
 			});
-			setTimeout(() => interrupt.abort(), 250);
+			interrupt.abort();
 			const result = await pending;
 			assert.equal(result.interrupted, true, JSON.stringify(result));
-			assert.equal(result.gitBundle?.terminationState, "interrupted");
-			assert.ok(result.gitBundle?.path && fs.existsSync(result.gitBundle.path));
-			assert.ok(result.gitBundle?.recovery, "interrupted finalization must retain a recovery ref for dirty state");
-			assert.equal(result.gitBundle?.incomplete, true);
-			assert.match(result.gitBundle?.portableMetadata ?? "", /"terminationState":"interrupted"/);
-			const bundleHeads = spawnSync("git", ["bundle", "list-heads", result.gitBundle!.path], { encoding: "utf8" });
-			assert.equal(bundleHeads.status, 0, bundleHeads.stderr);
-			assert.match(bundleHeads.stdout, /refs\/isolated\/recovery-0/);
-			assert.equal(result.acceptance?.finalization?.status, "failed");
+			assert.equal(fs.existsSync(dirtyFinalizationPath), true, "dirty endpoint worktree remains recoverable");
 		} finally {
-			await cleanupIsolatedGitRuntime(runtime);
-			assert.equal(fs.existsSync(runtime.root), false, "interrupted verified export must clean the isolated runtime");
+			await owner.close();
+			assert.equal(fs.existsSync(endpointRoot), false, "interrupted endpoint cleanup must remove the owner root");
 		}
 	});
 

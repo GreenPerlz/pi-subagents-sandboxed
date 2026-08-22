@@ -10,7 +10,7 @@ import { resolveProjectLocalPiPackageResources } from "../../agents/pi-packages.
 import { PI_CHILD_RUNTIME_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
 import { resolveGitMode } from "../../sandbox/config.ts";
-import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, mapIsolatedGitCwd, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, isInheritedIsolatedGitRuntime, mapIsolatedGitCwd, stripIsolatedGitExportDiagnostics, type IsolatedGitCapability, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
@@ -59,7 +59,7 @@ import {
 	aggregateParallelOutputs,
 	MAX_PARALLEL_CONCURRENCY,
 } from "../shared/parallel-utils.ts";
-import { buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
+import { buildPiArgs, cleanupTempDir, SUBAGENT_SCOPED_GIT_ENDPOINT_ENV } from "../shared/pi-args.ts";
 import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime, readStructuredOutput } from "../shared/structured-output.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
@@ -69,6 +69,7 @@ import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { shouldRequestFastMode, type FastModeStatus } from "../../shared/fast-mode.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, isChildProcessGroupGone, processControlUnsupported, signalChildProcessGroup } from "../../shared/post-exit-stdio-guard.ts";
+import { cancelScopedGitChildDescriptor, delegateScopedGitWriterDescriptor, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, scopedGitDescriptorMounts, waitForScopedGitChildRelease, waitForScopedGitProcessGone, type ScopedGitEndpointDescriptor } from "../../sandbox/scoped-git-endpoint.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
 import {
 	createMutatingFailureState,
@@ -82,6 +83,8 @@ import {
 	summarizeRecentMutatingFailures,
 } from "../shared/long-running-guard.ts";
 import { parseSessionTokens } from "../../shared/session-tokens.ts";
+import { resolvePackagedAgentRole } from "../shared/agent-role.ts";
+import { resolveCapabilityRights } from "../shared/capability-rights.ts";
 import {
 	cleanupWorktrees,
 	createWorktrees,
@@ -114,6 +117,8 @@ import {
 
 interface SubagentRunConfig {
 	id: string;
+	/** Minimal endpoint descriptor inherited by a nested async runner. */
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
 	steps: RunnerStep[];
 	resultPath: string;
 	cwd: string;
@@ -206,6 +211,21 @@ const ASYNC_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "S
 // request/config schema and production does nothing unless a test process opts
 // in with the exact run id after the real child has returned.
 const TEST_REJECT_AFTER_CHILD_ENV = "PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD";
+// Test-only synchronization seam for exercising socket replacement after the
+// inherited endpoint has been validated but before the first child subtree is
+// reserved. It is inert unless a test supplies an explicit gate path.
+const TEST_PAUSE_AFTER_INHERITED_AUTH_ENV = "PI_SUBAGENTS_TEST_PAUSE_AFTER_INHERITED_AUTH";
+
+async function waitForTestInheritedAuthGate(): Promise<void> {
+	const gate = process.env[TEST_PAUSE_AFTER_INHERITED_AUTH_ENV];
+	if (!gate) return;
+	const ready = `${gate}.ready`;
+	fs.writeFileSync(ready, "authenticated\n", { mode: 0o600 });
+	const deadline = Date.now() + 15_000;
+	while (fs.existsSync(gate) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+	try { fs.unlinkSync(ready); } catch { /* test cleanup owns the gate directory */ }
+	if (fs.existsSync(gate)) throw new Error("test inherited-auth gate timed out");
+}
 
 function findLatestSessionFile(sessionDir: string): string | null {
 	try {
@@ -315,6 +335,12 @@ interface RunPiStreamingResult {
 interface RunPiStreamingSandboxInput extends SubagentSandboxMountInput {
 	config: ResolvedSandboxConfig;
 	isolatedGit?: IsolatedGitWorktree;
+	isolatedGitCapability?: import("../../sandbox/isolated-git.ts").IsolatedGitCapability;
+	isolatedGitRights?: "read-only" | "writer";
+	/** Reserved endpoint subtree for this exact child process. */
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
+	scopedGitOwnerEndpoint?: ScopedGitEndpointDescriptor;
+	scopedGitWriter?: boolean;
 }
 
 function runPiStreaming(
@@ -331,44 +357,65 @@ function runPiStreaming(
 	sandbox?: RunPiStreamingSandboxInput,
 ): Promise<RunPiStreamingResult> {
 	return new Promise((resolve) => {
-		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
+		// Authentication below must precede caller-controlled output/package effects.
+		let outputStream: fs.WriteStream | undefined;
 		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv(maxSubagentDepth) };
-		const piSpawnSpec = getPiSpawnCommand(args, {
-			...(piPackageRoot ? { piPackageRoot } : {}),
-			...(piEntrypointOverride ? { entrypointOverride: piEntrypointOverride } : {}),
-			preferNodeCli: true,
-		});
+		let piSpawnSpec: ReturnType<typeof getPiSpawnCommand> | undefined;
 		let spawnSpec: SpawnableInvocation;
 		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;
 		let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
+		let scopedGitWriterBound = false;
+		const cancelScopedWriter = async () => {
+			if (!sandbox?.scopedGitWriter || scopedGitWriterBound || !sandbox.scopedGitEndpoint || !sandbox.scopedGitOwnerEndpoint) return;
+			try { await cancelScopedGitChildDescriptor(sandbox.scopedGitOwnerEndpoint, sandbox.scopedGitEndpoint); }
+			catch { /* A pending reservation remains fail-closed when cancellation is unproven. */ }
+		};
 		try {
-			if (sandbox?.config && resolveGitMode(sandbox.config) === "isolated" && !sandbox.isolatedGit) {
-				throw new Error("isolated Git requires a runtime-managed isolated worktree handle; refusing ordinary checkout execution");
+			if (sandbox?.config && resolveGitMode(sandbox.config) === "isolated" && !sandbox.isolatedGit && !sandbox.scopedGitEndpoint) {
+				throw new Error("isolated Git requires a runtime-managed isolated worktree handle or scoped endpoint; refusing ordinary checkout execution");
 			}
 			if (sandbox) {
+				// The capability must be present before any caller-controlled resource
+				// path participates in mount construction. Owner-held scope and lease
+				// checks run before the step endpoint is mounted.
+				if (sandbox.isolatedGit && !sandbox.isolatedGitCapability) {
+					throw new Error("isolated Git execution requires an explicit runtime-issued capability");
+				}
+				if (sandbox.isolatedGit && sandbox.isolatedGitCapability) {
+					sandbox.isolatedGit.runtime.assertCapability(sandbox.isolatedGitCapability, sandbox.isolatedGit);
+				}
+				// Authenticated isolated steps may now resolve the executable needed
+				// to construct the sandbox command and mounts.
+				piSpawnSpec = getPiSpawnCommand(args, {
+					...(piPackageRoot ? { piPackageRoot } : {}),
+					...(piEntrypointOverride ? { entrypointOverride: piEntrypointOverride } : {}),
+					preferNodeCli: true,
+				});
 				effectiveSandboxMounts = sandbox.isolatedGit
 					? buildSubagentSandboxMounts({
 						...sandbox,
 						includeCwd: false,
 						cwd,
-						protectedGitPaths: sandbox.isolatedGit.runtime.parentGitPaths,
+						protectedGitPaths: sandbox.isolatedGit.runtime.getProtectedMountPaths(sandbox.isolatedGit),
 						extraReadOnlyMounts: sandbox.config.extraReadOnlyMounts,
 						extraWritableMounts: sandbox.config.extraWritableMounts,
-						spawnCommand: piSpawnSpec.command,
-						spawnArgs: piSpawnSpec.args,
+						spawnCommand: piSpawnSpec!.command,
+						spawnArgs: piSpawnSpec!.args,
 					})
 					: buildSubagentSandboxMounts({
 					...sandbox,
+					includeCwd: sandbox.scopedGitEndpoint ? false : sandbox.includeCwd,
 					extraReadOnlyMounts: sandbox.config.extraReadOnlyMounts,
 					extraWritableMounts: sandbox.config.extraWritableMounts,
-					spawnCommand: piSpawnSpec.command,
-					spawnArgs: piSpawnSpec.args,
+					spawnCommand: piSpawnSpec!.command,
+					spawnArgs: piSpawnSpec!.args,
 					});
+				if (sandbox.scopedGitEndpoint) effectiveSandboxMounts.push(...scopedGitDescriptorMounts(sandbox.scopedGitEndpoint));
 				const wrapped = sandbox.isolatedGit
-					? { invocation: sandbox.isolatedGit.runtime.wrapInvocation(sandbox.isolatedGit, { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd }, effectiveSandboxMounts, sandbox.config), diagnostics: [] }
+					? { invocation: sandbox.isolatedGit.runtime.wrapInvocation(sandbox.isolatedGitCapability!, { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd }, effectiveSandboxMounts, sandbox.config), diagnostics: [] }
 					: createSandboxProvider(sandbox.config).wrapInvocation({
 						config: sandbox.config,
-						invocation: { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd },
+						invocation: { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd },
 						mounts: effectiveSandboxMounts,
 					});
 				if (wrapped.mounts?.length) {
@@ -388,12 +435,21 @@ function runPiStreaming(
 					env: wrapped.invocation.env ?? spawnEnv,
 				};
 			} else {
+				// No-sandbox execution still needs the resolved Pi command. The
+				// sandbox branch initializes this before mount construction, but an
+				// omitted sandbox used to dereference an undefined spawn spec here.
+				piSpawnSpec = getPiSpawnCommand(args, {
+					...(piPackageRoot ? { piPackageRoot } : {}),
+					...(piEntrypointOverride ? { entrypointOverride: piEntrypointOverride } : {}),
+					preferNodeCli: true,
+				});
 				spawnSpec = { command: piSpawnSpec.command, args: piSpawnSpec.args, cwd, env: spawnEnv };
 			}
 		} catch (setupError) {
 			const message = setupError instanceof Error ? setupError.message : String(setupError);
+			cancelScopedWriter();
 			cleanupTempDir(sandbox?.tempDir);
-			outputStream.end();
+			outputStream?.end();
 			resolve({
 				stderr: message,
 				exitCode: 1,
@@ -405,10 +461,26 @@ function runPiStreaming(
 			});
 			return;
 		}
+		// Resolve the package executable only after the inherited capability and
+		// all authenticated mount construction have succeeded.
+		try {
+			piSpawnSpec = getPiSpawnCommand(args, {
+				...(piPackageRoot ? { piPackageRoot } : {}),
+				...(piEntrypointOverride ? { entrypointOverride: piEntrypointOverride } : {}),
+				preferNodeCli: true,
+			});
+		} catch (resolveError) {
+			const message = resolveError instanceof Error ? resolveError.message : String(resolveError);
+			cancelScopedWriter();
+			cleanupTempDir(sandbox?.tempDir);
+			resolve({ stderr: message, exitCode: 1, messages: [], usage: emptyUsage(), error: message, finalOutput: "", ...(sandboxDetails ? { sandbox: sandboxDetails } : {}) });
+			return;
+		}
 		const processControlError = processControlUnsupported();
 		if (processControlError) {
+			cancelScopedWriter();
 			cleanupTempDir(sandbox?.tempDir);
-			outputStream.end();
+			outputStream?.end();
 			resolve({
 				stderr: processControlError,
 				exitCode: 1,
@@ -432,11 +504,51 @@ function runPiStreaming(
 				windowsHide: true,
 			});
 		} catch (spawnError) {
+			cancelScopedWriter();
 			cleanupTempDir(sandbox?.tempDir);
-			outputStream.end();
 			resolve({ stderr: String(spawnError), exitCode: 1, messages: [], usage: emptyUsage(), error: spawnError instanceof Error ? spawnError.message : String(spawnError), finalOutput: "" });
 			return;
 		}
+		let scopedGitBindError: string | undefined;
+		let scopedGitBindingReady = !Boolean(sandbox?.scopedGitWriter && sandbox.scopedGitEndpoint);
+		let pendingScopedClose: { kind: "close"; exitCode: number | null; signal?: NodeJS.Signals } | { kind: "error"; error: Error } | undefined;
+		if (sandbox?.scopedGitWriter && sandbox.scopedGitEndpoint) {
+			// Bind only after the spawned wrapper has a stable /proc identity. Hold
+			// terminal publication until exact bind and release proof complete.
+			void (async () => {
+				let identity;
+				let previousKey: string | undefined;
+				try {
+					for (let attempt = 0; attempt < 150 && !identity; attempt += 1) {
+						const current = readScopedGitProcessIdentity(child.pid!);
+						const key = current && `${current.startToken}:${current.ppid}:${current.pgid}:${current.argv.join("\\0")}`;
+						if (current && key === previousKey) identity = current;
+						previousKey = key;
+						if (!identity) await new Promise((resolve) => setTimeout(resolve, 2));
+					}
+					if (!identity) throw new Error("exact child identity was not observed before process exit");
+					await delegateScopedGitWriterDescriptor(sandbox.scopedGitEndpoint, identity);
+					scopedGitWriterBound = true;
+					await waitForScopedGitProcessGone(identity);
+					if (sandbox.scopedGitOwnerEndpoint) await waitForScopedGitChildRelease(sandbox.scopedGitOwnerEndpoint, sandbox.scopedGitEndpoint);
+				} catch (error) {
+					if (!scopedGitWriterBound) await cancelScopedWriter();
+					// The terminal result is completed below with this diagnostic.
+					scopedGitBindError = `Scoped Git writer teardown was not proven: ${error instanceof Error ? error.message : String(error)}`;
+				} finally {
+					scopedGitBindingReady = true;
+					if (pendingScopedClose) {
+						const pending = pendingScopedClose;
+						pendingScopedClose = undefined;
+						if (pending.kind === "close") child.emit("close", pending.exitCode, pending.signal);
+						else child.emit("error", pending.error);
+					}
+				}
+			})();
+		}
+		// Opening output is intentionally last: rejected inherited authority cannot
+		// create or truncate the caller-selected output path.
+		outputStream = fs.createWriteStream(outputFile, { flags: "w" });
 		let stderr = "";
 		let stdoutBuf = "";
 		let stderrBuf = "";
@@ -451,7 +563,7 @@ function runPiStreaming(
 
 		const writeOutputLine = (line: string) => {
 			if (!line.trim()) return;
-			outputStream.write(`${line}\n`);
+			outputStream!.write(`${line}\n`);
 		};
 
 		const writeOutputText = (text: string) => {
@@ -547,7 +659,7 @@ function runPiStreaming(
 		const processStderrText = (text: string) => {
 			stderr += text;
 			stderrBuf += text;
-			outputStream.write(text);
+			outputStream!.write(text);
 			if (!childEventContext) return;
 			const lines = stderrBuf.split("\n");
 			stderrBuf = lines.pop() || "";
@@ -695,6 +807,10 @@ function runPiStreaming(
 
 		child.on("close", (exitCode, signal) => {
 			if (settled) return;
+			if (!scopedGitBindingReady) {
+				pendingScopedClose ??= { kind: "close", exitCode, signal: signal ?? undefined };
+				return;
+			}
 			// A close event only proves the wrapper streams closed. Keep the
 			// escalation timer alive until the private group is absent or KILL has
 			// executed, then replay this terminal event through the normal path.
@@ -715,20 +831,23 @@ function runPiStreaming(
 				return;
 			}
 			pendingTerminalClose = undefined;
+			// A child that exited before writer binding cannot retain authority;
+			// cancel its pending reservation only after the private group fence.
+			cancelScopedWriter();
 			settled = true;
 			registerInterrupt?.(undefined);
 			clearDrainTimers();
 			clearStdioGuard();
 			if (stdoutBuf.trim()) processStdoutLine(stdoutBuf);
 			if (stderrBuf.trim()) appendChildLine("subagent.child.stderr", stderrBuf);
-			outputStream.end();
+			outputStream?.end();
 			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
-			const finalError = error ?? assistantError;
+			const finalError = error ?? assistantError ?? scopedGitBindError;
 			if ((exitCode ?? 0) !== 0 || finalError) attachFailureDiagnostics(finalError);
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !finalError;
 			resolve({
 				stderr,
-				teardownUnproven: Boolean(teardownFailure),
+				teardownUnproven: Boolean(teardownFailure || scopedGitBindError),
 				exitCode: teardownFailure ? 1 : interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
 				messages,
 				usage,
@@ -743,6 +862,10 @@ function runPiStreaming(
 
 		child.on("error", (spawnError) => {
 			if (settled) return;
+			if (!scopedGitBindingReady) {
+				pendingScopedClose ??= { kind: "error", error: spawnError instanceof Error ? spawnError : new Error(String(spawnError)) };
+				return;
+			}
 			if (process.platform === "linux" && !isChildProcessGroupGone(child) && !teardownFailure) {
 				pendingTerminalClose ??= { kind: "error", error: spawnError };
 				if (!teardownPollTimer) {
@@ -764,11 +887,11 @@ function runPiStreaming(
 			registerInterrupt?.(undefined);
 			clearDrainTimers();
 			clearStdioGuard();
-			outputStream.end();
+			outputStream?.end();
 			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
 			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
 			attachFailureDiagnostics(spawnErrorMessage);
-			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? assistantError ?? spawnErrorMessage, finalOutput, observedMutationAttempt, ...(sandboxDetails ? { sandbox: sandboxDetails } : {}) });
+			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? assistantError ?? scopedGitBindError ?? spawnErrorMessage, finalOutput, observedMutationAttempt, ...(scopedGitBindError ? { teardownUnproven: true } : {}), ...(sandboxDetails ? { sandbox: sandboxDetails } : {}) });
 		});
 	});
 }
@@ -918,14 +1041,21 @@ interface SingleStepContext {
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
 	isolatedGit?: IsolatedGitWorktree;
+	isolatedGitCapability?: import("../../sandbox/isolated-git.ts").IsolatedGitCapability;
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
+	scopedGitOwnerEndpoint?: ScopedGitEndpointDescriptor;
+	scopedGitWriter?: boolean;
+	isolatedGitRights?: "read-only" | "writer";
+	/** Sequential chains export their shared context only at outer finalization. */
+	deferIsolatedGitExport?: boolean;
 	progressPaths?: string[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	onAttemptStart?: (attempt: { model?: string; thinking?: string }) => void;
 	onChildEvent?: (event: ChildEvent) => void;
 }
 
-/** Run a single pi agent step, returning output and metadata */
-async function runSingleStep(
+/** Run a single pi agent step, returning output and metadata. */
+async function runSingleStepInner(
 	step: SubagentStep,
 	ctx: SingleStepContext,
 ): Promise<{
@@ -973,6 +1103,14 @@ async function runSingleStep(
 		payloadSize?: number;
 	};
 }> {
+	// Authenticate before resolving step cwd, package resources, structured
+	// output paths, or assembling any mount candidates. A forged or stale
+	// endpoint descriptor must have no mount-side effects.
+	if (ctx.isolatedGit) {
+		if (!ctx.isolatedGitCapability) throw new Error("isolated Git execution requires an explicit runtime-issued capability");
+		ctx.isolatedGit.runtime.assertCapability(ctx.isolatedGitCapability, ctx.isolatedGit);
+		ctx.isolatedGit.runtime.authorizeRequestedCwd(ctx.isolatedGitCapability, step.cwd ?? ctx.cwd);
+	}
 	const effectiveStructuredOutput = step.structuredOutput ?? (step.structuredOutputSchema
 		? createStructuredOutputRuntime(step.structuredOutputSchema, path.join(path.dirname(ctx.outputFile), "structured-output"))
 		: undefined);
@@ -985,6 +1123,17 @@ async function runSingleStep(
 	}
 	const sessionEnabled = Boolean(step.sessionFile) || ctx.sessionEnabled;
 	const sessionDir = step.sessionFile ? undefined : ctx.sessionDir;
+
+	// Reserve inherited endpoint scope before any artifact, output, session, or
+	// sandbox setup side effects. A stale/forged descriptor therefore fails at
+	// the authority boundary rather than after creating caller-visible files.
+	let effectiveScopedGitEndpoint = ctx.scopedGitEndpoint;
+	if (ctx.scopedGitEndpoint) {
+		effectiveScopedGitEndpoint = await reserveScopedGitChildDescriptor(ctx.scopedGitEndpoint, {
+			cwd: step.cwd ?? ctx.cwd,
+			rights: ctx.isolatedGitRights ?? "writer",
+		});
+	}
 
 	let artifactPaths: ArtifactPaths | undefined;
 	if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false) {
@@ -1008,6 +1157,9 @@ async function runSingleStep(
 	const effectiveSandbox = step.sandbox ?? ctx.sandbox;
 	const stepCwd = step.cwd ?? ctx.cwd;
 	const executionCwd = ctx.isolatedGit ? mapIsolatedGitCwd(ctx.isolatedGit, stepCwd) : stepCwd;
+	// Every nested child receives a fresh endpoint subtree. The writer subtree
+	// was reserved above, before caller-visible setup; read-only siblings can be
+	// issued independently without consuming the lease.
 	const projectLocalPackageResources = effectiveSandbox?.packageDiscovery === "project-local"
 		? resolveProjectLocalPiPackageResources(stepCwd)
 		: undefined;
@@ -1023,9 +1175,18 @@ async function runSingleStep(
 		return {
 			config: sandbox,
 			isolatedGit: ctx.isolatedGit,
+			isolatedGitCapability: ctx.isolatedGitCapability,
+			isolatedGitRights: ctx.isolatedGitRights,
+			scopedGitEndpoint: effectiveScopedGitEndpoint,
+			...(ctx.scopedGitEndpoint ? { scopedGitOwnerEndpoint: ctx.scopedGitEndpoint, scopedGitWriter: ctx.isolatedGitRights !== "read-only" } : {}),
 			cwd: executionCwd,
-			cwdMode: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }) ? "rw" : "ro",
+			cwdMode: inferSandboxCwdWritable({
+				agentName: step.agent,
+				tools: step.tools,
+				sandbox,
+			}) ? "rw" : "ro",
 			gitMode: sandbox.gitMode,
+			...(ctx.scopedGitEndpoint ? { includeCwd: false } : {}),
 			tempDir: input.tempDir,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
@@ -1087,6 +1248,9 @@ async function runSingleStep(
 			parentControlInbox: ctx.nestedRoute?.controlInbox,
 			parentRootRunId: ctx.nestedRoute?.rootRunId,
 			parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
+			scopedGitEndpoint: effectiveScopedGitEndpoint ?? (ctx.isolatedGit?.runtime && ctx.isolatedGitCapability
+				? ctx.isolatedGit.runtime.getScopedGitEndpointDescriptor(ctx.isolatedGitCapability)
+				: undefined),
 			structuredOutput: effectiveStructuredOutput,
 			sandbox: closedSandboxRuntime,
 			sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? ctx.sandboxIntercomBridge?.extensionDir : undefined,
@@ -1270,6 +1434,9 @@ async function runSingleStep(
 					parentControlInbox: ctx.nestedRoute?.controlInbox,
 					parentRootRunId: ctx.nestedRoute?.rootRunId,
 					parentCapabilityToken: ctx.nestedRoute?.capabilityToken,
+					scopedGitEndpoint: effectiveScopedGitEndpoint ?? (ctx.isolatedGit?.runtime && ctx.isolatedGitCapability
+						? ctx.isolatedGit.runtime.getScopedGitEndpointDescriptor(ctx.isolatedGitCapability)
+						: undefined),
 					sandbox: closedSandboxRuntime,
 				});
 				ctx.onAttemptStart?.({ model: finalizationModel, thinking: resolveCandidateLaunchThinking(finalizationModel, step.thinking) });
@@ -1353,7 +1520,7 @@ async function runSingleStep(
 		portableMetadata?: string;
 		payloadSize?: number;
 	} | undefined;
-	if (ctx.isolatedGit) {
+	if (ctx.isolatedGit && !ctx.deferIsolatedGitExport && !isInheritedIsolatedGitRuntime(ctx.isolatedGit.runtime)) {
 		const nestedFence = await waitForNestedDescendantsToStop(ctx.nestedRoute, ctx.id, ctx.flatIndex);
 		if (!nestedFence.stopped) {
 			ctx.isolatedGit.runtime.markExportFenceFailed();
@@ -1383,13 +1550,22 @@ async function runSingleStep(
 				syntheticPaths: ctx.isolatedGit.syntheticPaths,
 				terminationState,
 				agent: step.agent,
-				commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }),
+				commitRequired: resolveCapabilityRights({
+					packagedRole: resolvePackagedAgentRole(step.agent),
+					agentTools: step.tools,
+					sandbox: step.sandbox ?? ctx.sandbox,
+					taskMutationProhibited: taskDisallowsFileUpdates(step.task),
+					parentRights: ctx.isolatedGitCapability?.rights,
+					writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }),
+					exclusiveLease: true,
+				}) === "writer",
 			});
 			gitBundle = {
 				path: bundle.path,
 				checksum: bundle.checksum,
 				base: bundle.base,
 				head: bundle.head,
+				commits: bundle.commits,
 				commitSummary: bundle.commitSummary,
 				...(bundle.recovery ? { recovery: bundle.recovery } : {}),
 				...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
@@ -1405,7 +1581,16 @@ async function runSingleStep(
 				canonicalPayloadSize: bundle.canonicalPayloadSize,
 				portableMetadata: bundle.portableMetadata,
 			};
-			if (bundle.incomplete && !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }) && !finalResult?.error) {
+			const requiresAuthoredCommit = resolveCapabilityRights({
+			packagedRole: resolvePackagedAgentRole(step.agent),
+			agentTools: step.tools,
+			sandbox: step.sandbox ?? ctx.sandbox,
+			taskMutationProhibited: taskDisallowsFileUpdates(step.task),
+			parentRights: ctx.isolatedGitCapability?.rights,
+			writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }),
+			exclusiveLease: true,
+		}) === "writer";
+			if (bundle.incomplete && requiresAuthoredCommit && !finalResult?.error) {
 				if (finalResult) {
 					finalResult.exitCode = 1;
 					finalResult.error = "Isolated writer completed without a required authored commit; recovery bundle is incomplete.";
@@ -1483,6 +1668,45 @@ async function runSingleStep(
 		sandbox: finalResult?.sandbox,
 		gitBundle,
 	};
+}
+
+/** Release per-step runtime authority only after proven terminal close. */
+async function runSingleStep(step: SubagentStep, ctx: SingleStepContext): Promise<Awaited<ReturnType<typeof runSingleStepInner>>> {
+	let terminal: Awaited<ReturnType<typeof runSingleStepInner>> | undefined;
+	try {
+		terminal = await runSingleStepInner(step, ctx);
+		return terminal;
+	} finally {
+		if (ctx.isolatedGitCapability && ctx.isolatedGit) {
+			// teardownUnproven is an explicit recovery state, not a transient result
+			// that a later event may silently clear. Retain the parent lease until an
+			// operator/recovery path proves termination.
+			if (terminal?.teardownUnproven) {
+				ctx.isolatedGit.runtime.markExportFenceFailed();
+			} else {
+				const fence = await waitForNestedDescendantsToStop(ctx.nestedRoute, ctx.id, ctx.flatIndex);
+				if (fence.stopped) {
+					try {
+						ctx.isolatedGit.runtime.releaseInheritedContext(ctx.isolatedGitCapability);
+					} catch (releaseError) {
+						// Revocation failure is recovery state, not a replacement for the
+						// already-observed child outcome. Preserve the lease and make the
+						// result explicitly non-terminal until an owner proves teardown.
+						ctx.isolatedGit.runtime.markExportFenceFailed();
+						if (terminal) {
+							terminal.teardownUnproven = true;
+							const detail = releaseError instanceof Error ? releaseError.message : String(releaseError);
+							terminal.error = terminal.error ? `${terminal.error}\\nCapability release was not proven: ${detail}` : `Capability release was not proven: ${detail}`;
+							terminal.exitCode = terminal.exitCode === 0 ? 1 : terminal.exitCode;
+						}
+					}
+				} else {
+					ctx.isolatedGit.runtime.markExportFenceFailed();
+					if (terminal) terminal.teardownUnproven = true;
+				}
+			}
+		}
+	}
 }
 
 type RunnerStatusStep = NonNullable<AsyncStatus["steps"]>[number] & {
@@ -1611,9 +1835,19 @@ function ensureParallelProgressFile(cwd: string, group: Extract<RunnerStep, { pa
 
 type ParallelStepResult = Awaited<ReturnType<typeof runSingleStep>> & { skipped?: boolean; flatIndex?: number };
 
+function readScopedGitEndpointFromEnvironment(configEndpoint?: ScopedGitEndpointDescriptor): ScopedGitEndpointDescriptor | undefined {
+	const raw = configEndpoint ? JSON.stringify(configEndpoint) : process.env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV];
+	if (!raw) return undefined;
+	try { return JSON.parse(raw) as ScopedGitEndpointDescriptor; } catch { throw new Error("scoped Git endpoint descriptor is malformed"); }
+}
+
 async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 	const { id, steps, resultPath, cwd, placeholder, taskIndex, totalTasks, maxOutput, artifactsDir, artifactConfig } =
 		config;
+	const scopedEndpointFromEnvironment = readScopedGitEndpointFromEnvironment(config.scopedGitEndpoint);
+	const scopedEndpointEnv = config.scopedGitEndpoint
+		? JSON.stringify(config.scopedGitEndpoint)
+		: process.env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV];
 	let previousOutput = "";
 	const outputs: ChainOutputMap = {};
 	const results: StepResult[] = [];
@@ -1736,8 +1970,18 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 	const flatSteps = flattenSteps(steps);
+	const sequentialFlatIndices = new Set<number>();
+	let sequentialCursor = 0;
+	for (const candidate of steps) {
+		if (isParallelGroup(candidate)) sequentialCursor += candidate.parallel.length;
+		else if (isDynamicRunnerGroup(candidate)) sequentialCursor += 1;
+		else sequentialFlatIndices.add(sequentialCursor++);
+	}
 	let isolatedGitRuntime: IsolatedGitRuntime | undefined;
 	const isolatedGitWorktrees = new Map<number, IsolatedGitWorktree>();
+	let sequentialSharedIsolatedGitWorktree: IsolatedGitWorktree | undefined;
+	let sequentialSharedCommitRequired = false;
+	const scopedGitEndpoint = scopedEndpointFromEnvironment;
 	// The source `flatSteps` excludes dynamic fanout items. Persist the exact
 	// materialized step policy for every created runtime worktree so fallback
 	// exports cannot project the placeholder agent/commit policy.
@@ -1751,17 +1995,31 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			.filter((sandbox): sandbox is ResolvedSandboxConfig => sandbox?.gitMode === "isolated"),
 	];
 	const hasIsolatedGit = isolatedSandboxConfigs.length > 0;
-	let exportRemainingIsolated: ((terminationState: "execution-rejected" | "interrupted") => Promise<void>) | undefined;
+	if (scopedEndpointEnv && !hasIsolatedGit) {
+		throw new Error("inherited scoped Git endpoint requires an isolated Bubblewrap sandbox");
+	}
+	let exportRemainingIsolated: ((terminationState: "success" | "failure" | "execution-rejected" | "interrupted") => Promise<void>) | undefined;
 	let statusPayloadReady = false;
+	let statusPayload: RunnerStatusPayload;
+	let summary = "";
+	let truncated = false;
+	type PendingTerminalPublication = {
+		result: Awaited<ReturnType<typeof runSingleStep>>;
+		agent: string;
+		startedAt: number;
+		endedAt: number;
+	};
+	const pendingTerminalPublications = new Map<number, PendingTerminalPublication>();
+	const publishedTerminalIndexes = new Set<number>();
 	try {
 	if (hasIsolatedGit) {
 		if (isolatedSandboxConfigs.some((sandbox) => sandbox.provider !== "bubblewrap")) {
 			throw new Error("isolated Git requires the Bubblewrap sandbox provider; refusing to downgrade");
 		}
-		isolatedGitRuntime = createIsolatedGitRuntime({
+		if (!scopedGitEndpoint) {
+			isolatedGitRuntime = createIsolatedGitRuntime({
 			cwd,
 			runId: id,
-			ownerPid: process.pid,
 			provider: isolatedSandboxConfigs[0]?.provider,
 			network: isolatedSandboxConfigs[0]?.network,
 			profile: isolatedSandboxConfigs[0]?.profile,
@@ -1770,28 +2028,58 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			extraReadOnlyMounts: [...new Set(isolatedSandboxConfigs.flatMap((sandbox) => sandbox.extraReadOnlyMounts ?? []))],
 			extraWritableMounts: [...new Set(isolatedSandboxConfigs.flatMap((sandbox) => sandbox.extraWritableMounts ?? []))],
 		});
+		}
 	}
 	const resolveIsolatedGitWorktree = (step: SubagentStep, flatIndex: number): IsolatedGitWorktree | undefined => {
 		const sandbox = step.sandbox ?? config.sandbox;
-		if (sandbox?.gitMode !== "isolated") return undefined;
-		const existing = isolatedGitWorktrees.get(flatIndex) ?? isolatedGitRuntime?.worktrees.find((candidate) => candidate.index === flatIndex);
+		if (sandbox?.gitMode !== "isolated" || scopedGitEndpoint) return undefined;
+		const sequential = sequentialFlatIndices.has(flatIndex);
+		const packagedRole = resolvePackagedAgentRole(step.agent);
+		const writer = resolveCapabilityRights({
+			packagedRole,
+			agentTools: step.tools,
+			sandbox,
+			taskMutationProhibited: taskDisallowsFileUpdates(step.task),
+			parentRights: undefined,
+			writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }),
+			exclusiveLease: true,
+		}) === "writer";
+		const existing = sequential
+			? sequentialSharedIsolatedGitWorktree
+			: isolatedGitWorktrees.get(flatIndex) ?? isolatedGitRuntime?.worktrees.find((candidate) => candidate.index === flatIndex);
 		if (existing) {
 			isolatedGitWorktrees.set(flatIndex, existing);
-			materializedWorktreePolicies.set(flatIndex, { step, agent: step.agent, commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }) });
+			if (sequential) {
+				sequentialSharedCommitRequired ||= writer;
+			}
+			materializedWorktreePolicies.set(existing.index, { step, agent: step.agent, commitRequired: Boolean(sequentialSharedCommitRequired || writer) });
 			return existing;
 		}
 		if (!isolatedGitRuntime) throw new Error("isolated Git runtime was not created");
 		const policy = {
 			step,
 			agent: step.agent,
-			commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }),
+			commitRequired: sequential ? (sequentialSharedCommitRequired ||= writer) : writer,
 		};
 		// Materialize policy before checkout/setup so a failing hook still has the
 		// correct agent and commitRequired metadata for its recovery bundle.
 		materializedWorktreePolicies.set(flatIndex, policy);
 		const worktree = createIsolatedGitWorktree(isolatedGitRuntime, { index: flatIndex, agent: step.agent });
+		if (sequential) {
+			sequentialSharedIsolatedGitWorktree = worktree;
+		}
 		isolatedGitWorktrees.set(flatIndex, worktree);
 		return worktree;
+	};
+	/** Reserve per-step authority beneath the runner-owned scoped endpoint. */
+	const issueIsolatedCapability = async (
+		worktree: IsolatedGitWorktree,
+		rights: "writer" | "read-only",
+		cwd: string | undefined,
+		fallbackCwd: string,
+	): Promise<IsolatedGitCapability> => {
+		const resolvedCwd = cwd ?? fallbackCwd;
+		return worktree.runtime.issueInheritedContext({ worktree, rights, cwd: resolvedCwd });
 	};
 	/**
 	 * Create a missing recovery slot without invoking the user setup hook.
@@ -1800,18 +2088,18 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 	 */
 	const createRecoverySlot = (step: SubagentStep, flatIndex: number): IsolatedGitWorktree | undefined => {
 		const sandbox = step.sandbox ?? config.sandbox;
-		if (sandbox?.gitMode !== "isolated") return undefined;
+		if (sandbox?.gitMode !== "isolated" || scopedGitEndpoint) return undefined;
 		const existing = isolatedGitWorktrees.get(flatIndex) ?? isolatedGitRuntime?.worktrees.find((candidate) => candidate.index === flatIndex);
 		if (existing) {
 			isolatedGitWorktrees.set(flatIndex, existing);
-			materializedWorktreePolicies.set(flatIndex, { step, agent: step.agent, commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }) });
+			materializedWorktreePolicies.set(flatIndex, { step, agent: step.agent, commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(step.agent), agentTools: step.tools, sandbox, taskMutationProhibited: taskDisallowsFileUpdates(step.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }), exclusiveLease: true }) === "writer" });
 			return existing;
 		}
 		if (!isolatedGitRuntime) throw new Error("isolated Git runtime was not created");
 		const policy = {
 			step,
 			agent: step.agent,
-			commitRequired: !taskDisallowsFileUpdates(step.task) && inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }),
+			commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(step.agent), agentTools: step.tools, sandbox, taskMutationProhibited: taskDisallowsFileUpdates(step.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }), exclusiveLease: true }) === "writer",
 		};
 		materializedWorktreePolicies.set(flatIndex, policy);
 		const worktree = isolatedGitRuntime.createRecoveryWorktree({ index: flatIndex, agent: step.agent });
@@ -1823,15 +2111,16 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			return { worktree: createRecoverySlot(step, flatIndex) };
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
-			isolatedGitRuntime?.markExportFailed();
+			if (ownsIsolatedGitRuntime) isolatedGitRuntime?.markExportFailed();
 			return { error: `Recovery worktree creation failed for slot ${flatIndex} (${step.agent}): ${detail}. Preserve the isolated runtime at ${isolatedGitRuntime?.root ?? "the runtime root"} for manual recovery.` };
 		}
 	};
 	const sessionEnabled = Boolean(config.sessionDir)
 		|| shareEnabled
 		|| flatSteps.some((step) => Boolean(step.sessionFile));
-	let isolatedGitCleanupVerified = !isolatedGitRuntime;
-	const statusPayload: RunnerStatusPayload = {
+	const ownsIsolatedGitRuntime = Boolean(isolatedGitRuntime) && !isInheritedIsolatedGitRuntime(isolatedGitRuntime!);
+	let isolatedGitCleanupVerified = !isolatedGitRuntime || !ownsIsolatedGitRuntime;
+	statusPayload = {
 		runId: id,
 		...(config.sessionId ? { sessionId: config.sessionId } : {}),
 		mode: config.resultMode ?? (flatSteps.length > 1 ? "chain" : "single"),
@@ -1956,14 +2245,6 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		writeAtomicJson(statusPath, statusPayload);
 		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" || isolatedGitRuntime?.hookTeardownFailed ? "subagent.nested.updated" : "subagent.nested.completed");
 	};
-	type PendingTerminalPublication = {
-		result: Awaited<ReturnType<typeof runSingleStep>>;
-		agent: string;
-		startedAt: number;
-		endedAt: number;
-	};
-	const pendingTerminalPublications = new Map<number, PendingTerminalPublication>();
-	const publishedTerminalIndexes = new Set<number>();
 	const persistGroupDiagnostic = (diagnostic: { groupId: string; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string }): void => {
 		statusPayload.groupDiagnostics ??= [];
 		const existing = statusPayload.groupDiagnostics.findIndex((entry) => entry.groupId === diagnostic.groupId);
@@ -2027,8 +2308,8 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		for (const [flatIndex, pending] of pendingTerminalPublications) applyChildTerminal(flatIndex, pending, true);
 		pendingTerminalPublications.clear();
 	};
-	exportRemainingIsolated = async (terminationState: "execution-rejected" | "interrupted"): Promise<void> => {
-		if (!isolatedGitRuntime || isolatedGitRuntime.exportFenceFailed) return;
+	exportRemainingIsolated = async (terminationState: "success" | "failure" | "execution-rejected" | "interrupted"): Promise<void> => {
+		if (!ownsIsolatedGitRuntime || !isolatedGitRuntime || isolatedGitRuntime.exportFenceFailed) return;
 		// A child process can close before its nested foreground/background
 		// descendants publish terminal events. Never package or remove the runtime
 		// until the route is fenced on those terminal events.
@@ -2096,6 +2377,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					checksum: bundle.checksum,
 					base: bundle.base,
 					head: bundle.head,
+					commits: bundle.commits,
 					commitSummary: bundle.commitSummary,
 					...(bundle.recovery ? { recovery: bundle.recovery } : {}),
 					...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
@@ -2770,6 +3052,20 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				statusPayload.lastUpdate = taskStartTime;
 				writeStatusPayload();
 				appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.started", ts: taskStartTime, runId: id, stepIndex: fi, agent: task.agent }));
+				const dynamicWorktree = resolveIsolatedGitWorktree(task, fi);
+				const packagedRole = resolvePackagedAgentRole(task.agent);
+				const dynamicReadOnly = resolveCapabilityRights({
+					packagedRole,
+					agentTools: task.tools,
+					sandbox: task.sandbox ?? config.sandbox,
+					taskMutationProhibited: taskDisallowsFileUpdates(task.task),
+					parentRights: undefined,
+					writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }),
+					exclusiveLease: true,
+				}) !== "writer";
+				const dynamicCapability = dynamicWorktree
+					? await issueIsolatedCapability(dynamicWorktree, dynamicReadOnly ? "read-only" : "writer", task.cwd, config.cwd)
+					: undefined;
 				const singleResult = await runSingleStep(task, {
 					previousOutput, placeholder, cwd, sessionEnabled,
 					outputs,
@@ -2783,7 +3079,10 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					orchestratorIntercomTarget: config.controlIntercomTarget,
 					nestedRoute: config.nestedRoute,
 					sandbox: config.sandbox,
-					isolatedGit: resolveIsolatedGitWorktree(task, fi),
+					isolatedGit: dynamicWorktree,
+					isolatedGitCapability: dynamicCapability,
+					scopedGitEndpoint,
+					isolatedGitRights: dynamicReadOnly ? "read-only" : "writer",
 					progressPaths: config.progressPaths,
 					sandboxIntercomBridge: config.sandboxIntercomBridge,
 					registerInterrupt: registerChildInterrupt(),
@@ -2926,7 +3225,9 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			const groupStartFlatIndex = flatIndex;
 			let aborted = false;
 			let worktreeSetup: WorktreeSetup | undefined;
-			if (!group.worktree && hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, agentName: task.agent, sandbox: task.sandbox ?? config.sandbox })) })) {
+			if (!group.worktree
+				&& !group.parallel.some((task) => (task.sandbox ?? config.sandbox)?.gitMode === "isolated")
+				&& hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, agentName: task.agent, sandbox: task.sandbox ?? config.sandbox })) })) {
 				const failedAt = Date.now();
 				markParallelGroupSetupFailure({
 					statusPayload,
@@ -3073,6 +3374,19 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 							: undefined;
 						const { taskForRun, taskCwd: preparedTaskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
 						const isolatedGit = resolveIsolatedGitWorktree(taskForRun, fi);
+						const packagedRole = resolvePackagedAgentRole(taskForRun.agent);
+						const isolatedGitRights = resolveCapabilityRights({
+							packagedRole,
+							agentTools: taskForRun.tools,
+							sandbox: taskForRun.sandbox ?? config.sandbox,
+							taskMutationProhibited: taskDisallowsFileUpdates(taskForRun.task),
+							parentRights: undefined,
+							writableCwd: inferSandboxCwdWritable({ agentName: taskForRun.agent, tools: taskForRun.tools, sandbox: taskForRun.sandbox ?? config.sandbox }),
+							exclusiveLease: true,
+						});
+						const isolatedGitCapability = isolatedGit
+							? await issueIsolatedCapability(isolatedGit, isolatedGitRights, preparedTaskCwd, cwd)
+							: undefined;
 						// Keep the requested parent cwd in the step context; runSingleStep
 						// maps it to the private worktree and preserves subdirectories.
 						const taskCwd = preparedTaskCwd;
@@ -3091,6 +3405,9 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 							nestedRoute: config.nestedRoute,
 							sandbox: config.sandbox,
 							isolatedGit,
+							isolatedGitCapability,
+							scopedGitEndpoint,
+							isolatedGitRights: scopedGitEndpoint ? isolatedGitRights : (isolatedGitCapability ? isolatedGitRights : "writer"),
 							progressPaths: config.progressPaths,
 							sandboxIntercomBridge: config.sandboxIntercomBridge,
 							registerInterrupt: registerChildInterrupt(),
@@ -3155,7 +3472,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					writeStatusPayload();
 					const nestedFence = await waitForNestedDescendantsToStop(config.nestedRoute, id);
 					if (!nestedFence.stopped) {
-						isolatedGitRuntime?.markExportFenceFailed();
+						if (ownsIsolatedGitRuntime) isolatedGitRuntime?.markExportFenceFailed();
 						parallelExecutionError = `${parallelExecutionError}; nested descendants did not reach a proven terminal state before export; recover isolated worktrees at ${isolatedGitRuntime?.root ?? "the runtime root"}`;
 						statusPayload.error = parallelExecutionError;
 						worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${parallelExecutionError}` : parallelExecutionError;
@@ -3170,7 +3487,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 						const isolatedGit = recovery.worktree;
 						const projectedTaskError = recovery.error ? `${taskExecutionError}\n${recovery.error}` : taskExecutionError;
 						let gitBundle;
-						if (nestedFence.stopped && isolatedGit && !isolatedGit.runtime.isExported(isolatedGit.index)) {
+						if (ownsIsolatedGitRuntime && nestedFence.stopped && isolatedGit && !isolatedGit.runtime.isExported(isolatedGit.index)) {
 							try {
 								const bundle = exportIsolatedGitBundle(isolatedGit.runtime, {
 									outputDir: artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
@@ -3178,13 +3495,14 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 									syntheticPaths: isolatedGit.syntheticPaths,
 									terminationState: "execution-rejected",
 									agent: task.agent,
-									commitRequired: !taskDisallowsFileUpdates(task.task) && inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }),
+									commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(task.agent), agentTools: task.tools, sandbox: task.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(task.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
 								});
 								gitBundle = {
 									path: bundle.path,
 									checksum: bundle.checksum,
 									base: bundle.base,
 									head: bundle.head,
+									commits: bundle.commits,
 									commitSummary: bundle.commitSummary,
 									...(bundle.recovery ? { recovery: bundle.recovery } : {}),
 									...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
@@ -3385,7 +3703,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 								result.interrupted = undefined;
 								result.cancelled = undefined;
 								result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
-								result.error = result.error ? `${result.error}\\n${message}` : message;
+								result.error = result.error ? `${result.error}\n${message}` : message;
 							}
 							const step = statusPayload.steps[worktree.index];
 							if (step) {
@@ -3394,7 +3712,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 								step.interrupted = undefined;
 								step.cancelled = undefined;
 								step.exitCode = step.exitCode === 0 ? 1 : (step.exitCode ?? 1);
-								step.error = step.error ? `${step.error}\\n${message}` : message;
+								step.error = step.error ? `${step.error}\n${message}` : message;
 							}
 						}
 						writeStatusPayload();
@@ -3417,7 +3735,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 								step.cancelled = undefined;
 								step.exitCode = step.exitCode === 0 ? 1 : (step.exitCode ?? 1);
 								step.endedAt ??= endedAt;
-								step.error = step.error ? `${step.error}\\n${message}` : message;
+								step.error = step.error ? `${step.error}\n${message}` : message;
 							}
 							const result = results.find((candidate) => candidate.flatIndex === index);
 							if (result) {
@@ -3425,7 +3743,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 								result.interrupted = undefined;
 								result.cancelled = undefined;
 								result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
-								result.error = result.error ? `${result.error}\\n${message}` : message;
+								result.error = result.error ? `${result.error}\n${message}` : message;
 							}
 						}
 						statusPayload.lastUpdate = endedAt;
@@ -3459,6 +3777,19 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			}));
 
 			const isolatedGit = resolveIsolatedGitWorktree(seqStep, flatIndex);
+			const packagedRole = resolvePackagedAgentRole(seqStep.agent);
+			const isolatedGitRights = resolveCapabilityRights({
+				packagedRole,
+				agentTools: seqStep.tools,
+				sandbox: seqStep.sandbox ?? config.sandbox,
+				taskMutationProhibited: taskDisallowsFileUpdates(seqStep.task),
+				parentRights: undefined,
+				writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }),
+				exclusiveLease: true,
+			});
+			const isolatedGitCapability = isolatedGit
+				? await issueIsolatedCapability(isolatedGit, isolatedGitRights, seqStep.cwd, cwd)
+				: undefined;
 			let singleResult: Awaited<ReturnType<typeof runSingleStep>>;
 			try {
 				singleResult = await runSingleStep(seqStep, {
@@ -3475,6 +3806,10 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				nestedRoute: config.nestedRoute,
 				sandbox: config.sandbox,
 				isolatedGit,
+				isolatedGitCapability,
+				scopedGitEndpoint,
+				isolatedGitRights,
+				deferIsolatedGitExport: Boolean(isolatedGit),
 				progressPaths: config.progressPaths,
 				sandboxIntercomBridge: config.sandboxIntercomBridge,
 				registerInterrupt: registerChildInterrupt(),
@@ -3488,14 +3823,14 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				let rejection = `Sequential execution rejected: ${error instanceof Error ? error.message : String(error)}`;
 				const statusStep = statusPayload.steps[flatIndex];
 				if (singleResult && statusStep?.gitBundle === undefined && singleResult.gitBundle) statusStep.gitBundle = singleResult.gitBundle;
-				if (isolatedGit && !isolatedGit.runtime.isExported(isolatedGit.index)) {
+				if (isolatedGit && (!ownsIsolatedGitRuntime || !isolatedGit.runtime.isExported(isolatedGit.index))) {
 					const fence = await waitForNestedDescendantsToStop(config.nestedRoute, id);
 					if (!fence.stopped) {
-						isolatedGit.runtime.markExportFenceFailed();
+						if (ownsIsolatedGitRuntime) isolatedGit.runtime.markExportFenceFailed();
 						statusPayload.teardownUnproven = true;
 						if (singleResult) singleResult.teardownUnproven = true;
 						rejection = `${rejection}; nested descendants did not reach a proven terminal state before export; recover isolated worktree at ${isolatedGit.runtime.root}`;
-					} else {
+					} else if (ownsIsolatedGitRuntime && !isolatedGit.runtime.isExported(isolatedGit.index)) {
 						try {
 							const bundle = exportIsolatedGitBundle(isolatedGit.runtime, {
 								outputDir: artifactsDir ?? path.join(TEMP_ARTIFACTS_DIR, "isolated-git-bundles"),
@@ -3503,13 +3838,14 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 								syntheticPaths: isolatedGit.syntheticPaths,
 								terminationState: interrupted ? "interrupted" : "execution-rejected",
 								agent: seqStep.agent,
-								commitRequired: !taskDisallowsFileUpdates(seqStep.task) && inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }),
+								commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(seqStep.agent), agentTools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(seqStep.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
 							});
 							if (statusStep) statusStep.gitBundle = {
 								path: bundle.path,
 								checksum: bundle.checksum,
 								base: bundle.base,
 								head: bundle.head,
+								commits: bundle.commits,
 								commitSummary: bundle.commitSummary,
 								...(bundle.recovery ? { recovery: bundle.recovery } : {}),
 								...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
@@ -3661,8 +3997,8 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 
-	let summary = results.map((r) => `${r.agent}:\n${r.output}`).join("\n\n");
-	let truncated = false;
+	summary = results.map((r) => `${r.agent}:\n${r.output}`).join("\n\n");
+	truncated = false;
 
 	if (maxOutput) {
 		const config = { ...DEFAULT_MAX_OUTPUT, ...maxOutput };
@@ -3681,13 +4017,13 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 	// the same bundle or actionable export failure details.
 	if (isolatedGitRuntime) {
 		syncCanonicalResults();
-		await exportRemainingIsolated?.(interrupted ? "interrupted" : "execution-rejected");
+		await exportRemainingIsolated?.(interrupted ? "interrupted" : results.every((result) => result.exitCode === 0 && !result.error) ? "success" : "failure");
 		projectCanonicalResults();
 		// Verified exports are the cleanup fence. Keep failed/detached/fence-
 		// refused runtimes live, with the terminal projection below reporting the
 		// actionable recovery path.
-		if (!isolatedGitRuntime.exportFenceFailed && !isolatedGitRuntime.exportFailed) await cleanupIsolatedGitRuntime(isolatedGitRuntime);
-		isolatedGitCleanupVerified = !fs.existsSync(isolatedGitRuntime.root);
+		if (ownsIsolatedGitRuntime && !isolatedGitRuntime.exportFenceFailed && !isolatedGitRuntime.exportFailed) await cleanupIsolatedGitRuntime(isolatedGitRuntime);
+		isolatedGitCleanupVerified = !ownsIsolatedGitRuntime || !fs.existsSync(isolatedGitRuntime.root);
 		if (!isolatedGitCleanupVerified) {
 			// Cleanup refusal is itself an unproven teardown fence. Mark it before
 			// terminal status serialization so the guarded publisher emits the
@@ -3967,14 +4303,14 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					delete result.interrupted;
 					delete result.cancelled;
 					result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
-					result.error = result.error?.includes(message) ? result.error : result.error ? `${result.error}\\n${message}` : message;
+					result.error = result.error?.includes(message) ? result.error : result.error ? `${result.error}\n${message}` : message;
 				}
 				for (const pending of pendingTerminalPublications.values()) {
 					pending.result.success = false;
 					delete pending.result.interrupted;
 					delete pending.result.cancelled;
 					pending.result.exitCode = pending.result.exitCode === 0 ? 1 : (pending.result.exitCode ?? 1);
-					pending.result.error = pending.result.error?.includes(message) ? pending.result.error : pending.result.error ? `${pending.result.error}\\n${message}` : message;
+					pending.result.error = pending.result.error?.includes(message) ? pending.result.error : pending.result.error ? `${pending.result.error}\n${message}` : message;
 				}
 				for (const index of isolatedIndexes) {
 					const step = statusPayload.steps[index];
@@ -3984,24 +4320,24 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					delete step.interrupted;
 					delete step.cancelled;
 					step.exitCode = step.exitCode === 0 ? 1 : (step.exitCode ?? 1);
-					step.error = step.error?.includes(message) ? step.error : step.error ? `${step.error}\\n${message}` : message;
+					step.error = step.error?.includes(message) ? step.error : step.error ? `${step.error}\n${message}` : message;
 					if (statusPayload.teardownUnproven !== true && step.teardownUnproven !== true) {
 						try { appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.failed", ts: Date.now(), runId: id, stepIndex: index, agent: step.agent, exitCode: step.exitCode, durationMs: step.durationMs })); } catch { /* outer fallback still writes status/result */ }
 					}
 				}
 			};
 			const cleanupFailure = `Isolated Git cleanup/recovery finalization failed; recover worktree at ${isolatedGitRuntime.root}.`;
-			statusPayload.error = statusPayload.error ? `${statusPayload.error}\\n${cleanupFailure}` : cleanupFailure;
-			worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\\n${cleanupFailure}` : cleanupFailure;
-			summary = summary ? `${summary}\\n\\n${cleanupFailure}` : cleanupFailure;
+			statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${cleanupFailure}` : cleanupFailure;
+			worktreeExecutionError = worktreeExecutionError ? `${worktreeExecutionError}\n${cleanupFailure}` : cleanupFailure;
+			summary = summary ? `${summary}\n\n${cleanupFailure}` : cleanupFailure;
 			// Project before retrying cleanup: a throw is already a failed teardown
 			// observation, even if a later retry happens to remove the root.
 			projectIsolatedCleanupFailure(cleanupFailure);
 			try {
 				syncCanonicalResults();
-				await exportRemainingIsolated?.(interrupted ? "interrupted" : "execution-rejected");
+				await exportRemainingIsolated?.(interrupted ? "interrupted" : results.every((result) => result.exitCode === 0 && !result.error) ? "success" : "failure");
 				projectCanonicalResults();
-				await cleanupIsolatedGitRuntime(isolatedGitRuntime);
+				if (ownsIsolatedGitRuntime) await cleanupIsolatedGitRuntime(isolatedGitRuntime);
 				if (fs.existsSync(isolatedGitRuntime.root)) throw new Error(`Isolated Git cleanup was not proven; recover isolated worktrees at ${isolatedGitRuntime.root}`);
 			} catch (exportError) {
 				cleanupFailureProjected = true;
@@ -4236,8 +4572,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	try {
 		await runSubagentCore(config);
 	} catch (error) {
-		writeRejectedRunnerTerminal(config, error);
+			writeRejectedRunnerTerminal(config, error);
 		console.error("Subagent runner error:", error);
+		process.exitCode = 1;
 	}
 }
 

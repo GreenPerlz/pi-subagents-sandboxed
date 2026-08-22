@@ -8,7 +8,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { resolveSandboxConfig, resolveGitMode } from "../../sandbox/config.ts";
-import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitCapability, type ScopedGitEndpointDescriptor, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import {
@@ -71,6 +71,8 @@ import {
 } from "../../shared/types.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { resolveCapabilityRights } from "../shared/capability-rights.ts";
+import { resolvePackagedAgentRole } from "../shared/agent-role.ts"
 import { resolveModelCandidate } from "../shared/model-fallback.ts";
 import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { injectSingleOutputInstruction, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -100,6 +102,11 @@ interface ChainExecutionDetailsInput {
 	currentFlatIndex?: number;
 	dynamicChildren?: Record<number, Array<{ agent: string; label?: string; flatIndex: number; itemKey: string; outputName?: string; structured?: boolean; error?: string }>>;
 	dynamicGroupStatuses?: Record<number, { status: "pending" | "running" | "completed" | "failed" | "paused" | "cancelled" | "detached"; error?: string; acceptance?: SingleResult["acceptance"] }>;
+}
+
+interface TeardownHooks {
+	waitForNestedDescendantsToStop?: typeof waitForNestedDescendantsToStop;
+	releaseInheritedContext?: (runtime: IsolatedGitRuntime, capability: IsolatedGitCapability) => void;
 }
 
 interface ParallelChainRunInput {
@@ -161,6 +168,10 @@ interface ParallelChainRunInput {
 	sandbox?: ResolvedSandboxConfig;
 	sandboxes?: (ResolvedSandboxConfig | undefined)[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
+	issueIsolatedGitCapability?: (worktree: IsolatedGitWorktree, rights: "writer" | "read-only", cwd: string) => Promise<IsolatedGitCapability>;
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
+	/** Internal lifecycle test seam; production uses the shared fence/release implementations. */
+	teardownHooks?: TeardownHooks;
 	progressPaths?: string[];
 	onDetachedStarted?: (index: number, result: SingleResult) => void;
 	onDetachedTerminal?: (index: number, result: SingleResult) => void | Promise<void>;
@@ -238,9 +249,17 @@ function resolveParallelCleanTask(input: Pick<ParallelChainRunInput, "parallelTe
 	return cleanTask;
 }
 
-function commitRequiredForParallelTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined): boolean {
-	return !taskDisallowsFileUpdates(resolveParallelCleanTask(input, taskIndex))
-		&& inferSandboxCwdWritable({ agentName: agent?.name, tools: agent?.tools, sandbox });
+function commitRequiredForParallelTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined, parentRights?: "writer" | "read-only"): boolean {
+	const task = resolveParallelCleanTask(input, taskIndex);
+	return resolveCapabilityRights({
+		packagedRole: resolvePackagedAgentRole(agent?.name),
+		agentTools: agent?.tools,
+		sandbox,
+		taskMutationProhibited: taskDisallowsFileUpdates(task),
+		parentRights,
+		writableCwd: inferSandboxCwdWritable({ agentName: agent?.name, tools: agent?.tools, sandbox }),
+		exclusiveLease: true,
+	}) === "writer";
 }
 
 async function runParallelChainTasks(input: ParallelChainRunInput): Promise<SingleResult[]> {
@@ -307,6 +326,25 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				: (input.worktreeSetup
 					? input.worktreeSetup.worktrees[taskIndex]!.agentCwd
 					: resolveChildCwd(input.cwd ?? input.ctx.cwd, task.cwd));
+			// Scope-check each isolated task's canonical requested cwd before any
+			// per-task output/session/interrupt/artifact path or runtime setup.
+			// Issue capability only after the resolved sandbox is known, but before
+			// output/session/structured paths or other path-sensitive side effects.
+			const packagedRole = resolvePackagedAgentRole(task.agent);
+			const taskSandbox = input.sandboxes?.[taskIndex] ?? input.sandbox;
+			const capabilityRights = resolveCapabilityRights({
+				packagedRole,
+				agentTools: taskAgentConfig?.tools,
+				sandbox: taskSandbox,
+				taskMutationProhibited: taskDisallowsFileUpdates(cleanTask),
+				writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: taskAgentConfig?.tools, sandbox: taskSandbox }),
+				exclusiveLease: true,
+			});
+			const isolatedCapability = isolatedGit
+				? await (input.issueIsolatedGitCapability
+					? input.issueIsolatedGitCapability(isolatedGit, capabilityRights, taskCwd)
+					: isolatedGit.runtime.issueInheritedContext({ worktree: isolatedGit, rights: capabilityRights, cwd: taskCwd }))
+				: undefined;
 
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(input.chainDir, behavior.output))
@@ -358,6 +396,44 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				throw error;
 			}
 			let result: SingleResult;
+			let detachedCapabilityReleased = false;
+			let detachedEndpointFenceProven = false;
+			const releaseDetachedCapability = async (terminal?: SingleResult): Promise<void> => {
+				if (detachedCapabilityReleased || detachedEndpointFenceProven || (!isolatedCapability || !isolatedGit) && !input.scopedGitEndpoint || terminal?.teardownUnproven) {
+					if (terminal?.teardownUnproven) isolatedGit?.runtime.markExportFenceFailed();
+					return;
+				}
+				const fence = await (input.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(input.nestedRoute, input.runId, input.globalTaskIndex + taskIndex, { timeoutMs: input.nestedFenceTimeoutMs });
+				if (!fence.observed || !fence.stopped) {
+					if (isolatedGit) isolatedGit.runtime.markExportFenceFailed();
+					if (terminal) {
+						terminal.teardownUnproven = true;
+						terminal.exitCode = terminal.exitCode === 0 ? 1 : terminal.exitCode;
+						terminal.error = terminal.error ?? "Nested descendants did not reach a proven terminal state; inherited capability retained for recovery.";
+						input.onUpdate?.({ content: [{ type: "text", text: terminal.error }], details: { mode: "chain", results: [{ ...terminal, detached: true }] } });
+					}
+					return;
+				}
+				if (input.scopedGitEndpoint) {
+					detachedEndpointFenceProven = true;
+					return;
+				}
+				try {
+					(input.teardownHooks?.releaseInheritedContext ?? ((runtime, capability) => runtime.releaseInheritedContext(capability)))(isolatedGit.runtime, isolatedCapability!);
+					detachedCapabilityReleased = true;
+				} catch (error) {
+					// A release/revocation failure is not proof of teardown. Keep the
+					// lease and runtime recoverable instead of publishing terminal truth.
+					if (terminal) {
+						terminal.teardownUnproven = true;
+						terminal.exitCode = terminal.exitCode === 0 ? 1 : terminal.exitCode;
+						const detail = error instanceof Error ? error.message : String(error);
+						terminal.error = terminal.error ? `${terminal.error}\nCapability release was not proven: ${detail}` : `Capability release was not proven: ${detail}`;
+					}
+					try { isolatedGit?.runtime.markExportFenceFailed(); } catch { /* retain terminal teardown evidence if fence persistence also fails */ }
+					if (terminal) input.onUpdate?.({ content: [{ type: "text", text: terminal.error ?? "Capability release was not proven." }], details: { mode: "chain", results: [{ ...terminal, detached: true }] } });
+				}
+			};
 			try {
 				result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
 				cwd: taskCwd,
@@ -392,8 +468,11 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				acceptanceContext: { mode: "chain" },
 				sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox,
 				isolatedGit,
+				isolatedGitCapability: isolatedCapability,
+				isolatedGitEndpoint: input.scopedGitEndpoint,
+				isolatedGitRights: input.scopedGitEndpoint ? capabilityRights : undefined,
 				isolatedGitBundleDir: input.artifactsDir,
-				isolatedGitCommitRequired: Boolean(isolatedGit) && !taskDisallowsFileUpdates(cleanTask) && inferSandboxCwdWritable({ agentName: task.agent, tools: taskAgentConfig?.tools, sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox }),
+				isolatedGitCommitRequired: Boolean(isolatedGit) && commitRequiredForParallelTask(input, taskIndex, taskAgentConfig, input.sandboxes?.[taskIndex] ?? input.sandbox),
 				sandboxIntercomBridge: input.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? input.progressPaths : undefined,
 				onDetachedStarted: () => input.onDetachedStarted?.(input.globalTaskIndex + taskIndex, {
@@ -403,7 +482,14 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 					messages: [],
 					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 },
 				}),
-				onDetachedTerminal: input.onDetachedTerminal ? (result) => input.onDetachedTerminal!(input.globalTaskIndex + taskIndex, result) : undefined,
+				onDetachedTerminal: async (terminalResult) => {
+					// Descendant terminal publication is downstream of both the exact
+					// descendant-stop fence and capability revocation. A failed release
+					// remains recoverable and must not be presented as terminal truth.
+					await releaseDetachedCapability(terminalResult);
+					if (terminalResult.teardownUnproven || (isolatedCapability && !detachedCapabilityReleased) || (input.scopedGitEndpoint && !detachedEndpointFenceProven)) return;
+					await input.onDetachedTerminal?.(input.globalTaskIndex + taskIndex, terminalResult);
+				},
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
 						const stepResults = progressUpdate.details?.results || [];
@@ -456,6 +542,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			} finally {
 				unregisterInterrupt?.();
 				unregisterInterrupt = undefined;
+				if (!result?.detached) await releaseDetachedCapability(result);
 			}
 			if (result.detached) input.onDetachedStarted?.(input.globalTaskIndex + taskIndex, result);
 			if (input.foregroundControl?.currentIndex === input.globalTaskIndex + taskIndex) {
@@ -494,7 +581,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 					agent: task.agent,
 					commitRequired: commitRequiredForParallelTask(input, taskIndex, input.agents.find((agent) => agent.name === task.agent), input.sandboxes?.[taskIndex] ?? input.sandbox),
 				});
-				gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+				gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
 			} catch (exportError) {
 				worktree.runtime.markExportFailed();
 				const packaging = `Isolated Git bundle export failed; recover isolated worktree at ${worktree.runtime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
@@ -563,6 +650,9 @@ interface ChainExecutionParams {
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
+	/** Internal lifecycle test seam; production uses the shared fence/release implementations. */
+	teardownHooks?: TeardownHooks;
 }
 
 interface ChainExecutionResult {
@@ -717,6 +807,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const projected = existing ?? { flatIndex: worktree.index, agent: policy?.agent ?? `task-${worktree.index + 1}`, task: policy?.task ?? "chain execution", messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } };
 			projected.exitCode = projected.exitCode === 0 ? 1 : (projected.exitCode ?? 1);
 			projected.success = false;
+			projected.teardownUnproven = true;
 			// Cleanup failure has failure precedence over cancellation/interruption.
 			delete projected.cancelled;
 			delete projected.interrupted;
@@ -726,6 +817,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		if (target && !target.error?.includes(message)) {
 			target.exitCode = target.exitCode === 0 ? 1 : (target.exitCode ?? 1);
 			target.success = false;
+			target.teardownUnproven = true;
 			delete target.cancelled;
 			delete target.interrupted;
 			target.error = target.error ? `${target.error}\n${message}` : message;
@@ -741,17 +833,17 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		throw lastError;
 	};
 	const exportRemainingIsolated = async (terminationState: "success" | "failure" | "execution-rejected" | "interrupted" | "cancelled", reason = "Chain execution rejected", includeDetached = false): Promise<{ fenced: boolean }> => {
-		if (!isolatedGitRuntime) return { fenced: true };
+		if (!isolatedGitRuntime || !ownsIsolatedGitRuntime) return { fenced: true };
 		// A teardown callback may have already fenced this runtime after refusing
 		// private-group proof. Never clear that fence and package/delete descendants.
 		if (isolatedGitRuntime.exportFenceFailed) return { fenced: false };
-		const effectiveTerminationFor = (index: number): "success" | "failure" | "execution-rejected" | "interrupted" | "cancelled" => {
-			const existing = results.find((result) => result.flatIndex === index);
-			if (!existing) return terminationState;
-			if (existing.cancelled) return "cancelled";
-			if (existing.interrupted) return "interrupted";
-			if (existing.success === true && existing.exitCode === 0) return "success";
-			if (existing.exitCode !== 0) return "failure";
+		const effectiveTerminationFor = (_index: number): "success" | "failure" | "execution-rejected" | "interrupted" | "cancelled" => {
+			// A shared sequential checkout represents the complete group, not the
+			// first flat-index step. Later review/fix failures must remain visible in
+			// the exported terminal state.
+			if (results.some((result) => result.cancelled)) return "cancelled";
+			if (results.some((result) => result.interrupted)) return "interrupted";
+			if (results.some((result) => result.success !== true || result.exitCode !== 0)) return "failure";
 			return terminationState;
 		};
 		const fence = await waitForNestedDescendantsToStop(params.nestedRoute, runId, undefined, { timeoutMs: params.nestedFenceTimeoutMs });
@@ -792,8 +884,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				const exportOnly = Boolean(existing && normalized.onlyDiagnostics);
 				const fallback = existing
 					? { ...existing, ...(normalized.error ? { error: normalized.error } : exportOnly ? { error: undefined } : {}), ...(exportOnly ? { success: true, exitCode: 0 } : {}) }
-					: { flatIndex: worktree.index, agent: policy?.agent ?? `task-${worktree.index + 1}`, task: policy?.task ?? "chain execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 }, error: `${reason}; isolated worktree exported for recovery`, gitBundle: { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata } };
-				const gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+					: { flatIndex: worktree.index, agent: policy?.agent ?? `task-${worktree.index + 1}`, task: policy?.task ?? "chain execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 }, error: `${reason}; isolated worktree exported for recovery`, gitBundle: { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata } };
+				const gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
 				const effectiveFallback = bundle.incomplete && fallback.success === true
 					? { ...fallback, success: false, exitCode: fallback.exitCode === 0 ? 1 : fallback.exitCode, error: fallback.error ?? "Isolated writer completed without a required authored commit; recovery bundle is incomplete." }
 					: fallback;
@@ -808,7 +900,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	};
 	const finalizeBeforePublication = async (terminationState: "execution-rejected" | "interrupted" | "cancelled"): Promise<void> => {
 		await exportRemainingIsolated(terminationState);
-		if (isolatedGitRuntime && detachedIndexes.size === 0 && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+		if (ownsIsolatedGitRuntime && isolatedGitRuntime && detachedIndexes.size === 0 && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
 			try { await cleanupIsolatedGitRuntime(isolatedGitRuntime); }
 			catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
 			noteIsolatedCleanupFailure();
@@ -895,20 +987,25 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				commitRequired: policy?.commitRequired,
 			});
 			const bundle = retry.bundle;
-			result.gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+			result.gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
 			if (bundle.incomplete && policy?.commitRequired && !result.error) {
 				result.exitCode = 1;
 				result.error = "Isolated writer completed without a required authored commit; recovery bundle is incomplete.";
 			}
 		} catch (error) {
 			isolatedGitRuntime.markExportFailed();
+			teardownUnproven = true;
+			result.success = false;
+			delete result.interrupted;
+			delete result.cancelled;
+			result.teardownUnproven = true;
 			result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
 			result.error = result.error ? `${result.error}\nIsolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}: ${error instanceof Error ? error.message : String(error)}` : `Isolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}: ${error instanceof Error ? error.message : String(error)}`;
 		}
 		// Detached acknowledgements were already projected to the caller. Finish
 		// cleanup before publishing the eventual terminal object so no recovery
 		// truth changes after durable status/result/intercom publication.
-		if (isolatedGitRuntime.worktrees.length > 0 && isolatedGitRuntime.worktrees.every((candidate) => isolatedGitRuntime!.isExported(candidate.index)) && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+		if (ownsIsolatedGitRuntime && isolatedGitRuntime.worktrees.length > 0 && isolatedGitRuntime.worktrees.every((candidate) => isolatedGitRuntime!.isExported(candidate.index)) && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
 			try { await cleanupIsolatedGitRuntime(isolatedGitRuntime); }
 			catch (cleanupError) { noteIsolatedCleanupFailure(result, cleanupError); }
 			noteIsolatedCleanupFailure(result);
@@ -918,7 +1015,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	};
 	const buildIsolatedChainError = async (message: string, input: ChainExecutionDetailsInput): Promise<ChainExecutionResult> => {
 		await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected", message);
-		if (isolatedGitRuntime && detachedIndexes.size === 0 && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+		if (ownsIsolatedGitRuntime && isolatedGitRuntime && detachedIndexes.size === 0 && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
 			try { await cleanupIsolatedGitRuntime(isolatedGitRuntime); }
 			catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
 		}
@@ -962,6 +1059,13 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	// run. Each isolated child still receives a distinct writable metadata and
 	// worktree layer, while the packed base remains shared read-only.
 	let isolatedGitRuntime: IsolatedGitRuntime | undefined;
+	const ownsIsolatedGitRuntime = !params.scopedGitEndpoint;
+	// Sequential packaged stages deliberately share one checkout. A capability
+	// is issued for each stage so reviewers can narrow it to read-only while the
+	// next writer inherits the same HEAD and authored history.
+	let sequentialIsolatedGitWorktree: IsolatedGitWorktree | undefined;
+	let sequentialIsolatedGitCapability: import("../../sandbox/isolated-git.ts").IsolatedGitCapability | undefined;
+	let sequentialIsolatedGitCommitRequired = false;
 	const ensureIsolatedGitRuntime = (sandbox: ResolvedSandboxConfig): IsolatedGitRuntime => {
 		if (resolveGitMode(sandbox) !== "isolated") throw new Error("isolated Git runtime requested for a non-isolated sandbox");
 		if (sandbox.provider !== "bubblewrap") throw new Error("isolated Git requires the Bubblewrap sandbox provider; refusing to downgrade");
@@ -969,7 +1073,6 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			isolatedGitRuntime = createIsolatedGitRuntime({
 				cwd: path.resolve(cwd ?? ctx.cwd),
 				runId: `${runId}-isolated`,
-				ownerPid: process.pid,
 				provider: sandbox.provider,
 				network: sandbox.network,
 				profile: sandbox.profile,
@@ -1088,7 +1191,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
 			const stepSandboxes = stepAgentConfigs.map((agent) => resolveStepSandbox(agent));
-			const isolatedGitRequested = stepSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
+			const isolatedGitRequested = !params.scopedGitEndpoint && stepSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
 			if (isolatedGitRequested && step.worktree) {
 				return buildChainExecutionErrorResult("isolated Git cannot be combined with parent-managed worktree mode", makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
 			}
@@ -1098,7 +1201,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			)) {
 				return buildChainExecutionErrorResult("isolated Git parallel steps cannot include a non-isolated write-capable task", makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
 			}
-			if (!isolatedGitRequested && !step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
+			if (!isolatedGitRequested && !params.scopedGitEndpoint && !step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
 				return buildChainExecutionErrorResult(
 					sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`),
 					makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
@@ -1112,7 +1215,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				const behavior = parallelBehaviors[taskIndex]!;
 				const task = step.parallel[taskIndex]!;
 				const taskAgentConfig = agents.find((agent) => agent.name === task.agent);
-				const taskCwd = resolveChildCwd(cwd ?? ctx.cwd, task.cwd);
+				const taskCwd = resolveChildCwd(parallelCwd, task.cwd);
 				const outputPath = typeof behavior.output === "string" ? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output)) : undefined;
 				const savedOutputPath = shouldPersistSavedOutput({ output: behavior.output, outputMode: behavior.outputMode, tools: taskAgentConfig?.tools })
 					? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId, index: globalTaskIndex + taskIndex }) : undefined;
@@ -1258,6 +1361,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					sandbox: sharedSandbox,
 					sandboxes: stepSandboxes,
 					sandboxIntercomBridge: params.sandboxIntercomBridge,
+					scopedGitEndpoint: params.scopedGitEndpoint,
+					teardownHooks: params.teardownHooks,
 					progressPaths: [path.join(chainDir, "progress.md")],
 					onDetachedStarted: (index) => detachedIndexes.add(index),
 					onDetachedTerminal,
@@ -1322,7 +1427,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 							if (terminal) await publishDetachedTerminal(detachedIndex, terminal);
 						}
 					}
-					const detachedPath = isolatedGitRuntime ? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.` : formatRecoverableWorktreePaths(worktreeSetup);
+					const detachedPath = isolatedGitRuntime
+						? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.`
+						: params.scopedGitEndpoint
+							? "Recover retained isolated worktree evidence through the owning parent run after the child reaches terminal state."
+							: formatRecoverableWorktreePaths(worktreeSetup);
 					const message = `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child reaches terminal state, the preserved worktree can be exported or recovered.${detachedPath ? `\n${detachedPath}` : ""}`;
 					return {
 						content: [{ type: "text", text: worktreeSummaryForResult ? `${message}\n\n${worktreeSummaryForResult}` : message }],
@@ -1432,7 +1541,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 							const index = groupBaseIndex + taskIndex;
 							const existing = results.find((result) => result.flatIndex === index);
 							upsertChainResult(index, existing
-								? { ...existing, success: false, exitCode: existing.exitCode === 0 ? 1 : (existing.exitCode ?? 1), error: existing.error ? `${existing.error}\\n${message}` : message }
+								? { ...existing, success: false, exitCode: existing.exitCode === 0 ? 1 : (existing.exitCode ?? 1), error: existing.error ? `${existing.error}\n${message}` : message }
 								: { flatIndex: index, agent: step.parallel[taskIndex]?.agent ?? `task-${taskIndex + 1}`, task: step.parallel[taskIndex]?.task ?? "parallel execution", success: false, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 }, error: message });
 						}
 						throw new Error(message);
@@ -1557,7 +1666,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				}
 			}
 			let dynamicIsolatedGitWorktrees: (IsolatedGitWorktree | undefined)[] | undefined;
-			if (dynamicSandbox?.gitMode === "isolated") {
+			if (dynamicSandbox?.gitMode === "isolated" && !params.scopedGitEndpoint) {
 				let runtime: IsolatedGitRuntime | undefined;
 				try {
 					runtime = ensureIsolatedGitRuntime(dynamicSandbox);
@@ -1643,6 +1752,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				sandboxes: dynamicParallelStep.parallel.map(() => dynamicSandbox),
 				isolatedGitWorktrees: dynamicIsolatedGitWorktrees,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
+				scopedGitEndpoint: params.scopedGitEndpoint,
+				teardownHooks: params.teardownHooks,
 				progressPaths: [path.join(chainDir, "progress.md")],
 				onDetachedStarted: (index) => detachedIndexes.add(index),
 				onDetachedTerminal,
@@ -1684,7 +1795,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						if (terminal) await publishDetachedTerminal(detachedIndex, terminal);
 					}
 				}
-				const detachedPath = isolatedGitRuntime ? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.` : "";
+				const detachedPath = isolatedGitRuntime
+					? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.`
+					: params.scopedGitEndpoint
+						? "Recover retained isolated worktree evidence through the owning parent run after the child reaches terminal state."
+						: "";
 				return {
 					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child reaches terminal state, the preserved worktree can be exported or recovered.${detachedPath ? `\n${detachedPath}` : ""}` }],
 					details: buildChainExecutionDetails(makeDetailsInput({
@@ -1800,10 +1915,10 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				?? (seqStep.model ? resolveModelCandidate(seqStep.model, availableModels, ctx.model?.provider) : null)
 				?? resolveModelCandidate(agentConfig.model, availableModels, ctx.model?.provider);
 
+			const stepCwd = resolveChildCwd(cwd ?? ctx.cwd, seqStep.cwd);
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
 				: undefined;
-			const stepCwd = resolveChildCwd(cwd ?? ctx.cwd, seqStep.cwd);
 			const savedOutputPath = shouldPersistSavedOutput({
 				output: behavior.output,
 				outputMode: behavior.outputMode,
@@ -1860,15 +1975,37 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				throw error;
 			}
 			let isolatedWorktree: IsolatedGitWorktree | undefined;
-			if (stepSandbox && resolveGitMode(stepSandbox) === "isolated") {
+			let isolatedWorktreeReadOnly = false;
+			let writer = resolveCapabilityRights({
+				packagedRole: resolvePackagedAgentRole(agentConfig.name),
+				agentTools: agentConfig.tools,
+				sandbox: stepSandbox,
+				taskMutationProhibited: taskDisallowsFileUpdates(stepTask),
+				writableCwd: inferSandboxCwdWritable({ agentName: agentConfig.name, tools: agentConfig.tools, sandbox: stepSandbox }),
+				exclusiveLease: true,
+			}) === "writer";
+			if (stepSandbox && resolveGitMode(stepSandbox) === "isolated" && !params.scopedGitEndpoint) {
 				try {
-					const policy = {
+					const packagedRole = resolvePackagedAgentRole(agentConfig.name);
+					writer = resolveCapabilityRights({
+						packagedRole,
+						agentTools: agentConfig.tools,
+						sandbox: stepSandbox,
+						taskMutationProhibited: taskDisallowsFileUpdates(stepTask),
+						writableCwd: inferSandboxCwdWritable({ agentName: agentConfig.name, tools: agentConfig.tools, sandbox: stepSandbox }),
+						exclusiveLease: true,
+					}) === "writer";
+					isolatedWorktreeReadOnly = !writer;
+					const runtime = ensureIsolatedGitRuntime(stepSandbox);
+					isolatedWorktree = sequentialIsolatedGitWorktree ??= createIsolatedGitWorktree(runtime, { index: globalTaskIndex, agent: seqStep.agent });
+					sequentialIsolatedGitCapability = runtime.issueInheritedContext({ worktree: isolatedWorktree, rights: writer ? "writer" : "read-only", cwd: stepCwd });
+					sequentialIsolatedGitCommitRequired ||= writer;
+					const previousPolicy = isolatedWorktreePolicies.get(isolatedWorktree.index);
+					isolatedWorktreePolicies.set(isolatedWorktree.index, {
 						agent: seqStep.agent,
 						task: seqStep.task,
-						commitRequired: !taskDisallowsFileUpdates(stepTask) && inferSandboxCwdWritable({ agentName: seqStep.agent, tools: agentConfig.tools, sandbox: stepSandbox }),
-					};
-					isolatedWorktreePolicies.set(globalTaskIndex, policy);
-					isolatedWorktree = createIsolatedGitWorktree(ensureIsolatedGitRuntime(stepSandbox), { index: globalTaskIndex, agent: seqStep.agent });
+						commitRequired: Boolean(previousPolicy?.commitRequired || sequentialIsolatedGitCommitRequired),
+					});
 				} catch (error) {
 					unregisterForegroundInterrupt();
 					return await buildIsolatedChainError(`Isolated Git setup failed: ${error instanceof Error ? error.message : String(error)}`, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
@@ -1909,12 +2046,64 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				acceptanceContext: { mode: "chain" },
 				sandbox: stepSandbox,
 				isolatedGit: isolatedWorktree,
+				isolatedGitCapability: sequentialIsolatedGitCapability,
+				isolatedGitEndpoint: params.scopedGitEndpoint,
+				isolatedGitRights: params.scopedGitEndpoint ? (writer ? "writer" : "read-only") : (isolatedWorktreeReadOnly ? "read-only" : "writer"),
 				isolatedGitBundleDir: artifactsDir,
-				isolatedGitCommitRequired: Boolean(isolatedWorktree) && !taskDisallowsFileUpdates(stepTask) && inferSandboxCwdWritable({ agentName: seqStep.agent, tools: agentConfig?.tools, sandbox: stepSandbox }),
+				isolatedGitCommitRequired: Boolean(isolatedWorktree) && !isolatedWorktreeReadOnly,
+				// The shared sequential context is exported once, after the terminal
+				// descendant fence, not once per child.
+				exportIsolatedGitBundle: Boolean(isolatedWorktree) ? false : undefined,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? [path.join(chainDir, "progress.md")] : undefined,
 				onDetachedStarted: () => detachedIndexes.add(detachedTerminalIndex),
-				onDetachedTerminal: (result) => onDetachedTerminal(detachedTerminalIndex, result),
+				onDetachedTerminal: async (result) => {
+					if (params.scopedGitEndpoint && !result.teardownUnproven) {
+						const fence = await (params.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(params.nestedRoute, runId, detachedTerminalIndex, { timeoutMs: params.nestedFenceTimeoutMs });
+						if (!fence.observed || !fence.stopped) {
+							result.teardownUnproven = true;
+							result.success = false;
+							delete result.interrupted;
+							delete result.cancelled;
+							result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+							const recoveryMessage = "Nested descendants did not reach a proven terminal state before scoped Git endpoint cleanup; recover retained isolated worktree evidence through the owning parent run";
+							result.error = result.error ? `${result.error}\n${recoveryMessage}` : recoveryMessage;
+							onUpdate?.({ content: [{ type: "text", text: result.error }], details: { mode: "chain", results: results.concat([{ ...result, detached: true }]) } });
+						}
+					}
+					if (sequentialIsolatedGitCapability && isolatedWorktree && !result.teardownUnproven) {
+						const fence = await (params.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(params.nestedRoute, runId, detachedTerminalIndex, { timeoutMs: params.nestedFenceTimeoutMs });
+						if (fence.stopped) {
+							try {
+								(params.teardownHooks?.releaseInheritedContext ?? ((runtime, capability) => runtime.releaseInheritedContext(capability)))(isolatedWorktree.runtime, sequentialIsolatedGitCapability);
+								sequentialIsolatedGitCapability = undefined;
+							} catch (error) {
+								isolatedWorktree.runtime.markExportFenceFailed();
+								result.teardownUnproven = true;
+								result.success = false;
+								delete result.interrupted;
+								delete result.cancelled;
+								result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+								const detail = error instanceof Error ? error.message : String(error);
+								result.error = result.error ? `${result.error}\nCapability release was not proven: ${detail}` : `Capability release was not proven: ${detail}`;
+								onUpdate?.({ content: [{ type: "text", text: result.error }], details: { mode: "chain", results: results.concat([{ ...result, detached: true }]) } });
+							}
+						} else {
+							isolatedWorktree.runtime.markExportFenceFailed();
+							result.teardownUnproven = true;
+							result.success = false;
+							delete result.interrupted;
+							delete result.cancelled;
+							result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+							result.error = result.error ? `${result.error}\nNested descendants did not reach a proven terminal state; inherited capability retained for recovery.` : "Nested descendants did not reach a proven terminal state; inherited capability retained for recovery.";
+							onUpdate?.({ content: [{ type: "text", text: result.error }], details: { mode: "chain", results: results.concat([{ ...result, detached: true }]) } });
+						}
+					}
+					// A failed fence/release remains recoverable and must not publish a
+					// terminal detached projection.
+					if (result.teardownUnproven || sequentialIsolatedGitCapability) return;
+					await onDetachedTerminal(detachedTerminalIndex, result);
+				},
 				onUpdate: onUpdate
 					? (p) => {
 						const stepResults = p.details?.results || [];
@@ -1964,7 +2153,34 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						});
 					}
 					: undefined,
-			}).finally(() => {
+			}).then(async (settled) => {
+				if (sequentialIsolatedGitCapability && isolatedWorktree && !settled.teardownUnproven) {
+					// runSync defers shared-checkout export; release only after the
+					// exact nested descendant fence for this stage is proven.
+					const fence = await (params.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(params.nestedRoute, runId, globalTaskIndex, { timeoutMs: params.nestedFenceTimeoutMs });
+					if (fence.stopped) {
+						try {
+							(params.teardownHooks?.releaseInheritedContext ?? ((runtime, capability) => runtime.releaseInheritedContext(capability)))(isolatedWorktree.runtime, sequentialIsolatedGitCapability);
+							sequentialIsolatedGitCapability = undefined;
+						} catch (error) {
+							// Revocation is part of the terminal fence. If it cannot be
+							// proven, retain authority and make the result recoverable.
+							settled.teardownUnproven = true;
+							settled.exitCode = settled.exitCode === 0 ? 1 : settled.exitCode;
+							const detail = error instanceof Error ? error.message : String(error);
+							settled.error = settled.error ? `${settled.error}\nCapability release was not proven: ${detail}` : `Capability release was not proven: ${detail}`;
+							try { isolatedWorktree.runtime.markExportFenceFailed(); } catch { /* retain terminal teardown evidence if fence persistence also fails */ }
+						}
+					} else {
+						try { isolatedWorktree.runtime.markExportFenceFailed(); } catch { /* retain terminal state if fence persistence also fails */ }
+						settled.teardownUnproven = true;
+						settled.exitCode = settled.exitCode === 0 ? 1 : settled.exitCode;
+					}
+				} else if (sequentialIsolatedGitCapability && settled.teardownUnproven) {
+					isolatedWorktree?.runtime.markExportFenceFailed();
+				}
+				return settled;
+			}).finally(async () => {
 				unregisterForegroundInterrupt();
 				if (activeInterruptCleanup === unregisterForegroundInterrupt) activeInterruptCleanup = undefined;
 			});
@@ -2000,7 +2216,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				detachedIndexes.add(globalTaskIndex - 1);
 				chainExecutionSettled = true;
 				if (detachedTerminalIndexes.has(globalTaskIndex - 1)) await publishDetachedTerminal(globalTaskIndex - 1, r);
-				const detachedPath = isolatedGitRuntime ? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.` : "";
+				const detachedPath = isolatedGitRuntime
+					? `Recover isolated worktrees at ${isolatedGitRuntime.root} after the child reaches terminal state.`
+					: params.scopedGitEndpoint
+						? "Recover retained isolated worktree evidence through the owning parent run after the child reaches terminal state."
+						: "";
 				return {
 					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${r.agent}). Reply to the supervisor request first. After the child reaches terminal state, the preserved worktree can be exported or recovered.${detachedPath ? `\n${detachedPath}` : ""}` }],
 					details: buildChainExecutionDetails(makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - 1 })),
@@ -2013,6 +2233,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					const recovery = `Isolated Git bundle export failed; recover isolated worktree at ${isolatedGitRuntime.root}`;
 					const current = results[globalTaskIndex - 1];
 					if (current && !current.error?.includes("Isolated Git bundle export failed;")) current.error = current.error ? `${current.error}\n${recovery}` : recovery;
+					if (!r.error?.includes("Isolated Git bundle export failed;")) r.error = r.error ? `${r.error}\n${recovery}` : recovery;
 				}
 				const cancelled = singleAggregate === "cancelled" || (singleAggregate !== "failed" && Boolean(signal?.aborted && !foregroundControl?.interruptRequested));
 				const summary = buildChainSummary(chainSteps, results, chainDir, cancelled ? "cancelled" : "failed", {
@@ -2060,8 +2281,15 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	}
 	const summary = buildChainSummary(chainSteps, results, chainDir, "completed");
 	const worktreeSummary = worktreeSummaries.join("\n\n");
-	if (isolatedGitRuntime && detachedIndexes.size === 0) {
-		const exportOutcome = await exportRemainingIsolated("execution-rejected", "Chain completed but isolated Git export failed");
+	if (ownsIsolatedGitRuntime && isolatedGitRuntime && detachedIndexes.size === 0) {
+		const chainTermination = results.some((result) => result.cancelled)
+			? "cancelled" as const
+			: results.some((result) => result.interrupted)
+				? "interrupted" as const
+				: results.some((result) => result.success !== true || result.exitCode !== 0)
+					? "failure" as const
+					: "success" as const;
+		const exportOutcome = await exportRemainingIsolated(chainTermination, "Chain completed but isolated Git export failed");
 		if (!exportOutcome.fenced || isolatedGitRuntime.exportFailed || isolatedGitRuntime.exportFenceFailed) {
 			const packaging = !exportOutcome.fenced
 				? `Nested descendants did not reach a proven terminal state before export; recover isolated worktrees at ${isolatedGitRuntime.root}.`
@@ -2072,7 +2300,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				worktreePreserved: true,
 			};
 		}
-		if (isolatedGitRuntime && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+		if (ownsIsolatedGitRuntime && isolatedGitRuntime && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
 			const cleanupError = `Isolated Git cleanup failed after export; recover isolated worktrees at ${isolatedGitRuntime.root}.`;
 			try {
 				await cleanupIsolatedGitRuntime(isolatedGitRuntime);
@@ -2106,7 +2334,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		activeInterruptCleanup = undefined;
 		const executionMessage = `Chain execution rejected: ${error instanceof Error ? error.message : String(error)}`;
 		const exportOutcome = await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal?.aborted ? "cancelled" : "execution-rejected", executionMessage);
-		if (isolatedGitRuntime && exportOutcome.fenced && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
+		if (ownsIsolatedGitRuntime && isolatedGitRuntime && exportOutcome.fenced && !isolatedGitRuntime.exportFailed && !isolatedGitRuntime.exportFenceFailed) {
 			try {
 				await cleanupIsolatedGitRuntime(isolatedGitRuntime);
 			} catch (cleanupError) {

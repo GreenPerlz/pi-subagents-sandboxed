@@ -547,7 +547,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 
 function overlayRunFromPersistedResult(result: PersistedResultRecord): OverlayRun {
 	const groupDiagnostics = result.children.map(mapGroupDiagnostic).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
-	const indexedChildren = result.children.filter((child) => !child.groupId).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+	const indexedChildren = result.children.filter((child) => !child.groupId && !child.unindexed).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
 	const steps: OverlayStep[] = (indexedChildren.length ? indexedChildren : [{ agent: result.agent, state: result.state }]).map((child, index) => ({
 		agent: child.agent ?? `step-${index + 1}`,
 		state: child.state,
@@ -588,7 +588,7 @@ function overlayRunFromPersistedResult(result: PersistedResultRecord): OverlayRu
 }
 
 /** Narrow serial seam for persisted group-diagnostic projection tests. */
-export function projectPersistedResultForTests(result: { id: string; mode: SubagentRunMode; state: OverlayRunState; children: Array<{ groupId?: string; index?: number; agent?: string; state: OverlayRunState; sessionFile?: string; artifactPath?: string; model?: string; thinking?: string; fastMode?: FastModeStatus }>; sessionFile?: string; asyncDir?: string; updatedAt?: number; agent?: string }): OverlayRun {
+export function projectPersistedResultForTests(result: { id: string; mode: SubagentRunMode; state: OverlayRunState; children: Array<{ groupId?: string; unindexed?: boolean; index?: number; agent?: string; state: OverlayRunState; sessionFile?: string; artifactPath?: string; model?: string; thinking?: string; fastMode?: FastModeStatus }>; sessionFile?: string; asyncDir?: string; updatedAt?: number; agent?: string }): OverlayRun {
 	return overlayRunFromPersistedResult(result);
 }
 
@@ -605,7 +605,7 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 		const fgRuns = state.foregroundRuns?.get(id);
 		const childInfo = fgRuns?.children ?? [];
 		const groupDiagnostics = childInfo.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
-		const indexedChildInfo = childInfo.filter((child) => !("groupId" in child && child.groupId)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+		const indexedChildInfo = childInfo.filter((child) => !("groupId" in child && child.groupId) && !("unindexed" in child && child.unindexed)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
 		const agents = indexedChildInfo.map((c) => c.agent);
 		if (!agents.length && ctrl.currentAgent) agents.push(ctrl.currentAgent);
 
@@ -719,7 +719,7 @@ function collectFinishedForegroundRuns(state: SubagentState, now: number): Overl
 		if (liveIds.has(id)) continue;
 
 		const groupDiagnostics = run.children.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
-		const indexedChildren = run.children.filter((child) => !("groupId" in child && child.groupId)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+		const indexedChildren = run.children.filter((child) => !("groupId" in child && child.groupId) && !("unindexed" in child && child.unindexed)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
 		const agents = indexedChildren.map((c) => c.agent);
 		const elapsed = elapsedFromRange(run.startedAt, run.updatedAt, now);
 		const runState = resolveForegroundRunState(run.children);
@@ -784,7 +784,7 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 			? [{ agent: status.currentAgent, index: status.currentIndex ?? 0, status: status.state, sessionFile: status.sessionFile }]
 			: [];
 	const groupDiagnostics = children.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
-	const indexedChildren = children.filter((child) => !("groupId" in child && child.groupId)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+	const indexedChildren = children.filter((child) => !("groupId" in child && child.groupId) && !("unindexed" in child && child.unindexed)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
 	const nestedChildren = (status.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, staleState, status.updatedAt));
 	const sourceChild = indexedChildren.find((child) => child.model);
 	const runModel = sourceChild?.model;

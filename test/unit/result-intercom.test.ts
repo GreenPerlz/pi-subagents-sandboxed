@@ -149,6 +149,24 @@ describe("result intercom formatter", () => {
 		assert.equal(children[2]?.children?.[0]?.id, "nested-b");
 	});
 
+	it("excludes unindexed diagnostics from canonical error projection", () => {
+		const payload = buildSubagentResultIntercomPayload({
+			to: "chat",
+			runId: "run-unindexed",
+			mode: "parallel",
+			source: "async",
+			children: [
+				{ agent: "diagnostic", status: "failed", summary: "group failure", groupId: "g1", unindexed: true, index: 0 },
+				{ agent: "worker", status: "completed", summary: "done", index: 2 },
+			],
+			worktreeExecutionError: "execution failure",
+		});
+		assert.equal(payload.children[0]?.status, "failed");
+		assert.equal(payload.children[1]?.status, "failed");
+		assert.equal(payload.index, 2);
+		assert.equal(payload.agent, "worker");
+	});
+
 	it("attaches compact nested children under their parent result child without route secrets", () => {
 		const payload = buildSubagentResultIntercomPayload({
 			to: "chat",

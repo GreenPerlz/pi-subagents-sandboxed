@@ -7,6 +7,7 @@ import { resolveMcpDirectToolNames } from "./mcp-direct-tool-allowlist.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "./structured-output.ts";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS } from "../../shared/model-info.ts";
 import type { JsonSchemaObject } from "../../shared/types.ts";
+import type { ScopedGitEndpointDescriptor } from "../../sandbox/isolated-git.ts";
 const TASK_ARG_LIMIT = 8000;
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-prompt-runtime.ts");
 const FANOUT_CHILD_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "extension", "fanout-child.ts");
@@ -27,6 +28,18 @@ export const SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV = "PI_SUBAGENT_PARENT_CAPABILI
 export const SUBAGENT_INTERCOM_EXTENSION_DIR_ENV = "PI_SUBAGENT_INTERCOM_EXTENSION_DIR";
 export const SUBAGENT_INTERCOM_STATE_DIR_ENV = "PI_SUBAGENT_INTERCOM_STATE_DIR";
 export const SUBAGENT_FAST_MODE_ENV = "PI_SUBAGENT_FAST_MODE";
+export const SUBAGENT_SCOPED_GIT_ENDPOINT_ENV = "PI_SUBAGENT_SCOPED_GIT_ENDPOINT";
+
+/** Remove ambient authority before detached runners inherit the caller env.
+ * Depth limits are retained as runner policy inputs and are independently
+ * tightened by authenticated config before any nested launch. */
+export function sanitizeAuthorityEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string | undefined> {
+	const clean: Record<string, string | undefined> = { ...env };
+	for (const key of Object.keys(clean)) {
+		if ((key.startsWith("PI_SUBAGENT_") && key !== "PI_SUBAGENT_DEPTH" && key !== "PI_SUBAGENT_MAX_DEPTH") || key === "PI_SCOPED_GIT_ENDPOINT") delete clean[key];
+	}
+	return clean;
+}
 
 interface BuildPiArgsInput {
 	baseArgs: string[];
@@ -61,6 +74,9 @@ interface BuildPiArgsInput {
 	parentDepth?: number;
 	parentPath?: NestedPathEntry[];
 	parentCapabilityToken?: string;
+	/** Minimal nested endpoint identity; no host paths or authority. */
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
+	/** @deprecated use scopedGitEndpoint; retained at the boundary for older callers. */
 	structuredOutput?: {
 		schema: JsonSchemaObject;
 		schemaPath: string;
@@ -222,6 +238,18 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	// Explicitly clear inherited parent state so nested children resolve their
 	// own candidate independently.
 	env[SUBAGENT_FAST_MODE_ENV] = input.fastMode ? "1" : "0";
+	// There is one endpoint transport: the live narrowed endpoint descriptor.
+	const scopedGitEndpoint = input.scopedGitEndpoint;
+	if (scopedGitEndpoint) {
+		// The selected endpoint subtree is rebound directly onto the fixed target.
+		// Its child-visible coordinate is therefore always '.', never the owner's
+		// private relative path or hidden host metadata.
+		env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV] = JSON.stringify({ relativeSubtree: "." });
+	} else {
+		// Ambient environment state is never authority. Every nested launch must
+		// receive a handoff explicitly produced from the live capability above.
+		env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV] = "";
+	}
 	if (input.intercomSessionName) {
 		env.PI_SUBAGENT_INTERCOM_SESSION_NAME = input.intercomSessionName;
 	}

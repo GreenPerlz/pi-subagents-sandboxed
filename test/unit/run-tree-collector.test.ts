@@ -2002,6 +2002,7 @@ describe("deriveRunModelThinking with currentStep (issue #53)", () => {
 			children: [
 				{ index: 1, agent: "second", state: "complete" },
 				{ groupId: "dynamic-group-4", agent: "fanout", state: "failed", sessionFile: "/tmp/diagnostic.jsonl" },
+				{ unindexed: true, agent: "unindexed-fanout", state: "failed", index: 0 },
 				{ index: 0, agent: "first", state: "complete" },
 			],
 		});

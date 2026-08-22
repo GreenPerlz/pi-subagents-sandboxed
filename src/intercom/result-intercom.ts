@@ -38,6 +38,10 @@ export function resolveSubagentResultStatus(input: {
 	return "failed";
 }
 
+function isCanonicalResultChild(child: SubagentResultIntercomChild): boolean {
+	return !child.groupId && !child.unindexed;
+}
+
 function countStatuses(children: SubagentResultIntercomChild[]): Record<SubagentResultStatus, number> {
 	const counts: Record<SubagentResultStatus, number> = {
 		completed: 0,
@@ -151,6 +155,7 @@ export function attachNestedChildrenToResultChildren(
 	// positions from the canonical flat child sequence so an unindexed diagnostic
 	// can never shift every later nested attachment by one slot.
 	const isDiagnostic = (child: SubagentResultIntercomChild): boolean => Boolean(child.groupId || child.unindexed);
+	const isCanonical = (child: SubagentResultIntercomChild): boolean => !isDiagnostic(child);
 	const claimedIndexes = new Set(children.filter((child) => !isDiagnostic(child) && child.index !== undefined).map((child) => child.index!));
 	let nextCanonicalIndex = 0;
 	const resolveCanonicalIndex = (child: SubagentResultIntercomChild): number | undefined => {
@@ -215,7 +220,7 @@ function asyncResumeGuidance(input: {
 	asyncId?: string;
 }): string | undefined {
 	if (input.source !== "async" || !input.asyncId) return undefined;
-	const resumable = input.children.filter((child) => typeof child.sessionPath === "string" && fs.existsSync(child.sessionPath));
+	const resumable = input.children.filter((child) => !child.groupId && !child.unindexed && typeof child.sessionPath === "string" && fs.existsSync(child.sessionPath));
 	if (input.children.length === 1 && resumable.length === 1) {
 		return `Revive: subagent({ action: "resume", id: "${input.asyncId}", message: "..." })`;
 	}
@@ -306,12 +311,12 @@ export function buildSubagentResultIntercomPayload(input: GroupedResultIntercomM
 	if (input.worktreeExecutionError) {
 		// Unindexed group diagnostics must remain diagnostics; lifecycle failure
 		// belongs to the first canonical indexed child for revive/projection.
-		const canonical = children.find((child) => !child.groupId) ?? children[0];
+		const canonical = children.find(isCanonicalResultChild);
 		if (canonical) canonical.status = "failed";
 	}
 	const status = input.worktreeExecutionError ? "failed" : resolveGroupedStatus(children);
 	const summary = formatStatusCounts(countStatuses(children));
-	const firstChild = children.find((child) => !child.groupId) ?? children[0];
+	const firstChild = children.find(isCanonicalResultChild);
 	const payload: SubagentResultIntercomPayload = {
 		to: input.to,
 		runId: input.runId,

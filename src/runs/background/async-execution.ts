@@ -28,6 +28,7 @@ import { resolveExpectedWorktreeAgentCwd } from "../shared/worktree.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime } from "../shared/structured-output.ts";
+import type { ScopedGitEndpointDescriptor } from "../../sandbox/scoped-git-endpoint.ts";
 import { resolveEffectiveAcceptance } from "../shared/acceptance.ts";
 import {
 	type AcceptanceInput,
@@ -49,6 +50,8 @@ import { nestedResultsPath, resolveInheritedNestedRouteFromEnv, resolveNestedPar
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { formatAsyncRunnerIdentity } from "./pid-identity.ts";
 import { isChildProcessGroupGone, processControlUnsupported, signalChildProcessGroup, type ChildProcessIdentity } from "../../shared/post-exit-stdio-guard.ts";
+import { sanitizeAuthorityEnvironment, SUBAGENT_SCOPED_GIT_ENDPOINT_ENV } from "../shared/pi-args.ts";
+import { scopedGitDescriptorMounts } from "../../sandbox/scoped-git-endpoint.ts";
 
 const require = createRequire(import.meta.url);
 const hostPiPackageRoot = resolvePiPackageRoot();
@@ -143,6 +146,8 @@ interface AsyncChainParams {
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
+	/** Minimal owner-scoped endpoint inherited by a detached nested run. */
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
 }
 
 interface AsyncSingleParams {
@@ -175,6 +180,8 @@ interface AsyncSingleParams {
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
+	/** Minimal owner-scoped endpoint inherited by a detached nested run. */
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
 }
 
 interface AsyncExecutionResult {
@@ -198,6 +205,26 @@ export function formatAsyncStartedMessage(headline: string): string {
  */
 export function isAsyncAvailable(): boolean {
 	return jitiCliPath !== undefined && resolveAsyncRunnerRuntime() !== undefined;
+}
+
+/** Write launch authority without exposing a partial or permissive config. */
+function writePrivateRunnerConfig(cfgPath: string, cfg: object): void {
+	const temporary = `${cfgPath}.${process.pid}.${Date.now()}.tmp`;
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(temporary, "wx", 0o600);
+		fs.writeFileSync(fd, JSON.stringify(cfg), "utf8");
+		fs.fsyncSync(fd);
+		fs.fchmodSync(fd, 0o600);
+		fs.closeSync(fd);
+		fd = undefined;
+		fs.renameSync(temporary, cfgPath);
+		fs.chmodSync(cfgPath, 0o600);
+	} catch (error) {
+		if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+		try { fs.unlinkSync(temporary); } catch {}
+		throw error;
+	}
 }
 
 /**
@@ -225,7 +252,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 
 	fs.mkdirSync(TEMP_ROOT_DIR, { recursive: true });
 	const cfgPath = getAsyncConfigPath(suffix);
-	fs.writeFileSync(cfgPath, JSON.stringify(cfg));
+	writePrivateRunnerConfig(cfgPath, cfg);
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 
 	const removeConfigIfPresent = () => {
@@ -262,6 +289,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 	};
 	const proc = spawn(runtimePath, [jitiCliPath, runner, cfgPath], {
 		cwd,
+		env: sanitizeAuthorityEnvironment(),
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true,
@@ -344,6 +372,41 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 	}
 	proc.unref();
 	return { pid: proc.pid, runnerIdentity, runnerStartToken: startToken, runnerUid: uid };
+}
+
+function attachScopedRunnerIdentity(details: Details, identity: { pid?: number; runnerStartToken?: string; runnerUid?: number } | undefined): Details {
+	if (identity?.pid && identity.runnerStartToken && identity.runnerUid !== undefined) {
+		Object.defineProperties(details, {
+			__scopedRunnerPid: { value: identity.pid, enumerable: false },
+			__scopedRunnerStartToken: { value: identity.runnerStartToken, enumerable: false },
+			__scopedRunnerUid: { value: identity.runnerUid, enumerable: false },
+		});
+	}
+	return details;
+}
+
+function validateInheritedScopedEndpoint(
+	descriptor: ScopedGitEndpointDescriptor | undefined,
+	inheritedNestedRoute: NestedRouteInfo | undefined,
+): string | undefined {
+	if (!descriptor && inheritedNestedRoute && process.env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV]) {
+		return "nested async execution requires the live scoped Git endpoint descriptor";
+	}
+	if (!descriptor) return undefined;
+	if (!inheritedNestedRoute) return "top-level async execution creates its own scoped Git runtime; a parent endpoint descriptor is only valid for a live nested run";
+	try {
+		const mounts = scopedGitDescriptorMounts(descriptor);
+		const fixedMount = mounts.find((mount) => mount.target === "/run/pi-scoped-git");
+		if (!fixedMount) return "nested async scoped Git endpoint mount is unavailable";
+		// Validate the fixed subtree and its control socket before creating the
+		// async directory or any output/session artifacts. Host metadata is used
+		// only to check the owner socket and is never serialized to the child.
+		const endpointRoot = fixedMount.source;
+		if (!fs.existsSync(endpointRoot) || !fs.existsSync(path.join(endpointRoot, "endpoint"))) return "nested async scoped Git endpoint socket is unavailable";
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	return undefined;
 }
 
 function formatAsyncStartError(mode: SubagentRunMode, message: string): AsyncExecutionResult {
@@ -461,6 +524,8 @@ export function executeAsyncChain(
 
 	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
 	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+	const endpointValidationError = validateInheritedScopedEndpoint(params.scopedGitEndpoint, inheritedNestedRoute);
+	if (endpointValidationError) return formatAsyncStartError(resultMode, endpointValidationError);
 	const asyncDir = inheritedNestedRoute
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
 		: path.join(ASYNC_DIR, id);
@@ -637,6 +702,7 @@ export function executeAsyncChain(
 		if (error instanceof UnavailableSubagentSkillError || error instanceof AsyncStartValidationError) return formatAsyncStartError(resultMode, error.message);
 		throw error;
 	}
+	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = params.scopedGitEndpoint;
 	let childTargetIndex = 0;
 	const childIntercomTargets = childIntercomTarget ? steps.flatMap((step) => {
 		if ("parallel" in step) {
@@ -649,7 +715,7 @@ export function executeAsyncChain(
 		return [childIntercomTarget(step.agent, childTargetIndex++)];
 	}) : undefined;
 
-	let spawnResult: { pid?: number; error?: string } = {};
+	let spawnResult: ReturnType<typeof spawnRunner> = {};
 	try {
 		spawnResult = spawnRunner(
 			{
@@ -675,10 +741,10 @@ export function executeAsyncChain(
 				resultMode,
 				dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
 				workflowGraph,
+				scopedGitEndpoint: scopedGitRunEndpoint,
 				sandbox: sharedSandbox,
 				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
-				ownerPid: process.pid,
 				...(readProcessStartToken(process.pid) ? { ownerStartToken: readProcessStartToken(process.pid) } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
@@ -699,7 +765,6 @@ export function executeAsyncChain(
 	if (spawnResult.error) {
 		return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': ${spawnResult.error}`);
 	}
-
 	if (spawnResult.pid) {
 		const firstStep = chain[0];
 		const firstAgents = isParallelStep(firstStep)
@@ -794,7 +859,7 @@ export function executeAsyncChain(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`) }],
-		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph },
+		details: attachScopedRunnerIdentity({ mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph }, spawnResult),
 	};
 }
 
@@ -832,6 +897,7 @@ export function executeAsyncSingle(
 		: params.sandbox
 			? resolveSandboxConfig({ agent: agentConfig, run: params.sandbox })
 			: resolveSandboxConfig({ agent: agentConfig });
+	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = params.scopedGitEndpoint;
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
 	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(skillNames, runnerCwd, ctx.cwd);
@@ -844,6 +910,8 @@ export function executeAsyncSingle(
 
 	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
 	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+	const endpointValidationError = validateInheritedScopedEndpoint(params.scopedGitEndpoint, inheritedNestedRoute);
+	if (endpointValidationError) return formatAsyncStartError("single", endpointValidationError);
 	const asyncDir = inheritedNestedRoute
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
 		: path.join(ASYNC_DIR, id);
@@ -881,7 +949,7 @@ export function executeAsyncSingle(
 	);
 	const model = modelCandidates[0];
 	const fastModeCandidates = modelCandidates.map((candidate) => resolveFastModeStatus(params.fastMode ?? agentConfig.fastMode, candidate, availableModels, ctx.currentModelProvider));
-	let spawnResult: { pid?: number; error?: string } = {};
+	let spawnResult: ReturnType<typeof spawnRunner> = {};
 	try {
 		spawnResult = spawnRunner(
 			{
@@ -941,7 +1009,7 @@ export function executeAsyncSingle(
 				resultMode: "single",
 				sandbox,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
-				ownerPid: process.pid,
+				scopedGitEndpoint: scopedGitRunEndpoint,
 				...(readProcessStartToken(process.pid) ? { ownerStartToken: readProcessStartToken(process.pid) } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
@@ -1015,6 +1083,6 @@ export function executeAsyncSingle(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir },
+		details: attachScopedRunnerIdentity({ mode: "single", runId: id, results: [], asyncId: id, asyncDir }, spawnResult),
 	};
 }

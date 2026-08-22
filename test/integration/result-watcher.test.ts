@@ -557,6 +557,35 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("keeps grouped and unindexed diagnostics out of canonical failure projection", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-canonical-diagnostics-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const pi = { events: { on: () => () => {}, emit: (event: string, data: unknown) => emitted.push({ event, data }) } };
+			const state = createState();
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			const resultPath = path.join(resultsDir, "canonical-diagnostics.json");
+			fs.writeFileSync(resultPath, JSON.stringify({
+				id: "canonical-diagnostics",
+				runId: "canonical-diagnostics",
+				success: false,
+				state: "failed",
+				results: [
+					{ agent: "group-diagnostic", groupId: "group-1", unindexed: true, success: true, output: "group diagnostic" },
+					{ agent: "real-child", flatIndex: 0, success: true, output: "child output" },
+				],
+			}), "utf-8");
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			watcher.stopResultWatcher();
+			const completion = emitted.find((entry) => entry.event === "subagent:async-complete")?.data as { results?: Array<{ agent?: string; status?: string }> } | undefined;
+			assert.equal(completion?.results?.find((child) => child.agent === "real-child")?.status, "failed");
+			assert.equal(completion?.results?.find((child) => child.agent === "group-diagnostic")?.status, "completed");
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("enriches async completion and intercom payloads with nested registry children before deletion", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-nested-"));
 		const route = createNestedRoute("async-nested-root");

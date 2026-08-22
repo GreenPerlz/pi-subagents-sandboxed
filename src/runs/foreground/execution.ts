@@ -50,7 +50,7 @@ import {
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { getPiSpawnCommand, getPiSpawnEntrypointOverrideForTests } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
-import { exportIsolatedGitBundle, mapIsolatedGitCwd } from "../../sandbox/isolated-git.ts";
+import { cancelScopedGitChildDescriptor, delegateScopedGitWriterDescriptor, exportIsolatedGitBundle, isInheritedIsolatedGitRuntime, mapIsolatedGitCwd, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, scopedGitDescriptorMounts, validateScopedGitChildDescriptor, waitForScopedGitChildRelease, waitForScopedGitProcessGone, type ScopedGitEndpointDescriptor } from "../../sandbox/isolated-git.ts";
 import { resolveGitMode } from "../../sandbox/config.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
@@ -184,11 +184,53 @@ async function runSingleAttempt(
 		originalTask?: string;
 	},
 ): Promise<SingleResult> {
+	// Authenticate the exact runtime-issued capability before resolving any
+	// caller-controlled cwd/package/resource path. This gate deliberately comes
+	// before mapIsolatedGitCwd, package discovery, and mount assembly.
+	if (options.isolatedGit) {
+		if (!options.isolatedGitCapability) throw new Error("isolated Git execution requires an explicit runtime-issued capability");
+		options.isolatedGit.runtime.assertCapability(options.isolatedGitCapability, options.isolatedGit);
+		options.isolatedGit.runtime.authorizeRequestedCwd(options.isolatedGitCapability, options.cwd ?? runtimeCwd);
+	}
 	// Model candidates already carry a thinking suffix only when that specific
 	// model supports it. Keep the candidate authoritative across fallbacks.
 	const modelArg = model;
 	const requestedCwd = options.cwd ?? runtimeCwd;
 	const childCwd = options.isolatedGit ? mapIsolatedGitCwd(options.isolatedGit, requestedCwd) : requestedCwd;
+	let scopedGitEndpoint = options.isolatedGit && options.isolatedGitCapability
+		? options.isolatedGit.runtime.getScopedGitEndpointDescriptor(options.isolatedGitCapability)
+		: options.isolatedGitEndpoint;
+	const reservedOwner = scopedGitEndpoint as (ScopedGitEndpointDescriptor & { __scopedGitReservationOwner?: ScopedGitEndpointDescriptor; __scopedGitReservationBound?: boolean }) | undefined;
+	const scopedGitOwnerEndpoint = reservedOwner?.__scopedGitReservationOwner ?? scopedGitEndpoint;
+	const preReserved = reservedOwner?.__scopedGitReservationBound === true;
+	if (scopedGitEndpoint && !options.isolatedGit && !preReserved) {
+		const requestedScopedCwd = options.cwd ? path.resolve(options.cwd) : undefined;
+		const reservationDeadline = Date.now() + 15_000;
+		while (true) {
+			try {
+					scopedGitEndpoint = await reserveScopedGitChildDescriptor(scopedGitEndpoint, { cwd: requestedScopedCwd, rights: options.isolatedGitRights ?? "writer" });
+				break;
+			} catch (error) {
+				if (!/already delegated|already held/i.test(error instanceof Error ? error.message : String(error)) || Date.now() >= reservationDeadline) throw error;
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+		}
+	}
+	if (preReserved && scopedGitOwnerEndpoint && options.isolatedGitEndpoint !== scopedGitOwnerEndpoint) {
+		// The first attempt consumed a runSync preflight reservation. Subsequent
+		// acceptance/fallback attempts must reserve a fresh child from its owner.
+		options.isolatedGitEndpoint = scopedGitOwnerEndpoint;
+	}
+	// A writable reservation is cancelled only when spawn/setup fails before the
+	// foreground process can be bound. Once bind succeeds, every failure path is
+	// fail-closed until exact process-group disappearance is proven by the owner.
+	const scopedGitWriterReserved = Boolean(scopedGitEndpoint && options.isolatedGitEndpoint && !options.isolatedGit && options.isolatedGitRights !== "read-only");
+	let scopedGitWriterBound = false;
+	const cancelUnboundScopedWriter = async () => {
+		if (!scopedGitWriterReserved || scopedGitWriterBound || !scopedGitEndpoint) return;
+		if (!scopedGitOwnerEndpoint) return;
+		try { await cancelScopedGitChildDescriptor(scopedGitOwnerEndpoint, scopedGitEndpoint); } catch { /* owner remains fail-closed if cancellation cannot be proven */ }
+	};
 	const projectLocalPackageResources = options.sandbox?.packageDiscovery === "project-local"
 		// Package discovery belongs to the requested parent repository context;
 		// the private worktree contains only assigned Git content and may not carry
@@ -233,6 +275,8 @@ async function runSingleAttempt(
 		parentControlInbox: options.nestedRoute?.controlInbox,
 		parentRootRunId: options.nestedRoute?.rootRunId,
 		parentCapabilityToken: options.nestedRoute?.capabilityToken,
+		// Foreground nested launches carry only the scoped endpoint descriptor.
+		scopedGitEndpoint,
 		structuredOutput: options.structuredOutput,
 		sandbox: closedSandboxRuntime,
 		sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.extensionDir : undefined,
@@ -302,10 +346,17 @@ async function runSingleAttempt(
 			cwd: childCwd,
 			env: spawnEnv,
 		};
-		if (options.sandbox && resolveGitMode(options.sandbox) === "isolated" && !options.isolatedGit) {
+		if (options.sandbox && resolveGitMode(options.sandbox) === "isolated" && !options.isolatedGit && !options.isolatedGitEndpoint) {
 			throw new Error("isolated Git requires a runtime-managed isolated worktree handle; refusing ordinary checkout execution");
 		}
 		if (options.isolatedGit) {
+			// Authenticate capability identity before any caller-controlled resource
+			// path is handed to mount-policy construction. The runtime handoff was
+			// also serialized into the child environment above, so this is the final
+			// in-process fail-closed gate for direct runSync callers.
+			if (!options.isolatedGitCapability) {
+				throw new Error("isolated Git execution requires an explicit runtime-issued capability");
+			}
 			if (!options.sandbox || options.sandbox.provider !== "bubblewrap" || resolveGitMode(options.sandbox) !== "isolated") {
 				throw new Error("isolated Git requires the Bubblewrap sandbox and an explicit isolated Git mode");
 			}
@@ -328,21 +379,53 @@ async function runSingleAttempt(
 				packageRoots: projectLocalPackageResources?.packageRoots,
 				extraReadOnlyMounts: options.sandbox.extraReadOnlyMounts,
 				extraWritableMounts: options.sandbox.extraWritableMounts,
-				protectedGitPaths: options.isolatedGit.runtime.parentGitPaths,
+				protectedGitPaths: options.isolatedGit.runtime.getProtectedMountPaths(options.isolatedGit),
 				intercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
 				nestedRoute: options.nestedRoute,
 			});
-			const wrapped = options.isolatedGit.runtime.wrapInvocation(options.isolatedGit, piInvocation, effectiveSandboxMounts, options.sandbox);
+			const wrapped = options.isolatedGit.runtime.wrapInvocation(options.isolatedGitCapability, piInvocation, effectiveSandboxMounts, options.sandbox);
 			spawnSpec = {
 				command: wrapped.command,
 				args: wrapped.args,
 				cwd: wrapped.cwd ?? childCwd,
 				env: wrapped.env ?? spawnEnv,
 			};
+		} else if (options.isolatedGitEndpoint) {
+			if (!options.sandbox || options.sandbox.provider !== "bubblewrap" || resolveGitMode(options.sandbox) !== "isolated") throw new Error("scoped Git endpoint requires Bubblewrap isolated mode");
+			result.sandbox = sandboxResultDetails(options.sandbox);
+			effectiveSandboxMounts = buildSubagentSandboxMounts({
+				cwd: childCwd,
+				includeCwd: true,
+				cwdMode: "ro",
+				tempDir,
+				sessionDir: options.sessionDir,
+				sessionFile: options.sessionFile,
+				artifactsDir: options.artifactsDir,
+				jsonlPath: shared.jsonlPath,
+				outputPath: options.outputPath,
+				progressPaths: options.progressPaths,
+				structuredOutput: options.structuredOutput,
+				piArgs: args,
+				spawnCommand: piSpawnSpec.command,
+				spawnArgs: piSpawnSpec.args,
+				authMode: options.sandbox.auth,
+				packageRoots: projectLocalPackageResources?.packageRoots,
+				extraReadOnlyMounts: options.sandbox.extraReadOnlyMounts,
+				extraWritableMounts: options.sandbox.extraWritableMounts,
+				intercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
+				nestedRoute: options.nestedRoute,
+			});
+			const provider = createSandboxProvider(options.sandbox);
+			const wrapped = provider.wrapInvocation({ config: options.sandbox, invocation: piInvocation, mounts: [...effectiveSandboxMounts, ...scopedGitDescriptorMounts(scopedGitEndpoint!)] });
+			spawnSpec = { command: wrapped.invocation.command, args: wrapped.invocation.args, cwd: wrapped.invocation.cwd ?? childCwd, env: wrapped.invocation.env ?? spawnEnv };
 		} else if (options.sandbox) {
 			result.sandbox = sandboxResultDetails(options.sandbox);
 			const provider = createSandboxProvider(options.sandbox);
-			const cwdMode = inferSandboxCwdWritable({ agentName: agent.name, tools: agent.tools, sandbox: options.sandbox }) ? "rw" : "ro";
+			const cwdMode = inferSandboxCwdWritable({
+				agentName: agent.name,
+				tools: agent.tools,
+				sandbox: options.sandbox,
+			}) ? "rw" : "ro";
 			const sandboxInvocation: SpawnableInvocation = {
 				command: piSpawnSpec.command,
 				args: piSpawnSpec.args,
@@ -399,6 +482,7 @@ async function runSingleAttempt(
 			spawnSpec = piInvocation;
 		}
 	} catch (error) {
+		await cancelUnboundScopedWriter();
 		cleanupTempDir(tempDir);
 		const message = error instanceof Error ? error.message : String(error);
 		if (options.sandbox) result.sandbox = sandboxResultDetails(options.sandbox);
@@ -425,6 +509,7 @@ async function runSingleAttempt(
 				windowsHide: true,
 			});
 		} catch (error) {
+			void cancelUnboundScopedWriter();
 			cleanupTempDir(tempDir);
 			result.exitCode = 1;
 			result.error = error instanceof Error ? error.message : String(error);
@@ -434,6 +519,50 @@ async function runSingleAttempt(
 			result.progressSummary = { toolCount: 0, tokens: 0, durationMs: progress.durationMs };
 			resolve(1);
 			return;
+		}
+		// A nested writer is bound only after the child process identity is
+		// independently proven. The foreground result is held until both binding
+		// and exact reservation release are observable; a fast child cannot win
+		// the close/bind race.
+		let scopedGitBindingReady = !scopedGitWriterReserved;
+		let pendingScopedTerminalClose: { code: number | null; signal?: NodeJS.Signals } | undefined;
+		if (scopedGitWriterReserved && scopedGitEndpoint) {
+			void (async () => {
+				let identity;
+				let previousIdentityKey: string | undefined;
+				for (let attempt = 0; attempt < 150 && !identity; attempt += 1) {
+					const current = readScopedGitProcessIdentity(proc.pid!);
+					const currentKey = current && `${current.startToken}:${current.ppid}:${current.pgid}:${current.argv.join("\\0")}`;
+					if (current && currentKey === previousIdentityKey) identity = current;
+					previousIdentityKey = currentKey;
+					if (!identity) await new Promise((resolve) => setTimeout(resolve, 2));
+				}
+				try {
+					if (!identity) throw new Error("exact child identity was not observed before process exit");
+					await delegateScopedGitWriterDescriptor(scopedGitEndpoint, identity);
+					scopedGitWriterBound = true;
+					await waitForScopedGitProcessGone(identity);
+					if (scopedGitOwnerEndpoint) await waitForScopedGitChildRelease(scopedGitOwnerEndpoint, scopedGitEndpoint);
+				} catch (error) {
+					// A missed identity, reuse, or release proof is fail-closed. Cancel
+					// only an unbound reservation; bound reservations remain recoverable.
+					const detail = error instanceof Error ? error.message : String(error);
+					result.error = `Scoped Git writer teardown was not proven: ${detail}`;
+					result.exitCode = 1;
+					if (options.isolatedGitEndpoint && !options.isolatedGit) {
+						result.teardownUnproven = true;
+						result.error += "; recover retained isolated worktree evidence through the owning parent run";
+					}
+					if (!scopedGitWriterBound) await cancelUnboundScopedWriter();
+				} finally {
+					scopedGitBindingReady = true;
+					if (pendingScopedTerminalClose) {
+						const pending = pendingScopedTerminalClose;
+						pendingScopedTerminalClose = undefined;
+						queueMicrotask(() => proc.emit("close", pending.code, pending.signal));
+					}
+				}
+			})();
 		}
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let buf = "";
@@ -896,6 +1025,10 @@ async function runSingleAttempt(
 
 		proc.on("close", (code, signal) => {
 			if (terminalCloseHandled) return;
+			if (!scopedGitBindingReady) {
+				pendingScopedTerminalClose ??= { code, signal: signal ?? undefined };
+				return;
+			}
 			if (!teardownReady) {
 				pendingTerminalClose ??= { code, signal: signal ?? undefined };
 				return;
@@ -959,6 +1092,7 @@ async function runSingleAttempt(
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {
+			void cancelUnboundScopedWriter();
 			if (terminalCloseHandled) return;
 			if (!teardownReady) {
 				pendingTerminalClose ??= { code: 1, signal: undefined };
@@ -1205,7 +1339,17 @@ async function runAcceptanceFinalizationLoop(input: {
 			maxTurns,
 			...(previousFailure ? { previousFailure } : {}),
 		});
-		const finalizationOptions: RunSyncOptions = { ...input.options, sessionFile, outputMode: "inline" };
+		const finalizationOptions: RunSyncOptions = {
+			...input.options,
+			sessionFile,
+			outputMode: "inline",
+			// Acceptance continuation remains inside the same authenticated isolated
+			// checkout; never fall back to an ordinary read-only mount here.
+			isolatedGit: input.options.isolatedGit,
+			isolatedGitCapability: input.options.isolatedGitCapability,
+			isolatedGitEndpoint: input.options.isolatedGitEndpoint,
+			isolatedGitRights: input.options.isolatedGitRights,
+		};
 		delete finalizationOptions.sessionDir;
 		delete finalizationOptions.outputPath;
 		delete finalizationOptions.structuredOutput;
@@ -1317,6 +1461,35 @@ export async function runSync(
 			usage: emptyUsage(),
 			error: `Unknown agent: ${agentName}`,
 		};
+	}
+	// This gate must precede saved-output, skill, artifact, cwd, and package
+	// resolution performed by runSync itself—not only the eventual spawn path.
+	if (options.isolatedGit) {
+		if (!options.isolatedGitCapability) throw new Error("isolated Git execution requires an explicit runtime-issued capability");
+		options.isolatedGit.runtime.assertCapability(options.isolatedGitCapability, options.isolatedGit);
+		// Authorize the caller's exact requested cwd before resolving saved output,
+		// acceptance/session paths, skills, artifacts, or any other filesystem input.
+		options.isolatedGit.runtime.authorizeRequestedCwd(options.isolatedGitCapability, options.cwd ?? runtimeCwd);
+	}
+	if (options.isolatedGitEndpoint) {
+		const ownerEndpoint = options.isolatedGitEndpoint;
+		await validateScopedGitChildDescriptor(ownerEndpoint, {
+			cwd: options.cwd ? path.resolve(options.cwd) : undefined,
+			rights: options.isolatedGitRights ?? "writer",
+		});
+		// Reserve the child scope before resolving output, skills, artifacts,
+		// sessions, or package resources. The marker is non-enumerable and never
+		// crosses the Pi process boundary; it prevents runSingleAttempt from
+		// reserving a second scope for the first attempt.
+		const reservedEndpoint = await reserveScopedGitChildDescriptor(ownerEndpoint, {
+			cwd: options.cwd ? path.resolve(options.cwd) : undefined,
+			rights: options.isolatedGitRights ?? "writer",
+		});
+		Object.defineProperties(reservedEndpoint, {
+			__scopedGitReservationOwner: { value: ownerEndpoint, enumerable: false, configurable: true },
+			__scopedGitReservationBound: { value: true, enumerable: false, configurable: true },
+		});
+		options = { ...options, isolatedGitEndpoint: reservedEndpoint };
 	}
 	const processControlError = processControlUnsupported();
 	if (processControlError) {
@@ -1572,7 +1745,8 @@ export async function runSync(
 		}
 	}
 
-	if (options.isolatedGit && options.exportIsolatedGitBundle !== false && !result.detached) {
+	const ownsIsolatedGit = options.isolatedGit ? (options.isolatedGitOwner ?? !isInheritedIsolatedGitRuntime(options.isolatedGit.runtime)) : false;
+	if (options.isolatedGit && ownsIsolatedGit && options.exportIsolatedGitBundle !== false && !result.detached) {
 		// Process close/stdio drain only proves the direct child stopped. Wait for
 		// nested descendants to publish terminal events before packaging or cleanup.
 		const nestedFence = await waitForNestedDescendantsToStop(options.nestedRoute, options.runId, options.index ?? 0, {
@@ -1618,6 +1792,7 @@ export async function runSync(
 				base: bundle.base,
 				head: bundle.head,
 				commitSummary: bundle.commitSummary,
+				...(bundle.commits ? { commits: bundle.commits } : {}),
 				...(bundle.recovery ? { recovery: bundle.recovery } : {}),
 				...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
 				...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}),

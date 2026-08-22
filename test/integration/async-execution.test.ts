@@ -17,6 +17,7 @@ import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMin
 import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { isExpectedAsyncRunnerPid } from "../../src/runs/background/pid-identity.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, teardownIsolatedGitRuntimeForTests } from "../../src/sandbox/isolated-git.ts";
 import { SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
 import type { MockPi } from "../support/helpers.ts";
@@ -354,7 +355,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			maxSubagentDepth: 2,
 		};
 		mockPi.onCall({ output: "single done" });
-		const singleId = `async-handoff-single-${Date.now().toString(36)}`;
+		const singleId = `async-single-run-${Date.now().toString(36)}`;
 		const singleResult = executeAsyncSingle(singleId, {
 			agent: "worker",
 			task: "Do work",
@@ -368,7 +369,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		mockPi.onCall({ output: "parallel one done" });
 		mockPi.onCall({ output: "parallel two done" });
-		const parallelId = `async-handoff-parallel-${Date.now().toString(36)}`;
+		const parallelId = `async-parallel-run-${Date.now().toString(36)}`;
 		const parallelResult = executeAsyncChain(parallelId, {
 			chain: [{ parallel: [{ agent: "worker", task: "Do one" }, { agent: "reviewer", task: "Do two" }] }],
 			resultMode: "parallel",
@@ -384,7 +385,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(parallelPayload.agent, "parallel:worker+reviewer");
 
 		mockPi.onCall({ output: "chain done" });
-		const chainId = `async-handoff-chain-${Date.now().toString(36)}`;
+		const chainId = `async-chain-run-${Date.now().toString(36)}`;
 		const chainResult = executeAsyncChain(chainId, {
 			chain: [{ agent: "worker", task: "Do chained work" }],
 			agents: [makeAgent("worker")],
@@ -693,7 +694,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			const started = executeAsyncChain(id, {
 				chain: [{ parallel: [{ agent: "worker", task: "Commit isolated A" }, { agent: "worker", task: "Commit isolated B" }] }],
 				resultMode: "parallel",
-				agents: [makeAgent("worker", { tools: ["read", "bash"] })],
+				agents: [makeAgent("worker", { tools: ["read", "write"], sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", extraWritableMounts: [mockPi.dir] } })],
 				ctx: { pi: { events: eventBus }, cwd: repo, currentSessionId: "session-isolated-async" },
 				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 				shareEnabled: false,
@@ -846,6 +847,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			for (const args of allBwrapArgs) {
 				assert.deepEqual(args.slice(args.indexOf(tempDir) - 1, args.indexOf(tempDir) + 2), ["--ro-bind", tempDir, tempDir]);
 			}
+			const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+			const terminalDeadline = Date.now() + 10_000;
+			while (!fs.existsSync(resultPath) && Date.now() < terminalDeadline) await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.equal(fs.existsSync(resultPath), true, "dynamic read-only runner must reach terminal publication before the next test resets the mock queue");
 		} finally {
 			fakeBwrap.restore();
 		}
@@ -1031,7 +1036,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			sessionRoot: path.join(tempDir, "isolated-acceptance-sessions"),
 			sessionFilesByFlatIndex: [path.join(tempDir, "isolated-acceptance-session.jsonl")],
 			maxSubagentDepth: 2,
-			sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", extraWritableMounts: [mockPi.dir] },
+			sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", bashWrite: true, extraWritableMounts: [mockPi.dir] },
 		});
 		assert.equal(started.isError, undefined, started.content[0]?.text);
 		const resultPath = await waitForAsyncResultFile(id, 15_000);
@@ -1728,6 +1733,141 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("rejects malformed, missing, and traversal endpoint descriptors before async side effects", { skip: !isAsyncAvailable() ? "Detached runtime is required" : undefined }, async () => {
+		const repoDir = createRepo("pi-async-endpoint-invalid-");
+		const cases = [
+			["missing", {}],
+			["traversal", { relativeSubtree: "../outside" }],
+			["stale", { relativeSubtree: "." }],
+		] as const;
+		try {
+			for (const [name, descriptor] of cases) {
+				const id = `async-runner-hostile-${name}-${Date.now().toString(36)}`;
+				const started = executeAsyncChain!(id, {
+					chain: [{ agent: "worker", task: "must not run" }],
+					agents: [makeAgent("worker")],
+					ctx: { pi: { events: createEventBus() }, cwd: repoDir, currentSessionId: null },
+					artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+					shareEnabled: false,
+					sandbox: { provider: "bubblewrap", gitMode: "isolated" },
+					scopedGitEndpoint: descriptor,
+					maxSubagentDepth: 2,
+				});
+				assert.equal(started.isError, true, `${name}: invalid endpoint must fail before runner spawn`);
+				assert.equal(fs.existsSync(path.join(ASYNC_DIR, id)), false, `${name}: no async status/session directory`);
+				assert.equal(fs.existsSync(path.join(RESULTS_DIR, `${id}.json`)), false, `${name}: no result output`);
+			}
+		} finally {
+			removeTempDir(repoDir);
+		}
+	});
+
+	it("top-level async endpoint runtime commits, exports, and closes without stale state", { skip: !isAsyncAvailable() || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repoDir = createRepo("pi-async-endpoint-owner-");
+		const id = `async-endpoint-owner-${Date.now().toString(36)}`;
+		const runtimePrefix = `pi-isolated-git-${id}-`;
+		try {
+			mockPi.onCall({ delay: 1000, output: "endpoint owner committed", commands: ["printf 'endpoint\n' > endpoint.txt && git add endpoint.txt && git commit -m 'endpoint commit'"] });
+			const started = executeAsyncChain!(id, {
+				chain: [{ agent: "worker", task: "Commit through the scoped endpoint" }],
+				agents: [makeAgent("worker", { tools: ["read", "write", "bash"] })],
+				ctx: { pi: { events: createEventBus() }, cwd: repoDir, currentSessionId: null },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", network: "host", extraWritableMounts: [mockPi.dir] },
+				maxSubagentDepth: 2,
+			});
+			assert.equal(started.isError, undefined, started.content[0]?.text);
+			const runtimeDeadline = Date.now() + 10_000;
+			let activeRuntimes = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix));
+			while (activeRuntimes.length === 0 && Date.now() < runtimeDeadline) {
+				await new Promise((resolve) => setTimeout(resolve, 25));
+				activeRuntimes = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix));
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			activeRuntimes = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix));
+			assert.equal(activeRuntimes.length, 1, "inherited endpoint runner must reuse the parent runtime instead of opening Git state again");
+			const resultPath = await waitForAsyncResultFile(id, 30_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true, JSON.stringify(payload));
+			assert.equal(payload.state, "complete");
+			assert.ok(payload.results[0]?.gitBundle?.path && fs.existsSync(payload.results[0].gitBundle.path));
+			assert.ok(payload.results[0]?.gitBundle?.checksum);
+			assert.equal(fs.existsSync(path.join(ASYNC_DIR, id, "status.json")), true);
+			const leftovers = fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix));
+			assert.deepEqual(leftovers, [], "runner-owned isolated runtime must be closed after export");
+		} finally {
+			removeTempDir(repoDir);
+		}
+	});
+
+	it("async rejection preserves canonical child state without export noise", { skip: !isAsyncAvailable() ? "Detached runtime is required" : undefined }, async () => {
+		const previousRejectSeam = process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD;
+		const modes = [
+			{ name: "parallel", chain: [{ parallel: [{ agent: "worker", task: "Write then reject parallel lifecycle" }] }] },
+			{ name: "sequential", chain: [{ agent: "worker", task: "Write then reject sequential lifecycle" }] },
+		] as const;
+		try {
+			for (const mode of modes) {
+				const repoDir = createRepo(`pi-async-rejection-${mode.name}-`);
+				const id = `async-rejection-${mode.name}-${Date.now().toString(36)}`;;
+				process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD = id;
+				try {
+					mockPi.onCall({ output: `${mode.name} child output`, writeFiles: [{ path: `${mode.name}-rejected.txt`, content: "child recovery\n" }] });
+					const started = executeAsyncChain!(id, {
+						chain: mode.chain,
+						agents: [makeAgent("worker", { tools: ["read", "bash"] })],
+						ctx: { pi: { events: createEventBus() }, cwd: repoDir, currentSessionId: null },
+						artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+						shareEnabled: false,
+						sandbox: { provider: "none", extraWritableMounts: [mockPi.dir] },
+						maxSubagentDepth: 2,
+					});
+					assert.equal(started.isError, undefined, `${mode.name}: ${JSON.stringify(started)}`);
+					const resultPath = await waitForAsyncResultFile(id, 30_000);
+					const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+					const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+					assert.equal(payload.success, false, `${mode.name}: child rejection remains failed`);
+					assert.equal(payload.results.length, 1, `${mode.name}: canonical child index retained`);
+					assert.equal(payload.results[0]?.success, false, `${mode.name}: original child failure retained`);
+					assert.match(payload.results[0]?.error ?? "", /(?:Sequential|Parallel) execution rejected|test callback rejection/i);
+					assert.equal(/bundle export failed|cleanup failed/i.test(payload.results[0]?.error ?? ""), false, `${mode.name}: no false packaging/cleanup noise`);
+					assert.equal(status.steps?.[0]?.status, "failed", `${mode.name}: status keeps canonical failed step`);
+				} finally {
+					removeTempDir(repoDir);
+				}
+			}
+		} finally {
+			if (previousRejectSeam === undefined) delete process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD;
+			else process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD = previousRejectSeam;
+		}
+
+		const ownerRepo = createRepo("pi-async-owner-rejection-");
+		const ownerId = `async-owner-rejection-parallel-${Date.now().toString(36)}`;
+		process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD = ownerId;
+		try {
+			mockPi.onCall({ output: "owner child output", writeFiles: [{ path: "owner-rejected.txt", content: "owner recovery\n" }] });
+			const started = executeAsyncChain!(ownerId, {
+				chain: [{ parallel: [{ agent: "worker", task: "Write then reject owner lifecycle" }] }],
+				agents: [makeAgent("worker", { tools: ["read", "bash"] })],
+				ctx: { pi: { events: createEventBus() }, cwd: ownerRepo, currentSessionId: null },
+				artifactConfig: { enabled: true, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sandbox: { provider: "none", extraWritableMounts: [mockPi.dir] },
+				maxSubagentDepth: 2,
+			});
+			assert.equal(started.isError, undefined);
+			const resultPath = await waitForAsyncResultFile(ownerId, 30_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.results.length, 1, "owner control retains canonical index");
+			assert.equal(payload.success, false, "owner rejection suppresses false success");
+		} finally {
+			removeTempDir(ownerRepo);
+			if (previousRejectSeam === undefined) delete process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD;
+			else process.env.PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD = previousRejectSeam;
+		}
+	});
+
 	it("broad async sequential rejection is persisted to result/status/watcher/intercom", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const repoDir = createRepo("pi-subagent-async-worktree-lifecycle-");
 		const watcherResultsDir = createTempDir("pi-subagent-async-watcher-");
@@ -1749,7 +1889,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				artifactsDir,
 				shareEnabled: false,
 				controlIntercomTarget: "subagent-chat-main",
-				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] },
 				maxSubagentDepth: 2,
 			});
 			assert.ok(!result.isError);

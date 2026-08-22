@@ -25,8 +25,9 @@ import {
 	tryImport,
 	events,
 } from "../support/helpers.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT, SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
+import { INTERCOM_DETACH_REQUEST_EVENT, SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT, TEMP_ROOT_DIR } from "../../src/shared/types.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { createIsolatedGitRuntime, createIsolatedGitWorktree, teardownIsolatedGitRuntimeForTests } from "../../src/sandbox/isolated-git.ts";
 
 interface TestSequentialStep {
 	agent: string;
@@ -135,6 +136,18 @@ const available = !!chainMod;
 const executeChain = chainMod?.executeChain;
 const createSubagentExecutor = executorMod?.createSubagentExecutor;
 
+function chainRunEntries(): Set<string> {
+	const root = path.join(TEMP_ROOT_DIR, "chain-runs");
+	try { return new Set(fs.readdirSync(root)); } catch { return new Set(); }
+}
+
+function removeNewChainRuns(before: Set<string>): void {
+	const root = path.join(TEMP_ROOT_DIR, "chain-runs");
+	try {
+		for (const entry of fs.readdirSync(root)) if (!before.has(entry)) fs.rmSync(path.join(root, entry), { recursive: true, force: true });
+	} catch { /* The chain root may not have been created. */ }
+}
+
 function removeNewIsolatedRoots(before: Set<string>): void {
 	const processes = spawnSync("ps", ["-eo", "args"], { encoding: "utf8" }).stdout.split("\n");
 	for (const entry of fs.readdirSync(os.tmpdir())) {
@@ -152,6 +165,7 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 	let artifactsDir: string;
 	let mockPi: MockPi;
 	let isolatedRootsBefore: Set<string>;
+	let chainRunsBefore: Set<string>;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -166,12 +180,14 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		tempDir = createTempDir();
 		artifactsDir = path.join(tempDir, "artifacts");
 		isolatedRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		chainRunsBefore = chainRunEntries();
 		mockPi.reset();
 	});
 
 	afterEach(() => {
 		removeTempDir(tempDir);
 		removeNewIsolatedRoots(isolatedRootsBefore);
+		removeNewChainRuns(chainRunsBefore);
 	});
 
 	function makeChainParams(
@@ -1258,6 +1274,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 	let tempDir: string;
 	let mockPi: MockPi;
 	let isolatedRootsBefore: Set<string>;
+	let chainRunsBefore: Set<string>;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -1271,12 +1288,14 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 	beforeEach(() => {
 		tempDir = createTempDir();
 		isolatedRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		chainRunsBefore = chainRunEntries();
 		mockPi.reset();
 	});
 
 	afterEach(() => {
 		removeTempDir(tempDir);
 		removeNewIsolatedRoots(isolatedRootsBefore);
+		removeNewChainRuns(chainRunsBefore);
 	});
 
 	function makeChainParams(
@@ -1348,7 +1367,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 		const runId = "isolated-chain-cleanup";
 		const runtimePrefix = `pi-isolated-git-${runId}-isolated-`;
 		const runtimeRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix)));
-		const agents = [makeAgent("isolated-a", { tools: ["read", "bash"] }), makeAgent("isolated-b", { tools: ["read", "bash"] })];
+		const agents = [makeAgent("isolated-a", { tools: ["read", "bash"], sandbox: { bashWrite: true } }), makeAgent("isolated-b", { tools: ["read", "bash"], sandbox: { bashWrite: true } })];
 		const commitCommand = "printf 'child\\n' > child.txt && git add child.txt && git commit -m 'isolated chain child'";
 		mockPi.onCall({ output: "isolated chain A", commands: [commitCommand] });
 		mockPi.onCall({ output: "isolated chain B", commands: [commitCommand] });
@@ -1409,7 +1428,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 			const result = await executeChain(
 				makeChainParams(
 					[{ parallel: [{ agent: "worker", task: "Commit after nested child" }] }],
-					[makeAgent("worker", { tools: ["read", "bash"] })],
+					[makeAgent("worker", { tools: ["read", "bash"], sandbox: { bashWrite: true } })],
 					{ cwd: repoDir, ctx: makeMinimalCtx(repoDir), runId, nestedRoute: route, sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] } },
 				),
 			);
@@ -1476,7 +1495,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 				ctx: makeMinimalCtx(repoDir),
 				runId: "chain-export-failure-visible",
 				artifactsDir: blockedArtifacts,
-				sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] },
 			},
 		));
 		assert.equal(result.isError, true, result.content[0]?.text);
@@ -1517,7 +1536,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 			chain: [{ agent: "worker", task: "Commit the chain change" }],
 			cwd: repoDir,
 			clarify: false,
-			sandbox: { provider: "bubblewrap", gitMode: "isolated", extraWritableMounts: [mockPi.dir] },
+			sandbox: { provider: "bubblewrap", gitMode: "isolated", bashWrite: true, extraWritableMounts: [mockPi.dir] },
 		}, new AbortController().signal, (update: any) => {
 			const outputPath = update.details?.results?.[0]?.artifactPaths?.outputPath;
 			if (blockedArtifacts || typeof outputPath !== "string") return;

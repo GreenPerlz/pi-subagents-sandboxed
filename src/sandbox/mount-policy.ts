@@ -56,9 +56,11 @@ export interface SubagentSandboxMountInput {
 
 function validateWritableGitMount(protectedGitPaths: readonly string[] | undefined, source: string): void {
 	if (!protectedGitPaths) return;
+	const expandedSource = path.resolve(expandTilde(source));
 	for (const protectedPath of protectedGitPaths) {
-		if (!pathsOverlap(protectedPath, source)) continue;
-		throw new Error(`Writable sandbox mount '${path.resolve(source)}' overlaps protected Git metadata '${path.resolve(protectedPath)}'`);
+		const expandedProtected = path.resolve(expandTilde(protectedPath));
+		if (!pathsOverlap(expandedProtected, expandedSource)) continue;
+		throw new Error(`Writable sandbox mount '${expandedSource}' overlaps protected Git metadata '${expandedProtected}'`);
 	}
 }
 
@@ -70,7 +72,7 @@ function addSandboxMount(
 	protectedGitPaths?: readonly string[],
 ): void {
 	if (!source) return;
-	const resolved = path.resolve(source);
+	const resolved = path.resolve(expandTilde(source));
 	if (mode === "rw") validateWritableGitMount(protectedGitPaths, resolved);
 	const existingMode = seen.get(resolved);
 	if (existingMode) {
@@ -94,7 +96,7 @@ function addSandboxMountParent(
 	protectedGitPaths?: readonly string[],
 ): void {
 	if (!filePath) return;
-	const parent = path.dirname(filePath);
+	const parent = path.dirname(expandTilde(filePath));
 	// addSandboxMount validates before this mkdir. A nonexistent suffix must not
 	// be created under protected metadata merely to discover the overlap.
 	if (mode === "rw") validateWritableGitMount(protectedGitPaths, parent);
@@ -133,7 +135,7 @@ function addNestedRouteMount(
 function writableMountCandidates(input: SubagentSandboxMountInput): string[] {
 	const candidates: string[] = [];
 	const add = (candidate: string | undefined): void => {
-		if (candidate) candidates.push(path.resolve(candidate));
+		if (candidate) candidates.push(path.resolve(expandTilde(candidate)));
 	};
 	add(input.sessionDir);
 	if (input.sessionFile) {
@@ -356,8 +358,12 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 		addSandboxMount(mounts, seen, input.cwd, input.cwdMode ?? "rw");
 		addGitWorktreePointerMount(mounts, seen, input.cwd, input.gitMode, protectedGitPaths);
 	}
-	// Validate the complete writable set before any generated parent/resource
-	// directory is created by the mount assembly below.
+	// Validate caller-supplied resources before any generated parent/resource
+	// directory is created by the mount assembly below. Read-only resources are
+	// checked too: they can still expose private Git policy/metadata.
+	for (const resource of [...(input.extraReadOnlyMounts ?? []), ...(input.extraWritableMounts ?? []), ...(input.packageRoots ?? [])]) {
+		validateWritableGitMount(protectedGitPaths, path.resolve(expandTilde(resource)));
+	}
 	validateWritableMountCandidates(protectedGitPaths, input);
 	addSandboxMount(mounts, seen, input.tempDir, "ro");
 	addSandboxMount(mounts, seen, input.sessionDir, "rw", protectedGitPaths);

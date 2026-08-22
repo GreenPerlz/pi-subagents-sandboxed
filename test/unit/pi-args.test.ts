@@ -17,6 +17,7 @@ import {
 	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
 	SUBAGENT_PARENT_RUN_ID_ENV,
 	SUBAGENT_RUN_ID_ENV,
+	SUBAGENT_SCOPED_GIT_ENDPOINT_ENV,
 	applyThinkingSuffix,
 	buildPiArgs,
 } from "../../src/runs/shared/pi-args.ts";
@@ -113,6 +114,17 @@ afterEach(() => {
 	for (const root of tempRoots.splice(0)) {
 		fs.rmSync(root, { recursive: true, force: true });
 	}
+});
+
+describe("buildPiArgs scoped endpoint context", () => {
+	it("does not emit ambient endpoint authority for a fresh child", () => {
+		const result = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: true, inheritSkills: false });
+		assert.equal(result.env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV], "");
+	});
+	it("transports only the selected mount-relative scoped endpoint identity", () => {
+		const result = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: true, inheritSkills: false, scopedGitEndpoint: { relativeSubtree: "owner-private-child-scope" } });
+		assert.deepEqual(JSON.parse(result.env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV]!), { relativeSubtree: "." });
+	});
 });
 
 describe("buildPiArgs session wiring", () => {

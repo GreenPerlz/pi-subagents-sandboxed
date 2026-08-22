@@ -8,6 +8,8 @@ import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../ag
 import { hasExplicitSandboxOptOut, resolveSandboxConfig } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { packagedAgentIsReadOnly, resolvePackagedAgentRole } from "../shared/agent-role.ts";
+import { resolveCapabilityRights } from "../shared/capability-rights.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
@@ -60,7 +62,8 @@ import {
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../background/async-resume.ts";
 import { createNestedRoute, projectNestedEvents, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateAsyncJobNestedProjection, updateForegroundNestedProjection, waitForNestedDescendantsToStop, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { registerForegroundInterrupt } from "../shared/foreground-control.ts";
-import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV } from "../shared/pi-args.ts";
+import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV, SUBAGENT_SCOPED_GIT_ENDPOINT_ENV } from "../shared/pi-args.ts";
+import { delegateScopedGitWriterDescriptor, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, validateScopedGitChildDescriptor, type IsolatedGitCapability, type ScopedGitEndpointDescriptor } from "../../sandbox/isolated-git.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { isExpectedAsyncRunnerPid } from "../background/pid-identity.ts";
 import { resolveAggregateState } from "../../shared/aggregate-state.ts";
@@ -176,6 +179,9 @@ export interface SubagentParamsLike {
 	agentScope?: unknown;
 	chainDir?: string;
 	acceptance?: AcceptanceInput;
+	/** Foreground scoped Git endpoint supplied by the owner process. */
+	isolatedGitEndpoint?: ScopedGitEndpointDescriptor;
+	isolatedGitRights?: "read-only" | "writer";
 }
 
 function resolveChildSandboxConfig(input: {
@@ -184,6 +190,11 @@ function resolveChildSandboxConfig(input: {
 	run?: SandboxRunConfig;
 }): ResolvedSandboxConfig | undefined {
 	return resolveSandboxConfig(input);
+}
+
+interface TeardownHooks {
+	waitForNestedDescendantsToStop?: typeof waitForNestedDescendantsToStop;
+	releaseInheritedContext?: (runtime: IsolatedGitRuntime, capability: IsolatedGitCapability) => void;
 }
 
 interface ExecutorDeps {
@@ -200,6 +211,8 @@ interface ExecutorDeps {
 	nestedFenceTimeoutMs?: number;
 	/** Internal test seam; production defaults to exact /proc runner identity verification. */
 	isExpectedAsyncRunnerPid?: typeof isExpectedAsyncRunnerPid;
+	/** Internal lifecycle test seam; production uses the shared fence/release implementations. */
+	teardownHooks?: TeardownHooks;
 }
 
 interface ExecutionContextData {
@@ -223,6 +236,7 @@ interface ExecutionContextData {
 	intercomBridge: IntercomBridgeState;
 	nestedRoute?: NestedRouteInfo;
 	inheritedNestedRoute?: NestedRouteInfo;
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
 }
 
 function resolveRequestedCwd(runtimeCwd: string, requestedCwd: string | undefined): string {
@@ -323,8 +337,16 @@ function resolveNestedStepState(result: SingleResult): "complete" | "failed" | "
 	return status === "detached" ? "running" : status === "cancelled" ? "cancelled" : status === "paused" ? "paused" : status === "failed" ? "failed" : "complete";
 }
 
-function isolatedGitCommitRequired(task: string | undefined, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined): boolean {
-	return !taskDisallowsFileUpdates(task) && inferSandboxCwdWritable({ agentName: agent?.name, tools: agent?.tools, sandbox });
+function isolatedGitCommitRequired(task: string | undefined, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined, parentRights?: "writer" | "read-only"): boolean {
+	return resolveCapabilityRights({
+		packagedRole: resolvePackagedAgentRole(agent?.name),
+		agentTools: agent?.tools,
+		sandbox,
+		taskMutationProhibited: taskDisallowsFileUpdates(task),
+		parentRights,
+		writableCwd: inferSandboxCwdWritable({ agentName: agent?.name, tools: agent?.tools, sandbox }),
+		exclusiveLease: true,
+	}) === "writer";
 }
 
 function tokenUsageFromSingleResult(result: SingleResult): TokenUsage | undefined {
@@ -1092,7 +1114,11 @@ async function emitForegroundResultIntercom(input: {
 		summary: diagnostic.error ?? diagnostic.finalOutput ?? diagnostic.output ?? "(no output)",
 		groupId: diagnostic.groupId,
 	}));
-	const children = input.results.flatMap((result, index) => result.detached ? [] : [{
+	// Keep detached acknowledgements in grouped receipts. They are genuine
+	// indexed children (and remain non-terminal); a later terminal projection
+	// clears the flag at the same canonical index. Dropping them here loses the
+	// child entirely and shifts every following index.
+	const children = input.results.map((result, index) => ({
 		agent: result.agent,
 		status: resolveSubagentResultStatus({
 			exitCode: result.exitCode,
@@ -1109,7 +1135,7 @@ async function emitForegroundResultIntercom(input: {
 		...(result.gitBundle ? { gitBundle: result.gitBundle } : {}),
 		sessionPath: result.sessionFile,
 		intercomTarget: resolveSubagentIntercomTarget(input.runId, result.agent, result.flatIndex ?? index),
-	}]);
+	}));
 	if (children.length === 0 && diagnosticChildren.length === 0) return null;
 	const payload = buildSubagentResultIntercomPayload({
 		to: input.intercomBridge.orchestratorTarget,
@@ -1152,6 +1178,20 @@ async function maybeBuildForegroundIntercomReceipt(input: {
 	};
 }
 
+async function reserveAsyncScopedEndpoint(descriptor: ScopedGitEndpointDescriptor | undefined, cwd: string, writer: boolean): Promise<ScopedGitEndpointDescriptor | undefined> {
+	if (!descriptor) return undefined;
+	return reserveScopedGitChildDescriptor(descriptor, { cwd, rights: writer ? "writer" : "read-only" });
+}
+
+function bindAsyncScopedWriter(descriptor: ScopedGitEndpointDescriptor | undefined, result: { details?: Details }): void {
+	if (!descriptor) return;
+	const identityData = (result.details as Details & { __scopedRunnerPid?: number; __scopedRunnerStartToken?: string; __scopedRunnerUid?: number } | undefined);
+	if (!identityData?.__scopedRunnerPid || !identityData.__scopedRunnerStartToken || identityData.__scopedRunnerUid === undefined) return;
+	const identity = readScopedGitProcessIdentity(identityData.__scopedRunnerPid);
+	if (!identity || identity.startToken !== identityData.__scopedRunnerStartToken || identity.uid !== identityData.__scopedRunnerUid) return;
+	void delegateScopedGitWriterDescriptor(descriptor, identity).catch(() => { /* owner remains fail-closed */ });
+}
+
 function validationErrorResult(mode: Details["mode"], text: string): AgentToolResult<Details> {
 	return { content: [{ type: "text", text }], isError: true, details: { mode, results: [] } };
 }
@@ -1167,8 +1207,9 @@ function isRalphNestedWorkerAgentName(agent: unknown): boolean {
 
 function isOrchestratorInlineLoopAgentName(agent: unknown): boolean {
 	if (typeof agent !== "string") return false;
-	return ["explore", "explorer", "work", "worker", "review", "reviewer"]
-		.some((name) => agent === name || agent.endsWith(`-${name}`));
+	const role = agent.toLowerCase().split(".").at(-1);
+	return ["explore", "explorer", "work", "worker", "review", "reviewer"].some((name) =>
+		agent === name || agent.endsWith(`-${name}`) || role === name);
 }
 
 function collectRalphNestedLaunchAgentTargets(params: SubagentParamsLike): string[] {
@@ -1508,7 +1549,7 @@ function wrapChainTasksForFork(chain: ChainStep[], context: SubagentParamsLike["
 	});
 }
 
-function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentToolResult<Details> | null {
+async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Promise<AgentToolResult<Details> | null> {
 	const {
 		params,
 		effectiveCwd,
@@ -1540,6 +1581,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		}
 	}
 
+	let asyncScopedEndpoint: ScopedGitEndpointDescriptor | undefined = data.scopedGitEndpoint;
 	if (hasTasks && params.tasks) {
 		const maxParallelTasks = resolveTopLevelParallelMaxTasks(deps.config.parallel?.maxTasks);
 		if (params.tasks.length > maxParallelTasks) {
@@ -1597,7 +1639,13 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			...(task.progress !== undefined ? { progress: task.progress } : {}),
 			...(task.acceptance !== undefined ? { acceptance: task.acceptance } : {}),
 		}));
-		return executeAsyncChain(id, {
+		try {
+			const wantsWriter = params.tasks.some((task, index) => inferSandboxCwdWritable({ agentName: task.agent, tools: agentConfigs[index]?.tools, sandbox }));
+			asyncScopedEndpoint = await reserveAsyncScopedEndpoint(asyncScopedEndpoint, effectiveCwd, wantsWriter);
+		} catch (error) {
+			return validationErrorResult("parallel", `Scoped Git endpoint reservation failed closed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		const asyncResult = executeAsyncChain(id, {
 			chain: [{
 				parallel: parallelTasks,
 				concurrency: resolveTopLevelParallelConcurrency(params.concurrency, deps.config.parallel?.concurrency),
@@ -1615,6 +1663,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sessionRoot,
 			chainSkills: [],
 			sessionFilesByFlatIndex: params.tasks.map((_, index) => sessionFileForIndex(index)),
+			scopedGitEndpoint: asyncScopedEndpoint,
 			maxSubagentDepth: currentMaxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
 			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
@@ -1627,13 +1676,24 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sandboxRun: params.sandbox,
 			sandboxIntercomBridge,
 		});
+		bindAsyncScopedWriter(asyncScopedEndpoint, asyncResult);
+		return asyncResult;
 	}
 
 	if (hasChain && params.chain) {
 		const normalized = normalizeSkillInput(params.skill);
 		const chainSkills = normalized === false ? [] : (normalized ?? []);
 		const chain = wrapChainTasksForFork(params.chain as ChainStep[], params.context);
-		return executeAsyncChain(id, {
+		try {
+			const wantsWriter = chain.some((step) => {
+				const tasks = isParallelStep(step) ? step.parallel : isDynamicParallelStep(step) ? [step.parallel] : [step];
+				return tasks.some((task: any) => inferSandboxCwdWritable({ agentName: task.agent, tools: agents.find((candidate) => candidate.name === task.agent)?.tools, sandbox }));
+			});
+			asyncScopedEndpoint = await reserveAsyncScopedEndpoint(asyncScopedEndpoint, effectiveCwd, wantsWriter);
+		} catch (error) {
+			return validationErrorResult("chain", `Scoped Git endpoint reservation failed closed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		const asyncResult = executeAsyncChain(id, {
 			chain,
 			task: params.task,
 			agents,
@@ -1647,6 +1707,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sessionRoot,
 			chainSkills,
 			sessionFilesByFlatIndex: collectChainSessionFiles(chain, sessionFileForIndex),
+			scopedGitEndpoint: asyncScopedEndpoint,
 			dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
 			maxSubagentDepth: currentMaxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
@@ -1660,6 +1721,8 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			sandboxRun: params.sandbox,
 			sandboxIntercomBridge,
 		});
+		bindAsyncScopedWriter(asyncScopedEndpoint, asyncResult);
+		return asyncResult;
 	}
 
 	if (hasSingle) {
@@ -1683,7 +1746,12 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			agent: a,
 			run: params.sandbox,
 		});
-		return executeAsyncSingle(id, {
+		try {
+			asyncScopedEndpoint = await reserveAsyncScopedEndpoint(asyncScopedEndpoint, effectiveCwd, inferSandboxCwdWritable({ agentName: a.name, tools: a.tools, sandbox: singleSandbox }));
+		} catch (error) {
+			return validationErrorResult("single", `Scoped Git endpoint reservation failed closed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		const asyncResult = executeAsyncSingle(id, {
 			agent: params.agent!,
 			task: params.context === "fork" ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
 			agentConfig: a,
@@ -1711,7 +1779,10 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			acceptance: params.acceptance,
 			sandbox: singleSandbox,
 			sandboxIntercomBridge: resolveSandboxIntercomBridge(intercomBridge),
+			scopedGitEndpoint: asyncScopedEndpoint,
 		});
+		bindAsyncScopedWriter(asyncScopedEndpoint, asyncResult);
+		return asyncResult;
 	}
 
 	return null;
@@ -1799,6 +1870,8 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		sandboxSettings,
 		sandboxRun: params.sandbox,
 		sandboxIntercomBridge,
+		scopedGitEndpoint: data.scopedGitEndpoint,
+		teardownHooks: deps.teardownHooks,
 	});
 
 	if (chainResult.requestedAsync) {
@@ -1831,6 +1904,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			sessionRoot,
 			chainSkills: chainResult.requestedAsync.chainSkills,
 			sessionFilesByFlatIndex: collectChainSessionFiles(asyncChain, sessionFileForIndex),
+			scopedGitEndpoint: data.scopedGitEndpoint,
 			dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
 			maxSubagentDepth: currentMaxSubagentDepth,
 			worktreeSetupHook: deps.config.worktreeSetupHook,
@@ -1936,9 +2010,13 @@ interface ForegroundParallelRunInput {
 	onUpdate?: (r: AgentToolResult<Details>) => void;
 	worktreeSetup?: WorktreeSetup;
 	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[];
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
 	sandbox?: ResolvedSandboxConfig;
 	sandboxes?: (ResolvedSandboxConfig | undefined)[];
+	parentRights?: "writer" | "read-only";
 	sandboxIntercomBridge?: SandboxIntercomBridge;
+	issueIsolatedGitCapability?: (worktree: IsolatedGitWorktree, rights: "writer" | "read-only", cwd: string) => Promise<import("../../sandbox/isolated-git.ts").IsolatedGitCapability>;
+	teardownHooks?: TeardownHooks;
 	progressPaths?: string[];
 	onDetachedStarted?: (index: number, result: SingleResult) => void;
 	onDetachedTerminal?: (index: number, result: SingleResult) => void | Promise<void>;
@@ -2072,6 +2150,18 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 		const behavior = input.behaviors[index];
 		const effectiveSkills = behavior?.skills;
 		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees);
+		const agentConfig = input.agents.find((agent) => agent.name === task.agent);
+		// Issue capability after the resolved per-task sandbox is available and
+		// before output/session/artifact path work begins.
+		const isolatedCapability = input.isolatedGitWorktrees?.[index]
+			? await (input.issueIsolatedGitCapability
+				? input.issueIsolatedGitCapability(input.isolatedGitWorktrees[index]!, isolatedGitCommitRequired(task.task, agentConfig, input.sandboxes?.[index] ?? input.sandbox, input.parentRights) ? "writer" : "read-only", taskCwd)
+				: input.isolatedGitWorktrees[index]!.runtime.issueInheritedContext({
+					worktree: input.isolatedGitWorktrees[index]!,
+					rights: isolatedGitCommitRequired(task.task, agentConfig, input.sandboxes?.[index] ?? input.sandbox, input.parentRights) ? "writer" : "read-only",
+					cwd: taskCwd,
+				}))
+			: undefined;
 		const readInstructions = behavior
 			? buildChainInstructions({ ...behavior, output: false, progress: false }, taskCwd, false)
 			: { prefix: "", suffix: "" };
@@ -2079,7 +2169,6 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			? buildChainInstructions({ ...behavior, output: false, reads: false }, input.paramsCwd, index === input.firstProgressIndex)
 			: { prefix: "", suffix: "" };
 		const outputPath = resolveSingleOutputPath(behavior?.output, input.ctx.cwd, taskCwd);
-		const agentConfig = input.agents.find((agent) => agent.name === task.agent);
 		const savedOutputPath = shouldPersistSavedOutput({
 			output: behavior?.output,
 			outputMode: behavior?.outputMode,
@@ -2116,6 +2205,40 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 				return true;
 			});
 		}
+		let settledResult: SingleResult | undefined;
+		let isolatedCapabilityReleased = false;
+		const releaseIsolatedCapability = async (terminal?: SingleResult): Promise<void> => {
+			if (isolatedCapabilityReleased || !isolatedCapability || !input.isolatedGitWorktrees?.[index]) return;
+			const runtime = input.isolatedGitWorktrees[index]!.runtime;
+			if (terminal?.teardownUnproven) {
+				runtime.markExportFenceFailed();
+				return;
+			}
+			const fence = await (input.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(input.foregroundControl?.nestedRoute, input.runId, index, { timeoutMs: input.nestedFenceTimeoutMs });
+			if (!fence.stopped) {
+				runtime.markExportFenceFailed();
+				if (terminal) {
+					terminal.teardownUnproven = true;
+					terminal.exitCode = terminal.exitCode === 0 ? 1 : terminal.exitCode;
+					terminal.error = terminal.error ? `${terminal.error}\nNested descendants did not reach a proven terminal state; inherited capability retained for recovery.` : "Nested descendants did not reach a proven terminal state; inherited capability retained for recovery.";
+					input.onUpdate?.({ content: [{ type: "text", text: terminal.error }], details: { mode: "parallel", results: input.liveResults.map((candidate, candidateIndex) => candidateIndex === index ? { ...terminal, detached: true } : candidate).filter((candidate): candidate is SingleResult => candidate !== undefined) } });
+				}
+				return;
+			}
+			try {
+				(input.teardownHooks?.releaseInheritedContext ?? ((runtime, capability) => runtime.releaseInheritedContext(capability)))(runtime, isolatedCapability);
+				isolatedCapabilityReleased = true;
+			} catch (error) {
+				if (terminal) {
+					terminal.teardownUnproven = true;
+					terminal.exitCode = terminal.exitCode === 0 ? 1 : terminal.exitCode;
+					const detail = error instanceof Error ? error.message : String(error);
+					terminal.error = terminal.error ? `${terminal.error}\nCapability release was not proven: ${detail}` : `Capability release was not proven: ${detail}`;
+					input.onUpdate?.({ content: [{ type: "text", text: terminal.error }], details: { mode: "parallel", results: input.liveResults.map((candidate, candidateIndex) => candidateIndex === index ? { ...terminal, detached: true } : candidate).filter((candidate): candidate is SingleResult => candidate !== undefined) } });
+				}
+				try { runtime.markExportFenceFailed(); } catch { /* retain terminal teardown evidence even if fence persistence also fails */ }
+			}
+		};
 		try {
 		const result = await runSync(input.ctx.cwd, input.agents, task.agent, taskText, {
 			cwd: taskCwd,
@@ -2150,12 +2273,21 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			acceptanceContext: { mode: "parallel" },
 			sandbox: input.sandboxes?.[index] ?? input.sandbox,
 			isolatedGit: input.isolatedGitWorktrees?.[index],
+			isolatedGitCapability: isolatedCapability,
 			isolatedGitBundleDir: input.artifactsDir,
+			isolatedGitEndpoint: input.scopedGitEndpoint,
+			isolatedGitRights: input.scopedGitEndpoint ? (isolatedGitCommitRequired(taskText, agentConfig, input.sandboxes?.[index] ?? input.sandbox) ? "writer" : "read-only") : undefined,
 			isolatedGitCommitRequired: Boolean(input.isolatedGitWorktrees?.[index]) && isolatedGitCommitRequired(taskText, agentConfig, input.sandboxes?.[index] ?? input.sandbox),
 			sandboxIntercomBridge: input.sandboxIntercomBridge,
 			progressPaths: behavior?.progress ? input.progressPaths : undefined,
 			onDetachedStarted: input.onDetachedStarted ? (result) => input.onDetachedStarted!(index, result) : undefined,
-			onDetachedTerminal: input.onDetachedTerminal ? (result) => input.onDetachedTerminal!(index, result) : undefined,
+			onDetachedTerminal: async (result) => {
+				// A parallel terminal callback is publication. Wait for descendant
+				// termination and successful capability release before forwarding it.
+				await releaseIsolatedCapability(result);
+				if (result.teardownUnproven || (isolatedCapability && !isolatedCapabilityReleased)) return;
+				await input.onDetachedTerminal?.(index, result);
+			},
 			onUpdate: input.onUpdate
 				? (progressUpdate) => {
 					const stepResults = progressUpdate.details?.results || [];
@@ -2195,11 +2327,15 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 				}
 				: undefined,
 		});
+		settledResult = result;
 		return { ...result, flatIndex };
 		} finally {
 			unregisterInterrupt?.();
 			unregisterInterrupt = undefined;
 			if (input.foregroundControl?.currentIndex === index) input.foregroundControl.updatedAt = Date.now();
+			if (isolatedCapability && input.isolatedGitWorktrees?.[index] && !settledResult?.detached) {
+				await releaseIsolatedCapability(settledResult);
+			}
 		}
 	});
 }
@@ -2262,7 +2398,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	});
 	const sandboxIntercomBridge = resolveSandboxIntercomBridge(data.intercomBridge);
 	const taskSandboxes = agentConfigs.map((agent) => resolveChildSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox }));
-	const isolatedGitRequested = taskSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
+	const isolatedGitRequested = !data.scopedGitEndpoint && taskSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
 	if (isolatedGitRequested && params.worktree) {
 		return buildParallelModeError("isolated Git cannot be combined with parent-managed worktree mode; use isolated Git alone");
 	}
@@ -2272,7 +2408,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	)) {
 		return buildParallelModeError("isolated Git parallel runs cannot include a non-isolated write-capable task");
 	}
-	if (!params.worktree && !isolatedGitRequested && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
+	if (!params.worktree && !isolatedGitRequested && !data.scopedGitEndpoint && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
 		return buildParallelModeError(sandboxParallelWorktreeRequiredMessage());
 	}
 
@@ -2401,6 +2537,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				sandboxSettings,
 				sandboxRun: params.sandbox,
 				sandboxIntercomBridge,
+				scopedGitEndpoint: data.scopedGitEndpoint,
 			});
 		}
 	}
@@ -2411,6 +2548,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	if (duplicateOutputError) return buildParallelModeError(duplicateOutputError);
 	for (let index = 0; index < tasks.length; index++) {
 		const taskCwd = resolveParallelTaskCwd(tasks[index]!, effectiveCwd, undefined, index);
+		// The base probe above precedes output/session path resolution and setup.
 		const outputPath = resolveSingleOutputPath(behaviors[index]?.output, ctx.cwd, taskCwd);
 		const savedOutputPath = shouldPersistSavedOutput({
 			output: behaviors[index]?.output,
@@ -2439,6 +2577,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 
 	let isolatedRuntime: IsolatedGitRuntime | undefined;
 	let isolatedGitWorktrees: (IsolatedGitWorktree | undefined)[] | undefined;
+	const ownsIsolatedRuntime = true;
 	if (isolatedGitRequested) {
 		try {
 			const isolatedConfigs = taskSandboxes.filter((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
@@ -2447,7 +2586,6 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			isolatedRuntime = createIsolatedGitRuntime({
 				cwd: effectiveCwd,
 				runId,
-				ownerPid: process.pid,
 				provider: isolatedProvider,
 				network: isolatedConfigs[0]?.network,
 				profile: isolatedConfigs[0]?.profile,
@@ -2513,7 +2651,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0, cost: 0 },
 						success: false,
 						error: recoveryError,
-						...(bundle ? { gitBundle: { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata } } : {}),
+						...(bundle ? { gitBundle: { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata } } : {}),
 					});
 				}
 			}
@@ -2626,12 +2764,18 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			};
 		result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
 			result.success = false;
+			result.interrupted = undefined;
+			result.cancelled = undefined;
+			result.teardownUnproven = true;
 			result.error = result.error?.includes(message) ? result.error : result.error ? `${result.error}\n${message}` : message;
 			liveResults[index] = result;
 		}
 		if (target && !target.error?.includes(message)) {
 			target.exitCode = target.exitCode === 0 ? 1 : (target.exitCode ?? 1);
 			target.success = false;
+			target.interrupted = undefined;
+			target.cancelled = undefined;
+			target.teardownUnproven = true;
 			target.error = target.error ? `${target.error}\n${message}` : message;
 		}
 		return message;
@@ -2645,7 +2789,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		throw lastError;
 	};
 	const exportRemainingIsolated = async (terminationState: "success" | "failure" | "execution-rejected" | "interrupted" | "cancelled", includeDetached = false): Promise<void> => {
-		if (!isolatedRuntime) return;
+		if (!isolatedRuntime || !ownsIsolatedRuntime) return;
 		// A teardown callback may have already fenced this runtime after refusing
 		// private-group proof. Never clear that fence and package/delete descendants.
 		if (isolatedRuntime.exportFenceFailed) return;
@@ -2693,6 +2837,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 					checksum: bundle.checksum,
 					base: bundle.base,
 					head: bundle.head,
+					commits: bundle.commits,
 					commitSummary: bundle.commitSummary,
 					...(bundle.recovery ? { recovery: bundle.recovery } : {}),
 					...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}),
@@ -2726,17 +2871,18 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				exportDiagnostics.delete(worktree.index);
 			} catch (error) {
 				isolatedRuntime.markExportFailed();
+				teardownUnproven = true;
 				const exportError = `Isolated Git bundle export failed; recover worktree at ${isolatedRuntime.root}: ${error instanceof Error ? error.message : String(error)}`;
 				exportDiagnostics.set(worktree.index, exportError);
 				const existing = liveResults[worktree.index];
-				if (existing) liveResults[worktree.index] = { ...existing, exitCode: existing.exitCode === 0 ? 1 : existing.exitCode, success: false, error: existing.error ? `${existing.error}\n${exportError}` : exportError };
-				else liveResults[worktree.index] = { agent: tasks[worktree.index]?.agent ?? `task-${worktree.index + 1}`, task: tasks[worktree.index]?.task ?? "parallel execution", exitCode: 1, success: false, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, error: exportError };
+				if (existing) liveResults[worktree.index] = { ...existing, exitCode: existing.exitCode === 0 ? 1 : existing.exitCode, success: false, interrupted: undefined, cancelled: undefined, teardownUnproven: true, error: existing.error ? `${existing.error}\n${exportError}` : exportError };
+				else liveResults[worktree.index] = { agent: tasks[worktree.index]?.agent ?? `task-${worktree.index + 1}`, task: tasks[worktree.index]?.task ?? "parallel execution", exitCode: 1, success: false, teardownUnproven: true, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, error: exportError };
 			}
 		}
 	};
 	const buildIsolatedParallelError = async (message: string): Promise<AgentToolResult<Details>> => {
 		await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal.aborted ? "cancelled" : "execution-rejected");
-		if (isolatedRuntime && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
+		if (ownsIsolatedRuntime && isolatedRuntime && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
 			try { await cleanupIsolatedGitRuntime(isolatedRuntime); }
 			catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
 		}
@@ -2752,7 +2898,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		if (!parallelExecutionSettled || detachedCleanupComplete || detachedIndexes.size === 0 || detachedTerminalIndexes.size < detachedIndexes.size) return;
 		detachedCleanupComplete = true;
 		await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal.aborted ? "cancelled" : "execution-rejected", true);
-		if (isolatedRuntime?.exportFenceFailed || isolatedRuntime?.exportFailed) return;
+		if (ownsIsolatedRuntime && (isolatedRuntime?.exportFenceFailed || isolatedRuntime?.exportFailed)) return;
 		if (worktreeSetup) {
 			const fence = await waitForNestedDescendantsToStop(data.nestedRoute, runId, undefined, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
 			if (!fence.stopped) {
@@ -2765,7 +2911,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 					result.interrupted = undefined;
 					result.cancelled = undefined;
 					result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
-					result.error = result.error ? `${result.error}\\n${message}` : message;
+					result.error = result.error ? `${result.error}\n${message}` : message;
 					liveResults[index] = result;
 				}
 			} else try { cleanupWorktrees(worktreeSetup); }
@@ -2794,7 +2940,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				}
 			}
 		}
-		if (isolatedRuntime) {
+		if (ownsIsolatedRuntime && isolatedRuntime) {
 			try { await cleanupIsolatedGitRuntime(isolatedRuntime); }
 			catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
 			noteIsolatedCleanupFailure();
@@ -2838,12 +2984,34 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: data.effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: details.results, ...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}) });
 			return;
 		}
+		if (data.scopedGitEndpoint) {
+			const fence = await (deps.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(data.nestedRoute, runId, index, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
+			if (!fence.observed || !fence.stopped) {
+				teardownUnproven = true;
+				result.teardownUnproven = true;
+				result.success = false;
+				result.interrupted = undefined;
+				result.cancelled = undefined;
+				result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
+				const message = "Nested descendants did not reach a proven terminal state before scoped Git endpoint cleanup; recover retained isolated worktree evidence through the owning parent run";
+				result.error = result.error ? `${result.error}\n${message}` : message;
+				liveResults[index] = liveResults[index] ? { ...liveResults[index]!, ...result } : result;
+				const details = compactForegroundDetails({ mode: "parallel", runId, results: detachedProjectionResults().map((candidate, candidateIndex) => candidateIndex === index ? { ...candidate, detached: true } : candidate), progress: params.includeProgress ? allProgress : undefined });
+				onUpdate?.({ content: [{ type: "text", text: result.error }], details });
+				if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
+				rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: data.effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: details.results, ...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}) });
+				return;
+			}
+		}
 		if (isolatedRuntime && !isolatedRuntime.isExported(index)) {
 			const fence = await waitForNestedDescendantsToStop(data.nestedRoute, runId, index, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
 			if (!fence.stopped) {
-				isolatedRuntime.markExportFenceFailed();
+				if (ownsIsolatedRuntime) isolatedRuntime.markExportFenceFailed();
 				teardownUnproven = true;
 				result.teardownUnproven = true;
+				result.success = false;
+				result.interrupted = undefined;
+				result.cancelled = undefined;
 				result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
 				result.error = result.error
 					? `${result.error}\nNested descendants did not reach a proven terminal state before the export fence timed out; recover isolated worktree at ${isolatedRuntime.root}`
@@ -2866,7 +3034,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		// A detached worktree is terminal independently of its siblings. Export
 		// that worktree before publishing its terminal receipt; the runtime itself
 		// remains until every detached sibling has reached the same fence.
-		if (isolatedRuntime && !isolatedRuntime.isExported(index) && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
+		if (ownsIsolatedRuntime && isolatedRuntime && !isolatedRuntime.isExported(index) && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
 			const worktree = isolatedRuntime.worktrees.find((candidate) => candidate.index === index);
 			if (worktree) {
 				try {
@@ -2879,9 +3047,14 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 						commitRequired: tasks[index] ? isolatedGitCommitRequired(tasks[index]!.task, agents.find((candidate) => candidate.name === tasks[index]!.agent), taskSandboxes[index]) : undefined,
 					});
 					const bundle = retry.bundle;
-					liveResults[index] = { ...liveResults[index]!, gitBundle: { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata } };
+					liveResults[index] = { ...liveResults[index]!, gitBundle: { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata } };
 				} catch (error) {
 					isolatedRuntime.markExportFailed();
+					teardownUnproven = true;
+					result.success = false;
+					delete result.interrupted;
+					delete result.cancelled;
+					result.teardownUnproven = true;
 					result.exitCode = result.exitCode === 0 ? 1 : result.exitCode;
 					result.error = result.error ? `${result.error}\nIsolated Git bundle export failed; recover worktree at ${isolatedRuntime.root}: ${error instanceof Error ? error.message : String(error)}` : `Isolated Git bundle export failed; recover worktree at ${isolatedRuntime.root}: ${error instanceof Error ? error.message : String(error)}`;
 				}
@@ -2946,9 +3119,11 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			onUpdate,
 			worktreeSetup,
 			isolatedGitWorktrees,
+			scopedGitEndpoint: data.scopedGitEndpoint,
 			sandbox,
 			sandboxes: taskSandboxes,
 			sandboxIntercomBridge,
+			teardownHooks: deps.teardownHooks,
 			progressPaths,
 			onDetachedStarted: (index, result) => {
 				detachedIndexes.add(index);
@@ -3009,7 +3184,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			// returned error. Never rely on finally for the isolated runtime fence.
 			if (detachedIndexes.size === 0) {
 				await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal.aborted ? "cancelled" : "execution-rejected");
-				if (isolatedRuntime && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
+				if (ownsIsolatedRuntime && isolatedRuntime && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
 					try { await cleanupIsolatedGitRuntime(isolatedRuntime); }
 					catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
 				}
@@ -3040,7 +3215,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		// or export failure intentionally leaves the runtime actionable.
 		if (detachedIndexes.size === 0) {
 			await exportRemainingIsolated(foregroundControl?.interruptRequested ? "interrupted" : signal.aborted ? "cancelled" : "execution-rejected");
-			if (isolatedRuntime && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
+			if (ownsIsolatedRuntime && isolatedRuntime && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
 				try { await cleanupIsolatedGitRuntime(isolatedRuntime); }
 				catch (cleanupError) { noteIsolatedCleanupFailure(undefined, cleanupError); }
 				noteIsolatedCleanupFailure();
@@ -3058,7 +3233,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 						result.interrupted = undefined;
 						result.cancelled = undefined;
 						result.exitCode = result.exitCode === 0 ? 1 : (result.exitCode ?? 1);
-						result.error = result.error ? `${result.error}\\n${parallelCleanupFailure}` : parallelCleanupFailure;
+						result.error = result.error ? `${result.error}\n${parallelCleanupFailure}` : parallelCleanupFailure;
 						liveResults[index] = result;
 					}
 				} else try { cleanupWorktrees(worktreeSetup); }
@@ -3131,7 +3306,11 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		const detachedIndex = results.findIndex((result, index) => result.detached || detachedIndexes.has(index));
 		const detached = detachedIndex >= 0 ? results[detachedIndex] : undefined;
 		if (detached) {
-			const detachedPath = isolatedRuntime ? `Recover isolated worktrees at ${isolatedRuntime.root} after the child reaches terminal state.` : formatRecoverableWorktreePaths(worktreeSetup);
+			const detachedPath = isolatedRuntime
+				? `Recover isolated worktrees at ${isolatedRuntime.root} after the child reaches terminal state.`
+				: data.scopedGitEndpoint
+					? "Recover retained isolated worktree evidence through the owning parent run after the child reaches terminal state."
+					: formatRecoverableWorktreePaths(worktreeSetup);
 			const message = `Parallel run detached for intercom coordination (${detached.agent}). Reply to the supervisor request first. After the child reaches terminal state, the preserved worktree can be exported or recovered.${detachedPath ? `\n${detachedPath}` : ""}`;
 			return {
 				content: [{ type: "text", text: worktreeSuffix ? `${message}\n\n${worktreeSuffix}` : message }],
@@ -3422,6 +3601,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				agent: asyncAgentConfig,
 				run: params.sandbox,
 			});
+
 			return executeAsyncSingle(id, {
 				agent: params.agent!,
 				task: params.context === "fork" ? wrapForkTask(task) : task,
@@ -3448,11 +3628,37 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
 				nestedRoute: data.nestedRoute,
 				sandbox,
+				scopedGitEndpoint: data.scopedGitEndpoint,
 				sandboxIntercomBridge: resolveSandboxIntercomBridge(data.intercomBridge),
 			});
 		}
 	}
 
+	// Resolve sandbox policy before reserving any inherited endpoint subtree.
+	// The owner retains lifecycle authority; this process borrows a narrowed lease.
+	let sandbox: ReturnType<typeof resolveSandboxConfig>;
+	try {
+		sandbox = resolveSandboxConfig({
+			settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+			agent: agentConfig,
+			run: params.sandbox,
+		});
+	} catch (error) {
+		unregisterForegroundInterrupt();
+		const message = error instanceof Error ? error.message : String(error);
+		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "single", results: [] } };
+	}
+	if (data.scopedGitEndpoint) {
+		sandbox = {
+			provider: "bubblewrap",
+			gitMode: "isolated",
+			network: "none",
+			profile: "host-toolchain",
+			fallback: "fail",
+			auth: "none",
+		} as ReturnType<typeof resolveSandboxConfig>;
+	}
+	// Foreground nested authority is represented only by scopedGitEndpoint.
 	if (params.context === "fork") {
 		task = wrapForkTask(task);
 	}
@@ -3527,19 +3733,15 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		}
 		: undefined;
 
-	let sandbox: ReturnType<typeof resolveSandboxConfig>;
-	try {
-		sandbox = resolveSandboxConfig({
-			settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
-			agent: agentConfig,
-			run: params.sandbox,
-		});
-	} catch (error) {
-		unregisterForegroundInterrupt();
-		const message = error instanceof Error ? error.message : String(error);
-		const child: SingleResult = { agent: params.agent!, task: cleanTask, exitCode: 1, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, success: false, error: message };
-		rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: [child], ...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}) });
-		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "single", runId, results: [child] } };
+	if (data.scopedGitEndpoint) {
+		sandbox = {
+			provider: "bubblewrap",
+			gitMode: "isolated",
+			network: "none",
+			profile: "host-toolchain",
+			fallback: "fail",
+			auth: "none",
+		} as ReturnType<typeof resolveSandboxConfig>;
 	}
 	let isolatedRuntime: IsolatedGitRuntime | undefined;
 	let isolatedWorktree: IsolatedGitWorktree | undefined;
@@ -3549,18 +3751,18 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		const message = `Isolated Git cleanup failed after export; recover isolated worktree at ${root}.${cause ? ` ${cause instanceof Error ? cause.message : String(cause)}` : ""}`;
 		target.exitCode = target.exitCode === 0 ? 1 : (target.exitCode ?? 1);
 		target.success = false;
+		target.teardownUnproven = true;
 		delete target.interrupted;
 		delete target.cancelled;
 		target.error = target.error ? `${target.error}\n${message}` : message;
 		return message;
 	};
 	let detachedStarted = false;
-	if (sandbox?.gitMode === "isolated") {
+	if (sandbox?.gitMode === "isolated" && !data.scopedGitEndpoint) {
 		try {
 			isolatedRuntime = createIsolatedGitRuntime({
 				cwd: effectiveCwd,
 				runId,
-				ownerPid: process.pid,
 				provider: sandbox.provider,
 				network: sandbox.network,
 				profile: sandbox.profile,
@@ -3588,7 +3790,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 							agent: params.agent,
 							commitRequired: isolatedGitCommitRequired(task, agentConfig, sandbox),
 						});
-						gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+						gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
 					} catch (attemptError) { exportError = attemptError; }
 				}
 				if (!gitBundle) isolatedRuntime.markExportFailed();
@@ -3607,8 +3809,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			} else if (isolatedRuntime) {
 				// A synchronous first-slot failure can happen before the local
 				// worktree variable is assigned. If the runtime registered no slot,
-				// stop its policy server and remove the empty runtime rather than
-				// silently leaving an active privileged child behind.
+				// close its endpoint owner and remove the empty runtime rather than
+				// silently leaving active privileged state behind.
 				try {
 					if (isolatedRuntime.worktrees.length === 0) await cleanupIsolatedGitRuntime(isolatedRuntime);
 					else isolatedRuntime.markExportFailed();
@@ -3630,6 +3832,19 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, sessionId: deps.state.currentSessionId, startedAt: foregroundControl?.startedAt, results: [child], ...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}) });
 			return { content: [{ type: "text", text: child.error! }], isError: true, details: compactForegroundDetails({ mode: "single", runId, results: [child] }) };
 		}
+	}
+	let isolatedCapability: import("../../sandbox/isolated-git.ts").IsolatedGitCapability | undefined;
+	try {
+		if (isolatedWorktree) {
+			isolatedCapability = isolatedWorktree.runtime.issueInheritedContext({
+				worktree: isolatedWorktree,
+				rights: isolatedGitCommitRequired(task, agentConfig, sandbox) ? "writer" : "read-only",
+				cwd: effectiveCwd,
+			});
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "single", runId, results: [] } };
 	}
 	let r: SingleResult | undefined;
 	try {
@@ -3658,11 +3873,44 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		onControlEvent,
 		onDetachedStarted: () => { detachedStarted = true; },
 		onDetachedTerminal: async (detachedResult) => {
+			// Detached execution owns the capability until terminal close and an exact
+			// descendant fence, not merely acknowledgement. Retain authority when the
+			// fence is unproven so the parent can recover/finish teardown.
+			let releaseCapability = true;
+			if (data.scopedGitEndpoint && !detachedResult.teardownUnproven) {
+				const fence = await (deps.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(data.nestedRoute, runId, 0, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
+				if (!fence.observed || !fence.stopped) {
+					detachedResult.teardownUnproven = true;
+					detachedResult.success = false;
+					delete detachedResult.interrupted;
+					delete detachedResult.cancelled;
+					detachedResult.exitCode = detachedResult.exitCode === 0 ? 1 : detachedResult.exitCode;
+					const message = "Nested descendants did not reach a proven terminal state before scoped Git endpoint cleanup; recover retained isolated worktree evidence through the owning parent run";
+					detachedResult.error = detachedResult.error ? `${detachedResult.error}\n${message}` : message;
+				}
+			}
+			if (!isolatedRuntime && isolatedWorktree && !detachedResult.teardownUnproven) {
+				const fence = await waitForNestedDescendantsToStop(data.nestedRoute, runId, 0, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
+				if (!fence.stopped) {
+					releaseCapability = false;
+					detachedResult.teardownUnproven = true;
+					detachedResult.success = false;
+					delete detachedResult.interrupted;
+					delete detachedResult.cancelled;
+					detachedResult.exitCode = detachedResult.exitCode === 0 ? 1 : detachedResult.exitCode;
+					detachedResult.error = detachedResult.error ? `${detachedResult.error}\nNested descendants did not reach a proven terminal state; inherited capability retained for recovery.` : "Nested descendants did not reach a proven terminal state; inherited capability retained for recovery.";
+				}
+			}
+			if (detachedResult.teardownUnproven) releaseCapability = false;
 			if (isolatedRuntime && isolatedWorktree && !isolatedRuntime.isExported(isolatedWorktree.index) && !detachedResult.teardownUnproven) {
 				const fence = await waitForNestedDescendantsToStop(data.nestedRoute, runId, 0, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
 				if (!fence.stopped) {
+					releaseCapability = false;
 					isolatedRuntime.markExportFenceFailed();
 					detachedResult.teardownUnproven = true;
+					detachedResult.success = false;
+					delete detachedResult.interrupted;
+					delete detachedResult.cancelled;
 					const recovery = `Nested descendants did not reach a proven terminal state before export; recover isolated worktree at ${isolatedRuntime.root}`;
 					detachedResult.exitCode = detachedResult.exitCode === 0 ? 1 : detachedResult.exitCode;
 					detachedResult.error = detachedResult.error ? `${detachedResult.error}\n${recovery}` : recovery;
@@ -3676,7 +3924,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 							agent: params.agent,
 							commitRequired: isolatedGitCommitRequired(task, agentConfig, sandbox),
 						});
-						detachedResult.gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+						detachedResult.gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
 						if (bundle.incomplete && isolatedGitCommitRequired(task, agentConfig, sandbox) && !detachedResult.error) {
 							detachedResult.exitCode = 1;
 							detachedResult.error = "Isolated writer completed without a required authored commit; recovery bundle is incomplete.";
@@ -3690,7 +3938,18 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 						detachedResult.error = detachedResult.error ? `${detachedResult.error}\n${exportError}` : exportError;
 					}
 				}
-				if (isolatedRuntime.isExported(isolatedWorktree.index) && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed) {
+				if (releaseCapability && isolatedCapability && isolatedWorktree) {
+					try {
+						isolatedWorktree.runtime.releaseInheritedContext(isolatedCapability);
+					} catch (error) {
+						isolatedWorktree.runtime.markExportFenceFailed();
+						detachedResult.teardownUnproven = true;
+						detachedResult.exitCode = detachedResult.exitCode === 0 ? 1 : detachedResult.exitCode;
+						const detail = error instanceof Error ? error.message : String(error);
+						detachedResult.error = detachedResult.error ? `${detachedResult.error}\nCapability release was not proven: ${detail}` : `Capability release was not proven: ${detail}`;
+					}
+				}
+				if (isolatedRuntime.isExported(isolatedWorktree.index) && !isolatedRuntime.exportFailed && !isolatedRuntime.exportFenceFailed && !detachedResult.teardownUnproven) {
 					try { await cleanupIsolatedGitRuntime(isolatedRuntime); }
 					catch (cleanupError) { noteSingleCleanupFailure(detachedResult, cleanupError); }
 					if (isolatedRuntime.exportFailed || fs.existsSync(isolatedRuntime.root)) {
@@ -3702,6 +3961,21 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 						detachedResult.error = detachedResult.error ? `${detachedResult.error}\n${cleanupError}` : cleanupError;
 					}
 				}
+			}
+
+			if (detachedResult.teardownUnproven) {
+				// Keep the actionable recovery projection, but suppress terminal
+				// detached publication when release or descendant termination was not
+				// proven.
+				rememberForegroundRun(deps.state, {
+					runId,
+					mode: "single",
+					cwd: effectiveCwd,
+					sessionId: deps.state.currentSessionId,
+					results: [detachedResult],
+					...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
+				});
+				return;
 			}
 			const terminalDetails = compactForegroundDetails({
 				mode: "single",
@@ -3722,7 +3996,6 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				content: [{ type: "text", text: detachedResult.error || getSingleResultOutput(detachedResult) || "(no output)" }],
 				details: terminalDetails,
 			});
-			if (detachedResult.teardownUnproven) return;
 			await emitForegroundResultIntercom({
 				pi: deps.pi,
 				intercomBridge: data.intercomBridge,
@@ -3745,12 +4018,58 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		acceptanceContext: { mode: "single" },
 		sandbox,
 		isolatedGit: isolatedWorktree,
+		isolatedGitCapability: isolatedCapability,
+		isolatedGitEndpoint: data.scopedGitEndpoint,
+		isolatedGitRights: data.scopedGitEndpoint ? (isolatedGitCommitRequired(task, agentConfig, sandbox) ? "writer" : "read-only") : undefined,
 		isolatedGitBundleDir: artifactsDir,
 		isolatedGitCommitRequired: Boolean(isolatedWorktree) && isolatedGitCommitRequired(task, agentConfig, sandbox),
+		isolatedGitOwner: true,
 		sandboxIntercomBridge: resolveSandboxIntercomBridge(data.intercomBridge),
-		}).finally(() => {
-			unregisterForegroundInterrupt();
-		});
+		}).then(async (settled) => {
+			r = settled;
+			if (data.scopedGitEndpoint && !settled.detached && !settled.teardownUnproven) {
+				const fence = await (deps.teardownHooks?.waitForNestedDescendantsToStop ?? waitForNestedDescendantsToStop)(data.nestedRoute, runId, 0, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
+				if (!fence.observed || !fence.stopped) {
+					settled.teardownUnproven = true;
+					settled.success = false;
+					delete settled.interrupted;
+					delete settled.cancelled;
+					settled.exitCode = settled.exitCode === 0 ? 1 : settled.exitCode;
+					const message = "Nested descendants did not reach a proven terminal state before scoped Git endpoint cleanup; recover retained isolated worktree evidence through the owning parent run";
+					settled.error = settled.error ? `${settled.error}\\n${message}` : message;
+				}
+			}
+			if (isolatedCapability && !settled.detached && isolatedWorktree) {
+				if (settled.teardownUnproven) {
+					isolatedWorktree.runtime.markExportFenceFailed();
+				} else {
+					const fence = await waitForNestedDescendantsToStop(data.nestedRoute, runId, 0, { timeoutMs: nestedFenceTimeoutForExecutor(deps) });
+					if (fence.stopped) {
+						try {
+							isolatedWorktree.runtime.releaseInheritedContext(isolatedCapability);
+						} catch (error) {
+							isolatedWorktree.runtime.markExportFenceFailed();
+							settled.teardownUnproven = true;
+							settled.success = false;
+							delete settled.interrupted;
+							delete settled.cancelled;
+							settled.exitCode = settled.exitCode === 0 ? 1 : settled.exitCode;
+							const detail = error instanceof Error ? error.message : String(error);
+							settled.error = settled.error ? `${settled.error}\\nCapability release was not proven: ${detail}` : `Capability release was not proven: ${detail}`;
+						}
+					} else {
+						isolatedWorktree.runtime.markExportFenceFailed();
+						settled.teardownUnproven = true;
+						settled.success = false;
+						delete settled.interrupted;
+						delete settled.cancelled;
+						settled.exitCode = settled.exitCode === 0 ? 1 : settled.exitCode;
+						settled.error = settled.error ? `${settled.error}\\nNested descendants did not reach a proven terminal state; inherited capability retained for recovery.` : "Nested descendants did not reach a proven terminal state; inherited capability retained for recovery.";
+					}
+				}
+			}
+			return settled;
+		}).finally(() => unregisterForegroundInterrupt());
 	} catch (error) {
 		unregisterForegroundInterrupt();
 		const executionMessage = `Foreground execution rejected: ${error instanceof Error ? error.message : String(error)}`;
@@ -3770,7 +4089,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 						agent: params.agent,
 						commitRequired: isolatedGitCommitRequired(task, agentConfig, sandbox),
 					});
-					gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
+					gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
 				} catch (exportError) {
 					isolatedRuntime.markExportFailed();
 					recovery = `Isolated Git bundle export failed; recover worktree at ${isolatedRuntime.root}: ${exportError instanceof Error ? exportError.message : String(exportError)}`;
@@ -3886,6 +4205,14 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		...(foregroundControl?.nestedChildren?.length ? { nestedChildren: foregroundControl.nestedChildren } : {}),
 	});
 
+	if (r.teardownUnproven) {
+		return {
+			content: [{ type: "text", text: r.error || "Terminal cleanup remains unproven; recover the retained isolated worktree." }],
+			details,
+			isError: true,
+		};
+	}
+
 	if (!r.detached) {
 		if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
 		const intercomReceipt = await maybeBuildForegroundIntercomReceipt({
@@ -3952,6 +4279,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		deps.state.foregroundRuns ??= new Map();
 		deps.state.foregroundControls ??= new Map();
 		deps.state.lastForegroundControlId ??= null;
+		let preAuthenticatedEndpoint: ScopedGitEndpointDescriptor | undefined;
+		const rawEndpoint = process.env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV];
+		if (rawEndpoint) { try { preAuthenticatedEndpoint = JSON.parse(rawEndpoint) as ScopedGitEndpointDescriptor; } catch (error) { return { content: [{ type: "text", text: `Scoped Git endpoint descriptor is malformed: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "single", results: [] } }; } }
 		const requestCwd = resolveRequestedCwd(ctx.cwd, params.cwd);
 		const paramsWithResolvedCwd = params.cwd === undefined ? params : { ...params, cwd: requestCwd };
 		if (params.action) {
@@ -4125,6 +4455,20 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		});
 		const runId = randomUUID().slice(0, 8);
 		const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
+		let scopedGitEndpoint: ScopedGitEndpointDescriptor | undefined = effectiveParams.isolatedGitEndpoint ?? preAuthenticatedEndpoint;
+		if (scopedGitEndpoint) {
+			const relativeSubtree = scopedGitEndpoint.relativeSubtree;
+			if (typeof relativeSubtree !== "string" || !relativeSubtree || path.isAbsolute(relativeSubtree) || relativeSubtree.split(/[\\/]/u).some((part) => part === "..")) {
+				return { content: [{ type: "text", text: "Scoped Git endpoint descriptor rejected: invalid scoped endpoint descriptor" }], isError: true, details: { mode: "single", results: [] } };
+			}
+		}
+		if (scopedGitEndpoint) {
+			try {
+				await validateScopedGitChildDescriptor(scopedGitEndpoint, { cwd: effectiveCwd, rights: effectiveParams.isolatedGitRights ?? "writer" });
+			} catch (error) {
+				return { content: [{ type: "text", text: `Scoped Git endpoint preflight rejected: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "single", results: [] } };
+			}
+		}
 		const nestedParentAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
 		const nestedRoute = inheritedNestedRoute ?? createNestedRoute(runId);
 		const shareEnabled = effectiveParams.share === true;
@@ -4145,7 +4489,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const orchestratorInlineLoopLaunch = isOrchestratorNestedLaunch(nestedLaunchContext, isOrchestratorInlineLoopAgentName);
 
 		// The orchestrator must consume explore/work/review results before it can
-		// construct the next handoff. An ambient async default must not detach these
+		// reserve the next scoped stage. An ambient async default must not detach these
 		// omitted-async loop calls; an explicit async value still wins.
 		const requestedAsync = orchestratorInlineLoopLaunch && effectiveParams.async === undefined
 			? false
@@ -4285,6 +4629,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			intercomBridge,
 			nestedRoute,
 			inheritedNestedRoute,
+			scopedGitEndpoint,
 		};
 
 		const foregroundMode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
@@ -4306,6 +4651,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				currentAgent: undefined,
 				currentIndex: undefined,
 				currentActivityState: undefined,
+				currentModel: foregroundChildren[0]?.model,
 				nestedRoute,
 				interrupt: undefined,
 			};
@@ -4510,7 +4856,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 
 		let nestedForegroundStarted = false;
 		try {
-			const asyncResult = runAsyncPath(execData, deps);
+			const asyncResult = await runAsyncPath(execData, deps);
 			if (asyncResult) return withForkContext(withPreflightSummary(asyncResult), effectiveParams.context);
 			if (foregroundControl) {
 				writeNestedForegroundEvent("subagent.nested.started");

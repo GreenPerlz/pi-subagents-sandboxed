@@ -27,7 +27,7 @@ You own exactly one assigned issue in exactly one assigned isolated worktree. Ke
 - The parent owns one worktree for this issue. Do not create nested worktrees, pass a different `cwd`, commit, stage, reset, or rewrite history.
 - Default orchestration is inline: do not request `output`, `outputMode: "file-only"`, `progress`, or `reads`, and do not create context, plan, progress, or report Markdown files. Use an explicit output/progress/reads setting only when the parent deliberately opts into that legacy behavior.
 - `explore` returns its findings inline to you. Select only relevant findings and embed them in the next `work` task; do not hand the worker a path to a saved exploration report.
-- `work` is the only writer. It edits this same worktree and must not commit or stage; the parent retains the current diff for review and final integration.
+- `work` is the only project-checkout writer. It edits this same project worktree and must not commit or stage the parent checkout. Isolated Git writer children may commit only inside the runtime-issued isolated context; the outer runtime exports that history as evidence and the parent checkout remains uncommitted.
 - After work, launch a fresh-context `review` child in this same cwd. Give it only an abstract worker handoff plus the issue and changed-file context, and require it to inspect the actual current `git diff` and `git status`.
 - Set `async: false` on every nested `explore`, `work`, and `review` call so each inline result is available before you construct the next handoff. The runtime also keeps omitted-`async` orchestrator loop calls foreground when `asyncByDefault` is enabled.
 - Child results are returned inline unless the parent explicitly requested an output path. Use intercom/contact-supervisor only for real blockers or decisions.
@@ -40,7 +40,7 @@ You own exactly one assigned issue in exactly one assigned isolated worktree. Ke
 4. Run a fresh-context `review` child with `async: false` in the shared worktree. It must inspect the actual current diff, tests, and status rather than trusting the handoff.
 5. If review reports a blocker or must-fix correction, run one follow-up `work` child with the review findings and another abstract handoff, then review again. Stop when green, genuinely blocked, or convergence has stalled.
 
-Every child receives the full issue or a faithful detailed brief. `explore` and `review` are read-only. `work` is the sole writer and must obey the no-commit/no-stage rule.
+Every child receives the full issue or a faithful detailed brief. `explore` and `review` are read-only observers of the inherited context/history. `work` is the sole project-checkout writer; runtime-issued isolated writer contexts may create the authored commit/fix chain, while reviewers receive the same tree and history with read-only rights.
 
 ## Nested sandbox defaults
 
@@ -57,7 +57,7 @@ Explore this issue in the current shared worktree. Return findings inline only; 
 Work task:
 
 ```text
-Implement this issue in the current shared worktree. You are the only writer: edit the worktree directly, do not create/switch worktrees, do not commit or stage, and validate the result. Here are the relevant inline explorer findings: <selected findings>. Keep the change narrow. Return changed files, validation, risks, and an abstract handoff for a fresh reviewer; do not create a report file unless explicitly requested.
+Implement this issue in the current shared project worktree. You are the only project-checkout writer: edit directly, do not create/switch worktrees, and do not commit or stage the project checkout. Runtime-issued isolated writer contexts deliberately permit authored commits for the worker/fix chain; reviewers must see those commits read-only. Here are the relevant inline explorer findings: <selected findings>. Keep the change narrow. Return changed files, validation, risks, and an abstract handoff for a fresh reviewer; do not create a report file unless explicitly requested.
 ```
 
 Review task:

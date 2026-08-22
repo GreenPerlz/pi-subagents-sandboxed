@@ -248,7 +248,7 @@ export function createResultWatcher(
 			if (topLevelFailure && normalizedChildren.length > 0 && !childFailure) {
 				// Group diagnostics are unindexed aggregate records; project a
 				// top-level lifecycle failure onto the first canonical child instead.
-				const canonical = normalizedChildren.find((child) => !child.groupId) ?? normalizedChildren[0];
+				const canonical = normalizedChildren.find((child) => !child.groupId && !child.unindexed);
 				if (canonical) canonical.status = "failed";
 			}
 			const observedFailure = aggregateState === "failed";
@@ -367,6 +367,11 @@ export function createResultWatcher(
 			state.watcherRestartTimer = null;
 		}
 		try {
+			// Async launch and watcher startup race: the detached runner may create
+			// the result root only after this call. Ensure the watch target exists
+			// before fs.watch so the first result cannot be missed or leave a noisy
+			// ENOENT handle behind.
+			fsApi.mkdirSync(resultsDir, { recursive: true });
 			state.watcher = fsApi.watch(resultsDir, (ev, file) => {
 				if (ev !== "rename" || !file) return;
 				const resultFile = resolveResultFileFromWatchEvent(file.toString());

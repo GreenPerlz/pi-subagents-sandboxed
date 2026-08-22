@@ -832,7 +832,10 @@ export async function waitForNestedDescendantsToStop(
 	parentStepIndex?: number,
 	options: { timeoutMs?: number; pollMs?: number } = {},
 ): Promise<{ observed: boolean; stopped: boolean }> {
-	if (!route) return { observed: false, stopped: true };
+	// No route means no nested authority was issued, so absence is itself a
+	// proven terminal state. When a route exists, one successful projection is
+	// observation even if every descendant was already terminal on first poll.
+	if (!route) return { observed: true, stopped: true };
 	const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs !== undefined && options.timeoutMs >= 0 ? options.timeoutMs : 30_000;
 	const pollMs = Number.isFinite(options.pollMs) && options.pollMs !== undefined && options.pollMs > 0 ? options.pollMs : 25;
 	const deadline = Date.now() + timeoutMs;
@@ -841,6 +844,7 @@ export async function waitForNestedDescendantsToStop(
 		let live = false;
 		try {
 			const registry = projectNestedEvents(route);
+			observed = true;
 			live = hasLiveNestedDescendantsForParent(registry.children, parentRunId, parentStepIndex);
 		} catch {
 			// A malformed or unavailable route cannot prove termination. Keep the

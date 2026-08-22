@@ -534,6 +534,27 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, intercomStateDir), undefined);
 	});
 
+	it("expands tilde before rejecting protected read-only and writable mounts", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const protectedRoot = path.join(os.homedir(), `pi-protected-mount-${process.pid}-${Date.now()}`);
+		tempRoots.push(protectedRoot);
+		mkdirp(protectedRoot);
+		for (const mode of ["ro", "rw"] as const) {
+			const candidate = path.join(protectedRoot, mode, "resource");
+			mkdirp(path.dirname(candidate));
+			assert.throws(
+				() => buildSubagentSandboxMounts({
+					cwd,
+					includeCwd: false,
+					protectedGitPaths: [`~/${path.relative(os.homedir(), protectedRoot)}`],
+					...(mode === "ro" ? { extraReadOnlyMounts: [`~/${path.relative(os.homedir(), candidate)}`] } : { extraWritableMounts: [`~/${path.relative(os.homedir(), candidate)}`] }),
+				}),
+				/overlaps protected Git metadata/i,
+			);
+		}
+	});
+
 	it("mounts nested subagent event route root writable when nested routing is provided", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));

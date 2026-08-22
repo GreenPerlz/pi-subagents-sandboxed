@@ -428,6 +428,8 @@ export interface GitBundleResult {
 	base: string;
 	head: string;
 	commitSummary: string;
+	/** Authored commit IDs/summaries; runtime recovery commits are excluded. */
+	commits?: Array<{ id: string; subject: string; author: string }>;
 	recovery?: string;
 	stagedSnapshot?: string;
 	stagedTree?: string;
@@ -941,14 +943,22 @@ export interface RunSyncOptions {
 	modelOverride?: string;
 	/** Request the provider priority service tier; eligibility is evaluated per candidate. */
 	fastMode?: boolean;
-	/** Runtime-managed isolated Git worktree. Isolated mode never infers this from a path. */
+	/** Runtime-managed isolated Git worktree, retained for export and teardown identity. */
 	isolatedGit?: import("../sandbox/isolated-git.ts").IsolatedGitWorktree;
+	/** Foreground nested scoped endpoint descriptor. */
+	isolatedGitEndpoint?: import("../sandbox/isolated-git.ts").ScopedGitEndpointDescriptor;
+	/** Runtime-issued authority used to construct the child invocation. */
+	isolatedGitCapability?: import("../sandbox/isolated-git.ts").IsolatedGitCapability;
+	/** Resolved endpoint rights; authority comes from the scoped descriptor. */
+	isolatedGitRights?: "read-only" | "writer";
 	/** Destination for the terminal isolated Git bundle. */
 	isolatedGitBundleDir?: string;
 	/** Isolated writer semantics require an authored child commit. */
 	isolatedGitCommitRequired?: boolean;
 	/** Internal continuation guard: finalization turns must not export twice. */
 	exportIsolatedGitBundle?: boolean;
+	/** Explicit lifecycle ownership; inherited descendants are non-owning. */
+	isolatedGitOwner?: boolean;
 	/** Registry models available for heuristic bare-model resolution and provider trust checks. */
 	availableModels?: Array<{ provider: string; id: string; fullId: string; api?: string; baseUrl?: string }>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */

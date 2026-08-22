@@ -601,9 +601,23 @@ describe("nested descendant termination fence", () => {
 		try {
 			const started = Date.now();
 			const result = await waitForNestedDescendantsToStop(route, route.rootRunId, 0, { timeoutMs: 1_000, pollMs: 10 });
-			assert.equal(result.observed, false);
+			assert.equal(result.observed, true);
 			assert.equal(result.stopped, true);
 			assert.ok(Date.now() - started < 100, "an empty route should not wait for the timeout");
+		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("accepts a descendant that is already terminal on the first projection", async () => {
+		const route = createNestedRoute("nested-fence-terminal-first");
+		try {
+			writeNestedEvent(route, { type: "subagent.nested.completed", ts: Date.now(), parentRunId: route.rootRunId, parentStepIndex: 0, child: {
+				id: "nested-fence-terminal-child", parentRunId: route.rootRunId, parentStepIndex: 0, depth: 1,
+				path: [{ runId: route.rootRunId, stepIndex: 0 }], state: "complete", agent: "worker",
+			} });
+			const result = await waitForNestedDescendantsToStop(route, route.rootRunId, 0, { timeoutMs: 100, pollMs: 5 });
+			assert.deepEqual(result, { observed: true, stopped: true });
 		} finally {
 			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 		}

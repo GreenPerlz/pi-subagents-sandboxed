@@ -696,7 +696,12 @@ function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
 				if (raw.uid !== identity.uid) throw new Error("Nested route lock belongs to another user.");
 				const observed = linuxStartToken(raw.pid as number); if (!observed) throw new Error("Nested route lock identity cannot be proven exactly.");
 				stale = observed !== raw.startToken;
-			} catch (lockError) { throw lockError instanceof Error ? lockError : new Error(String(lockError)); }
+			} catch (lockError) {
+				// The owner may have released between EEXIST and inspection.
+				// Treat that narrow race as contention, never as a dropped record.
+				if ((lockError as NodeJS.ErrnoException).code === "ENOENT") { continue; }
+				throw lockError instanceof Error ? lockError : new Error(String(lockError));
+			}
 			if (stale) { try { fs.rmSync(lock, { recursive: true, force: false }); } catch { /* another contender won */ } continue; }
 			// A live owner gets bounded backoff rather than dropping a journal
 			// operation immediately.

@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import type { ForegroundResumeChild, GitBundleResult, NestedRunSummary, SubagentRunMode } from "../../shared/types.ts";
+import type { ForegroundResumeChild, GitBundleResult, NestedRouteInfo, NestedRunSummary, SubagentRunMode } from "../../shared/types.ts";
+import { validateNestedRouteForRevival } from "../shared/nested-events.ts";
 import type { FastModeStatus } from "../../shared/fast-mode.ts";
 
 export type PersistedForegroundState = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
@@ -58,6 +59,7 @@ export interface PersistedForegroundStatus {
 	groupDiagnostics?: Array<{ groupId: string; unindexed: true; agent: string; status: string; output?: string; error?: string; finalOutput?: string }>;
 	teardownUnproven?: boolean;
 	nestedChildren?: NestedRunSummary[];
+	nestedRoute?: NestedRouteInfo;
 	statusFile?: string;
 }
 
@@ -84,6 +86,13 @@ function readPersistedForegroundStatus(statusFile: string): PersistedForegroundS
 	try {
 		const raw = JSON.parse(fs.readFileSync(statusFile, "utf-8")) as Partial<PersistedForegroundStatus>;
 		if (!raw.runId || !raw.mode || !raw.state || typeof raw.updatedAt !== "number") return undefined;
+		let nestedRoute: PersistedForegroundStatus["nestedRoute"];
+		try {
+			if (raw.nestedRoute) nestedRoute = validateNestedRouteForRevival(raw.nestedRoute);
+		} catch {
+			// Keep the foreground record visible, but fail closed for the
+			// unauthenticated nested projection.
+		}
 		return {
 			runId: raw.runId,
 			...(raw.sessionId ? { sessionId: raw.sessionId } : {}),
@@ -100,6 +109,7 @@ function readPersistedForegroundStatus(statusFile: string): PersistedForegroundS
 			...(Array.isArray(raw.groupDiagnostics) ? { groupDiagnostics: raw.groupDiagnostics } : {}),
 			...(raw.teardownUnproven === true ? { teardownUnproven: true } : {}),
 			...(Array.isArray(raw.nestedChildren) ? { nestedChildren: raw.nestedChildren } : {}),
+			...(nestedRoute ? { nestedRoute } : {}),
 			statusFile,
 		};
 	} catch {

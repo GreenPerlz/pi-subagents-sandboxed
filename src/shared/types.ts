@@ -825,6 +825,7 @@ export interface ForegroundResumeRun {
 	children: ForegroundResumeChild[];
 	teardownUnproven?: boolean;
 	nestedChildren?: NestedRunSummary[];
+	nestedRoute?: NestedRouteInfo;
 }
 
 export interface SubagentState {

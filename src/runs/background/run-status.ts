@@ -13,7 +13,7 @@ import { resolveSubagentRunId } from "./run-id-resolver.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
 import { isExpectedAsyncRunnerPid } from "./pid-identity.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedRegistryForRoot, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, mergeNestedRunSnapshots, projectNestedEvents, resolveExactNestedRoute, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 
 interface RunStatusParams {
 	action?: "status";
@@ -209,14 +209,18 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			let nestedChildren: NestedRunSummary[] = [];
 			let nestedWarning: string | undefined;
 			try {
-				const nestedRoute = findNestedRouteForRootId(status.runId);
+				// Prefer the exact persisted route. Ambient root lookup is only used
+				// when no route metadata was persisted; mismatches fail closed.
+				const nestedRoute = resolveExactNestedRoute(status.runId, status.nestedRoute);
 				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, {
 					resultsDir,
 					kill: deps.kill,
 					now: deps.now,
 					isExpectedAsyncRunnerPid: deps.isExpectedAsyncRunnerPid,
 				});
-				nestedChildren = projectNestedRegistryForRoot(status.runId)?.children ?? [];
+				const persistedChildren = (status.steps ?? []).flatMap((step) => step.children ?? []);
+				const routeChildren = nestedRoute ? projectNestedEvents(nestedRoute).children : [];
+				nestedChildren = mergeNestedRunSnapshots(persistedChildren, routeChildren);
 				attachRootChildrenToSteps(status.runId, status.steps, nestedChildren);
 			} catch (error) {
 				nestedWarning = `Nested status unavailable: ${error instanceof Error ? error.message : String(error)}`;

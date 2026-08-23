@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { listAsyncRuns, formatAsyncRunOutputPath, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { listPersistedForegroundRuns, type PersistedForegroundStatus } from "../runs/foreground/foreground-status.ts";
-import { updateForegroundNestedProjection } from "../runs/shared/nested-events.ts";
+import { mergeNestedRunSnapshots, projectNestedEvents, resolveExactNestedRoute, updateForegroundNestedProjection } from "../runs/shared/nested-events.ts";
 import {
 	ASYNC_DIR,
 	FOREGROUND_DIR,
@@ -785,7 +785,15 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 			: [];
 	const groupDiagnostics = children.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
 	const indexedChildren = children.filter((child) => !("groupId" in child && child.groupId) && !("unindexed" in child && child.unindexed)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
-	const nestedChildren = (status.nestedChildren ?? []).map((nested) => mapNestedRunWithStaleState(nested, staleState, status.updatedAt));
+	let persistedNestedChildren = status.nestedChildren ?? [];
+	try {
+		const route = resolveExactNestedRoute(status.runId, status.nestedRoute);
+		if (route) persistedNestedChildren = mergeNestedRunSnapshots(persistedNestedChildren, projectNestedEvents(route).children);
+	} catch {
+		// A mismatched route is fail-closed: do not trust route-bound children.
+		if (status.nestedRoute) persistedNestedChildren = [];
+	}
+	const nestedChildren = persistedNestedChildren.map((nested) => mapNestedRunWithStaleState(nested, staleState, status.updatedAt));
 	const sourceChild = indexedChildren.find((child) => child.model);
 	const runModel = sourceChild?.model;
 	const runThinking = sourceChild?.thinking;
@@ -805,7 +813,7 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		gitBundle: child.gitBundle,
 		sessionFile: child.sessionFile,
 		artifactPath: child.artifactPath,
-		children: nestedChildren.filter((nested) => status.nestedChildren?.find((raw) => raw.id === nested.id)?.parentStepIndex === index),
+		children: nestedChildren.filter((nested) => persistedNestedChildren.find((raw) => raw.id === nested.id)?.parentStepIndex === index),
 	}));
 	const attachedIds = new Set(steps.flatMap((step) => step.children.map((child) => child.id)));
 	const unattached = nestedChildren.filter((child) => !attachedIds.has(child.id));
@@ -953,14 +961,21 @@ function collectPersistedAsyncRuns(state: SubagentState, now: number, options: C
 	const resultById = new Map(resultRecords.map((record) => [record.id, record]));
 
 	for (const run of persistedStatusRuns) {
-		if (liveIds.has(run.id) || seenIds.has(run.id)) continue;
+		if (seenIds.has(run.id)) continue;
+		const live = state.asyncJobs.get(run.id);
+		// A detached in-memory record can lag the durable status file. Prefer
+		// the fresher persisted projection so newly observed children are not
+		// hidden by an old process-local snapshot.
+		if (liveIds.has(run.id) && (run.lastUpdate ?? run.endedAt ?? run.startedAt) <= (live?.updatedAt ?? live?.startedAt ?? 0)) continue;
 		runs.push(overlayRunFromPersistedStatus(run, resultById.get(run.id), now));
 		seenIds.add(run.id);
 		if (runs.length >= limit) return runs;
 	}
 
 	for (const result of resultRecords) {
-		if (liveIds.has(result.id) || seenIds.has(result.id)) continue;
+		if (seenIds.has(result.id)) continue;
+		const live = state.asyncJobs.get(result.id);
+		if (liveIds.has(result.id) && (result.updatedAt ?? 0) <= (live?.updatedAt ?? live?.startedAt ?? 0)) continue;
 		runs.push(overlayRunFromPersistedResult(result));
 		seenIds.add(result.id);
 		if (runs.length >= limit) break;
@@ -978,12 +993,14 @@ function collectPersistedAsyncRuns(state: SubagentState, now: number, options: C
  * list of top-level runs with nested children represented in a tree.
  */
 export function collectRunTree(state: SubagentState, now = Date.now(), options: CollectRunTreeOptions = {}): OverlayRun[] {
+	const persistedAsyncRuns = collectPersistedAsyncRuns(state, now, options);
+	const persistedAsyncIds = new Set(persistedAsyncRuns.map((run) => run.id));
 	const runs: OverlayRun[] = [
 		...collectForegroundRuns(state, now),
 		...collectFinishedForegroundRuns(state, now),
 		...collectPersistedForegroundRuns(state, now, options),
-		...collectAsyncRuns(state, now),
-		...collectPersistedAsyncRuns(state, now, options),
+		...collectAsyncRuns(state, now).filter((run) => !persistedAsyncIds.has(run.id)),
+		...persistedAsyncRuns,
 	];
 	runs.sort((a, b) => {
 		const startDiff = (b.startedAt ?? 0) - (a.startedAt ?? 0);

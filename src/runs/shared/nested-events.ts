@@ -466,20 +466,38 @@ function mergeSummary(existing: NestedRunSummary | undefined, event: NestedEvent
 
 function attachChild(children: NestedRunSummary[], event: NestedEventRecord): NestedRunSummary[] {
 	let updated = false;
-	const walk = (items: NestedRunSummary[]): NestedRunSummary[] => items.map((item) => {
-		if (item.id === event.parentRunId) {
-			const existingChildren = item.children ?? [];
-			const childIndex = existingChildren.findIndex((child) => child.id === event.child.id);
-			const nextChild = mergeSummary(childIndex >= 0 ? existingChildren[childIndex] : undefined, event);
-			const nextChildren = childIndex >= 0
-				? existingChildren.map((child, index) => index === childIndex ? nextChild : child)
-				: [...existingChildren, nextChild];
-			updated = true;
-			return { ...item, children: nextChildren.slice(0, MAX_CHILDREN), lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
+	const addToParent = (item: NestedRunSummary): NestedRunSummary => {
+		const nextChild = mergeSummary(undefined, event);
+		const stepIndex = event.parentStepIndex;
+		if (stepIndex !== undefined && item.steps?.[stepIndex]) {
+			const step = item.steps[stepIndex];
+			const existing = step.children ?? [];
+			const childIndex = existing.findIndex((child) => child.id === event.child.id);
+			const legacyExisting = item.children?.find((child) => child.id === event.child.id);
+			const merged = mergeSummary(childIndex >= 0 ? existing[childIndex] : legacyExisting, event);
+			const stepChildren = childIndex >= 0
+				? existing.map((child, index) => index === childIndex ? merged : child)
+				: [...existing, merged];
+			// A child routed to a known launching step must not also be rendered
+			// through the legacy direct-children slot.
+			const directChildren = (item.children ?? []).filter((child) => child.id !== event.child.id);
+			return { ...item, children: directChildren.length ? directChildren : undefined, steps: item.steps.map((candidate, index) => index === stepIndex ? { ...candidate, children: stepChildren.slice(0, MAX_CHILDREN) } : candidate), lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
 		}
-		if (!item.children?.length) return item;
-		const nextChildren = walk(item.children);
-		return nextChildren === item.children ? item : { ...item, children: nextChildren };
+		const existingChildren = item.children ?? [];
+		const childIndex = existingChildren.findIndex((child) => child.id === event.child.id);
+		const merged = mergeSummary(childIndex >= 0 ? existingChildren[childIndex] : undefined, event);
+		const nextChildren = childIndex >= 0
+			? existingChildren.map((child, index) => index === childIndex ? merged : child)
+			: [...existingChildren, nextChild];
+		return { ...item, children: nextChildren.slice(0, MAX_CHILDREN), lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
+	};
+	const walk = (items: NestedRunSummary[]): NestedRunSummary[] => items.map((item) => {
+		if (item.id === event.parentRunId) { updated = true; return addToParent(item); }
+		const nested = [ ...(item.children ?? []), ...(item.steps?.flatMap((step) => step.children ?? []) ?? []) ];
+		if (!nested.length) return item;
+		const nextChildren = item.children ? walk(item.children) : item.children;
+		const nextSteps = item.steps?.map((step) => step.children?.length ? { ...step, children: walk(step.children) } : step);
+		return nextChildren !== item.children || nextSteps !== item.steps ? { ...item, ...(nextChildren ? { children: nextChildren } : {}), ...(nextSteps ? { steps: nextSteps } : {}) } : item;
 	});
 	const next = walk(children);
 	if (updated) return next;
@@ -496,6 +514,63 @@ export function applyNestedEvent(registry: NestedRegistry, event: NestedEventRec
 		updatedAt: Math.max(registry.updatedAt, event.ts),
 		children: attachChild(registry.children, event),
 	};
+}
+
+function nestedTerminal(state: NestedRunState | undefined, teardownUnproven = false): boolean {
+	return !teardownUnproven && (state === "complete" || state === "failed" || state === "paused" || state === "cancelled");
+}
+
+function mergeNestedStepSnapshots(existing: NestedStepSummary | undefined, incoming: NestedStepSummary): NestedStepSummary {
+	if (!existing) return incoming;
+	const existingUpdate = existing.endedAt ?? existing.lastActivityAt ?? existing.startedAt ?? 0;
+	const incomingUpdate = incoming.endedAt ?? incoming.lastActivityAt ?? incoming.startedAt ?? 0;
+	const state = existing.teardownUnproven || incoming.teardownUnproven
+		? (incoming.teardownUnproven ? incoming.status : existing.status)
+		: nestedTerminal(existing.status) && !nestedTerminal(incoming.status) ? existing.status
+			: nestedTerminal(incoming.status) && !nestedTerminal(existing.status) ? incoming.status
+				: incomingUpdate >= existingUpdate ? incoming.status : existing.status;
+		return {
+			...existing,
+			...(incomingUpdate >= existingUpdate ? incoming : {}),
+			status: state,
+			...(existing.teardownUnproven || incoming.teardownUnproven ? { teardownUnproven: true } : {}),
+			...(existing.children || incoming.children ? { children: mergeNestedRunSnapshots(existing.children ?? [], incoming.children ?? []) } : {}),
+		};
+}
+
+/** Monotonic union used when a status snapshot and the durable route both exist.
+ * A stale snapshot may not erase children or terminal evidence already observed. */
+export function mergeNestedRunSnapshots(...snapshots: Array<NestedRunSummary[] | undefined>): NestedRunSummary[] {
+	const byId = new Map<string, NestedRunSummary>();
+	for (const snapshot of snapshots) for (const incoming of snapshot ?? []) {
+		const existing = byId.get(incoming.id);
+		if (!existing) { byId.set(incoming.id, incoming); continue; }
+		const existingUpdate = existing.lastUpdate ?? 0;
+		const incomingUpdate = incoming.lastUpdate ?? 0;
+		const state = existing.teardownUnproven || incoming.teardownUnproven
+			? (incoming.teardownUnproven ? incoming.state : existing.state)
+			: nestedTerminal(existing.state) && !nestedTerminal(incoming.state) ? existing.state
+				: nestedTerminal(incoming.state) && !nestedTerminal(existing.state) ? incoming.state
+					: incomingUpdate >= existingUpdate ? incoming.state : existing.state;
+		const steps = incoming.steps || existing.steps
+			? (incoming.steps ?? existing.steps ?? []).map((step, index) => mergeNestedStepSnapshots(existing.steps?.[index] ?? existing.steps?.find((candidate) => candidate.agent === step.agent), step))
+			: undefined;
+		const mergedSteps = existing.steps && incoming.steps && incoming.steps.length < existing.steps.length
+			? existing.steps.map((step, index) => mergeNestedStepSnapshots(step, incoming.steps?.[index] ?? step))
+			: steps;
+		const mergedChildren = mergeNestedRunSnapshots(existing.children, incoming.children);
+		const mergedStepChildren = mergedSteps?.flatMap((step) => step.children ?? []) ?? [];
+		const attachedIds = new Set(mergedStepChildren.map((child) => child.id));
+		byId.set(incoming.id, {
+			...existing,
+			...(incomingUpdate >= existingUpdate ? incoming : {}),
+			state,
+			...(existing.teardownUnproven || incoming.teardownUnproven ? { teardownUnproven: true } : {}),
+			...(mergedSteps ? { steps: mergedSteps } : {}),
+			...(mergedChildren.length || mergedStepChildren.length ? { children: mergedChildren.filter((child) => !attachedIds.has(child.id)) } : {}),
+		});
+	}
+	return [...byId.values()].slice(0, MAX_CHILDREN);
 }
 
 function parseControlRequest(content: string, route: NestedRoute): NestedControlRequestRecord | undefined {
@@ -530,6 +605,16 @@ export function findNestedRouteForRootId(rootRunId: string): NestedRoute | undef
 	return undefined;
 }
 export function projectNestedRegistryForRoot(rootRunId: string): NestedRegistry | undefined { const route = findNestedRouteForRootId(rootRunId); return route ? projectNestedEvents(route) : undefined; }
+
+/** Resolve persisted authority without silently substituting another root's route. */
+export function resolveExactNestedRoute(rootRunId: string, persisted?: NestedRouteInfo): NestedRoute | undefined {
+	// A persisted route is the authenticated authority even when the detached
+	// status filename/run id differs (legacy foreground and nested layouts can
+	// use a parent id in event records). Validation binds it to route.json and
+	// refuses forged coordinates; never substitute an ambient route on failure.
+	if (persisted) return validateNestedRouteForRevival(persisted);
+	return findNestedRouteForRootId(rootRunId);
+}
 export function findNestedRun(children: NestedRunSummary[] | undefined, id: string): NestedRunSummary | undefined {
 	for (const child of children ?? []) { if (child.id === id) return child; const nested = findNestedRun(child.children, id) ?? findNestedRun(child.steps?.flatMap((step) => step.children ?? []), id); if (nested) return nested; } return undefined;
 }
@@ -1128,14 +1213,14 @@ export function attachRootChildrenToSteps<T extends { children?: NestedRunSummar
 export function updateAsyncJobNestedProjection(job: AsyncJobState): void {
 	if (!job.nestedRoute) return;
 	const registry = projectNestedEvents(job.nestedRoute);
-	job.nestedChildren = registry.children;
-	attachRootChildrenToSteps(job.asyncId, job.steps, registry.children);
+	job.nestedChildren = mergeNestedRunSnapshots(job.nestedChildren, registry.children);
+	attachRootChildrenToSteps(job.asyncId, job.steps, job.nestedChildren);
 }
 
 export function updateForegroundNestedProjection(control: SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never): void {
 	if (!control.nestedRoute) return;
 	const registry = projectNestedEvents(control.nestedRoute);
-	control.nestedChildren = registry.children;
+	control.nestedChildren = mergeNestedRunSnapshots(control.nestedChildren, registry.children);
 }
 
 export function hasLiveNestedDescendants(children: NestedRunSummary[] | undefined): boolean {

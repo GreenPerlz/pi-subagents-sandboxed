@@ -18,6 +18,7 @@ import {
 	nestedSummaryFromAsyncStatus,
 	selectNestedChildrenForParent,
 	parseNestedEventRecords,
+	mergeNestedRunSnapshots,
 	projectNestedEvents,
 	resolveNestedParentAddressFromEnv,
 	resolveNestedRouteFromEnv,
@@ -213,6 +214,30 @@ describe("nested event parsing and projection", () => {
 		// Terminal observers must see the completed child, not the earlier running
 		// projection that was persisted before the detached callback finished.
 		assert.equal(control.nestedChildren?.[0]?.state, "complete");
+	});
+
+	it("attaches grandchildren to their exact launching step without duplicate direct rendering", () => {
+		const route = trackRoute();
+		writeNestedEvent(route, {
+			type: "subagent.nested.started", ts: 100, parentRunId: "root-run", parentStepIndex: 1,
+			child: { ...child("parent-child", "running", 100), steps: [{ agent: "nested-step", status: "running" }] },
+		});
+		writeNestedEvent(route, {
+			type: "subagent.nested.started", ts: 200, parentRunId: "parent-child", parentStepIndex: 0,
+			child: { ...child("grandchild", "running", 200, "parent-child"), parentStepIndex: 0, depth: 2, path: [{ runId: "root-run", stepIndex: 1 }, { runId: "parent-child", stepIndex: 0 }] },
+		});
+		const parent = projectNestedEvents(route).children[0];
+		assert.equal(parent?.children, undefined);
+		assert.equal(parent?.steps?.[0]?.children?.[0]?.id, "grandchild");
+		assert.equal(parent?.steps?.[0]?.children?.length, 1);
+	});
+
+	it("unions stale snapshots while retaining terminal and sibling evidence", () => {
+		const stale = [child("first", "running", 100), child("second", "running", 100)];
+		const fresh = [{ ...child("first", "complete", 200), teardownUnproven: false }];
+		const merged = mergeNestedRunSnapshots(stale, fresh);
+		assert.deepEqual(merged.map((item) => item.id), ["first", "second"]);
+		assert.equal(merged[0]?.state, "complete");
 	});
 
 	it("attaches root children to visible step slices by original step index", () => {

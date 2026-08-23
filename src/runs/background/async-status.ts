@@ -5,7 +5,7 @@ import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-
 import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode, type TokenUsage } from "../../shared/types.ts";
 import type { FastModeStatus } from "../../shared/fast-mode.ts";
 import { readStatus } from "../../shared/utils.ts";
-import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedEvents, projectNestedRegistryForRoot, readNestedRegistry } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, mergeNestedRunSnapshots, projectNestedEvents, readNestedRegistry, resolveExactNestedRoute } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
 import { isExpectedAsyncRunnerPid } from "./pid-identity.ts";
@@ -146,17 +146,16 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	const chainStepCount = status.chainStepCount ?? steps.length;
 	const parallelGroups = normalizeParallelGroups(status.parallelGroups, steps.length, chainStepCount);
 	let nestedChildren: NestedRunSummary[] = status.nestedChildren ?? [];
-	if (nestedChildren.length === 0 && nestedWarnings.length === 0) {
+	if (nestedWarnings.length === 0) {
 		try {
-			if (options?.readOnly) {
-				const route = status.nestedRoute ?? findNestedRouteForRootId(status.runId || path.basename(asyncDir));
-				nestedChildren = route ? readNestedRegistry(route).children : [];
-			} else {
-				nestedChildren = status.nestedRoute
-					? projectNestedEvents(status.nestedRoute).children
-					: projectNestedRegistryForRoot(status.runId || path.basename(asyncDir))?.children ?? [];
-			}
+			const rootRunId = status.runId || path.basename(asyncDir);
+			const route = resolveExactNestedRoute(rootRunId, status.nestedRoute);
+			const routeChildren = route ? (options?.readOnly ? readNestedRegistry(route).children : projectNestedEvents(route).children) : [];
+			// Status files can lag the event journal (and vice versa). Always take
+			// the monotonic union rather than letting a non-empty stale snapshot win.
+			nestedChildren = mergeNestedRunSnapshots(nestedChildren, routeChildren);
 		} catch (error) {
+			if (status.nestedRoute) nestedChildren = [];
 			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
 		}
 	}
@@ -306,7 +305,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		// itself because tests require orphan listing to stay side-effect-free.
 		if (reconciliation?.repaired) {
 			try {
-				const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
+				const nestedRoute = resolveExactNestedRoute(status.runId || path.basename(asyncDir), status.nestedRoute);
 				if (nestedRoute) {
 					reconcileNestedAsyncDescendants(nestedRoute, {
 						resultsDir: options.resultsDir,
@@ -323,7 +322,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		if (allowedStates && !allowedStates.has(status.state)) continue;
 		if (options.reconcile !== false && !reconciliation?.repaired) {
 			try {
-				const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
+				const nestedRoute = resolveExactNestedRoute(status.runId || path.basename(asyncDir), status.nestedRoute);
 				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, {
 					resultsDir: options.resultsDir,
 					kill: options.kill,

@@ -444,6 +444,7 @@ function persistForegroundStatus(input: {
 	currentTool?: string;
 	sessionFile?: string;
 	nestedChildren?: NestedRunSummary[];
+	nestedRoute?: NestedRouteInfo;
 	groupDiagnostics?: Details["groupDiagnostics"];
 	teardownUnproven?: boolean;
 	foregroundDirRoot?: string;
@@ -465,6 +466,7 @@ function persistForegroundStatus(input: {
 			...(input.groupDiagnostics?.length ? { groupDiagnostics: input.groupDiagnostics } : {}),
 			...(input.teardownUnproven ? { teardownUnproven: true } : {}),
 			...(input.nestedChildren?.length ? { nestedChildren: input.nestedChildren } : {}),
+			...(input.nestedRoute ? { nestedRoute: input.nestedRoute } : {}),
 		});
 	} catch {
 		// Foreground persistence should never fail the user-visible subagent run.
@@ -488,6 +490,7 @@ function rememberForegroundRun(state: SubagentState, input: { runId: string; mod
 	const children = foregroundChildrenFromResults([...input.results, ...diagnosticResults]);
 	const teardownUnproven = input.results.some((result) => result.teardownUnproven === true);
 	state.foregroundRuns ??= new Map();
+	const nestedRoute = state.foregroundControls.get(input.runId)?.nestedRoute;
 	state.foregroundRuns.set(input.runId, {
 		runId: input.runId,
 		mode: input.mode,
@@ -497,6 +500,7 @@ function rememberForegroundRun(state: SubagentState, input: { runId: string; mod
 		children,
 		...(teardownUnproven ? { teardownUnproven: true } : {}),
 		...(input.nestedChildren?.length ? { nestedChildren: input.nestedChildren } : {}),
+		...(nestedRoute ? { nestedRoute } : {}),
 	});
 	persistForegroundStatus({
 		runId: input.runId,
@@ -511,6 +515,7 @@ function rememberForegroundRun(state: SubagentState, input: { runId: string; mod
 		...(input.groupDiagnostics?.length ? { groupDiagnostics: input.groupDiagnostics } : {}),
 		sessionFile: children.find((child) => child.sessionFile)?.sessionFile,
 		...(input.nestedChildren?.length ? { nestedChildren: input.nestedChildren } : {}),
+		...(nestedRoute ? { nestedRoute } : {}),
 	});
 	while (state.foregroundRuns.size > 50) {
 		const oldest = [...state.foregroundRuns.values()].sort((left, right) => left.updatedAt - right.updatedAt)[0];

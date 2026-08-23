@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import registerFanoutChildSubagentExtension, { startNestedControlInboxListener } from "../../src/extension/fanout-child.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
-import { createNestedRoute, projectNestedEvents, readNestedControlRequests, readNestedControlResults, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { claimNestedControlRequest, createNestedRoute, projectNestedEvents, resetNestedJournalRuntime, readNestedControlRequests, readNestedControlResults, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import {
 	SUBAGENT_CHILD_AGENT_ENV,
 	SUBAGENT_CHILD_ENV,
@@ -887,6 +887,27 @@ describe("nested control routing", { concurrency: false }, () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("acknowledges a completed result after listener restart without replaying the side effect", async () => {
+		const route = createNestedRoute("root-completed-replay");
+		routeRoots.push(path.dirname(route.eventSink));
+		setNestedRouteEnv(route, "root-completed-replay");
+		process.env[SUBAGENT_CHILD_ENV] = "1";
+		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+		let sideEffects = 0;
+		const state = createState();
+		state.foregroundControls.set("replay-target", { runId: "replay-target", mode: "single", startedAt: 1, updatedAt: 1, interrupt() { sideEffects++; return true; } });
+		const request = { ts: 1, requestId: "completed-before-ack", targetRunId: "replay-target", action: "interrupt" as const };
+		writeNestedControlRequest(route, request);
+		assert.equal(claimNestedControlRequest(route, request.requestId), "new");
+		writeNestedControlResult(route, { ts: 2, requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "already interrupted" });
+		resetNestedJournalRuntime(route);
+		const timer = startNestedControlInboxListener({ events: { emit() {}, on() { return () => {}; } } } as any, state);
+		assert.ok(timer);
+		await waitFor(() => readNestedControlRequests(route).length === 0);
+		clearInterval(timer);
+		assert.equal(sideEffects, 0);
 	});
 
 	it("drains delayed resume controls sequentially in journal order", async () => {

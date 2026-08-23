@@ -3291,11 +3291,13 @@ process.exit(${exitCode});
 		});
 	});
 
-	it("passes fanout routing env only when builtin subagent is declared", async () => {
+	it("passes authenticated routing to every child while gating fanout authority", async () => {
 		const envKeys = [
 			SUBAGENT_FANOUT_CHILD_ENV,
 			SUBAGENT_PARENT_EVENT_SINK_ENV,
 			SUBAGENT_PARENT_CONTROL_INBOX_ENV,
+			SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
+			SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
 			SUBAGENT_PARENT_RUN_ID_ENV,
 			SUBAGENT_PARENT_CHILD_INDEX_ENV,
 		];
@@ -3303,6 +3305,8 @@ process.exit(${exitCode});
 		try {
 			process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] = "/tmp/inherited/events.jsonl";
 			process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = "/tmp/inherited/control";
+			process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = "inherited-root";
+			process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = "inherited-capability";
 			process.env[SUBAGENT_PARENT_RUN_ID_ENV] = "inherited-run";
 			process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "7";
 
@@ -3314,6 +3318,8 @@ process.exit(${exitCode});
 				PI_SUBAGENT_FANOUT_CHILD: "1",
 				PI_SUBAGENT_PARENT_EVENT_SINK: "/tmp/inherited/events.jsonl",
 				PI_SUBAGENT_PARENT_CONTROL_INBOX: "/tmp/inherited/control",
+				PI_SUBAGENT_PARENT_ROOT_RUN_ID: "inherited-root",
+				PI_SUBAGENT_PARENT_CAPABILITY_TOKEN: "inherited-capability",
 				PI_SUBAGENT_PARENT_RUN_ID: "fanout-run",
 				PI_SUBAGENT_PARENT_CHILD_INDEX: "2",
 			});
@@ -3324,10 +3330,12 @@ process.exit(${exitCode});
 			assert.equal(nonFanout.exitCode, 0);
 			assert.deepEqual(JSON.parse(nonFanout.finalOutput ?? "{}"), {
 				PI_SUBAGENT_FANOUT_CHILD: "0",
-				PI_SUBAGENT_PARENT_EVENT_SINK: "",
-				PI_SUBAGENT_PARENT_CONTROL_INBOX: "",
-				PI_SUBAGENT_PARENT_RUN_ID: "",
-				PI_SUBAGENT_PARENT_CHILD_INDEX: "",
+				PI_SUBAGENT_PARENT_EVENT_SINK: "/tmp/inherited/events.jsonl",
+				PI_SUBAGENT_PARENT_CONTROL_INBOX: "/tmp/inherited/control",
+				PI_SUBAGENT_PARENT_ROOT_RUN_ID: "inherited-root",
+				PI_SUBAGENT_PARENT_CAPABILITY_TOKEN: "inherited-capability",
+				PI_SUBAGENT_PARENT_RUN_ID: "non-fanout-run",
+				PI_SUBAGENT_PARENT_CHILD_INDEX: "0",
 			});
 		} finally {
 			for (const key of envKeys) {

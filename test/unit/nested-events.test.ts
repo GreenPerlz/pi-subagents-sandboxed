@@ -27,6 +27,7 @@ import {
 	waitForNestedDescendantsToStop,
 	writeNestedControlRequest,
 	writeNestedControlResult,
+	writeNestedEventJournalFixtureForTest,
 	writeNestedJournalFixtureForTest,
 	writeNestedEvent,
 	readNestedControlRequests,
@@ -767,7 +768,7 @@ describe("bounded journals and recovery seams", () => {
 
 	it("does not reread historical event frames after a 10k checkpoint", () => {
 		const route = trackRoute("bounded-events-10k");
-		for (let index = 0; index < 10_000; index++) writeNestedEvent(route, { type: "subagent.nested.updated", ts: index, parentRunId: route.rootRunId, child: child("event-child", "running", index) });
+		writeNestedEventJournalFixtureForTest(route, Array.from({ length: 10_000 }, (_, index) => ({ type: "subagent.nested.updated" as const, ts: index, parentRunId: route.rootRunId, child: child("event-child", "running", index) })));
 		projectNestedEvents(route);
 		resetNestedJournalWorkCounters();
 		projectNestedEvents(route);

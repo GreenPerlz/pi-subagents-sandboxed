@@ -1022,6 +1022,17 @@ export function writeNestedControlResult(route: NestedRoute, result: Omit<Nested
 	withRouteLock(route, () => { const runtime = runtimeFor(route); const state = runtime.state; reconcileWriterCursor(route, state, "result"); const prior = runtime.results.get(sanitized.requestId); if (prior) { if (JSON.stringify(prior) !== JSON.stringify(sanitized)) throw new Error("Conflicting nested control result for requestId."); return; } state.resultSequence++; state.resultWriteOffset += appendJournal(route, "result", sanitized, state.resultSequence); journalFault("append", "result"); runtime.results.set(sanitized.requestId, sanitized); appendIndex(route, "result", sanitized); writeState(route, state, "result"); if (statSize(journalPath(route, "result")) >= compactionThreshold() && state.resultReadOffset === state.resultWriteOffset) compactJournal(route, state, undefined, "result", runtime); });
 }
 
+/** Test-only durable event fixture seam: publishes a complete journal in one fsync batch. */
+export function writeNestedEventJournalFixtureForTest(route: NestedRoute, events: Array<Omit<NestedEventRecord, "rootRunId" | "capabilityToken">>): void {
+	validateRouteShape(route); assertTrustedRouteEntry(route.eventSink, "directory");
+	const records = events.map((event) => { const parsed = parseRecord(JSON.stringify({ ...event, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken }), route); if (!parsed) throw new Error("Invalid event fixture record."); return parsed; });
+	withRouteLock(route, () => {
+		const runtime = runtimeFor(route); const state = runtime.state; const file = journalPath(route, "event"); ensureJournal(file); const fd = fs.openSync(file, "a", 0o600); let offset = statSize(file); let sequence = state.eventSequence;
+		try { for (const record of records) { sequence++; const frame = makeFrame("event", sequence, record); fs.writeFileSync(fd, frame); offset += frame.length; } if (typeof fs.fdatasyncSync === "function") fs.fdatasyncSync(fd); else fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+		fsyncDirectory(routeRoot(route)); state.eventSequence = sequence; state.eventWriteOffset = offset; writeState(route, state, "event");
+	});
+}
+
 /** Test-only durable fixture seam: publishes a complete control/result journal
  * in one fsync batch so durability-reader benchmarks do not spend minutes
  * constructing historical evidence through individual production writes. */

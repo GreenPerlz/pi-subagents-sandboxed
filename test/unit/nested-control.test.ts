@@ -768,14 +768,17 @@ describe("nested control routing", { concurrency: false }, () => {
 		try {
 			const route = createNestedRun("nested-timeout");
 			const executor = createExecutor(stateWithNestedRoute(route));
-			setTimeout(() => {
-				const request = readNestedControlRequests(route)[0];
-				if (request) writeNestedControlResult(route, { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "late success" });
-			}, 1_200);
+			const lateResult = new Promise<void>((resolve) => setTimeout(() => {
+				try {
+					const request = readNestedControlRequests(route)[0];
+					if (request) writeNestedControlResult(route, { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "late success" });
+				} finally { resolve(); }
+			}, 1_200));
 			const result = await executor.execute("interrupt", { action: "interrupt", id: "nested-timeout" }, new AbortController().signal, undefined, ctx(root));
 			assert.equal(result.isError, true);
 			assert.match(text(result), /owner is not reachable/);
 			assert.doesNotMatch(text(result), /late success/);
+			await lateResult;
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

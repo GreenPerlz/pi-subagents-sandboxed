@@ -27,9 +27,11 @@ import {
 	waitForNestedDescendantsToStop,
 	writeNestedControlRequest,
 	writeNestedControlResult,
+	writeNestedJournalFixtureForTest,
 	writeNestedEvent,
 	readNestedControlRequests,
 	readNestedControlResults,
+	readNestedControlResult,
 } from "../../src/runs/shared/nested-events.ts";
 import {
 	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
@@ -715,19 +717,42 @@ describe("framed nested journals", () => {
 		ackNestedControlRequest(route, request.requestId);
 		assert.equal(readNestedControlRequests(route).length, 0);
 	});
+
+	it("recovers a result journal append after a crash before index and state", () => {
+		const route = trackRoute("result-append-recovery");
+		const request = { ts: 1, requestId: "result-recovery-request", targetRunId: "nested-child", action: "interrupt" as const };
+		writeNestedControlRequest(route, request);
+		assert.equal(claimNestedControlRequest(route, request.requestId), "new");
+		setNestedJournalFaultInjector((phase, kind) => { if (phase === "append" && kind === "result") throw new Error("crash-after-result-append"); });
+		assert.throws(() => writeNestedControlResult(route, { ts: 2, requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "durable" }), /crash-after-result-append/);
+		setNestedJournalFaultInjector(undefined);
+		resetNestedJournalRuntime(route);
+		assert.equal(claimNestedControlRequest(route, request.requestId), "completed");
+		assert.deepEqual(readNestedControlResult(route, request.requestId)?.message, "durable");
+		ackNestedControlRequest(route, request.requestId);
+		assert.equal(readNestedControlRequests(route).length, 0);
+	});
+
+	it("recovers a durable result from a fresh child process without replay", async () => {
+		const route = trackRoute("fresh-result-recovery");
+		const request = { ts: 1, requestId: "fresh-result-request", targetRunId: "nested-child", action: "interrupt" as const };
+		writeNestedControlRequest(route, request);
+		const script = `import { writeNestedControlResult } from ${JSON.stringify(path.resolve("src/runs/shared/nested-events.ts"))}; const route=JSON.parse(process.argv[1]); writeNestedControlResult(route,{ts:2,requestId:"fresh-result-request",targetRunId:"nested-child",ok:true,message:"child-durable"});`;
+		const childProcess = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script, JSON.stringify(route)], { stdio: ["ignore", "pipe", "pipe"] });
+		const [code] = await once(childProcess, "close");
+		assert.equal(code, 0);
+		resetNestedJournalRuntime(route);
+		assert.equal(claimNestedControlRequest(route, request.requestId), "completed");
+		assert.equal(readNestedControlResult(route, request.requestId)?.message, "child-durable");
+	});
 });
 
 describe("bounded journals and recovery seams", () => {
 	it("does not reread historical control/result frames on idle polls", () => {
 		const route = trackRoute("bounded-10k");
-		for (let index = 0; index < 10_000; index++) {
-			const id = `request-${index}`;
-			writeNestedControlRequest(route, { ts: index, requestId: id, targetRunId: "nested-child", action: "interrupt" });
-			writeNestedControlResult(route, { ts: index, requestId: id, targetRunId: "nested-child", ok: true, message: "done" });
-		}
-		assert.equal(readNestedControlRequests(route).length, 10_000);
+		writeNestedJournalFixtureForTest(route, 10_000);
+		assert.equal(readNestedControlRequests(route).length, 0);
 		assert.equal(readNestedControlResults(route).length, 10_000);
-		for (let index = 0; index < 10_000; index++) ackNestedControlRequest(route, `request-${index}`);
 		resetNestedJournalRuntime(route);
 		assert.equal(readNestedControlRequests(route).length, 0);
 		resetNestedJournalWorkCounters();
@@ -800,6 +825,24 @@ describe("bounded journals and recovery seams", () => {
 		assert.equal(getNestedJournalWorkCounters().readdir, 0);
 		fs.writeFileSync(path.join(route.eventSink, "late-legacy.json"), JSON.stringify(records[0]), "utf8");
 		assert.throws(() => projectNestedEvents(route), /Legacy file arrived after migration/);
+	});
+
+	it("resumes an incomplete durable manifest after a fresh runtime restart", () => {
+		const route = trackRoute("legacy-incomplete-manifest");
+		const records = ["one", "two"].map((id, index) => ({ type: "subagent.nested.updated" as const, ts: index + 1, rootRunId: route.rootRunId, parentRunId: "root-run", parentStepIndex: 1, capabilityToken: route.capabilityToken, child: child(`manifest-${id}`, "running", index + 1) }));
+		fs.writeFileSync(path.join(route.eventSink, "first.json"), JSON.stringify(records[0]), "utf8");
+		fs.writeFileSync(path.join(route.eventSink, "second.json"), JSON.stringify(records[1]), "utf8");
+		let crashed = false;
+		setNestedJournalFaultInjector((phase, kind) => { if (!crashed && phase === "manifest" && kind === "event") { crashed = true; throw new Error("manifest-crash"); } });
+		assert.throws(() => projectNestedEvents(route), /manifest-crash/);
+		setNestedJournalFaultInjector(undefined);
+		const manifest = JSON.parse(fs.readFileSync(path.join(path.dirname(route.eventSink), ".legacy-import-manifest.json"), "utf8")) as { complete: boolean; files: Record<string, { records: string[] }> };
+		assert.equal(manifest.complete, false);
+		assert.equal(Object.values(manifest.files).reduce((count, file) => count + file.records.length, 0), 1);
+		resetNestedJournalRuntime(route);
+		const resumed = projectNestedEvents(route);
+		assert.equal(resumed.children.filter((item) => item.id.startsWith("manifest-")).length, 2);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(path.dirname(route.eventSink), ".legacy-import-manifest.json"), "utf8")).complete, true);
 	});
 
 	it("replays a partially imported mixed legacy file without duplicates", () => {

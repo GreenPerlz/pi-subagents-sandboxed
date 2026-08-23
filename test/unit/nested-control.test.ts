@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
-import registerFanoutChildSubagentExtension from "../../src/extension/fanout-child.ts";
+import registerFanoutChildSubagentExtension, { startNestedControlInboxListener } from "../../src/extension/fanout-child.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
 import { createNestedRoute, projectNestedEvents, readNestedControlRequests, readNestedControlResults, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import {
@@ -887,6 +887,35 @@ describe("nested control routing", { concurrency: false }, () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("drains delayed resume controls sequentially in journal order", async () => {
+		const route = createNestedRoute("root-ordered-controls");
+		routeRoots.push(path.dirname(route.eventSink));
+		setNestedRouteEnv(route, "root-ordered-controls");
+		process.env[SUBAGENT_CHILD_ENV] = "1";
+		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+		const emitted: string[] = [];
+		const handlers = new Set<(payload: unknown) => void>();
+		const events = {
+			emit(_name: string, payload: any) {
+				if (payload?.message?.includes("first")) emitted.push("first");
+				else if (payload?.message?.includes("second")) emitted.push("second");
+				const delay = payload?.message?.includes("first") ? 120 : 0;
+				setTimeout(() => handlers.forEach((handler) => handler({ requestId: payload.requestId, delivered: true })), delay);
+			},
+			on(_name: string, handler: (payload: unknown) => void) { handlers.add(handler); return () => handlers.delete(handler); },
+		};
+		const state = createState();
+		for (const runId of ["ordered-first", "ordered-second"]) state.foregroundControls.set(runId, { runId, mode: "single", startedAt: 1, updatedAt: 1, currentAgent: "worker", currentIndex: 0 });
+		const pi = { events, registerTool() {}, getSessionName() { return "child"; } } as any;
+		const timer = startNestedControlInboxListener(pi, state);
+		assert.ok(timer);
+		writeNestedControlRequest(route, { ts: 1, requestId: "ordered-first-request", targetRunId: "ordered-first", action: "resume", message: "first" });
+		writeNestedControlRequest(route, { ts: 2, requestId: "ordered-second-request", targetRunId: "ordered-second", action: "resume", message: "second" });
+		await waitFor(() => readNestedControlResults(route).length === 2, 2_000);
+		assert.deepEqual(emitted, ["first", "second"]);
+		clearInterval(timer);
 	});
 
 	it("keeps the fanout child control listener alive after control inbox polling errors", async () => {

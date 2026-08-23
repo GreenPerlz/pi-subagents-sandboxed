@@ -7,7 +7,7 @@ import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
-import { ackNestedControlRequest, claimNestedControlRequest, readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
+import { ackNestedControlRequest, claimNestedControlRequest, readNestedControlResult, readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
@@ -56,7 +56,7 @@ function createChildSafeState(): SubagentState {
 	};
 }
 
-function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState): NodeJS.Timeout | undefined {
+export function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState): NodeJS.Timeout | undefined {
 	let route;
 	try {
 		route = resolveNestedRouteFromEnv();
@@ -64,77 +64,85 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 		return undefined;
 	}
 	if (!route) return undefined;
-	const seen = new Set<string>();
-	const inFlight = new Set<string>();
+	let processing = false;
 	const pendingResults = new Map<string, Parameters<typeof writeNestedControlResult>[1]>();
-	const timer = setInterval(() => {
+	const processQueue = async (): Promise<void> => {
+		if (processing) return;
+		processing = true;
 		try {
-			for (const request of readNestedControlRequests(route)) {
-				if (seen.has(request.requestId) || inFlight.has(request.requestId)) continue;
-				inFlight.add(request.requestId);
-				void (async () => {
-					try {
-						let result = pendingResults.get(request.requestId);
-						if (!result) {
-							const claim = claimNestedControlRequest(route, request.requestId);
-							if (claim === "claimed") {
-								result = { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: false, message: "Control request has an ambiguous prior side-effect; refusing replay." };
-							} else {
-							let ok = false;
-							let message = "Control request failed.";
-							try {
-								const control = state.foregroundControls.get(request.targetRunId);
-								if (!control) {
-									message = `Nested run ${request.targetRunId} is not active in this fanout child.`;
-								} else if (request.action === "interrupt") {
-									ok = control.interrupt?.() === true;
-									message = ok
-										? `Interrupt requested for nested run ${request.targetRunId}.`
-										: `Nested run ${request.targetRunId} has no active child step to interrupt.`;
-								} else if (!request.message?.trim()) {
-									message = "Nested resume requires message.";
-								} else if (!control.currentAgent) {
-									message = `Nested run ${request.targetRunId} has no active child message route.`;
-								} else {
-									const index = control.currentIndex ?? 0;
-									const target = resolveSubagentIntercomTarget(request.targetRunId, control.currentAgent, index);
-									ok = await deliverSubagentIntercomMessageEvent(
-										pi.events,
-										target,
-										`Follow-up for nested run ${request.targetRunId} (${control.currentAgent}):\n\n${request.message.trim()}`,
-										500,
-										{ source: "nested-resume", runId: request.targetRunId, agent: control.currentAgent, index },
-									);
-									message = ok
-										? `Delivered follow-up to live nested run ${request.targetRunId}.`
-										: `Nested child intercom target is not registered: ${target}`;
-								}
-							} catch (error) {
-								message = error instanceof Error ? error.message : String(error);
-							}
-							result = { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok, message };
-							}
-						}
+			for (;;) {
+				const request = readNestedControlRequests(route)[0];
+				if (!request) break;
+				let result = pendingResults.get(request.requestId);
+				if (!result) {
+					const claim = claimNestedControlRequest(route, request.requestId);
+					if (claim === "completed") {
+						// A previous process durably published the result but died before
+						// acknowledgement. Recover that exact result; never re-run control.
+						result = readNestedControlResult(route, request.requestId);
+						if (!result) throw new Error(`Durable result for completed request '${request.requestId}' is unavailable.`);
+					} else if (claim === "claimed") {
+						result = { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: false, message: "Control request has an ambiguous prior side-effect; refusing replay." };
+					} else {
+						let ok = false;
+						let message = "Control request failed.";
 						try {
-							writeNestedControlResult(route, result);
+							const control = state.foregroundControls.get(request.targetRunId);
+							if (!control) {
+								message = `Nested run ${request.targetRunId} is not active in this fanout child.`;
+							} else if (request.action === "interrupt") {
+								ok = control.interrupt?.() === true;
+								message = ok
+									? `Interrupt requested for nested run ${request.targetRunId}.`
+									: `Nested run ${request.targetRunId} has no active child step to interrupt.`;
+							} else if (!request.message?.trim()) {
+								message = "Nested resume requires message.";
+							} else if (!control.currentAgent) {
+								message = `Nested run ${request.targetRunId} has no active child message route.`;
+							} else {
+								const index = control.currentIndex ?? 0;
+								const target = resolveSubagentIntercomTarget(request.targetRunId, control.currentAgent, index);
+								ok = await deliverSubagentIntercomMessageEvent(
+									pi.events,
+									target,
+									`Follow-up for nested run ${request.targetRunId} (${control.currentAgent}):\n\n${request.message.trim()}`,
+									500,
+									{ source: "nested-resume", runId: request.targetRunId, agent: control.currentAgent, index },
+								);
+								message = ok
+									? `Delivered follow-up to live nested run ${request.targetRunId}.`
+									: `Nested child intercom target is not registered: ${target}`;
+							}
 						} catch (error) {
-							pendingResults.set(request.requestId, result);
-							console.error(`Failed to write nested control result for request '${request.requestId}' targeting '${request.targetRunId}' via inbox '${route.controlInbox}'; keeping request for retry:`, error);
-							return;
+							message = error instanceof Error ? error.message : String(error);
 						}
-						pendingResults.delete(request.requestId);
-						ackNestedControlRequest(route, request.requestId, request.filePath);
-						seen.add(request.requestId);
-						// Legacy request files are retained as immutable evidence.
-					} finally {
-						inFlight.delete(request.requestId);
+						result = { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok, message };
 					}
-				})();
+				}
+				try {
+					writeNestedControlResult(route, result);
+				} catch (error) {
+					pendingResults.set(request.requestId, result);
+					console.error(`Failed to write nested control result for request '${request.requestId}' targeting '${request.targetRunId}' via inbox '${route.controlInbox}'; keeping request for retry:`, error);
+					return;
+				}
+				try {
+					ackNestedControlRequest(route, request.requestId, request.filePath);
+				} catch (error) {
+					pendingResults.set(request.requestId, result);
+					throw error;
+				}
+				pendingResults.delete(request.requestId);
+				// Legacy request files are retained as immutable evidence.
 			}
 		} catch (error) {
 			console.error(`Failed to poll nested control inbox '${route.controlInbox}' for root '${route.rootRunId}':`, error);
+		} finally {
+			processing = false;
 		}
-	}, 200);
+	};
+	const timer = setInterval(() => { void processQueue(); }, 200);
+	void processQueue();
 	timer.unref?.();
 	return timer;
 }

@@ -790,6 +790,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.ok(Array.isArray(status?.steps?.[0]?.sandbox?.mounts));
 
 			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
+			assert.deepEqual(bwrapArgs.slice(bwrapArgs.indexOf("PI_SUBAGENT_CHILD") - 1, bwrapArgs.indexOf("PI_SUBAGENT_CHILD") + 2), ["--setenv", "PI_SUBAGENT_CHILD", "1"]);
+			assert.deepEqual(bwrapArgs.slice(bwrapArgs.indexOf("PI_SUBAGENT_FANOUT_CHILD") - 1, bwrapArgs.indexOf("PI_SUBAGENT_FANOUT_CHILD") + 2), ["--setenv", "PI_SUBAGENT_FANOUT_CHILD", "0"]);
 			const asyncSessionDir = path.join(sessionRoot, `async-${id}`);
 			assert.deepEqual(bwrapArgs.slice(bwrapArgs.indexOf(asyncSessionDir) - 1, bwrapArgs.indexOf(asyncSessionDir) + 2), ["--bind", asyncSessionDir, asyncSessionDir]);
 			assert.deepEqual(bwrapArgs.slice(bwrapArgs.indexOf(path.dirname(outputPath)) - 1, bwrapArgs.indexOf(path.dirname(outputPath)) + 2), ["--bind", path.dirname(outputPath), path.dirname(outputPath)]);

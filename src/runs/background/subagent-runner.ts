@@ -434,10 +434,10 @@ function runPiStreaming(
 					});
 				if (sandbox.scopedGitEndpoint) effectiveSandboxMounts.push(...scopedGitDescriptorMounts(sandbox.scopedGitEndpoint));
 				const wrapped = sandbox.isolatedGit
-					? { invocation: sandbox.isolatedGit.runtime.wrapInvocation(sandbox.isolatedGitCapability!, { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd }, effectiveSandboxMounts, sandbox.config), diagnostics: [] }
+					? { invocation: sandbox.isolatedGit.runtime.wrapInvocation(sandbox.isolatedGitCapability!, { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd, env: spawnEnv }, effectiveSandboxMounts, sandbox.config), diagnostics: [] }
 					: createSandboxProvider(sandbox.config).wrapInvocation({
 						config: sandbox.config,
-						invocation: { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd, pinReadonlyMounts: Boolean(sandbox.scopedGitEndpoint) },
+						invocation: { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd, env: spawnEnv, pinReadonlyMounts: Boolean(sandbox.scopedGitEndpoint) },
 						mounts: effectiveSandboxMounts,
 					});
 				pinnedSandboxFds = wrapped.invocation.inheritedFds;

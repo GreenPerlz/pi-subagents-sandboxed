@@ -727,8 +727,11 @@ describe("bounded journals and recovery seams", () => {
 		}
 		assert.equal(readNestedControlRequests(route).length, 10_000);
 		assert.equal(readNestedControlResults(route).length, 10_000);
+		for (let index = 0; index < 10_000; index++) ackNestedControlRequest(route, `request-${index}`);
+		resetNestedJournalRuntime(route);
+		assert.equal(readNestedControlRequests(route).length, 0);
 		resetNestedJournalWorkCounters();
-		assert.equal(readNestedControlRequests(route).length, 10_000);
+		assert.equal(readNestedControlRequests(route).length, 0);
 		assert.equal(readNestedControlResults(route).length, 10_000);
 		assert.deepEqual(getNestedJournalWorkCounters(), { frames: 0, bytes: 0, readdir: 0 });
 		writeNestedControlResult(route, { ts: 10_001, requestId: "request-new", targetRunId: "nested-child", ok: true, message: "new" });

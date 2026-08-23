@@ -3739,16 +3739,15 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		sandbox = { ...sandbox, gitMode: "read-only" };
 	}
 	if (data.scopedGitEndpoint) {
-		// Force inherited Git/network/auth policy while retaining authorized
-		// runtime mounts needed by the child command (for example its mock queue).
+		// The endpoint narrows Git authority only. Keep the trusted child agent's
+		// model network/auth policy: a nested Bubblewrap can inherit, but cannot
+		// broaden, its outer network namespace or exact credential-file mounts.
 		sandbox = {
 			...sandbox,
 			provider: "bubblewrap",
 			gitMode: "isolated",
-			network: "none",
 			profile: "host-toolchain",
 			fallback: "fail",
-			auth: "none",
 		} as ReturnType<typeof resolveSandboxConfig>;
 	}
 	// Foreground nested authority is represented only by scopedGitEndpoint.
@@ -3827,16 +3826,12 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		: undefined;
 
 	if (data.scopedGitEndpoint) {
-		// Force inherited Git/network/auth policy while retaining authorized
-		// runtime mounts needed by the child command (for example its mock queue).
 		sandbox = {
 			...sandbox,
 			provider: "bubblewrap",
 			gitMode: "isolated",
-			network: "none",
 			profile: "host-toolchain",
 			fallback: "fail",
-			auth: "none",
 		} as ReturnType<typeof resolveSandboxConfig>;
 	}
 	let isolatedRuntime: IsolatedGitRuntime | undefined;

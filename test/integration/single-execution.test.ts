@@ -2920,6 +2920,8 @@ process.exit(${exitCode});
 			assert.equal(result.isError, undefined, result.content[0]?.text);
 			assert.equal(result.details.results.length, 1);
 			assert.equal(result.details.results[0]?.gitBundle, undefined, "an inherited child must not export the owner bundle");
+			assert.equal(result.details.results[0]?.sandbox?.network, inheritedWork.sandbox?.network, "the scoped Git endpoint must not replace the child model network policy");
+			assert.equal(result.details.results[0]?.sandbox?.auth, inheritedWork.sandbox?.auth, "the scoped Git endpoint must not replace exact child auth mounts");
 			assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix) && !runtimeRootsBefore.has(entry)), [], "nested execution must not create a second isolated runtime");
 			assert.equal(fs.existsSync(worktree.worktreePath), true, "the owner worktree remains live");
 			const endpointAfterChild = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];

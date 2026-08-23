@@ -21,6 +21,7 @@ import {
 	projectNestedEvents,
 	resolveNestedParentAddressFromEnv,
 	resolveNestedRouteFromEnv,
+	resolveRequiredInheritedNestedRouteFromEnv,
 	updateAsyncJobNestedProjection,
 	updateForegroundNestedProjection,
 	validateNestedRouteForRevival,
@@ -130,6 +131,12 @@ describe("nested event route validation", () => {
 
 		process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = "wrong-token";
 		assert.throws(() => resolveNestedRouteFromEnv(), /capability token/);
+		assert.throws(() => resolveRequiredInheritedNestedRouteFromEnv(), /capability token/);
+	});
+
+	it("fails closed for partial inherited route metadata", () => {
+		process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = "ambient-root";
+		assert.throws(() => resolveRequiredInheritedNestedRouteFromEnv(), /route|metadata|does not exist/i);
 	});
 
 	it("validates exact live persisted route coordinates and rejects stale or forged metadata", () => {

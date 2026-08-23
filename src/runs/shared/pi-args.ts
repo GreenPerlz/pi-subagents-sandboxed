@@ -200,39 +200,49 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	const env: Record<string, string | undefined> = {};
 	env[SUBAGENT_CHILD_ENV] = "1";
 	env[SUBAGENT_FANOUT_CHILD_ENV] = fanoutAuthorized ? "1" : "0";
-	const inheritedNestedRoute = Boolean(process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] && process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] && process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV]);
-	const parentRunId = input.parentRunId ?? input.runId ?? (inheritedNestedRoute ? process.env[SUBAGENT_RUN_ID_ENV] : undefined) ?? process.env[SUBAGENT_PARENT_RUN_ID_ENV] ?? "";
+	// Routing/control authority is inherited independently from the permission to
+	// launch descendants.  A leaf still has to register events in its parent's
+	// route, but it must not receive fanout-child.ts or the subagent tool.
+	// Ambient ancestry is accepted only as a complete route handoff; top-level
+	// launches with no explicit parent route therefore suppress it.
+	const inheritedNestedRoute = Boolean(
+		process.env[SUBAGENT_PARENT_EVENT_SINK_ENV]
+			&& process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV]
+			&& process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV]
+			&& process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV],
+	);
+	const explicitParentRoute = input.parentEventSink !== undefined || input.parentControlInbox !== undefined || input.parentRootRunId !== undefined || input.parentCapabilityToken !== undefined;
+	const routeInherited = inheritedNestedRoute && !explicitParentRoute;
+	const routeEventSink = input.parentEventSink ?? (routeInherited ? process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] : undefined) ?? "";
+	const routeControlInbox = input.parentControlInbox ?? (routeInherited ? process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] : undefined) ?? "";
+	const routeRootRunId = input.parentRootRunId ?? (routeInherited ? process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] : undefined) ?? "";
+	const routeCapabilityToken = input.parentCapabilityToken ?? (routeInherited ? process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] : undefined) ?? "";
+	const routeInheritedAncestry = routeInherited || explicitParentRoute;
+	const parentRunId = input.parentRunId ?? input.runId ?? (routeInherited ? process.env[SUBAGENT_RUN_ID_ENV] : undefined) ?? (routeInherited ? process.env[SUBAGENT_PARENT_RUN_ID_ENV] : undefined) ?? "";
 	const parentChildIndex = input.parentChildIndex !== undefined
 		? String(input.parentChildIndex)
 		: input.childIndex !== undefined
 			? String(input.childIndex)
-			: process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] ?? "";
+			: routeInherited ? process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] ?? "" : "";
 	const inheritedDepth = Number(process.env[SUBAGENT_PARENT_DEPTH_ENV]);
-	const parentDepth = input.parentDepth ?? (inheritedNestedRoute && Number.isFinite(inheritedDepth) ? inheritedDepth + 1 : 1);
-	const parentPath = input.parentPath ?? [
-		...parseNestedPathEnv(process.env[SUBAGENT_PARENT_PATH_ENV]),
+	const parentDepth = input.parentDepth ?? (routeInherited && Number.isFinite(inheritedDepth) ? inheritedDepth + 1 : 1);
+	const parentPath = input.parentPath ?? (routeInheritedAncestry ? [
+		...parseNestedPathEnv(routeInherited ? process.env[SUBAGENT_PARENT_PATH_ENV] : undefined),
 		...(parentRunId ? [{
 			runId: parentRunId,
 			...(parentChildIndex && /^\d+$/.test(parentChildIndex) ? { stepIndex: Number(parentChildIndex) } : {}),
 			...(input.childAgentName ? { agent: input.childAgentName } : {}),
 		}] : []),
-	];
-	env[SUBAGENT_PARENT_EVENT_SINK_ENV] = fanoutAuthorized
-		? input.parentEventSink ?? process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] ?? ""
-		: "";
-	env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = fanoutAuthorized
-		? input.parentControlInbox ?? process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] ?? ""
-		: "";
-	env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = fanoutAuthorized
-		? input.parentRootRunId ?? process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] ?? input.runId ?? ""
-		: "";
-	env[SUBAGENT_PARENT_RUN_ID_ENV] = fanoutAuthorized ? parentRunId : "";
-	env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = fanoutAuthorized ? parentChildIndex : "";
-	env[SUBAGENT_PARENT_DEPTH_ENV] = fanoutAuthorized ? String(parentDepth) : "";
-	env[SUBAGENT_PARENT_PATH_ENV] = fanoutAuthorized ? encodeNestedPathEnv(parentPath) : "";
-	env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = fanoutAuthorized
-		? input.parentCapabilityToken ?? process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] ?? ""
-		: "";
+	] : []);
+	// These values describe the authenticated route, not child-tool authority.
+	env[SUBAGENT_PARENT_EVENT_SINK_ENV] = routeEventSink;
+	env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = routeControlInbox;
+	env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = routeRootRunId;
+	env[SUBAGENT_PARENT_RUN_ID_ENV] = routeInheritedAncestry ? parentRunId : "";
+	env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = routeInheritedAncestry ? parentChildIndex : "";
+	env[SUBAGENT_PARENT_DEPTH_ENV] = routeInheritedAncestry ? String(parentDepth) : "";
+	env[SUBAGENT_PARENT_PATH_ENV] = routeInheritedAncestry ? encodeNestedPathEnv(parentPath) : "";
+	env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = routeCapabilityToken;
 	env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = input.inheritProjectContext ? "1" : "0";
 	env.PI_SUBAGENT_INHERIT_SKILLS = input.inheritSkills ? "1" : "0";
 	// Explicitly clear inherited parent state so nested children resolve their

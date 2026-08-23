@@ -60,7 +60,7 @@ import {
 	stripDetailsOutputsForIntercomReceipt,
 } from "../../intercom/result-intercom.ts";
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../background/async-resume.ts";
-import { createNestedRoute, projectNestedEvents, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateAsyncJobNestedProjection, updateForegroundNestedProjection, validateNestedRouteForRevival, waitForNestedDescendantsToStop, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { createNestedRoute, projectNestedEvents, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveRequiredInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateAsyncJobNestedProjection, updateForegroundNestedProjection, validateNestedRouteForRevival, waitForNestedDescendantsToStop, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { registerForegroundInterrupt } from "../shared/foreground-control.ts";
 import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV, SUBAGENT_SCOPED_GIT_ENDPOINT_ENV } from "../shared/pi-args.ts";
 import { delegateScopedGitWriterDescriptor, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, validateScopedGitChildDescriptor, type IsolatedGitCapability, type ScopedGitEndpointDescriptor } from "../../sandbox/isolated-git.ts";
@@ -4381,6 +4381,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (rawEndpoint) { try { preAuthenticatedEndpoint = JSON.parse(rawEndpoint) as ScopedGitEndpointDescriptor; } catch (error) { return { content: [{ type: "text", text: `Scoped Git endpoint descriptor is malformed: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "single", results: [] } }; } }
 		const requestCwd = resolveRequestedCwd(ctx.cwd, params.cwd);
 		const paramsWithResolvedCwd = params.cwd === undefined ? params : { ...params, cwd: requestCwd };
+		let authenticatedInheritedRoute: ReturnType<typeof resolveRequiredInheritedNestedRouteFromEnv>;
+		try {
+			authenticatedInheritedRoute = resolveRequiredInheritedNestedRouteFromEnv();
+		} catch (error) {
+			return {
+				content: [{ type: "text", text: `Inherited nested route rejected: ${error instanceof Error ? error.message : String(error)}` }],
+				isError: true,
+				details: { mode: "management", results: [] },
+			};
+		}
 		if (params.action) {
 			if (params.action === "doctor") {
 				let currentSessionFile: string | null = null;
@@ -4555,7 +4565,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			extensionDir: process.env[SUBAGENT_INTERCOM_EXTENSION_DIR_ENV],
 		});
 		const runId = randomUUID().slice(0, 8);
-		const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
+		const inheritedNestedRoute = authenticatedInheritedRoute;
 		let scopedGitEndpoint: ScopedGitEndpointDescriptor | undefined = effectiveParams.isolatedGitEndpoint ?? preAuthenticatedEndpoint;
 		if (scopedGitEndpoint) {
 			const relativeSubtree = scopedGitEndpoint.relativeSubtree;

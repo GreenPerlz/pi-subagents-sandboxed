@@ -566,7 +566,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.ok(!args.includes("--no-extensions"), "non-fanout children should allow ambient extension discovery");
 	});
 
-	it("clears all fanout routing env values for non-fanout children", () => {
+	it("inherits the authenticated route for non-fanout children without fanout authority", () => {
 		const { args, env } = buildPiArgs({
 			baseArgs: ["-p"],
 			task: "hello",
@@ -584,18 +584,18 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		const extensionArgs = args.filter((arg, index) => args[index - 1] === "--extension");
 		assert.equal(env[SUBAGENT_FANOUT_CHILD_ENV], "0");
-		assert.equal(env[SUBAGENT_PARENT_EVENT_SINK_ENV], "");
-		assert.equal(env[SUBAGENT_PARENT_CONTROL_INBOX_ENV], "");
-		assert.equal(env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV], "");
-		assert.equal(env[SUBAGENT_PARENT_RUN_ID_ENV], "");
-		assert.equal(env[SUBAGENT_PARENT_CHILD_INDEX_ENV], "");
-		assert.equal(env[SUBAGENT_PARENT_DEPTH_ENV], "");
-		assert.equal(env[SUBAGENT_PARENT_PATH_ENV], "");
-		assert.equal(env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV], "");
+		assert.equal(env[SUBAGENT_PARENT_EVENT_SINK_ENV], "/tmp/should-not-leak/events");
+		assert.equal(env[SUBAGENT_PARENT_CONTROL_INBOX_ENV], "/tmp/should-not-leak/control");
+		assert.equal(env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV], "root-should-not-leak");
+		assert.equal(env[SUBAGENT_PARENT_RUN_ID_ENV], "should-not-leak");
+		assert.equal(env[SUBAGENT_PARENT_CHILD_INDEX_ENV], "9");
+		assert.equal(env[SUBAGENT_PARENT_DEPTH_ENV], "1");
+		assert.deepEqual(JSON.parse(env[SUBAGENT_PARENT_PATH_ENV] ?? "[]"), [{ runId: "should-not-leak", stepIndex: 9 }]);
+		assert.equal(env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV], "token-should-not-leak");
 		assert.ok(!extensionArgs.some((arg) => arg.endsWith(path.join("src", "extension", "fanout-child.ts"))));
 	});
 
-	it("inherits routing env only for authorized fanout children", () => {
+	it("inherits routing env for leaves while fanout remains authorized-only", () => {
 		process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] = "/tmp/inherited/events";
 		process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = "/tmp/inherited/control";
 		process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = "inherited-root";
@@ -632,14 +632,34 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			tools: ["read"],
 		});
 		assert.equal(nonFanout.env[SUBAGENT_FANOUT_CHILD_ENV], "0");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_EVENT_SINK_ENV], "");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV], "");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV], "");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_RUN_ID_ENV], "");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_CHILD_INDEX_ENV], "");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_DEPTH_ENV], "");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_PATH_ENV], "");
-		assert.equal(nonFanout.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV], "");
+		assert.equal(nonFanout.env[SUBAGENT_PARENT_EVENT_SINK_ENV], "/tmp/inherited/events");
+		assert.equal(nonFanout.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV], "/tmp/inherited/control");
+		assert.equal(nonFanout.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV], "inherited-root");
+		assert.equal(nonFanout.env[SUBAGENT_PARENT_RUN_ID_ENV], "owner-run");
+		assert.equal(nonFanout.env[SUBAGENT_PARENT_CHILD_INDEX_ENV], "4");
+		assert.equal(nonFanout.env[SUBAGENT_PARENT_DEPTH_ENV], "3");
+		assert.deepEqual(JSON.parse(nonFanout.env[SUBAGENT_PARENT_PATH_ENV] ?? "[]"), [{ runId: "root-run", stepIndex: 0 }, { runId: "owner-run", stepIndex: 1 }, { runId: "owner-run", stepIndex: 4 }]);
+		assert.equal(nonFanout.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV], "inherited-token");
+	});
+
+	it("suppresses ambient ancestry when an explicit parent route is provided", () => {
+		process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] = "/tmp/ambient/events";
+		process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = "/tmp/ambient/control";
+		process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = "ambient-root";
+		process.env[SUBAGENT_PARENT_RUN_ID_ENV] = "ambient-parent";
+		process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "7";
+		process.env[SUBAGENT_PARENT_PATH_ENV] = JSON.stringify([{ runId: "ambient-root", stepIndex: 0 }]);
+		process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = "ambient-token";
+
+		const { env } = buildPiArgs({
+			baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false,
+			tools: ["read"], runId: "explicit-child", childIndex: 2,
+			parentEventSink: "/tmp/explicit/events", parentControlInbox: "/tmp/explicit/control",
+			parentRootRunId: "explicit-root", parentCapabilityToken: "explicit-token",
+		});
+		assert.equal(env[SUBAGENT_PARENT_EVENT_SINK_ENV], "/tmp/explicit/events");
+		assert.equal(env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV], "explicit-root");
+		assert.deepEqual(JSON.parse(env[SUBAGENT_PARENT_PATH_ENV] ?? "[]"), [{ runId: "explicit-child", stepIndex: 2 }]);
 	});
 
 	it("prefers the current subagent run id over inherited ancestor ids for nested fanout routing", () => {

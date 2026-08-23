@@ -219,9 +219,30 @@ export function resolveNestedRouteFromEnv(env: NodeJS.ProcessEnv = process.env):
 	return validateNestedRouteAuthority({ rootRunId, eventSink, controlInbox, capabilityToken }, false);
 }
 
+/** Resolve a parent route supplied by a child launch.  A partial or forged
+ * handoff is an authentication failure, not permission to create a new route. */
+export function resolveRequiredInheritedNestedRouteFromEnv(env: NodeJS.ProcessEnv = process.env): NestedRoute | undefined {
+	const hasRouteMetadata = [
+		SUBAGENT_PARENT_EVENT_SINK_ENV,
+		SUBAGENT_PARENT_CONTROL_INBOX_ENV,
+		SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
+		SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
+		SUBAGENT_PARENT_RUN_ID_ENV,
+		SUBAGENT_PARENT_CHILD_INDEX_ENV,
+		SUBAGENT_PARENT_DEPTH_ENV,
+		SUBAGENT_PARENT_PATH_ENV,
+	].some((key) => Boolean(env[key]));
+	if (!hasRouteMetadata) return undefined;
+	const route = resolveNestedRouteFromEnv(env);
+	if (!route) throw new Error("Inherited nested route metadata is incomplete.");
+	return route;
+}
+
+/** Best-effort route lookup for status projection paths that have their own
+ * fail-closed scope. New child launches must use the required resolver above. */
 export function resolveInheritedNestedRouteFromEnv(env: NodeJS.ProcessEnv = process.env): NestedRoute | undefined {
 	try {
-		return resolveNestedRouteFromEnv(env);
+		return resolveRequiredInheritedNestedRouteFromEnv(env);
 	} catch (error) {
 		console.error("Ignoring invalid nested subagent event route:", error);
 		return undefined;

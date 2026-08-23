@@ -48,6 +48,25 @@ const JOURNAL_STATE = ".journal-state.json";
 const LEGACY_MANIFEST = ".legacy-import-manifest.json";
 const ROUTE_LOCK = ".route.lock";
 const COMPACTION_BYTES = 4 * 1024 * 1024;
+function compactionThreshold(): number { const value = Number(process.env.PI_NESTED_COMPACTION_BYTES); return Number.isSafeInteger(value) && value > 0 ? value : COMPACTION_BYTES; }
+const INDEX_FILE = { control: ".control-index.jsonl", result: ".result-index.jsonl" } as const;
+const ACK_FILE = ".control-acked.jsonl";
+const EXECUTION_FILE = ".control-execution.jsonl";
+const COMPACTION_FILE = ".journal-compaction.json";
+const LEGACY_INFLIGHT = ".legacy-import-inflight.json";
+
+/** Test and recovery seam. A fault is raised after the named durable phase. */
+export type NestedJournalFaultPhase = "seal" | "new" | "state" | "snapshot" | "cleanup";
+let journalFaultInjector: ((phase: NestedJournalFaultPhase, kind: "event" | "control" | "result") => void) | undefined;
+const journalWork = { frames: 0, bytes: 0, readdir: 0 };
+export function resetNestedJournalWorkCounters(): void { journalWork.frames = 0; journalWork.bytes = 0; journalWork.readdir = 0; }
+export function getNestedJournalWorkCounters(): { frames: number; bytes: number; readdir: number } { return { ...journalWork }; }
+export function setNestedJournalFaultInjector(injector: ((phase: NestedJournalFaultPhase, kind: "event" | "control" | "result") => void) | undefined): void {
+	journalFaultInjector = injector;
+}
+/** Test/restart seam; production callers simply omit the route. */
+export function resetNestedJournalRuntime(route?: NestedRoute): void { if (route) journalRuntimes.delete(runtimeKey(route)); else journalRuntimes.clear(); }
+function journalFault(phase: NestedJournalFaultPhase, kind: "event" | "control" | "result"): void { journalFaultInjector?.(phase, kind); }
 
 type NestedStatusEventType = "subagent.nested.started" | "subagent.nested.updated" | "subagent.nested.completed";
 type NestedControlResultEventType = "subagent.nested.control-result";
@@ -542,6 +561,17 @@ interface JournalState {
 	deliveredResults: string[];
 }
 
+interface JournalRuntime {
+	state: JournalState;
+	pending: Map<string, NestedControlRequestRecord>;
+	acked: Set<string>;
+	results: Map<string, NestedControlResultRecord>;
+	claimed: Set<string>;
+	loaded: boolean;
+}
+const journalRuntimes = new Map<string, JournalRuntime>();
+function runtimeKey(route: NestedRoute): string { return routeRoot(route); }
+
 function emptyJournalState(): JournalState {
 	return { version: 1, generation: 0, eventReadOffset: 0, eventWriteOffset: 0, eventSequence: 0, eventReadSequence: 0, controlReadOffset: 0, controlWriteOffset: 0, controlSequence: 0, controlReadSequence: 0, resultReadOffset: 0, resultWriteOffset: 0, resultSequence: 0, resultReadSequence: 0, pendingRequests: {}, ackedRequests: [], results: {}, deliveredResults: [] };
 }
@@ -572,61 +602,108 @@ function readState(route: NestedRoute): JournalState {
 		const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
 		if (raw.version !== 1 || typeof raw.generation !== "number") throw new Error("invalid journal state version");
 		const number = (key: string) => typeof raw[key] === "number" && Number.isSafeInteger(raw[key]) && (raw[key] as number) >= 0 ? raw[key] as number : 0;
-		const pending: Record<string, NestedControlRequestRecord> = {};
-		if (raw.pendingRequests && typeof raw.pendingRequests === "object") for (const [id, value] of Object.entries(raw.pendingRequests as Record<string, unknown>)) {
-			const request = parseControlRequest(JSON.stringify(value), route); if (request) pending[id] = request;
-		}
-		const results: Record<string, NestedControlResultRecord> = {};
-		if (raw.results && typeof raw.results === "object") for (const [id, value] of Object.entries(raw.results as Record<string, unknown>)) {
-			const result = parseControlResult(JSON.stringify(value), route); if (result) results[id] = result;
-		}
+		// State is deliberately metadata-only. Older state files carried the
+		// complete maps; accepting them here keeps upgrades lossless, while new
+		// writes never make an idle poll parse/rewrite historical records.
 		return {
 			version: 1, generation: number("generation"), eventReadOffset: number("eventReadOffset"), eventWriteOffset: number("eventWriteOffset"), eventSequence: number("eventSequence"), eventReadSequence: number("eventReadSequence"),
 			controlReadOffset: number("controlReadOffset"), controlWriteOffset: number("controlWriteOffset"), controlSequence: number("controlSequence"), controlReadSequence: number("controlReadSequence"),
 			resultReadOffset: number("resultReadOffset"), resultWriteOffset: number("resultWriteOffset"), resultSequence: number("resultSequence"), resultReadSequence: number("resultReadSequence"),
-			pendingRequests: pending,
-			ackedRequests: Array.isArray(raw.ackedRequests) ? raw.ackedRequests.filter((v): v is string => isSafeNestedId(v)).slice(-4096) : [],
-			results,
-			deliveredResults: Array.isArray(raw.deliveredResults) ? raw.deliveredResults.filter((v): v is string => isSafeNestedId(v)).slice(-4096) : [],
+			pendingRequests: {},
+			ackedRequests: Array.isArray(raw.ackedRequests) ? raw.ackedRequests.filter((v): v is string => isSafeNestedId(v)) : [],
+			results: {},
+			deliveredResults: Array.isArray(raw.deliveredResults) ? raw.deliveredResults.filter((v): v is string => isSafeNestedId(v)) : [],
 		};
 	} catch (error) { throw new Error(`Nested journal state is invalid: ${error instanceof Error ? error.message : String(error)}`); }
 }
-function writeState(route: NestedRoute, state: JournalState): void { durableWrite(statePath(route), `${JSON.stringify(state)}\n`); }
+function writeState(route: NestedRoute, state: JournalState, kind: "event" | "control" | "result" = "event"): void {
+	const metadata = { ...state, pendingRequests: undefined, results: undefined, ackedRequests: undefined };
+	delete (metadata as Partial<JournalState>).pendingRequests;
+	delete (metadata as Partial<JournalState>).results;
+	durableWrite(statePath(route), `${JSON.stringify(metadata)}\n`);
+	journalFault("state", kind);
+}
+function indexPath(route: NestedRoute, kind: "control" | "result"): string { return path.join(routeRoot(route), INDEX_FILE[kind]); }
+function ackPath(route: NestedRoute): string { return path.join(routeRoot(route), ACK_FILE); }
+function executionPath(route: NestedRoute): string { return path.join(routeRoot(route), EXECUTION_FILE); }
+function loadExecutions(route: NestedRoute, runtime: JournalRuntime): void { const file = executionPath(route); if (!fs.existsSync(file)) return; trustedDataFile(file); for (const id of fs.readFileSync(file, "utf8").split("\n")) if (isSafeNestedId(id)) runtime.claimed.add(id); }
+function appendExecution(route: NestedRoute, requestId: string): void { const file = executionPath(route); ensureJournal(file); const fd = fs.openSync(file, "a", 0o600); try { fs.writeFileSync(fd, `${requestId}\n`, "utf8"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); } fsyncDirectory(routeRoot(route)); }
+function appendAck(route: NestedRoute, requestId: string): void { const file = ackPath(route); ensureJournal(file); const fd = fs.openSync(file, "a", 0o600); try { fs.writeFileSync(fd, `${requestId}\n`, "utf8"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); } fsyncDirectory(routeRoot(route)); }
+function loadAcks(route: NestedRoute, runtime: JournalRuntime): void { const file = ackPath(route); if (!fs.existsSync(file)) return; trustedDataFile(file); for (const id of fs.readFileSync(file, "utf8").split("\n")) if (isSafeNestedId(id)) runtime.acked.add(id); }
+function appendIndex(route: NestedRoute, kind: "control" | "result", value: object): void {
+	const file = indexPath(route, kind); ensureJournal(file);
+	const fd = fs.openSync(file, "a", 0o600); try { fs.writeFileSync(fd, `${JSON.stringify(value)}\n`, "utf8"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+	fsyncDirectory(routeRoot(route));
+}
+function loadIndex(route: NestedRoute, kind: "control" | "result", runtime: JournalRuntime): void {
+	const file = indexPath(route, kind);
+	if (!fs.existsSync(file)) return;
+	trustedDataFile(file);
+	for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			if (kind === "control") { const request = parseControlRequest(line, route); if (request) runtime.pending.set(request.requestId, request); }
+			else { const result = parseControlResult(line, route); if (result) runtime.results.set(result.requestId, result); }
+		} catch { /* immutable index evidence remains available in the journal */ }
+	}
+}
+function runtimeFor(route: NestedRoute): JournalRuntime {
+	const key = runtimeKey(route); const prior = journalRuntimes.get(key); if (prior?.loaded) { reconcileCompaction(route, prior); return prior; }
+	const state = readState(route);
+	const runtime: JournalRuntime = { state, pending: new Map(), acked: new Set(state.ackedRequests), results: new Map(), claimed: new Set(), loaded: true };
+	reconcileCompaction(route, runtime);
+	loadAcks(route, runtime); loadExecutions(route, runtime); loadIndex(route, "control", runtime); loadIndex(route, "result", runtime);
+	// Upgrade old state files without making them hot forever: import their
+	// maps once into the append-only indexes, then subsequent state is compact.
+	const old = JSON.parse(fs.existsSync(statePath(route)) ? fs.readFileSync(statePath(route), "utf8") : "{}") as Record<string, unknown>;
+	if (old.pendingRequests && typeof old.pendingRequests === "object") for (const value of Object.values(old.pendingRequests as Record<string, unknown>)) { const request = parseControlRequest(JSON.stringify(value), route); if (request && !runtime.pending.has(request.requestId)) { runtime.pending.set(request.requestId, request); appendIndex(route, "control", request); } }
+	if (old.results && typeof old.results === "object") for (const value of Object.values(old.results as Record<string, unknown>)) { const result = parseControlResult(JSON.stringify(value), route); if (result && !runtime.results.has(result.requestId)) { runtime.results.set(result.requestId, result); appendIndex(route, "result", result); } }
+	journalRuntimes.set(key, runtime); return runtime;
+}
 
 function linuxStartToken(pid: number): string | undefined {
-	if (!Number.isInteger(pid) || pid <= 0) return undefined;
+	if (!Number.isInteger(pid) || pid <= 0 || process.platform !== "linux") return undefined;
 	try {
 		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
 		const close = stat.lastIndexOf(")");
 		const fields = stat.slice(close + 2).trim().split(/\s+/);
-		return fields[19]; // field 22, after pid and comm
+		return fields.length > 19 && /^\d+$/.test(fields[19]!) ? fields[19] : undefined;
 	} catch { return undefined; }
 }
 function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
 	const lock = path.join(routeRoot(route), ROUTE_LOCK);
-	const identity = { pid: process.pid, uid: typeof process.getuid === "function" ? process.getuid() : 0, startToken: linuxStartToken(process.pid) ?? `${process.pid}-${process.ppid}` };
-	for (;;) {
+	const startToken = linuxStartToken(process.pid);
+	if (typeof process.getuid !== "function" || !startToken) throw new Error("Nested route locking requires Linux exact process identity proof.");
+	const identity = { pid: process.pid, uid: process.getuid(), startToken, token: randomUUID() };
+	for (let attempt = 0; attempt < 80; attempt++) {
 		try {
 			fs.mkdirSync(lock, { mode: 0o700 });
 			try { fs.writeFileSync(path.join(lock, "owner"), `${JSON.stringify(identity)}\n`, { flag: "wx", mode: 0o600 }); } catch { fs.rmSync(lock, { recursive: true, force: true }); throw new Error("Unable to publish nested route lock identity."); }
-			try { return fn(); } finally { fs.rmSync(lock, { recursive: true, force: true }); fsyncDirectory(routeRoot(route)); }
+			try { return fn(); } finally {
+				// Never remove a replacement lock. The owner token is the release
+				// capability, not merely the pathname.
+				try { const owner = JSON.parse(fs.readFileSync(path.join(lock, "owner"), "utf8")) as { token?: unknown }; if (owner.token === identity.token) { fs.rmSync(lock, { recursive: true, force: false }); fsyncDirectory(routeRoot(route)); } } catch { /* replacement or crash: leave it untouched */ }
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			let stale = false;
 			try {
-				const st = fs.lstatSync(lock); if (!st.isDirectory() || (st.mode & 0o077) !== 0 || (typeof process.getuid === "function" && st.uid !== process.getuid())) throw new Error("Nested route lock is not trusted.");
-				const ownerFile = path.join(lock, "owner");
-				const ownerStat = fs.lstatSync(ownerFile);
-				if (ownerStat.isSymbolicLink() || !ownerStat.isFile() || (ownerStat.mode & 0o077) !== 0 || (typeof process.getuid === "function" && ownerStat.uid !== process.getuid())) throw new Error("Nested route lock owner is not trusted.");
-				const raw = JSON.parse(fs.readFileSync(ownerFile, "utf8")) as { pid?: unknown; uid?: unknown; startToken?: unknown };
-				if (typeof raw.pid !== "number" || typeof raw.uid !== "number" || typeof raw.startToken !== "string") throw new Error("Nested route lock identity is ambiguous.");
+				const st = fs.lstatSync(lock); if (!st.isDirectory() || (st.mode & 0o077) !== 0 || st.uid !== identity.uid) throw new Error("Nested route lock is not trusted.");
+				const ownerFile = path.join(lock, "owner"); const ownerStat = fs.lstatSync(ownerFile);
+				if (ownerStat.isSymbolicLink() || !ownerStat.isFile() || (ownerStat.mode & 0o077) !== 0 || ownerStat.uid !== identity.uid) throw new Error("Nested route lock owner is not trusted.");
+				const raw = JSON.parse(fs.readFileSync(ownerFile, "utf8")) as { pid?: unknown; uid?: unknown; startToken?: unknown; token?: unknown };
+				if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0 || !Number.isInteger(raw.uid) || (raw.uid as number) < 0 || typeof raw.startToken !== "string" || !/^\d+$/.test(raw.startToken) || typeof raw.token !== "string" || !isSafeNestedId(raw.token)) throw new Error("Nested route lock identity is ambiguous.");
 				if (raw.uid !== identity.uid) throw new Error("Nested route lock belongs to another user.");
-				stale = linuxStartToken(raw.pid) !== raw.startToken;
+				const observed = linuxStartToken(raw.pid as number); if (!observed) throw new Error("Nested route lock identity cannot be proven exactly.");
+				stale = observed !== raw.startToken;
 			} catch (lockError) { throw lockError instanceof Error ? lockError : new Error(String(lockError)); }
-			if (!stale) throw new Error("Nested route is busy.");
-			fs.rmSync(lock, { recursive: true, force: false });
+			if (stale) { try { fs.rmSync(lock, { recursive: true, force: false }); } catch { /* another contender won */ } continue; }
+			// A live owner gets bounded backoff rather than dropping a journal
+			// operation immediately.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(100, 2 + attempt * 2));
 		}
 	}
+	throw new Error("Nested route remained busy after bounded lock contention retries.");
 }
 
 function frameKind(kind: "event" | "control" | "result"): number { return kind === "event" ? 1 : kind === "control" ? 2 : 3; }
@@ -645,6 +722,7 @@ function ensureJournal(file: string): void {
 function appendJournal(route: NestedRoute, kind: "event" | "control" | "result", record: object, sequence: number): number {
 	const file = journalPath(route, kind); ensureJournal(file); const frame = makeFrame(kind, sequence, record);
 	const fd = fs.openSync(file, "a", 0o600); try { fs.writeFileSync(fd, frame); if (typeof fs.fdatasyncSync === "function") fs.fdatasyncSync(fd); else fs.fsyncSync(fd); } finally { fs.closeSync(fd); } fsyncDirectory(routeRoot(route));
+	legacyFingerprints.set(runtimeKey(route), legacyDirectoryMtime(route));
 	return frame.length;
 }
 interface Framed<T> { sequence: number; record: T; nextOffset: number; }
@@ -691,19 +769,75 @@ function legacyRecords(route: NestedRoute, kind: "event" | "control" | "result")
 	}
 	return records;
 }
-function importLegacy(route: NestedRoute): void {
-	if (fs.existsSync(manifestPath(route))) { trustedDataFile(manifestPath(route)); return; }
-	withRouteLock(route, () => {
-		if (fs.existsSync(manifestPath(route))) return;
-		let state = readState(route);
-		for (const [kind, records] of [["event", legacyRecords(route, "event")], ["control", legacyRecords(route, "control")], ["result", legacyRecords(route, "result")]] as const) {
-			for (const record of records) {
-				if (kind === "event") { state.eventSequence++; state.eventWriteOffset += appendJournal(route, kind, record, state.eventSequence); }
-				else if (kind === "control") { state.controlSequence++; state.controlWriteOffset += appendJournal(route, kind, record, state.controlSequence); }
-				else { state.resultSequence++; state.resultWriteOffset += appendJournal(route, kind, record, state.resultSequence); }
-			}
+interface LegacyManifest { version: 2; complete: boolean; files: Record<string, { hash: string; records: string[] }>; directoryMtime: string }
+const legacyFingerprints = new Map<string, string>();
+function legacyDirectoryMtime(route: NestedRoute): string {
+	try { const a = fs.statSync(route.eventSink).mtimeMs.toString(); const b = fs.statSync(route.controlInbox).mtimeMs.toString(); return `${a}:${b}`; } catch { return "missing"; }
+}
+function readLegacyManifest(route: NestedRoute): LegacyManifest | undefined {
+	if (!fs.existsSync(manifestPath(route))) return undefined;
+	trustedDataFile(manifestPath(route));
+	try { const value = JSON.parse(fs.readFileSync(manifestPath(route), "utf8")) as Partial<LegacyManifest>; if (value.version !== 2 || !value.files || typeof value.directoryMtime !== "string") throw new Error("invalid legacy import manifest"); return { version: 2, complete: value.complete === true, files: value.files, directoryMtime: value.directoryMtime }; } catch (error) { throw new Error(`Legacy migration manifest is invalid: ${error instanceof Error ? error.message : String(error)}`); }
+}
+function legacyCandidates(route: NestedRoute): Array<{ kind: "event" | "control" | "result"; file: string; hash: string; records: Array<NestedEventRecord | NestedControlRequestRecord | NestedControlResultRecord> }> {
+	const output: Array<{ kind: "event" | "control" | "result"; file: string; hash: string; records: Array<NestedEventRecord | NestedControlRequestRecord | NestedControlResultRecord> }> = [];
+	for (const [kind, dir] of [["event", route.eventSink], ["control", route.controlInbox], ["result", route.eventSink]] as const) {
+		let entries: string[];
+		try { journalWork.readdir++; entries = fs.readdirSync(dir).filter((entry) => (entry.endsWith(".json") || entry.endsWith(".jsonl")) && !entry.startsWith("." )).sort(); } catch { continue; }
+		for (const entry of entries) {
+			const file = path.join(dir, entry); if (!containedPath(dir, file)) continue;
+			try { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.size > MAX_EVENT_BYTES) continue; const content = fs.readFileSync(file, "utf8");
+				const records: Array<NestedEventRecord | NestedControlRequestRecord | NestedControlResultRecord> = [];
+				for (const line of (content.includes("\n") ? content.split("\n").filter((line) => line.trim()) : [content])) { const parsed = kind === "event" ? parseRecord(line, route) : kind === "control" ? parseControlRequest(line, route) : parseControlResult(line, route); if (parsed) records.push(parsed); }
+				output.push({ kind, file, hash: createHash("sha256").update(content).digest("hex"), records });
+			} catch { /* malformed legacy evidence is left untouched and auditable */ }
 		}
-		writeState(route, state); durableWrite(manifestPath(route), `${JSON.stringify({ version: 1, importedAt: Date.now(), legacyFilesUntouched: true })}\n`);
+	}
+	return output;
+}
+function importLegacy(route: NestedRoute): void {
+	const existing = readLegacyManifest(route);
+	if (existing) {
+		const current = legacyDirectoryMtime(route); const key = runtimeKey(route);
+		if (legacyFingerprints.get(key) === current) return;
+		// A directory mtime changes for journal appends too. A full scan is only
+		// performed after a restart or when the mtime changed; idle polls do none.
+		if (existing.complete) {
+			const candidates = legacyCandidates(route); const known = new Set(Object.keys(existing.files));
+			const late = candidates.find((candidate) => !known.has(candidate.file) || existing.files[candidate.file]?.hash !== candidate.hash);
+			if (late) throw new Error(`Legacy file arrived after migration; refusing untracked replay: ${late.file}`);
+		}
+		legacyFingerprints.set(key, current); return;
+	}
+	withRouteLock(route, () => {
+		if (readLegacyManifest(route)) return;
+		let state = readState(route); const manifest: LegacyManifest = { version: 2, complete: false, files: {}, directoryMtime: legacyDirectoryMtime(route) };
+		let inflightDigest: string | undefined;
+		try { const raw = JSON.parse(fs.readFileSync(path.join(routeRoot(route), LEGACY_INFLIGHT), "utf8")) as { digest?: unknown }; if (typeof raw.digest === "string") inflightDigest = raw.digest; } catch {}
+		for (const candidate of legacyCandidates(route)) {
+			const prior = manifest.files[candidate.file];
+			// Event and result legacy records share a directory. Once a file has
+			// been classified, an empty parse under the other kind must not erase
+			// its durable progress.
+			if (!candidate.records.length && prior) continue;
+			if (prior?.hash === candidate.hash && prior.records.length === candidate.records.length) continue;
+			const imported: string[] = [];
+			for (const record of candidate.records) {
+				const digest = createHash("sha256").update(JSON.stringify(record)).digest("hex"); if (imported.includes(digest)) continue;
+				const offsetKey = candidate.kind === "event" ? "eventWriteOffset" : candidate.kind === "control" ? "controlWriteOffset" : "resultWriteOffset";
+				const sequenceKey = candidate.kind === "event" ? "eventSequence" : candidate.kind === "control" ? "controlSequence" : "resultSequence";
+				const searchOffset = inflightDigest === digest ? 0 : state[offsetKey];
+				const alreadyAppended = readFramesRelaxed<Record<string, unknown>>(route, candidate.kind, searchOffset, searchOffset === 0 ? 0 : state[sequenceKey]).frames.some((frame) => createHash("sha256").update(JSON.stringify(frame.record)).digest("hex") === digest);
+				if (alreadyAppended) { reconcileWriterCursor(route, state, candidate.kind); imported.push(digest); if (inflightDigest === digest) { try { fs.unlinkSync(path.join(routeRoot(route), LEGACY_INFLIGHT)); } catch {} inflightDigest = undefined; } continue; }
+				durableWrite(path.join(routeRoot(route), LEGACY_INFLIGHT), `${JSON.stringify({ file: candidate.file, kind: candidate.kind, digest })}\n`);
+				if (candidate.kind === "event") { state.eventSequence++; state.eventWriteOffset += appendJournal(route, candidate.kind, record, state.eventSequence); }
+				else if (candidate.kind === "control") { state.controlSequence++; state.controlWriteOffset += appendJournal(route, candidate.kind, record, state.controlSequence); appendIndex(route, "control", record); }
+				else { state.resultSequence++; state.resultWriteOffset += appendJournal(route, candidate.kind, record, state.resultSequence); appendIndex(route, "result", record); }
+				imported.push(digest); manifest.files[candidate.file] = { hash: candidate.hash, records: imported }; writeState(route, state, candidate.kind); try { fs.unlinkSync(path.join(routeRoot(route), LEGACY_INFLIGHT)); } catch {}
+			}
+			manifest.files[candidate.file] = { hash: candidate.hash, records: imported }; durableWrite(manifestPath(route), `${JSON.stringify(manifest)}\n`);
+		}
+		manifest.complete = true; manifest.directoryMtime = legacyDirectoryMtime(route); durableWrite(manifestPath(route), `${JSON.stringify(manifest)}\n`); legacyFingerprints.set(runtimeKey(route), manifest.directoryMtime);
 	});
 }
 
@@ -719,7 +853,7 @@ export function readNestedRegistry(route: NestedRoute): NestedRegistry {
 export function projectNestedEvents(route: NestedRoute): NestedRegistry {
 	validateRouteShape(route); assertTrustedRouteEntry(route.eventSink, "directory"); importLegacy(route);
 	return withRouteLock(route, () => {
-		let state = readState(route); let registry = readNestedRegistry(route); let changed = false;
+		const runtime = runtimeFor(route); let state = runtime.state; let registry = readNestedRegistry(route); let changed = false;
 		// The reader cursor is independent from the writer sequence: an active
 		// parent commonly polls while children append. This bounded pass starts at
 		// the persisted byte offset and never enumerates or reparses old frames.
@@ -733,8 +867,8 @@ export function projectNestedEvents(route: NestedRoute): NestedRegistry {
 		}
 		if (state.eventReadOffset !== state.eventWriteOffset) { state.eventWriteOffset = Math.max(state.eventWriteOffset, state.eventReadOffset); }
 		if (changed) { registry = { ...registry, processedEvents: [] }; durableWrite(registryPath(route), `${JSON.stringify(registry)}\n`); }
-		writeState(route, state);
-		if (statSize(journalPath(route, "event")) >= COMPACTION_BYTES && state.eventReadOffset === state.eventWriteOffset) compactEvents(route, state, registry);
+		if (frames.length || state.eventReadOffset !== state.eventWriteOffset) writeState(route, state, "event");
+		if (statSize(journalPath(route, "event")) >= compactionThreshold() && state.eventReadOffset === state.eventWriteOffset) compactJournal(route, state, registry, "event", runtime);
 		return registry;
 	});
 }
@@ -749,7 +883,7 @@ function readFramesRelaxed<T>(route: NestedRoute, kind: "event" | "control" | "r
 			if (!h.subarray(0, 8).equals(JOURNAL_MAGIC) || h.readUInt8(8) !== JOURNAL_VERSION || h.readUInt8(9) !== frameKind(kind) || !Number.isSafeInteger(seq) || seq <= previous || length > JOURNAL_MAX_BODY_BYTES || next > stat.size) { badAt = position; break; }
 			const body = Buffer.alloc(length); fs.readSync(fd, body, 0, length, position + JOURNAL_HEADER_BYTES); if (!createHash("sha256").update(body).digest().equals(h.subarray(24, 56))) { badAt = position; break; }
 			let record: T; try { record = JSON.parse(body.toString("utf8")) as T; } catch { badAt = position; break; }
-			frames.push({ sequence: seq, record, nextOffset: next }); previous = seq; position = next;
+			frames.push({ sequence: seq, record, nextOffset: next }); journalWork.frames++; journalWork.bytes += JOURNAL_HEADER_BYTES + length; previous = seq; position = next;
 		}
 	} finally { fs.closeSync(fd); }
 	if (badAt !== undefined) {
@@ -765,45 +899,88 @@ function reconcileWriterCursor(route: NestedRoute, state: JournalState, kind: "e
 	if (size <= offset) return;
 	const delta = readFramesRelaxed<Record<string, unknown>>(route, kind, offset, state[sequenceKey]);
 	state[offsetKey] = delta.end; if (delta.frames.length) state[sequenceKey] = delta.frames[delta.frames.length - 1]!.sequence;
+	const runtime = journalRuntimes.get(runtimeKey(route));
 	for (const frame of delta.frames) {
-		if (kind === "control") { const request = parseControlRequest(JSON.stringify(frame.record), route); if (request) state.pendingRequests[request.requestId] = request; }
-		if (kind === "result") { const result = parseControlResult(JSON.stringify(frame.record), route); if (result) state.results[result.requestId] ??= result; }
+		if (kind === "control") { const request = parseControlRequest(JSON.stringify(frame.record), route); if (request && runtime) { runtime.pending.set(request.requestId, request); appendIndex(route, "control", request); } }
+		if (kind === "result") { const result = parseControlResult(JSON.stringify(frame.record), route); if (result && runtime) { runtime.results.set(result.requestId, result); appendIndex(route, "result", result); } }
 	}
 }
-function compactEvents(route: NestedRoute, state: JournalState, registry: NestedRegistry): void {
-	const file = journalPath(route, "event"); if (!fs.existsSync(file)) return; trustedDataFile(file);
-	const sealed = `${file}.sealed.${state.generation + 1}`; fs.renameSync(file, sealed); fsyncDirectory(routeRoot(route)); ensureJournal(file);
-	state.generation++; state.eventReadOffset = 0; state.eventWriteOffset = 0; writeState(route, state); fsyncDirectory(routeRoot(route));
+function compactJournal(route: NestedRoute, state: JournalState, snapshot: NestedRegistry | undefined, kind: "event" | "control" | "result", runtime: JournalRuntime): void {
+	const file = journalPath(route, kind); if (!fs.existsSync(file) || statSize(file) === 0) return; trustedDataFile(file);
+	const generation = state.generation + 1; const sealed = `${file}.sealed.${generation}`;
+	const plan = path.join(routeRoot(route), COMPACTION_FILE);
+	// The plan is the recovery authority. Until snapshot publication is durable,
+	// a sealed generation is never discarded and can be merged back on restart.
+	durableWrite(plan, `${JSON.stringify({ version: 1, kind, generation, file, sealed, phase: "planned" })}\n`); journalFault("seal", kind);
+	if (!fs.existsSync(sealed)) { fs.renameSync(file, sealed); fsyncDirectory(routeRoot(route)); }
+	journalFault("seal", kind);
+	durableWrite(plan, `${JSON.stringify({ version: 1, kind, generation, file, sealed, phase: "sealed" })}\n`);
+	ensureJournal(file); journalFault("new", kind);
+	if (kind === "event" && snapshot) durableWrite(registryPath(route), `${JSON.stringify(snapshot)}\n`);
+	if (kind === "control") durableWrite(indexPath(route, "control"), [...runtime.pending.values()].map((value) => JSON.stringify(value)).join("\n") + (runtime.pending.size ? "\n" : ""));
+	if (kind === "result") durableWrite(indexPath(route, "result"), [...runtime.results.values()].map((value) => JSON.stringify(value)).join("\n") + (runtime.results.size ? "\n" : ""));
+	journalFault("snapshot", kind);
+	state.generation = generation;
+	if (kind === "event") { state.eventReadOffset = 0; state.eventWriteOffset = 0; }
+	if (kind === "control") { state.controlReadOffset = 0; state.controlWriteOffset = 0; }
+	if (kind === "result") { state.resultReadOffset = 0; state.resultWriteOffset = 0; }
+	writeState(route, state, kind); durableWrite(plan, `${JSON.stringify({ version: 1, kind, generation, file, sealed, phase: "published" })}\n`);
+	journalFault("cleanup", kind);
+	try { fs.unlinkSync(sealed); } catch { /* cleanup is retried by reconciliation */ }
+	fsyncDirectory(routeRoot(route)); legacyFingerprints.set(runtimeKey(route), legacyDirectoryMtime(route)); try { fs.unlinkSync(plan); } catch { /* evidence remains for next recovery */ }
+}
+function reconcileCompaction(route: NestedRoute, runtime: JournalRuntime): void {
+	const planFile = path.join(routeRoot(route), COMPACTION_FILE); if (!fs.existsSync(planFile)) return;
+	trustedDataFile(planFile); let plan: { kind?: "event" | "control" | "result"; file?: string; sealed?: string; phase?: string };
+	try { plan = JSON.parse(fs.readFileSync(planFile, "utf8")); } catch { throw new Error("Nested journal compaction plan is corrupt; refusing ambiguous recovery."); }
+	if (!plan.kind || !plan.file || !plan.sealed || !containedPath(routeRoot(route), plan.file) || !containedPath(routeRoot(route), plan.sealed)) throw new Error("Nested journal compaction plan is unsafe.");
+	if (plan.phase === "published" && fs.existsSync(plan.file)) { try { fs.unlinkSync(plan.sealed); } catch {} fs.unlinkSync(planFile); fsyncDirectory(routeRoot(route)); return; }
+	// No published snapshot: restore the sealed bytes as the active prefix,
+	// preserving the sealed file as immutable evidence until the next publish.
+	if (fs.existsSync(plan.sealed)) {
+		const active = fs.existsSync(plan.file) ? fs.readFileSync(plan.file) : Buffer.alloc(0);
+		const merged = Buffer.concat([fs.readFileSync(plan.sealed), active]);
+		const temp = `${plan.file}.${randomUUID()}.recovery`; const fd = fs.openSync(temp, "wx", 0o600); try { fs.writeFileSync(fd, merged); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+		fs.renameSync(temp, plan.file); fsyncDirectory(routeRoot(route));
+	}
+	try { fs.unlinkSync(planFile); } catch {}
 }
 
 export function writeNestedEvent(route: NestedRoute, event: Omit<NestedEventRecord, "rootRunId" | "capabilityToken">): void {
 	validateRouteShape(route); assertTrustedRouteEntry(route.eventSink, "directory"); const record: NestedEventRecord = { ...event, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken }; const sanitized = parseRecord(JSON.stringify(record), route); if (!sanitized) throw new Error("Nested event record failed validation.");
-	withRouteLock(route, () => { const state = readState(route); reconcileWriterCursor(route, state, "event"); state.eventSequence++; state.eventWriteOffset += appendJournal(route, "event", sanitized, state.eventSequence); writeState(route, state); });
+	withRouteLock(route, () => { const runtime = runtimeFor(route); const state = runtime.state; reconcileWriterCursor(route, state, "event"); state.eventSequence++; state.eventWriteOffset += appendJournal(route, "event", sanitized, state.eventSequence); writeState(route, state, "event"); });
 }
 
 export function writeNestedControlRequest(route: NestedRoute, request: Omit<NestedControlRequestRecord, "type" | "rootRunId" | "capabilityToken">): string {
 	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); assertSafeId("requestId", request.requestId); assertSafeId("targetRunId", request.targetRunId); const record: NestedControlRequestRecord = { type: "subagent.nested.control-request", ...request, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken }; const sanitized = parseControlRequest(JSON.stringify(record), route); if (!sanitized) throw new Error("Nested control request failed validation.");
-	return withRouteLock(route, () => { const state = readState(route); reconcileWriterCursor(route, state, "control"); const existing = state.pendingRequests[sanitized.requestId]; if (existing && JSON.stringify(existing) !== JSON.stringify(sanitized)) throw new Error("Conflicting nested control request for requestId."); if (!existing && !state.ackedRequests.includes(sanitized.requestId)) { state.controlSequence++; const bytes = appendJournal(route, "control", sanitized, state.controlSequence); state.controlWriteOffset += bytes; state.pendingRequests[sanitized.requestId] = sanitized; writeState(route, state); } const marker = path.join(route.controlInbox, `${sanitized.requestId}.compat`); let markerFd: number; try { markerFd = fs.openSync(marker, "wx", 0o600); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; return marker; } try { fs.writeFileSync(markerFd, "journal-request\\n", "utf8"); fs.fsyncSync(markerFd); } finally { fs.closeSync(markerFd); } fsyncDirectory(route.controlInbox); return marker; });
+	return withRouteLock(route, () => { const runtime = runtimeFor(route); const state = runtime.state; reconcileWriterCursor(route, state, "control"); const existing = runtime.pending.get(sanitized.requestId); if (existing && JSON.stringify(existing) !== JSON.stringify(sanitized)) throw new Error("Conflicting nested control request for requestId."); if (!existing && !runtime.acked.has(sanitized.requestId)) { state.controlSequence++; const bytes = appendJournal(route, "control", sanitized, state.controlSequence); state.controlWriteOffset += bytes; runtime.pending.set(sanitized.requestId, sanitized); appendIndex(route, "control", sanitized); writeState(route, state, "control"); } const marker = path.join(route.controlInbox, `${sanitized.requestId}.compat`); let markerFd: number; try { markerFd = fs.openSync(marker, "wx", 0o600); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; return marker; } try { fs.writeFileSync(markerFd, "journal-request\\n", "utf8"); fs.fsyncSync(markerFd); } finally { fs.closeSync(markerFd); } fsyncDirectory(route.controlInbox); legacyFingerprints.set(runtimeKey(route), legacyDirectoryMtime(route)); return marker; });
 }
 
 export function readNestedControlRequests(route: NestedRoute): Array<NestedControlRequestRecord & { filePath: string }> {
 	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); importLegacy(route);
-	return withRouteLock(route, () => { const state = readState(route); const delta = readFramesRelaxed<NestedControlRequestRecord>(route, "control", state.controlReadOffset, state.controlReadSequence); state.controlReadOffset = delta.end; if (delta.frames.length) state.controlReadSequence = delta.frames[delta.frames.length - 1]!.sequence; for (const frame of delta.frames) { const request = parseControlRequest(JSON.stringify(frame.record), route); if (request && !state.ackedRequests.includes(request.requestId)) state.pendingRequests[request.requestId] = request; } writeState(route, state); return Object.values(state.pendingRequests).filter((request) => !state.ackedRequests.includes(request.requestId)).sort((a, b) => a.ts - b.ts).map((request) => ({ ...request, filePath: path.join(route.controlInbox, `${request.requestId}.compat`) })); });
+	return withRouteLock(route, () => { const runtime = runtimeFor(route); const state = runtime.state; const delta = readFramesRelaxed<NestedControlRequestRecord>(route, "control", state.controlReadOffset, state.controlReadSequence); state.controlReadOffset = delta.end; if (delta.frames.length) state.controlReadSequence = delta.frames[delta.frames.length - 1]!.sequence; for (const frame of delta.frames) { const request = parseControlRequest(JSON.stringify(frame.record), route); if (request && !runtime.acked.has(request.requestId)) runtime.pending.set(request.requestId, request); } if (delta.frames.length) writeState(route, state, "control"); if (statSize(journalPath(route, "control")) >= compactionThreshold() && state.controlReadOffset === state.controlWriteOffset) compactJournal(route, state, undefined, "control", runtime); return [...runtime.pending.values()].filter((request) => !runtime.acked.has(request.requestId)).map((request) => ({ ...request, filePath: path.join(route.controlInbox, `${request.requestId}.compat`) })); });
 }
 
 export function writeNestedControlResult(route: NestedRoute, result: Omit<NestedControlResultRecord, "type" | "rootRunId" | "capabilityToken">): void {
 	validateRouteShape(route); assertSafeId("requestId", result.requestId); assertSafeId("targetRunId", result.targetRunId); const record: NestedControlResultRecord = { type: "subagent.nested.control-result", ...result, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken }; const sanitized = parseControlResult(JSON.stringify(record), route); if (!sanitized) throw new Error("Nested control result failed validation.");
-	withRouteLock(route, () => { const state = readState(route); reconcileWriterCursor(route, state, "result"); const prior = state.results[sanitized.requestId]; if (prior) { if (JSON.stringify(prior) !== JSON.stringify(sanitized)) throw new Error("Conflicting nested control result for requestId."); return; } state.resultSequence++; state.resultWriteOffset += appendJournal(route, "result", sanitized, state.resultSequence); state.results[sanitized.requestId] = sanitized; writeState(route, state); });
+	withRouteLock(route, () => { const runtime = runtimeFor(route); const state = runtime.state; reconcileWriterCursor(route, state, "result"); const prior = runtime.results.get(sanitized.requestId); if (prior) { if (JSON.stringify(prior) !== JSON.stringify(sanitized)) throw new Error("Conflicting nested control result for requestId."); return; } state.resultSequence++; state.resultWriteOffset += appendJournal(route, "result", sanitized, state.resultSequence); runtime.results.set(sanitized.requestId, sanitized); appendIndex(route, "result", sanitized); writeState(route, state, "result"); if (statSize(journalPath(route, "result")) >= compactionThreshold() && state.resultReadOffset === state.resultWriteOffset) compactJournal(route, state, undefined, "result", runtime); });
+}
+
+/** Claim the side-effect window durably. A restart seeing a claim without a
+ * result must fail closed rather than execute the side effect a second time. */
+export function claimNestedControlRequest(route: NestedRoute, requestId: string): "new" | "claimed" | "completed" {
+	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); assertSafeId("requestId", requestId);
+	return withRouteLock(route, () => { const runtime = runtimeFor(route); if (runtime.results.has(requestId)) return "completed"; if (runtime.claimed.has(requestId)) return "claimed"; runtime.claimed.add(requestId); appendExecution(route, requestId); return "new"; });
 }
 
 /** A result must be durable before a request is acknowledged. */
 export function ackNestedControlRequest(route: NestedRoute, requestId: string, legacyFilePath?: string): void {
-	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); assertSafeId("requestId", requestId); withRouteLock(route, () => { const state = readState(route); if (!state.ackedRequests.includes(requestId)) state.ackedRequests.push(requestId); delete state.pendingRequests[requestId]; state.ackedRequests = state.ackedRequests.slice(-4096); writeState(route, state); if (legacyFilePath && path.basename(legacyFilePath) !== CONTROL_JOURNAL && containedPath(route.controlInbox, legacyFilePath)) { try { const stat = fs.lstatSync(legacyFilePath); if (stat.isFile()) fs.unlinkSync(legacyFilePath); } catch { /* evidence may already have been removed */ } } });
+	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); assertSafeId("requestId", requestId); withRouteLock(route, () => { const runtime = runtimeFor(route); const state = runtime.state; const request = runtime.pending.get(requestId); const result = runtime.results.get(requestId); if (!request) { if (runtime.acked.has(requestId)) return; throw new Error(`Cannot acknowledge unknown nested control request '${requestId}'.`); } if (!result || result.targetRunId !== request.targetRunId) throw new Error(`Cannot acknowledge nested control request '${requestId}' before a durable matching result.`); runtime.acked.add(requestId); appendAck(route, requestId); runtime.pending.delete(requestId); writeState(route, state, "control"); /* Legacy request files remain immutable evidence. */ });
 }
 
 export function readNestedControlResults(route: NestedRoute): NestedControlResultRecord[] {
 	validateRouteShape(route); assertTrustedRouteEntry(route.eventSink, "directory"); importLegacy(route);
-	return withRouteLock(route, () => { const state = readState(route); const delta = readFramesRelaxed<NestedControlResultRecord>(route, "result", state.resultReadOffset, state.resultReadSequence); state.resultReadOffset = delta.end; if (delta.frames.length) state.resultReadSequence = delta.frames[delta.frames.length - 1]!.sequence; for (const frame of delta.frames) { const result = parseControlResult(JSON.stringify(frame.record), route); if (result) state.results[result.requestId] ??= result; } writeState(route, state); return Object.values(state.results); });
+	return withRouteLock(route, () => { const runtime = runtimeFor(route); const state = runtime.state; const delta = readFramesRelaxed<NestedControlResultRecord>(route, "result", state.resultReadOffset, state.resultReadSequence); state.resultReadOffset = delta.end; if (delta.frames.length) { state.resultReadSequence = delta.frames[delta.frames.length - 1]!.sequence; for (const frame of delta.frames) { const result = parseControlResult(JSON.stringify(frame.record), route); if (result) runtime.results.set(result.requestId, result); } writeState(route, state, "result"); } if (statSize(journalPath(route, "result")) >= compactionThreshold() && state.resultReadOffset === state.resultWriteOffset) compactJournal(route, state, undefined, "result", runtime); return [...runtime.results.values()]; });
 }
 
 export function nestedRouteEnv(route: NestedRoute): Record<string, string> {

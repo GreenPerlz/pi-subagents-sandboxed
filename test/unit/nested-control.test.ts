@@ -912,7 +912,7 @@ describe("nested control routing", { concurrency: false }, () => {
 			await waitFor(() => logged.some((entry) => String(entry[0] ?? "").includes(route.controlInbox) && String(entry[0] ?? "").includes("root-poll-error")));
 
 			fs.rmSync(route.controlInbox, { force: true });
-			fs.mkdirSync(route.controlInbox, { recursive: true });
+			fs.mkdirSync(route.controlInbox, { recursive: true, mode: 0o700 });
 			const requestPath = writeNestedControlRequest(route, {
 				ts: Date.now(),
 				requestId: "poll-error-recovers",
@@ -921,7 +921,7 @@ describe("nested control routing", { concurrency: false }, () => {
 			});
 
 			await waitFor(() => readNestedControlResults(route).some((result) => result.requestId === "poll-error-recovers" && result.ok === false));
-			assert.equal(fs.existsSync(requestPath), false);
+			assert.equal(fs.existsSync(requestPath), true);
 		} finally {
 			console.error = originalError;
 		}
@@ -957,9 +957,9 @@ describe("nested control routing", { concurrency: false }, () => {
 			assert.equal(fs.existsSync(requestPath), true);
 
 			fs.rmSync(route.eventSink, { force: true });
-			fs.mkdirSync(route.eventSink, { recursive: true });
+			fs.mkdirSync(route.eventSink, { recursive: true, mode: 0o700 });
 			await waitFor(() => readNestedControlResults(route).some((result) => result.requestId === "result-write-fails" && result.ok === false));
-			assert.equal(fs.existsSync(requestPath), false);
+			assert.equal(fs.existsSync(requestPath), true);
 		} finally {
 			console.error = originalError;
 		}
@@ -986,7 +986,7 @@ describe("nested control routing", { concurrency: false }, () => {
 		registerFanoutChildSubagentExtension(pi);
 		await waitFor(() => readNestedControlResults(route).some((result) => result.requestId === "ownerless-request" && result.ok === false));
 
-		assert.equal(fs.existsSync(requestPath), false);
+		assert.equal(fs.existsSync(requestPath), true);
 		const result = readNestedControlResults(route).find((item) => item.requestId === "ownerless-request");
 		assert.match(result?.message ?? "", /not active/);
 	});

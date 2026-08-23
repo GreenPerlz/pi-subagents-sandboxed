@@ -7,7 +7,7 @@ import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
-import { ackNestedControlRequest, readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
+import { ackNestedControlRequest, claimNestedControlRequest, readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
@@ -76,6 +76,10 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 					try {
 						let result = pendingResults.get(request.requestId);
 						if (!result) {
+							const claim = claimNestedControlRequest(route, request.requestId);
+							if (claim === "claimed") {
+								result = { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: false, message: "Control request has an ambiguous prior side-effect; refusing replay." };
+							} else {
 							let ok = false;
 							let message = "Control request failed.";
 							try {
@@ -109,6 +113,7 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 								message = error instanceof Error ? error.message : String(error);
 							}
 							result = { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok, message };
+							}
 						}
 						try {
 							writeNestedControlResult(route, result);
@@ -120,9 +125,7 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 						pendingResults.delete(request.requestId);
 						ackNestedControlRequest(route, request.requestId, request.filePath);
 						seen.add(request.requestId);
-						// ackNestedControlRequest retains journal evidence and only unlinks
-						// legacy request files for compatibility.
-						try { if (path.basename(request.filePath) !== "control-requests.journal") fs.unlinkSync(request.filePath); } catch {}
+						// Legacy request files are retained as immutable evidence.
 					} finally {
 						inFlight.delete(request.requestId);
 					}

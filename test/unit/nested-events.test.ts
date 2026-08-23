@@ -5,6 +5,11 @@ import { afterEach, describe, it } from "node:test";
 import type { AsyncJobState, SubagentState } from "../../src/shared/types.ts";
 import {
 	ackNestedControlRequest,
+	claimNestedControlRequest,
+	getNestedJournalWorkCounters,
+	resetNestedJournalRuntime,
+	resetNestedJournalWorkCounters,
+	setNestedJournalFaultInjector,
 	createNestedRoute,
 	hasLiveNestedDescendants,
 	hasLiveNestedDescendantsForParent,
@@ -707,5 +712,64 @@ describe("framed nested journals", () => {
 		assert.equal(readNestedControlResults(route).length, 1);
 		ackNestedControlRequest(route, request.requestId);
 		assert.equal(readNestedControlRequests(route).length, 0);
+	});
+});
+
+describe("bounded journals and recovery seams", () => {
+	it("does not reread historical control/result frames on idle polls", () => {
+		const route = trackRoute("bounded-10k");
+		for (let index = 0; index < 10_000; index++) {
+			const id = `request-${index}`;
+			writeNestedControlRequest(route, { ts: index, requestId: id, targetRunId: "nested-child", action: "interrupt" });
+			writeNestedControlResult(route, { ts: index, requestId: id, targetRunId: "nested-child", ok: true, message: "done" });
+		}
+		assert.equal(readNestedControlRequests(route).length, 10_000);
+		assert.equal(readNestedControlResults(route).length, 10_000);
+		resetNestedJournalWorkCounters();
+		assert.equal(readNestedControlRequests(route).length, 10_000);
+		assert.equal(readNestedControlResults(route).length, 10_000);
+		assert.deepEqual(getNestedJournalWorkCounters(), { frames: 0, bytes: 0, readdir: 0 });
+		writeNestedControlResult(route, { ts: 10_001, requestId: "request-new", targetRunId: "nested-child", ok: true, message: "new" });
+		readNestedControlResults(route);
+		assert.equal(getNestedJournalWorkCounters().frames, 1);
+		assert.equal(getNestedJournalWorkCounters().readdir, 0);
+	});
+
+	it("requires a matching durable result and fails closed after an ambiguous claim", () => {
+		const route = trackRoute("ambiguous-control");
+		writeNestedControlRequest(route, { ts: 1, requestId: "ambiguous-request", targetRunId: "nested-child", action: "interrupt" });
+		assert.throws(() => ackNestedControlRequest(route, "ambiguous-request"), /durable matching result/);
+		assert.equal(claimNestedControlRequest(route, "ambiguous-request"), "new");
+		resetNestedJournalRuntime(route);
+		assert.equal(claimNestedControlRequest(route, "ambiguous-request"), "claimed");
+	});
+
+	it("reconciles every compaction fault phase without losing the sealed generation", () => {
+		const phases = ["seal", "new", "snapshot", "state", "cleanup"] as const;
+		for (const phase of phases) {
+			const route = trackRoute(`crash-${phase}`);
+			writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child(`child-${phase}`, "running", 1) });
+			projectNestedEvents(route);
+			process.env.PI_NESTED_COMPACTION_BYTES = "1";
+			setNestedJournalFaultInjector((current, kind) => { if (kind === "event" && current === phase) throw new Error(`fault-${phase}`); });
+			assert.throws(() => projectNestedEvents(route), /fault-/);
+			setNestedJournalFaultInjector(undefined);
+			assert.equal(projectNestedEvents(route).children[0]?.id, `child-${phase}`);
+			delete process.env.PI_NESTED_COMPACTION_BYTES;
+		}
+		delete process.env.PI_NESTED_COMPACTION_BYTES;
+	});
+});
+
+describe("nested route lock identity", () => {
+	it("fails closed on malformed ownership metadata and recovers only stale exact identities", () => {
+		const route = trackRoute("lock-identity");
+		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
+		fs.mkdirSync(lock, { mode: 0o700 });
+		fs.writeFileSync(path.join(lock, "owner"), JSON.stringify({ pid: "not-an-integer", uid: process.getuid?.() ?? 0, startToken: "x" }), { mode: 0o600 });
+		assert.throws(() => writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("locked", "running", 1) }), /ambiguous|trusted|identity/);
+		fs.rmSync(lock, { recursive: true, force: true });
+		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 2, parentRunId: route.rootRunId, child: child("locked", "running", 2) });
+		assert.equal(projectNestedEvents(route).children[0]?.id, "locked");
 	});
 });

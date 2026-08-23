@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import type { ForegroundResumeChild, GitBundleResult, NestedRouteInfo, NestedRunSummary, SubagentRunMode } from "../../shared/types.ts";
+import type { ForegroundResumeChild, GitBundleResult, NestedRouteInfo, NestedRunSummary, NestedRouteValidity, SubagentRunMode } from "../../shared/types.ts";
 import { validateNestedRouteForRevival } from "../shared/nested-events.ts";
 import type { FastModeStatus } from "../../shared/fast-mode.ts";
 
@@ -60,6 +60,8 @@ export interface PersistedForegroundStatus {
 	teardownUnproven?: boolean;
 	nestedChildren?: NestedRunSummary[];
 	nestedRoute?: NestedRouteInfo;
+	nestedRouteValidity?: NestedRouteValidity;
+	nestedRouteError?: string;
 	statusFile?: string;
 }
 
@@ -87,11 +89,12 @@ function readPersistedForegroundStatus(statusFile: string): PersistedForegroundS
 		const raw = JSON.parse(fs.readFileSync(statusFile, "utf-8")) as Partial<PersistedForegroundStatus>;
 		if (!raw.runId || !raw.mode || !raw.state || typeof raw.updatedAt !== "number") return undefined;
 		let nestedRoute: PersistedForegroundStatus["nestedRoute"];
-		try {
-			if (raw.nestedRoute) nestedRoute = validateNestedRouteForRevival(raw.nestedRoute);
-		} catch {
-			// Keep the foreground record visible, but fail closed for the
-			// unauthenticated nested projection.
+		let nestedRouteValidity: NestedRouteValidity = "legacy";
+		let nestedRouteError: string | undefined;
+		if (raw.nestedRoute !== undefined) {
+			nestedRoute = raw.nestedRoute as NestedRouteInfo;
+			try { nestedRoute = validateNestedRouteForRevival(raw.nestedRoute); nestedRouteValidity = "trusted"; }
+			catch (error) { nestedRouteValidity = "invalid"; nestedRouteError = error instanceof Error ? error.message : String(error); }
 		}
 		return {
 			runId: raw.runId,
@@ -109,7 +112,9 @@ function readPersistedForegroundStatus(statusFile: string): PersistedForegroundS
 			...(Array.isArray(raw.groupDiagnostics) ? { groupDiagnostics: raw.groupDiagnostics } : {}),
 			...(raw.teardownUnproven === true ? { teardownUnproven: true } : {}),
 			...(Array.isArray(raw.nestedChildren) ? { nestedChildren: raw.nestedChildren } : {}),
-			...(nestedRoute ? { nestedRoute } : {}),
+			...(raw.nestedRoute !== undefined ? { nestedRoute: raw.nestedRoute as NestedRouteInfo } : {}),
+			nestedRouteValidity,
+			...(nestedRouteError ? { nestedRouteError } : {}),
 			statusFile,
 		};
 	} catch {

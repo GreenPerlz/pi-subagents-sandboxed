@@ -11,6 +11,7 @@ import {
 	type NestedRunSummary,
 	type NestedRunState,
 	type NestedStepSummary,
+	type NestedRouteValidity,
 	type SubagentRunMode,
 	type SubagentState,
 } from "../../shared/types.ts";
@@ -293,6 +294,23 @@ function sanitizeState(value: unknown, fallback: NestedRunState): NestedRunState
 		: fallback;
 }
 
+function sanitizeGroupDiagnostics(value: unknown): NestedRunSummary["groupDiagnostics"] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return value.slice(0, MAX_STEPS).flatMap((item) => {
+		if (!item || typeof item !== "object") return [];
+		const raw = item as Record<string, unknown>;
+		const groupId = stringValue(raw.groupId, 128);
+		const agent = stringValue(raw.agent, 128);
+		const status = raw.status === "failed" || raw.status === "complete" || raw.status === "paused" || raw.status === "cancelled" ? raw.status : undefined;
+		if (!groupId || !agent || !status) return [];
+		return [{ groupId, unindexed: true as const, agent, status,
+			...(stringValue(raw.output, 4096) ? { output: stringValue(raw.output, 4096) } : {}),
+			...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
+			...(stringValue(raw.finalOutput, 4096) ? { finalOutput: stringValue(raw.finalOutput, 4096) } : {}),
+		}];
+	});
+}
+
 function sanitizeFastMode(value: unknown): FastModeStatus | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const raw = value as Record<string, unknown>;
@@ -328,6 +346,8 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		...(clampNumber(raw.startedAt) !== undefined ? { startedAt: clampNumber(raw.startedAt) } : {}),
 		...(clampNumber(raw.endedAt) !== undefined ? { endedAt: clampNumber(raw.endedAt) } : {}),
 		...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
+		...(stringValue(raw.finalOutput, 4096) ? { finalOutput: stringValue(raw.finalOutput, 4096) } : {}),
+		...(raw.gitBundle && typeof raw.gitBundle === "object" ? { gitBundle: raw.gitBundle as NestedStepSummary["gitBundle"] } : {}),
 		...(raw.teardownUnproven === true ? { teardownUnproven: true } : {}),
 		...(depth < MAX_DEPTH && Array.isArray(raw.children) ? { children: raw.children.map((child) => sanitizeSummary(child, depth + 1)).filter((child): child is NestedRunSummary => Boolean(child)).slice(0, MAX_CHILDREN) } : {}),
 	};
@@ -382,6 +402,8 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.lastUpdate) !== undefined ? { lastUpdate: clampNumber(raw.lastUpdate) } : {}),
 		...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
 		...(stringValue(raw.summary, 4096) ? { summary: stringValue(raw.summary, 4096) } : {}),
+		...(stringValue(raw.finalOutput, 4096) ? { finalOutput: stringValue(raw.finalOutput, 4096) } : {}),
+		...(sanitizeGroupDiagnostics(raw.groupDiagnostics) ? { groupDiagnostics: sanitizeGroupDiagnostics(raw.groupDiagnostics) } : {}),
 		...(raw.teardownUnproven === true ? { teardownUnproven: true } : {}),
 		...(steps && steps.length > 0 ? { steps } : {}),
 		...(depth < MAX_DEPTH && Array.isArray(raw.children) ? { children: raw.children.map((child) => sanitizeSummary(child, depth + 1)).filter((child): child is NestedRunSummary => Boolean(child)).slice(0, MAX_CHILDREN) } : {}),
@@ -438,30 +460,77 @@ function terminal(state: NestedRunState, teardownUnproven = false): boolean {
 }
 
 function mergeSummary(existing: NestedRunSummary | undefined, event: NestedEventRecord): NestedRunSummary {
-	// A detached acknowledgement is an update, not terminal truth. The owning
-	// process emits a later completed event after its process and descendants stop.
-	// Never coerce a running acknowledgement into a terminal state here: doing so
-	// makes the stop fence trust an acknowledgement while the child is still live.
-	const incomingSteps = event.child.steps?.map((step, index) => {
-		const previous = existing?.steps?.[index] ?? existing?.steps?.find((candidate) => candidate.agent === step.agent);
-		return previous?.teardownUnproven ? { ...step, teardownUnproven: true } : step;
-	});
-	const incoming = {
-		...event.child,
-		...(incomingSteps ? { steps: incomingSteps } : {}),
-		...(existing?.teardownUnproven || event.child.teardownUnproven ? { teardownUnproven: true } : {}),
-		lastUpdate: event.child.lastUpdate ?? event.ts,
-	};
+	const incoming = { ...event.child, lastUpdate: event.child.lastUpdate ?? event.ts };
+	return mergeNestedRunSummary(existing, incoming);
+}
+
+function nestedFreshness(run: NestedRunSummary | undefined): number {
+	if (!run) return 0;
+	return Math.max(run.lastUpdate ?? 0, run.startedAt ?? 0, run.endedAt ?? 0,
+		...(run.steps ?? []).map((step) => Math.max(step.startedAt ?? 0, step.endedAt ?? 0, step.lastActivityAt ?? 0,
+			...mergeNestedRunFreshness(step.children))),
+		...mergeNestedRunFreshness(run.children));
+}
+function mergeNestedRunFreshness(children: NestedRunSummary[] | undefined): number[] {
+	return (children ?? []).map((child) => nestedFreshness(child));
+}
+
+/** Merge a partial snapshot without allowing omitted rich fields to erase an earlier record. */
+function mergeNestedRunSummary(existing: NestedRunSummary | undefined, incoming: NestedRunSummary): NestedRunSummary {
 	if (!existing) return incoming;
-	const existingUpdate = existing.lastUpdate ?? 0;
-	const incomingUpdate = incoming.lastUpdate ?? event.ts;
-	if (incomingUpdate < existingUpdate) return existing;
-	// An explicit teardown failure is a newer nonterminal truth even if an older
-	// terminal event was already projected. Never let that terminal snapshot win.
-	if (incoming.teardownUnproven) return { ...existing, ...incoming, lastUpdate: Math.max(existingUpdate, incomingUpdate) };
-	if (terminal(existing.state, existing.teardownUnproven) && !terminal(incoming.state, incoming.teardownUnproven)) return existing;
-	if (terminal(existing.state, existing.teardownUnproven) && terminal(incoming.state, incoming.teardownUnproven) && incomingUpdate === existingUpdate) return existing;
-	return { ...existing, ...incoming, state: incoming.state, lastUpdate: Math.max(existingUpdate, incomingUpdate) };
+	const existingUpdate = nestedFreshness(existing);
+	const incomingUpdate = nestedFreshness(incoming);
+	const incomingIsNewer = incomingUpdate >= existingUpdate;
+	const existingTerminal = nestedTerminal(existing.state, existing.teardownUnproven);
+	const incomingTerminal = nestedTerminal(incoming.state, incoming.teardownUnproven);
+	const state = existing.teardownUnproven || incoming.teardownUnproven
+		? (incoming.teardownUnproven ? incoming.state : existing.state)
+		: existingTerminal && !incomingTerminal ? existing.state
+			: incomingTerminal && !existingTerminal ? incoming.state
+			: incomingIsNewer ? incoming.state : existing.state;
+	// Steps are canonical by position/index. Repeated agent names are legal and
+	// must never cause a later record to attach to the first matching agent.
+	const stepCount = Math.max(existing.steps?.length ?? 0, incoming.steps?.length ?? 0);
+	const steps = stepCount ? Array.from({ length: stepCount }, (_, index) => {
+		const next = incoming.steps?.[index];
+		const previous = existing.steps?.[index];
+		if (!next) return previous!;
+		return mergeNestedStepSnapshots(previous, next);
+	}).filter((step): step is NestedStepSummary => Boolean(step)) : undefined;
+	const children = mergeNestedRunSnapshots(existing.children, incoming.children);
+	const stepChildren = steps?.flatMap((step) => step.children ?? []) ?? [];
+	const attachedIds = new Set(stepChildren.map((child) => child.id));
+	return {
+		...existing,
+		...(incomingIsNewer ? incoming : {}),
+		state,
+		lastUpdate: Math.max(existing.lastUpdate ?? 0, incoming.lastUpdate ?? 0),
+		...(existing.teardownUnproven || incoming.teardownUnproven ? { teardownUnproven: true } : {}),
+		...(steps ? { steps } : {}),
+		...(children.length || stepChildren.length ? { children: children.filter((child) => !attachedIds.has(child.id)) } : {}),
+	};
+}
+
+function mergeNestedStepSnapshots(existing: NestedStepSummary | undefined, incoming: NestedStepSummary): NestedStepSummary {
+	if (!existing) return incoming;
+	const existingUpdate = Math.max(existing.startedAt ?? 0, existing.endedAt ?? 0, existing.lastActivityAt ?? 0);
+	const incomingUpdate = Math.max(incoming.startedAt ?? 0, incoming.endedAt ?? 0, incoming.lastActivityAt ?? 0);
+	const incomingIsNewer = incomingUpdate >= existingUpdate;
+	const existingTerminal = nestedTerminal(existing.status as NestedRunState, existing.teardownUnproven);
+	const incomingTerminal = nestedTerminal(incoming.status as NestedRunState, incoming.teardownUnproven);
+	const status = existing.teardownUnproven || incoming.teardownUnproven
+		? (incoming.teardownUnproven ? incoming.status : existing.status)
+		: existingTerminal && !incomingTerminal ? existing.status
+			: incomingTerminal && !existingTerminal ? incoming.status
+			: incomingIsNewer ? incoming.status : existing.status;
+	const children = mergeNestedRunSnapshots(existing.children, incoming.children);
+	return {
+		...existing,
+		...(incomingIsNewer ? incoming : {}),
+		status,
+		...(existing.teardownUnproven || incoming.teardownUnproven ? { teardownUnproven: true } : {}),
+		...(children.length || existing.children || incoming.children ? { children } : {}),
+	};
 }
 
 function attachChild(children: NestedRunSummary[], event: NestedEventRecord): NestedRunSummary[] {
@@ -516,59 +585,16 @@ export function applyNestedEvent(registry: NestedRegistry, event: NestedEventRec
 	};
 }
 
-function nestedTerminal(state: NestedRunState | undefined, teardownUnproven = false): boolean {
-	return !teardownUnproven && (state === "complete" || state === "failed" || state === "paused" || state === "cancelled");
+function nestedTerminal(state: NestedRunState | NestedStepSummary["status"] | undefined, teardownUnproven = false): boolean {
+	return !teardownUnproven && (state === "complete" || state === "completed" || state === "failed" || state === "paused" || state === "cancelled");
 }
 
-function mergeNestedStepSnapshots(existing: NestedStepSummary | undefined, incoming: NestedStepSummary): NestedStepSummary {
-	if (!existing) return incoming;
-	const existingUpdate = existing.endedAt ?? existing.lastActivityAt ?? existing.startedAt ?? 0;
-	const incomingUpdate = incoming.endedAt ?? incoming.lastActivityAt ?? incoming.startedAt ?? 0;
-	const state = existing.teardownUnproven || incoming.teardownUnproven
-		? (incoming.teardownUnproven ? incoming.status : existing.status)
-		: nestedTerminal(existing.status) && !nestedTerminal(incoming.status) ? existing.status
-			: nestedTerminal(incoming.status) && !nestedTerminal(existing.status) ? incoming.status
-				: incomingUpdate >= existingUpdate ? incoming.status : existing.status;
-		return {
-			...existing,
-			...(incomingUpdate >= existingUpdate ? incoming : {}),
-			status: state,
-			...(existing.teardownUnproven || incoming.teardownUnproven ? { teardownUnproven: true } : {}),
-			...(existing.children || incoming.children ? { children: mergeNestedRunSnapshots(existing.children ?? [], incoming.children ?? []) } : {}),
-		};
-}
-
-/** Monotonic union used when a status snapshot and the durable route both exist.
- * A stale snapshot may not erase children or terminal evidence already observed. */
+/** Monotonic union used when a status snapshot and the durable route both exist. */
 export function mergeNestedRunSnapshots(...snapshots: Array<NestedRunSummary[] | undefined>): NestedRunSummary[] {
 	const byId = new Map<string, NestedRunSummary>();
 	for (const snapshot of snapshots) for (const incoming of snapshot ?? []) {
 		const existing = byId.get(incoming.id);
-		if (!existing) { byId.set(incoming.id, incoming); continue; }
-		const existingUpdate = existing.lastUpdate ?? 0;
-		const incomingUpdate = incoming.lastUpdate ?? 0;
-		const state = existing.teardownUnproven || incoming.teardownUnproven
-			? (incoming.teardownUnproven ? incoming.state : existing.state)
-			: nestedTerminal(existing.state) && !nestedTerminal(incoming.state) ? existing.state
-				: nestedTerminal(incoming.state) && !nestedTerminal(existing.state) ? incoming.state
-					: incomingUpdate >= existingUpdate ? incoming.state : existing.state;
-		const steps = incoming.steps || existing.steps
-			? (incoming.steps ?? existing.steps ?? []).map((step, index) => mergeNestedStepSnapshots(existing.steps?.[index] ?? existing.steps?.find((candidate) => candidate.agent === step.agent), step))
-			: undefined;
-		const mergedSteps = existing.steps && incoming.steps && incoming.steps.length < existing.steps.length
-			? existing.steps.map((step, index) => mergeNestedStepSnapshots(step, incoming.steps?.[index] ?? step))
-			: steps;
-		const mergedChildren = mergeNestedRunSnapshots(existing.children, incoming.children);
-		const mergedStepChildren = mergedSteps?.flatMap((step) => step.children ?? []) ?? [];
-		const attachedIds = new Set(mergedStepChildren.map((child) => child.id));
-		byId.set(incoming.id, {
-			...existing,
-			...(incomingUpdate >= existingUpdate ? incoming : {}),
-			state,
-			...(existing.teardownUnproven || incoming.teardownUnproven ? { teardownUnproven: true } : {}),
-			...(mergedSteps ? { steps: mergedSteps } : {}),
-			...(mergedChildren.length || mergedStepChildren.length ? { children: mergedChildren.filter((child) => !attachedIds.has(child.id)) } : {}),
-		});
+		byId.set(incoming.id, existing ? mergeNestedRunSummary(existing, incoming) : incoming);
 	}
 	return [...byId.values()].slice(0, MAX_CHILDREN);
 }
@@ -607,13 +633,34 @@ export function findNestedRouteForRootId(rootRunId: string): NestedRoute | undef
 export function projectNestedRegistryForRoot(rootRunId: string): NestedRegistry | undefined { const route = findNestedRouteForRootId(rootRunId); return route ? projectNestedEvents(route) : undefined; }
 
 /** Resolve persisted authority without silently substituting another root's route. */
+export interface NestedRouteResolution {
+	route?: NestedRoute;
+	validity: NestedRouteValidity;
+	error?: string;
+}
+export function resolveNestedRoute(rootRunId: string, persisted?: NestedRouteInfo): NestedRouteResolution {
+	if (persisted === undefined) {
+		const route = findNestedRouteForRootId(rootRunId);
+		return { route, validity: route ? "trusted" : "legacy" };
+	}
+	try {
+		// First validate coordinates and route identity even when the route was
+		// cleaned up. A correctly shaped but absent route is unavailable, not forged.
+		validateRouteShape(persisted);
+		const root = commonRouteRoot(persisted);
+		if (!fs.existsSync(root)) return { validity: "unavailable", error: "Persisted nested route was cleaned up." };
+		validateNestedRouteAuthority(persisted, true);
+		return { route: persisted, validity: "trusted" };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (message.includes("route root does not exist") || message.includes("route directories do not exist")) return { validity: "unavailable", error: message };
+		return { validity: "invalid", error: message };
+	}
+}
 export function resolveExactNestedRoute(rootRunId: string, persisted?: NestedRouteInfo): NestedRoute | undefined {
-	// A persisted route is the authenticated authority even when the detached
-	// status filename/run id differs (legacy foreground and nested layouts can
-	// use a parent id in event records). Validation binds it to route.json and
-	// refuses forged coordinates; never substitute an ambient route on failure.
-	if (persisted) return validateNestedRouteForRevival(persisted);
-	return findNestedRouteForRootId(rootRunId);
+	const result = resolveNestedRoute(rootRunId, persisted);
+	if (result.validity === "invalid") throw new Error(result.error ?? "Persisted nested route is invalid.");
+	return result.route;
 }
 export function findNestedRun(children: NestedRunSummary[] | undefined, id: string): NestedRunSummary | undefined {
 	for (const child of children ?? []) { if (child.id === id) return child; const nested = findNestedRun(child.children, id) ?? findNestedRun(child.steps?.flatMap((step) => step.children ?? []), id); if (nested) return nested; } return undefined;
@@ -1317,6 +1364,8 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		...(status.sessionId ? { sessionId: status.sessionId } : {}),
 		mode: status.mode ?? fallback.mode,
 		state: status.state,
+		...(status.steps?.length ? { agents: status.steps.map((step) => step.agent).slice(0, MAX_STEPS) } : {}),
+		...(status.parallelGroups?.length ? { parallelGroups: status.parallelGroups.slice(0, MAX_STEPS) } : {}),
 		...(status.currentStep !== undefined ? { currentStep: status.currentStep } : {}),
 		...(status.chainStepCount !== undefined ? { chainStepCount: status.chainStepCount } : {}),
 		...(status.activityState ? { activityState: status.activityState } : {}),
@@ -1331,9 +1380,12 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		...(status.totalTokens ? { totalTokens: status.totalTokens } : {}),
 		...(status.startedAt !== undefined ? { startedAt: status.startedAt } : { startedAt: fallback.ts }),
 		...(status.endedAt !== undefined ? { endedAt: status.endedAt } : {}),
+		...(status.error ? { error: status.error } : {}),
+		...(status.finalOutput !== undefined ? { finalOutput: status.finalOutput.slice(0, 4096) } : {}),
 		lastUpdate: status.lastUpdate ?? fallback.ts,
 		...(status.teardownUnproven ? { teardownUnproven: true } : {}),
 		...(status.sessionFile ? { sessionFile: status.sessionFile } : {}),
+		...(sanitizeGroupDiagnostics(status.groupDiagnostics) ? { groupDiagnostics: sanitizeGroupDiagnostics(status.groupDiagnostics) } : {}),
 		...(status.steps?.length ? { steps: status.steps.map((step) => ({
 			agent: step.agent,
 			status: step.status,
@@ -1352,6 +1404,8 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 			...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
 			...(step.endedAt !== undefined ? { endedAt: step.endedAt } : {}),
 			...(step.error ? { error: step.error } : {}),
+			...(step.finalOutput !== undefined ? { finalOutput: step.finalOutput.slice(0, 4096) } : {}),
+			...(step.gitBundle ? { gitBundle: step.gitBundle } : {}),
 			...(step.teardownUnproven ? { teardownUnproven: true } : {}),
 		})).slice(0, MAX_STEPS) } : {}),
 	};

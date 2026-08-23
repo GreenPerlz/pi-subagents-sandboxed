@@ -13,7 +13,7 @@ import { resolveSubagentRunId } from "./run-id-resolver.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
 import { isExpectedAsyncRunnerPid } from "./pid-identity.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { attachRootChildrenToSteps, mergeNestedRunSnapshots, projectNestedEvents, resolveExactNestedRoute, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, mergeNestedRunSnapshots, projectNestedEvents, resolveNestedRoute, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 
 interface RunStatusParams {
 	action?: "status";
@@ -206,23 +206,24 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		const logPath = path.join(asyncDir, `subagent-log-${effectiveRunId}.md`);
 		const eventsPath = path.join(asyncDir, "events.jsonl");
 		if (status) {
-			let nestedChildren: NestedRunSummary[] = [];
+			let nestedChildren: NestedRunSummary[] = status.nestedChildren ?? [];
 			let nestedWarning: string | undefined;
+			const persistedChildren = mergeNestedRunSnapshots(status.nestedChildren, ...(status.steps ?? []).map((step) => step.children));
+			const resolution = resolveNestedRoute(status.runId, status.nestedRoute);
+			if (resolution.error) nestedWarning = resolution.error;
 			try {
-				// Prefer the exact persisted route. Ambient root lookup is only used
-				// when no route metadata was persisted; mismatches fail closed.
-				const nestedRoute = resolveExactNestedRoute(status.runId, status.nestedRoute);
-				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, {
-					resultsDir,
-					kill: deps.kill,
-					now: deps.now,
-					isExpectedAsyncRunnerPid: deps.isExpectedAsyncRunnerPid,
-				});
-				const persistedChildren = (status.steps ?? []).flatMap((step) => step.children ?? []);
-				const routeChildren = nestedRoute ? projectNestedEvents(nestedRoute).children : [];
-				nestedChildren = mergeNestedRunSnapshots(persistedChildren, routeChildren);
+				if (resolution.route) {
+					reconcileNestedAsyncDescendants(resolution.route, {
+						resultsDir,
+						kill: deps.kill,
+						now: deps.now,
+						isExpectedAsyncRunnerPid: deps.isExpectedAsyncRunnerPid,
+					});
+					nestedChildren = mergeNestedRunSnapshots(persistedChildren, projectNestedEvents(resolution.route).children);
+				} else nestedChildren = persistedChildren;
 				attachRootChildrenToSteps(status.runId, status.steps, nestedChildren);
 			} catch (error) {
+				nestedChildren = persistedChildren;
 				nestedWarning = `Nested status unavailable: ${error instanceof Error ? error.message : String(error)}`;
 			}
 			const outputPath = formatAsyncRunOutputPath({ asyncDir, outputFile: status.outputFile });

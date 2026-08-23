@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { listAsyncRuns, formatAsyncRunOutputPath, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { listPersistedForegroundRuns, type PersistedForegroundStatus } from "../runs/foreground/foreground-status.ts";
-import { mergeNestedRunSnapshots, projectNestedEvents, resolveExactNestedRoute, updateForegroundNestedProjection } from "../runs/shared/nested-events.ts";
+import { mergeNestedRunSnapshots, projectNestedEvents, resolveNestedRoute, updateForegroundNestedProjection } from "../runs/shared/nested-events.ts";
 import {
 	ASYNC_DIR,
 	FOREGROUND_DIR,
@@ -112,6 +112,7 @@ export interface OverlayRun {
 	asyncDir?: string;
 	steps: OverlayStep[];
 	groupDiagnostics?: OverlayGroupDiagnostic[];
+	nestedWarning?: string;
 }
 
 export interface CollectRunTreeOptions {
@@ -786,12 +787,13 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 	const groupDiagnostics = children.map((child) => mapGroupDiagnostic(child as { groupId?: string; agent?: string; status?: string; error?: string; finalOutput?: string })).filter((diagnostic): diagnostic is OverlayGroupDiagnostic => Boolean(diagnostic));
 	const indexedChildren = children.filter((child) => !("groupId" in child && child.groupId) && !("unindexed" in child && child.unindexed)).slice().sort((left, right) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
 	let persistedNestedChildren = status.nestedChildren ?? [];
+	let nestedWarning: string | undefined;
+	const resolution = resolveNestedRoute(status.runId, status.nestedRoute);
+	if (resolution.error) nestedWarning = resolution.error;
 	try {
-		const route = resolveExactNestedRoute(status.runId, status.nestedRoute);
-		if (route) persistedNestedChildren = mergeNestedRunSnapshots(persistedNestedChildren, projectNestedEvents(route).children);
-	} catch {
-		// A mismatched route is fail-closed: do not trust route-bound children.
-		if (status.nestedRoute) persistedNestedChildren = [];
+		if (resolution.route) persistedNestedChildren = mergeNestedRunSnapshots(persistedNestedChildren, projectNestedEvents(resolution.route).children);
+	} catch (error) {
+		nestedWarning = error instanceof Error ? error.message : String(error);
 	}
 	const nestedChildren = persistedNestedChildren.map((nested) => mapNestedRunWithStaleState(nested, staleState, status.updatedAt));
 	const sourceChild = indexedChildren.find((child) => child.model);
@@ -839,6 +841,7 @@ function overlayRunFromPersistedForeground(status: PersistedForegroundStatus, no
 		artifactPath: indexedChildren.find((child) => child.artifactPath)?.artifactPath,
 		steps,
 		...(groupDiagnostics.length ? { groupDiagnostics } : {}),
+		...(nestedWarning ? { nestedWarning } : {}),
 	};
 }
 

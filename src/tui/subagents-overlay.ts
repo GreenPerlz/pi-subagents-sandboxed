@@ -313,6 +313,7 @@ function renderRun(run: OverlayRun, theme: Theme, width: number, lines: string[]
 	const header = `${selector}${glyph} ${label} ${stateLabel(run.state, theme)} ${badge} · ${run.id}${meta}`;
 	lines.push(truncateToWidth(header, width));
 	counter.index++;
+	if (run.nestedWarning) lines.push(truncateToWidth(`${indent(1)}${theme.fg("warning", "Warning: ")}${run.nestedWarning}`, width));
 	for (const [stepIndex, step] of run.steps.entries()) {
 		// Skip redundant step line for single foreground runs where the step
 		// duplicates the run header (same agent). Still render nested children

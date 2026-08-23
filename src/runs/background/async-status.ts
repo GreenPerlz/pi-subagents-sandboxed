@@ -2,10 +2,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
-import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode, type TokenUsage } from "../../shared/types.ts";
+import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode, type TokenUsage, type NestedRouteValidity } from "../../shared/types.ts";
 import type { FastModeStatus } from "../../shared/fast-mode.ts";
 import { readStatus } from "../../shared/utils.ts";
-import { attachRootChildrenToSteps, mergeNestedRunSnapshots, projectNestedEvents, readNestedRegistry, resolveExactNestedRoute } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, mergeNestedRunSnapshots, projectNestedEvents, readNestedRegistry, resolveNestedRoute, resolveExactNestedRoute } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
 import { isExpectedAsyncRunnerPid } from "./pid-identity.ts";
@@ -77,6 +77,8 @@ export interface AsyncRunSummary {
 	sessionFile?: string;
 	nestedChildren?: NestedRunSummary[];
 	nestedWarnings?: string[];
+	nestedRouteValidity?: NestedRouteValidity;
+	nestedRouteError?: string;
 }
 
 interface AsyncRunListOptions {
@@ -146,17 +148,20 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	const chainStepCount = status.chainStepCount ?? steps.length;
 	const parallelGroups = normalizeParallelGroups(status.parallelGroups, steps.length, chainStepCount);
 	let nestedChildren: NestedRunSummary[] = status.nestedChildren ?? [];
+	let nestedRouteValidity: NestedRouteValidity = status.nestedRoute !== undefined ? "invalid" : "legacy";
 	if (nestedWarnings.length === 0) {
-		try {
-			const rootRunId = status.runId || path.basename(asyncDir);
-			const route = resolveExactNestedRoute(rootRunId, status.nestedRoute);
-			const routeChildren = route ? (options?.readOnly ? readNestedRegistry(route).children : projectNestedEvents(route).children) : [];
-			// Status files can lag the event journal (and vice versa). Always take
-			// the monotonic union rather than letting a non-empty stale snapshot win.
-			nestedChildren = mergeNestedRunSnapshots(nestedChildren, routeChildren);
-		} catch (error) {
-			if (status.nestedRoute) nestedChildren = [];
-			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+		const rootRunId = status.runId || path.basename(asyncDir);
+		const resolution = resolveNestedRoute(rootRunId, status.nestedRoute);
+		nestedRouteValidity = resolution.validity;
+		if (resolution.error) nestedWarnings.push(`Nested status unavailable: ${resolution.error}`);
+		if (resolution.route) {
+			try {
+				const routeChildren = options?.readOnly ? readNestedRegistry(resolution.route).children : projectNestedEvents(resolution.route).children;
+				nestedChildren = mergeNestedRunSnapshots(nestedChildren, routeChildren);
+			} catch (error) {
+				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+				nestedRouteValidity = "unavailable";
+			}
 		}
 	}
 	const summarizedSteps = steps.map((step, index) => {
@@ -230,6 +235,8 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		steps: summarizedSteps,
 		...(nestedChildren.length ? { nestedChildren } : {}),
 		...(nestedWarnings.length ? { nestedWarnings } : {}),
+		nestedRouteValidity,
+		...(nestedWarnings.length ? { nestedRouteError: nestedWarnings[0] } : {}),
 		...(status.sessionDir ? { sessionDir: status.sessionDir } : {}),
 		...(status.outputFile ? { outputFile: status.outputFile } : {}),
 		...(status.totalTokens ? { totalTokens: status.totalTokens } : {}),

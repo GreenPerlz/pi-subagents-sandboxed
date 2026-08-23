@@ -22,6 +22,7 @@ import {
 	projectNestedEvents,
 	resolveNestedParentAddressFromEnv,
 	resolveNestedRouteFromEnv,
+	resolveNestedRoute,
 	resolveRequiredInheritedNestedRouteFromEnv,
 	updateAsyncJobNestedProjection,
 	updateForegroundNestedProjection,
@@ -91,6 +92,44 @@ function child(id: string, state: "queued" | "running" | "complete" | "failed" |
 		steps: [{ agent: "leaf", status: state === "running" ? "running" as const : "complete" as const }],
 	};
 }
+
+describe("nested snapshot fidelity and route authority", () => {
+	it("retains rich started fields when a newer partial terminal snapshot arrives", () => {
+		const started = child("partial", "running", 10) as any;
+		started.cwd = "/work";
+		started.model = "model-a";
+		started.thinking = "high";
+		started.totalTokens = { input: 2, output: 3, total: 5 };
+		started.summary = "started summary";
+		started.steps = [{ agent: "same", status: "running", model: "model-a", startedAt: 10 }, { agent: "same", status: "running", model: "model-b", startedAt: 11 }];
+		const completed = { ...child("partial", "complete", 20), endedAt: 20, steps: [{ agent: "same", status: "complete", endedAt: 20 }] } as any;
+		const [merged] = mergeNestedRunSnapshots([started], [completed]);
+		assert.equal(merged.cwd, "/work");
+		assert.equal(merged.model, "model-a");
+		assert.equal(merged.summary, "started summary");
+		assert.equal(merged.steps?.[1]?.model, "model-b");
+		assert.equal(merged.state, "complete");
+	});
+
+	it("uses fresh nested descendants even when the parent snapshot is stale", () => {
+		const live = child("fresh-parent", "running", 10) as any;
+		const persisted = { ...child("fresh-parent", "complete", 5), children: [{ ...child("fresh-child", "complete", 100), endedAt: 100 }] } as any;
+		const [merged] = mergeNestedRunSnapshots([live], [persisted]);
+		assert.equal(merged.state, "complete");
+		assert.equal(merged.children?.[0]?.id, "fresh-child");
+	});
+
+	it("classifies cleaned trusted routes as unavailable and forged routes as invalid", () => {
+		const route = trackRoute("authority-root");
+		const trusted = resolveNestedRoute("authority-root", route);
+		assert.equal(trusted.validity, "trusted");
+		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		assert.equal(resolveNestedRoute("authority-root", route).validity, "unavailable");
+		const ambient = trackRoute("authority-root");
+		const forged = { ...ambient, capabilityToken: "forged-token" };
+		assert.equal(resolveNestedRoute("authority-root", forged).validity, "invalid");
+	});
+});
 
 describe("nested event route validation", () => {
 	it("resolves nested parent addresses with full inherited path", () => {

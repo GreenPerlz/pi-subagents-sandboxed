@@ -554,6 +554,7 @@ export interface AsyncParallelGroupStatus {
 
 export type NestedRunState = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
 export type NestedOwnerState = "live" | "gone" | "unknown";
+export type NestedRouteValidity = "legacy" | "trusted" | "unavailable" | "invalid";
 
 export interface NestedRunAddress {
 	id: string;
@@ -582,8 +583,10 @@ export interface NestedStepSummary {
 	startedAt?: number;
 	endedAt?: number;
 	error?: string;
+	finalOutput?: string;
 	teardownUnproven?: boolean;
 	children?: NestedRunSummary[];
+	gitBundle?: GitBundleResult;
 }
 
 export interface NestedRunSummary extends NestedRunAddress {
@@ -611,6 +614,8 @@ export interface NestedRunSummary extends NestedRunAddress {
 	steps?: NestedStepSummary[];
 	children?: NestedRunSummary[];
 	activityState?: ActivityState;
+	finalOutput?: string;
+	groupDiagnostics?: Array<{ groupId: string; unindexed: true; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string; finalOutput?: string }>;
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolStartedAt?: number;
@@ -696,8 +701,11 @@ export interface AsyncStatus {
 	groupDiagnostics?: Array<{ groupId: string; unindexed: true; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string; finalOutput?: string }>;
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
+	nestedChildren?: NestedRunSummary[];
 	/** Durable fail-closed marker: revival must not silently drop a route. */
 	nestedRouteRequired?: true;
+	nestedRouteValidity?: NestedRouteValidity;
+	nestedRouteError?: string;
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 	steps?: Array<{
 		/** Canonical indexed child identity; diagnostics must not consume slots. */

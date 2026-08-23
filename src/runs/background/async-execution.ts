@@ -33,6 +33,7 @@ import { resolveEffectiveAcceptance } from "../shared/acceptance.ts";
 import {
 	type AcceptanceInput,
 	type ArtifactConfig,
+	type AsyncStatus,
 	type Details,
 	type MaxOutputConfig,
 	type NestedRouteInfo,
@@ -141,6 +142,8 @@ interface AsyncChainParams {
 	controlIntercomTarget?: string;
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
+	/** Explicit authenticated ancestry restored by a routed launch. */
+	nestedSelf?: NonNullable<AsyncStatus["nestedSelf"]>;
 	acceptance?: AcceptanceInput;
 	sandbox?: ResolvedSandboxConfig;
 	sandboxSettings?: SandboxSettingsDefaults;
@@ -175,6 +178,8 @@ interface AsyncSingleParams {
 	controlIntercomTarget?: string;
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
+	/** Explicit authenticated ancestry restored by async revival. */
+	nestedSelf?: NonNullable<AsyncStatus["nestedSelf"]>;
 	acceptance?: AcceptanceInput;
 	sandbox?: ResolvedSandboxConfig;
 	sandboxSettings?: SandboxSettingsDefaults;
@@ -395,7 +400,6 @@ function validateInheritedScopedEndpoint(
 		return "nested async execution requires the live scoped Git endpoint descriptor";
 	}
 	if (!descriptor) return undefined;
-	if (!inheritedNestedRoute) return "top-level async execution creates its own scoped Git runtime; a parent endpoint descriptor is only valid for a live nested run";
 	try {
 		const mounts = scopedGitDescriptorMounts(descriptor);
 		const fixedMount = mounts.find((mount) => mount.target === "/run/pi-scoped-git");
@@ -449,6 +453,7 @@ export function executeAsyncChain(
 		controlIntercomTarget,
 		childIntercomTarget,
 		nestedRoute,
+		nestedSelf,
 	} = params;
 	const resultMode = params.resultMode ?? "chain";
 	const chainSkills = params.chainSkills ?? [];
@@ -547,10 +552,20 @@ export function executeAsyncChain(
 
 	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
 	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
-	const endpointValidationError = validateInheritedScopedEndpoint(params.scopedGitEndpoint, inheritedNestedRoute);
+	const explicitNestedRoute = Object.prototype.hasOwnProperty.call(params, "nestedRoute") && nestedRoute !== undefined;
+	const effectiveNestedRoute = nestedRoute ?? inheritedNestedRoute;
+	const effectiveNestedSelf = nestedSelf ?? (!explicitNestedRoute && inheritedNestedRoute && nestedAddress ? {
+		parentRunId: nestedAddress.parentRunId,
+		parentStepIndex: nestedAddress.parentStepIndex,
+		depth: nestedAddress.depth,
+		path: nestedAddress.path,
+	} : undefined);
+	const authorityRoute = explicitNestedRoute && !effectiveNestedSelf ? undefined : inheritedNestedRoute;
+	const effectiveScopedGitEndpoint = explicitNestedRoute && !effectiveNestedSelf && inheritedNestedRoute ? undefined : params.scopedGitEndpoint;
+	const endpointValidationError = validateInheritedScopedEndpoint(effectiveScopedGitEndpoint, authorityRoute);
 	if (endpointValidationError) return formatAsyncStartError(resultMode, endpointValidationError);
-	const asyncDir = inheritedNestedRoute
-		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
+	const asyncDir = effectiveNestedRoute && effectiveNestedSelf
+		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", effectiveNestedRoute.rootRunId, id)
 		: path.join(ASYNC_DIR, id);
 	try {
 		fs.mkdirSync(asyncDir, { recursive: true });
@@ -746,7 +761,7 @@ export function executeAsyncChain(
 		if (error instanceof UnavailableSubagentSkillError || error instanceof AsyncStartValidationError) return formatAsyncStartError(resultMode, error.message);
 		throw error;
 	}
-	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = params.scopedGitEndpoint;
+	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = effectiveScopedGitEndpoint;
 	let childTargetIndex = 0;
 	const childIntercomTargets = childIntercomTarget ? steps.flatMap((step) => {
 		if ("parallel" in step) {
@@ -765,7 +780,7 @@ export function executeAsyncChain(
 			{
 				id,
 				steps,
-				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : path.join(RESULTS_DIR, `${id}.json`),
+				resultPath: effectiveNestedRoute && effectiveNestedSelf ? nestedResultsPath(effectiveNestedRoute.rootRunId, id) : path.join(RESULTS_DIR, `${id}.json`),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
 				maxOutput,
@@ -790,13 +805,8 @@ export function executeAsyncChain(
 				progressPaths: progressInstructionCreated ? [path.join(runnerCwd, "progress.md")] : undefined,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				...(readProcessStartToken(process.pid) ? { ownerStartToken: readProcessStartToken(process.pid) } : {}),
-				nestedRoute: nestedRoute ?? inheritedNestedRoute,
-				nestedSelf: inheritedNestedRoute && nestedAddress ? {
-					parentRunId: nestedAddress.parentRunId,
-					parentStepIndex: nestedAddress.parentStepIndex,
-					depth: nestedAddress.depth,
-					path: nestedAddress.path,
-				} : undefined,
+				nestedRoute: effectiveNestedRoute,
+				nestedSelf: effectiveNestedSelf,
 			},
 			id,
 			runnerCwd,
@@ -834,21 +844,22 @@ export function executeAsyncChain(
 				flatStepStart++;
 			}
 		}
-		if (inheritedNestedRoute && nestedAddress) {
+		if (effectiveNestedRoute && effectiveNestedSelf) {
 			const now = Date.now();
 			try {
-				writeNestedEvent(inheritedNestedRoute, {
+				writeNestedEvent(effectiveNestedRoute, {
 					type: "subagent.nested.started",
 					ts: now,
-					parentRunId: nestedAddress.parentRunId,
-					parentStepIndex: nestedAddress.parentStepIndex,
+					parentRunId: effectiveNestedSelf.parentRunId,
+					parentStepIndex: effectiveNestedSelf.parentStepIndex,
 					child: {
 						id,
-						parentRunId: nestedAddress.parentRunId,
-						parentStepIndex: nestedAddress.parentStepIndex,
-						depth: nestedAddress.depth,
-						path: nestedAddress.path,
+						parentRunId: effectiveNestedSelf.parentRunId,
+						parentStepIndex: effectiveNestedSelf.parentStepIndex,
+						depth: effectiveNestedSelf.depth,
+						path: effectiveNestedSelf.path,
 						asyncDir,
+						cwd: runnerCwd,
 						pid: spawnResult.pid,
 						ownerIntercomTarget: process.env.PI_SUBAGENT_INTERCOM_SESSION_NAME,
 						leafIntercomTarget: childIntercomTargets?.[0],
@@ -891,7 +902,7 @@ export function executeAsyncChain(
 			workflowGraph,
 			cwd: runnerCwd,
 			asyncDir,
-			nestedRoute,
+			nestedRoute: effectiveNestedRoute,
 		});
 	}
 
@@ -932,16 +943,28 @@ export function executeAsyncSingle(
 		controlIntercomTarget,
 		childIntercomTarget,
 		nestedRoute,
+		nestedSelf,
 	} = params;
 	const task = params.task ?? "";
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
+	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+	const explicitNestedRoute = Object.prototype.hasOwnProperty.call(params, "nestedRoute") && nestedRoute !== undefined;
+	const effectiveNestedRoute = nestedRoute ?? inheritedNestedRoute;
+	const effectiveNestedSelf = nestedSelf ?? (!explicitNestedRoute && inheritedNestedRoute && nestedAddress ? {
+		parentRunId: nestedAddress.parentRunId,
+		parentStepIndex: nestedAddress.parentStepIndex,
+		depth: nestedAddress.depth,
+		path: nestedAddress.path,
+	} : undefined);
+	const authorityRoute = explicitNestedRoute && !effectiveNestedSelf ? undefined : inheritedNestedRoute;
+	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = explicitNestedRoute && !effectiveNestedSelf && inheritedNestedRoute ? undefined : params.scopedGitEndpoint;
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
 	let sandbox = hasSandboxResolutionInputs
 		? resolveSandboxConfig({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun })
 		: params.sandbox
 			? resolveSandboxConfig({ agent: agentConfig, run: params.sandbox })
 			: resolveSandboxConfig({ agent: agentConfig });
-	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = params.scopedGitEndpoint;
 	if (params.worktree === false && !scopedGitRunEndpoint && sandbox?.gitMode === "isolated"
 		&& worktreeOptOutIsAuthorized(params.sandboxSettings)
 		&& agentConfig.canOptOutOfWorktree === true) {
@@ -957,12 +980,10 @@ export function executeAsyncSingle(
 		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
 	}
 
-	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
-	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
-	const endpointValidationError = validateInheritedScopedEndpoint(params.scopedGitEndpoint, inheritedNestedRoute);
+	const endpointValidationError = validateInheritedScopedEndpoint(scopedGitRunEndpoint, authorityRoute);
 	if (endpointValidationError) return formatAsyncStartError("single", endpointValidationError);
-	const asyncDir = inheritedNestedRoute
-		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
+	const asyncDir = effectiveNestedRoute && effectiveNestedSelf
+		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", effectiveNestedRoute.rootRunId, id)
 		: path.join(ASYNC_DIR, id);
 	try {
 		fs.mkdirSync(asyncDir, { recursive: true });
@@ -1040,7 +1061,7 @@ export function executeAsyncSingle(
 						}),
 					},
 				],
-				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : path.join(RESULTS_DIR, `${id}.json`),
+				resultPath: effectiveNestedRoute && effectiveNestedSelf ? nestedResultsPath(effectiveNestedRoute.rootRunId, id) : path.join(RESULTS_DIR, `${id}.json`),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
 				maxOutput,
@@ -1062,13 +1083,8 @@ export function executeAsyncSingle(
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
 				scopedGitEndpoint: scopedGitRunEndpoint,
 				...(readProcessStartToken(process.pid) ? { ownerStartToken: readProcessStartToken(process.pid) } : {}),
-				nestedRoute: nestedRoute ?? inheritedNestedRoute,
-				nestedSelf: inheritedNestedRoute && nestedAddress ? {
-					parentRunId: nestedAddress.parentRunId,
-					parentStepIndex: nestedAddress.parentStepIndex,
-					depth: nestedAddress.depth,
-					path: nestedAddress.path,
-				} : undefined,
+				nestedRoute: effectiveNestedRoute,
+				nestedSelf: effectiveNestedSelf,
 			},
 			id,
 			runnerCwd,
@@ -1083,21 +1099,22 @@ export function executeAsyncSingle(
 	}
 
 	if (spawnResult.pid) {
-		if (inheritedNestedRoute && nestedAddress) {
+		if (effectiveNestedRoute && effectiveNestedSelf) {
 			const now = Date.now();
 			try {
-				writeNestedEvent(inheritedNestedRoute, {
+				writeNestedEvent(effectiveNestedRoute, {
 					type: "subagent.nested.started",
 					ts: now,
-					parentRunId: nestedAddress.parentRunId,
-					parentStepIndex: nestedAddress.parentStepIndex,
+					parentRunId: effectiveNestedSelf.parentRunId,
+					parentStepIndex: effectiveNestedSelf.parentStepIndex,
 					child: {
 						id,
-						parentRunId: nestedAddress.parentRunId,
-						parentStepIndex: nestedAddress.parentStepIndex,
-						depth: nestedAddress.depth,
-						path: nestedAddress.path,
+						parentRunId: effectiveNestedSelf.parentRunId,
+						parentStepIndex: effectiveNestedSelf.parentStepIndex,
+						depth: effectiveNestedSelf.depth,
+						path: effectiveNestedSelf.path,
 						asyncDir,
+						cwd: runnerCwd,
 						pid: spawnResult.pid,
 						ownerIntercomTarget: process.env.PI_SUBAGENT_INTERCOM_SESSION_NAME,
 						leafIntercomTarget: childIntercomTarget?.(agent, 0),
@@ -1128,7 +1145,8 @@ export function executeAsyncSingle(
 			task: task?.slice(0, 50),
 			cwd: runnerCwd,
 			asyncDir,
-			nestedRoute,
+			nestedRoute: effectiveNestedRoute,
+			...(effectiveNestedSelf ? { nestedSelf: effectiveNestedSelf } : {}),
 		});
 	}
 

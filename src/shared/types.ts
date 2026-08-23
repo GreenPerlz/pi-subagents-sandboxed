@@ -588,6 +588,7 @@ export interface NestedStepSummary {
 
 export interface NestedRunSummary extends NestedRunAddress {
 	asyncDir?: string;
+	cwd?: string;
 	pid?: number;
 	sessionId?: string;
 	sessionFile?: string;
@@ -651,6 +652,7 @@ export interface AsyncStartedEvent {
 	groupDiagnostics?: NonNullable<AsyncStatus["groupDiagnostics"]>;
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
+	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 }
 
 export interface AsyncStatus {
@@ -693,6 +695,10 @@ export interface AsyncStatus {
 	/** Unindexed dynamic aggregate diagnostics; never consume child slots. */
 	groupDiagnostics?: Array<{ groupId: string; unindexed: true; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string; finalOutput?: string }>;
 	workflowGraph?: WorkflowGraphSnapshot;
+	nestedRoute?: NestedRouteInfo;
+	/** Durable fail-closed marker: revival must not silently drop a route. */
+	nestedRouteRequired?: true;
+	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 	steps?: Array<{
 		/** Canonical indexed child identity; diagnostics must not consume slots. */
 		flatIndex?: number;

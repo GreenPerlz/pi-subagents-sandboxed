@@ -15,6 +15,7 @@ import {
 	resolveNestedRouteFromEnv,
 	updateAsyncJobNestedProjection,
 	updateForegroundNestedProjection,
+	validateNestedRouteForRevival,
 	waitForNestedDescendantsToStop,
 	writeNestedEvent,
 } from "../../src/runs/shared/nested-events.ts";
@@ -114,6 +115,22 @@ describe("nested event route validation", () => {
 
 		process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = "wrong-token";
 		assert.throws(() => resolveNestedRouteFromEnv(), /capability token/);
+	});
+
+	it("validates exact live persisted route coordinates and rejects stale or forged metadata", () => {
+		const route = trackRoute("revival-root");
+		assert.deepEqual(validateNestedRouteForRevival(route), route);
+		assert.throws(() => validateNestedRouteForRevival({ ...route, eventSink: path.join(path.dirname(route.eventSink), "other-events") }), /canonical route events|does not exist/);
+		assert.throws(() => validateNestedRouteForRevival({ ...route, rootRunId: "other-root" }), /does not match/);
+		fs.chmodSync(route.eventSink, 0o755);
+		assert.throws(() => validateNestedRouteForRevival(route), /permissions are too broad/);
+		fs.chmodSync(route.eventSink, 0o700);
+		const routeFile = path.join(path.dirname(route.eventSink), "route.json");
+		fs.unlinkSync(routeFile);
+		fs.symlinkSync(import.meta.filename, routeFile);
+		assert.throws(() => validateNestedRouteForRevival(route), /not a trusted regular file/);
+		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		assert.throws(() => validateNestedRouteForRevival(route), /do not exist|does not exist/);
 	});
 });
 

@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
-import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR } from "../../src/shared/types.ts";
+import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR, TEMP_ROOT_DIR } from "../../src/shared/types.ts";
+import { createNestedRoute, nestedResultsPath, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV, SUBAGENT_PARENT_CONTROL_INBOX_ENV, SUBAGENT_PARENT_DEPTH_ENV, SUBAGENT_PARENT_EVENT_SINK_ENV, SUBAGENT_PARENT_PATH_ENV, SUBAGENT_PARENT_ROOT_RUN_ID_ENV, SUBAGENT_PARENT_RUN_ID_ENV } from "../../src/runs/shared/pi-args.ts";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
@@ -684,6 +686,157 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			}
 		} finally {
 			fs.rmSync(asyncDir, { recursive: true, force: true });
+		}
+	});
+
+	it("restores a top-level async root route into the revived child environment and mount", async () => {
+		const runId = `top-route-resume-${Date.now().toString(36)}`;
+		const route = createNestedRoute(runId);
+		const ambientRoute = createNestedRoute(`ambient-${runId}`);
+		const inheritedEnv = [SUBAGENT_PARENT_EVENT_SINK_ENV, SUBAGENT_PARENT_CONTROL_INBOX_ENV, SUBAGENT_PARENT_ROOT_RUN_ID_ENV, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV, SUBAGENT_PARENT_RUN_ID_ENV, SUBAGENT_PARENT_DEPTH_ENV, SUBAGENT_PARENT_PATH_ENV] as const;
+		const savedEnv = new Map(inheritedEnv.map((key) => [key, process.env[key]]));
+		Object.assign(process.env, {
+			[SUBAGENT_PARENT_EVENT_SINK_ENV]: ambientRoute.eventSink,
+			[SUBAGENT_PARENT_CONTROL_INBOX_ENV]: ambientRoute.controlInbox,
+			[SUBAGENT_PARENT_ROOT_RUN_ID_ENV]: ambientRoute.rootRunId,
+			[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV]: ambientRoute.capabilityToken,
+			[SUBAGENT_PARENT_RUN_ID_ENV]: "ambient-parent",
+			[SUBAGENT_PARENT_DEPTH_ENV]: "1",
+			[SUBAGENT_PARENT_PATH_ENV]: JSON.stringify([{ runId: ambientRoute.rootRunId, stepIndex: 0 }]),
+		});
+		const asyncDir = path.join(ASYNC_DIR, runId);
+		const sessionFile = path.join(tempDir, "top-route-session.jsonl");
+		mockPi.onCall({ output: "top route restored", commands: [
+			`test \"$PI_SUBAGENT_PARENT_ROOT_RUN_ID\" = ${JSON.stringify(runId)} && test -d \"$PI_SUBAGENT_PARENT_EVENT_SINK\" && test -d \"$PI_SUBAGENT_PARENT_CONTROL_INBOX\" && test -n \"$PI_SUBAGENT_PARENT_CAPABILITY_TOKEN\"`,
+		] });
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(sessionFile, "", "utf8");
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, mode: "single", state: "complete", cwd: tempDir, sessionFile, nestedRoute: route, nestedRouteRequired: true, steps: [{ agent: "worker", status: "complete", sessionFile }] }), "utf8");
+			const { executor } = makeExecutor({ bridgeMode: "off", agents: [makeAgent("worker", { tools: ["read", "subagent"] })] });
+			const resumed = await executor.execute("top-route-resume", { action: "resume", id: runId, message: "Continue with descendants" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(resumed.isError, undefined, resumed.content[0]?.text);
+			const revivedId = resumed.details?.asyncId;
+			assert.ok(revivedId);
+			const revivedResult = path.join(RESULTS_DIR, `${revivedId}.json`);
+			const deadline = Date.now() + 10_000;
+			while (!fs.existsSync(revivedResult) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(fs.existsSync(revivedResult), true);
+			const payload = JSON.parse(fs.readFileSync(revivedResult, "utf8")) as { success?: boolean; nestedRoute?: unknown; nestedSelf?: unknown };
+			assert.equal(payload.success, true, JSON.stringify(payload));
+			assert.deepEqual(payload.nestedRoute, route);
+			assert.equal(payload.nestedSelf, undefined, "top-level revival remains a root while retaining its route");
+
+			const missingId = `${runId}-missing`;
+			const missingDir = path.join(ASYNC_DIR, missingId);
+			fs.mkdirSync(missingDir, { recursive: true });
+			fs.writeFileSync(path.join(missingDir, "status.json"), JSON.stringify({ runId: missingId, mode: "single", state: "complete", cwd: tempDir, sessionFile, nestedRouteRequired: true, steps: [{ agent: "worker", status: "complete", sessionFile }] }), "utf8");
+			const denied = await executor.execute("top-route-missing", { action: "resume", id: missingId, message: "must not launch invisibly" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(denied.isError, true);
+			assert.match(denied.content[0]?.text ?? "", /requires persisted nested route metadata/);
+			fs.rmSync(missingDir, { recursive: true, force: true });
+		} finally {
+			for (const key of inheritedEnv) {
+				const value = savedEnv.get(key);
+				if (value === undefined) delete process.env[key]; else process.env[key] = value;
+			}
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			fs.rmSync(path.dirname(ambientRoute.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("restores the authenticated nested route when reviving a terminal nested async run", async () => {
+		mockPi.onCall({ delay: 1500, output: "revived nested answer" });
+		const rootRunId = `nested-revive-root-${Date.now().toString(36)}`;
+		const sourceRunId = `nested-source-${Date.now().toString(36)}`;
+		const route = createNestedRoute(rootRunId);
+		const sourceAsyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootRunId, sourceRunId);
+		const sourceSession = path.join(tempDir, sourceRunId, "step-0.jsonl");
+		const latestSession = path.join(tempDir, sourceRunId, "step-1.jsonl");
+		const nestedSelf = { parentRunId: "parent-run", parentStepIndex: 2, depth: 2, path: [{ runId: rootRunId, stepIndex: 0 }, { runId: "parent-run", stepIndex: 2 }] };
+		let mismatchRoute: ReturnType<typeof createNestedRoute> | undefined;
+		try {
+			fs.mkdirSync(sourceAsyncDir, { recursive: true });
+			fs.mkdirSync(path.dirname(sourceSession), { recursive: true });
+			fs.writeFileSync(sourceSession, "", "utf8");
+			fs.writeFileSync(latestSession, "", "utf8");
+			const sourceStatus = {
+				runId: sourceRunId, mode: "chain", state: "complete", cwd: tempDir, sessionFile: latestSession,
+				nestedRoute: route, nestedSelf, steps: [
+					{ flatIndex: 0, agent: "worker", status: "complete", sessionFile: sourceSession },
+					{ flatIndex: 1, agent: "later", status: "complete", sessionFile: latestSession },
+				],
+			};
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify(sourceStatus), "utf8");
+			writeNestedEvent(route, { type: "subagent.nested.completed", ts: Date.now(), parentRunId: nestedSelf.parentRunId, parentStepIndex: nestedSelf.parentStepIndex, child: {
+				id: sourceRunId, ...nestedSelf, asyncDir: sourceAsyncDir, cwd: tempDir, sessionFile: latestSession, state: "complete", agent: "worker", agents: ["worker", "later"], mode: "chain", chainStepCount: 2,
+				steps: [{ flatIndex: 0, agent: "worker", status: "complete", sessionFile: sourceSession }, { flatIndex: 1, agent: "later", status: "complete", sessionFile: latestSession }],
+				startedAt: Date.now() - 100, endedAt: Date.now(), lastUpdate: Date.now(),
+
+			} });
+			const { executor, state } = makeExecutor({ bridgeMode: "off" });
+			state.asyncJobs.set(rootRunId, { id: rootRunId, nestedRoute: route } as never);
+			const parentSession = path.join(tempDir, "parent-session.jsonl");
+			fs.writeFileSync(parentSession, "", "utf8");
+			const ctx = { ...makeMinimalCtx(tempDir), sessionManager: { getSessionId: () => "session-123", getSessionFile: () => parentSession } };
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({ ...sourceStatus, cwd: path.join(tempDir, "forged-cwd") }), "utf8");
+			const forgedCwd = await executor.execute("nested-cwd-mismatch", { action: "resume", id: sourceRunId, index: 0, message: "must reject cwd replacement" }, new AbortController().signal, undefined, ctx);
+			assert.equal(forgedCwd.isError, true);
+			assert.match(forgedCwd.content[0]?.text ?? "", /persisted cwd does not match its authenticated registry entry/);
+			mismatchRoute = createNestedRoute(rootRunId);
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({ ...sourceStatus, nestedRoute: mismatchRoute }), "utf8");
+			const mismatched = await executor.execute("nested-route-mismatch", { action: "resume", id: sourceRunId, index: 0, message: "must reject route replacement" }, new AbortController().signal, undefined, ctx);
+			assert.equal(mismatched.isError, true);
+			assert.match(mismatched.content[0]?.text ?? "", /persisted route does not match its authenticated registry route/);
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({ ...sourceStatus, steps: [{ ...sourceStatus.steps[0], agent: "forged-agent" }, sourceStatus.steps[1]] }), "utf8");
+			const forgedAgent = await executor.execute("nested-agent-mismatch", { action: "resume", id: sourceRunId, index: 0, message: "must reject agent replacement" }, new AbortController().signal, undefined, ctx);
+			assert.equal(forgedAgent.isError, true);
+			assert.match(forgedAgent.content[0]?.text ?? "", /persisted agent does not match its authenticated registry entry/);
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify(sourceStatus), "utf8");
+			const resumed = await executor.execute("nested-route-resume", { action: "resume", id: sourceRunId, index: 0, message: "Continue under the same route" }, new AbortController().signal, undefined, ctx);
+			assert.equal(resumed.isError, undefined, resumed.content[0]?.text);
+			const revivedId = resumed.details?.asyncId;
+			assert.ok(revivedId);
+			const visibilityDeadline = Date.now() + 5_000;
+			let revived = projectNestedEvents(route).children.find((child) => child.id === revivedId);
+			while (!revived && Date.now() < visibilityDeadline) { await new Promise((resolve) => setTimeout(resolve, 25)); revived = projectNestedEvents(route).children.find((child) => child.id === revivedId); }
+			assert.ok(revived, "revived child must publish into the original route");
+			assert.equal(revived.parentRunId, nestedSelf.parentRunId);
+			assert.equal(revived.parentStepIndex, nestedSelf.parentStepIndex);
+			assert.ok(projectNestedEvents(route).children.some((child) => child.id === sourceRunId), "completed source sibling remains visible");
+			const interrupted = await executor.execute("nested-route-interrupt", { action: "interrupt", id: revivedId }, new AbortController().signal, undefined, ctx);
+			assert.equal(interrupted.isError, undefined, interrupted.content[0]?.text);
+			const resultPath = nestedResultsPath(rootRunId, revivedId);
+			const resultDeadline = Date.now() + 10_000;
+			while (!fs.existsSync(resultPath) && Date.now() < resultDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(fs.existsSync(resultPath), true, JSON.stringify({ resultPath, projected: projectNestedEvents(route).children.find((child) => child.id === revivedId) }));
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as { nestedRoute?: unknown; nestedSelf?: { path?: unknown[] } };
+			const revivedSelf = { ...nestedSelf, path: [...nestedSelf.path, { runId: sourceRunId, stepIndex: nestedSelf.parentStepIndex, agent: "worker" }] };
+			assert.deepEqual(payload.nestedRoute, route);
+			assert.deepEqual(payload.nestedSelf, revivedSelf);
+
+			mockPi.onCall({ output: "revived nested twice" });
+			const resumedAgain = await executor.execute("nested-route-resume-again", { action: "resume", id: revivedId, message: "Continue again under the same route" }, new AbortController().signal, undefined, ctx);
+			assert.equal(resumedAgain.isError, undefined, resumedAgain.content[0]?.text);
+			const secondRevivedId = resumedAgain.details?.asyncId;
+			assert.ok(secondRevivedId);
+			const secondResultPath = nestedResultsPath(rootRunId, secondRevivedId);
+			const secondDeadline = Date.now() + 10_000;
+			while (!fs.existsSync(secondResultPath) && Date.now() < secondDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.equal(fs.existsSync(secondResultPath), true);
+			const secondPayload = JSON.parse(fs.readFileSync(secondResultPath, "utf8")) as { nestedRoute?: unknown; nestedSelf?: { path?: Array<{ runId?: string }> } };
+			assert.deepEqual(secondPayload.nestedRoute, route);
+			assert.equal(secondPayload.nestedSelf?.path?.some((entry) => entry.runId === revivedId), true, "repeated revival extends authenticated lineage");
+			const projectedIds = projectNestedEvents(route).children.map((child) => child.id);
+			assert.ok(projectedIds.includes(sourceRunId));
+			assert.ok(projectedIds.includes(revivedId));
+			assert.ok(projectedIds.includes(secondRevivedId));
+		} finally {
+			if (mismatchRoute) fs.rmSync(path.dirname(mismatchRoute.eventSink), { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			fs.rmSync(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootRunId), { recursive: true, force: true });
+			fs.rmSync(path.join(RESULTS_DIR, "nested", rootRunId), { recursive: true, force: true });
 		}
 	});
 

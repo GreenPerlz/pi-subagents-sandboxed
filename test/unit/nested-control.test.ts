@@ -858,7 +858,7 @@ describe("nested control routing", { concurrency: false }, () => {
 				.execute("resume", { action: "resume", id: "nested-sibling-resume", message: "continue" }, new AbortController().signal, undefined, ctx(root, parentSessionFile));
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /not under that nested run's session directory/);
+			assert.match(text(result), /not under its authenticated run lineage/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

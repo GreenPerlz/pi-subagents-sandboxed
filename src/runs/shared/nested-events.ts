@@ -102,12 +102,65 @@ function commonRouteRoot(route: Pick<NestedRoute, "eventSink" | "controlInbox">)
 	return path.dirname(path.resolve(route.eventSink));
 }
 
+function assertTrustedRouteEntry(target: string, kind: "directory" | "file"): void {
+	const stat = fs.lstatSync(target);
+	if (stat.isSymbolicLink() || (kind === "directory" ? !stat.isDirectory() : !stat.isFile())) throw new Error(`Nested route ${kind} is not a trusted regular ${kind}: ${target}`);
+	if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error(`Nested route ${kind} is not owned by the current user: ${target}`);
+	if ((stat.mode & 0o077) !== 0) throw new Error(`Nested route ${kind} permissions are too broad: ${target}`);
+	if (fs.realpathSync(target) !== path.resolve(target)) throw new Error(`Nested route ${kind} resolves through a non-canonical path: ${target}`);
+}
+
 function validateRouteShape(route: NestedRoute): void {
 	assertSafeId("rootRunId", route.rootRunId);
 	assertSafeId("capabilityToken", route.capabilityToken);
+	const routeRoot = commonRouteRoot(route);
 	if (!containedPath(NESTED_EVENTS_DIR, route.eventSink)) throw new Error("Nested event sink is outside the subagent nested event root.");
 	if (!containedPath(NESTED_EVENTS_DIR, route.controlInbox)) throw new Error("Nested control inbox is outside the subagent nested event root.");
-	if (commonRouteRoot(route) !== path.dirname(path.resolve(route.controlInbox))) throw new Error("Nested event sink and control inbox must share one route root.");
+	if (path.resolve(route.eventSink) !== path.join(routeRoot, "events")) throw new Error("Nested event sink must be the canonical route events directory.");
+	if (path.resolve(route.controlInbox) !== path.join(routeRoot, "controls")) throw new Error("Nested control inbox must be the canonical route controls directory.");
+	if (routeRoot !== path.join(path.resolve(NESTED_EVENTS_DIR), `${route.rootRunId}-${route.capabilityToken}`)) throw new Error("Nested route root does not match the root id and capability token.");
+}
+
+function validateNestedRouteAuthority(value: unknown, requireOperationalDirectories: boolean): NestedRoute {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Persisted nested route metadata must be an object.");
+	const raw = value as Record<string, unknown>;
+	for (const field of ["rootRunId", "eventSink", "controlInbox", "capabilityToken"] as const) {
+		if (typeof raw[field] !== "string" || raw[field].length === 0) throw new Error(`Persisted nested route metadata is missing ${field}.`);
+	}
+	const route = {
+		rootRunId: raw.rootRunId as string,
+		eventSink: raw.eventSink as string,
+		controlInbox: raw.controlInbox as string,
+		capabilityToken: raw.capabilityToken as string,
+	};
+	validateRouteShape(route);
+	const routeRoot = commonRouteRoot(route);
+	if (!fs.existsSync(routeRoot)) throw new Error("Nested route root does not exist.");
+	assertTrustedRouteEntry(routeRoot, "directory");
+	if (requireOperationalDirectories) {
+		if (!fs.existsSync(route.eventSink) || !fs.existsSync(route.controlInbox)) throw new Error("Nested route directories do not exist.");
+		assertTrustedRouteEntry(route.eventSink, "directory");
+		assertTrustedRouteEntry(route.controlInbox, "directory");
+	}
+	const routeFile = path.join(routeRoot, ROUTE_FILE);
+	let metadata: unknown;
+	try {
+		assertTrustedRouteEntry(routeFile, "file");
+		metadata = JSON.parse(fs.readFileSync(routeFile, "utf8"));
+	} catch (error) {
+		throw new Error(`Persisted nested route metadata has no readable route.json: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)
+		|| (metadata as Record<string, unknown>).rootRunId !== route.rootRunId
+		|| (metadata as Record<string, unknown>).capabilityToken !== route.capabilityToken) {
+		throw new Error("Persisted nested route metadata does not match the live route.json.");
+	}
+	return route;
+}
+
+/** Strict validation for persisted revival metadata. Never substitute ambient authority. */
+export function validateNestedRouteForRevival(value: unknown): NestedRoute {
+	return validateNestedRouteAuthority(value, true);
 }
 
 export function createNestedRoute(rootRunId: string): NestedRoute {
@@ -128,14 +181,7 @@ export function resolveNestedRouteFromEnv(env: NodeJS.ProcessEnv = process.env):
 	const controlInbox = env[SUBAGENT_PARENT_CONTROL_INBOX_ENV];
 	const capabilityToken = env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV];
 	if (!rootRunId || !eventSink || !controlInbox || !capabilityToken) return undefined;
-	const route = { rootRunId, eventSink, controlInbox, capabilityToken };
-	validateRouteShape(route);
-	const routeFile = path.join(commonRouteRoot(route), ROUTE_FILE);
-	const metadata = JSON.parse(fs.readFileSync(routeFile, "utf-8")) as { rootRunId?: unknown; capabilityToken?: unknown };
-	if (metadata.rootRunId !== rootRunId || metadata.capabilityToken !== capabilityToken) {
-		throw new Error("Nested event route metadata does not match the provided root id and capability token.");
-	}
-	return route;
+	return validateNestedRouteAuthority({ rootRunId, eventSink, controlInbox, capabilityToken }, false);
 }
 
 export function resolveInheritedNestedRouteFromEnv(env: NodeJS.ProcessEnv = process.env): NestedRoute | undefined {
@@ -249,6 +295,7 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		path: pathParts,
 		state: sanitizeState(raw.state, "running"),
 		...(stringValue(raw.asyncDir, 2048) ? { asyncDir: stringValue(raw.asyncDir, 2048) } : {}),
+		...(stringValue(raw.cwd, 2048) ? { cwd: stringValue(raw.cwd, 2048) } : {}),
 		...(clampNumber(raw.pid) !== undefined && clampNumber(raw.pid)! > 0 && Number.isInteger(clampNumber(raw.pid)) ? { pid: clampNumber(raw.pid) } : {}),
 		...(stringValue(raw.sessionId, 256) ? { sessionId: stringValue(raw.sessionId, 256) } : {}),
 		...(stringValue(raw.sessionFile, 2048) ? { sessionFile: stringValue(raw.sessionFile, 2048) } : {}),
@@ -870,6 +917,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		depth: fallback.depth,
 		path: fallback.path ?? [{ runId: fallback.parentRunId, ...(fallback.parentStepIndex !== undefined ? { stepIndex: fallback.parentStepIndex } : {}) }],
 		asyncDir,
+		...(status.cwd ? { cwd: status.cwd } : {}),
 		...(status.pid ? { pid: status.pid } : {}),
 		...(status.sessionId ? { sessionId: status.sessionId } : {}),
 		mode: status.mode ?? fallback.mode,

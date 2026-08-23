@@ -2182,7 +2182,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		artifactsDir,
 		sessionDir: config.sessionDir,
 		outputFile: path.join(asyncDir, "output-0.log"),
-		...(config.nestedRoute ? { nestedRoute: config.nestedRoute } : {}),
+		...(config.nestedRoute ? { nestedRoute: config.nestedRoute, nestedRouteRequired: true as const } : {}),
 	};
 	statusPayloadReady = true;
 
@@ -4283,6 +4283,8 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			sessionId: config.sessionId,
 			sessionFile: effectiveSessionFile,
 			intercomTarget: config.controlIntercomTarget,
+			...(config.nestedRoute ? { nestedRoute: config.nestedRoute, nestedRouteRequired: true as const } : {}),
+			...(config.nestedSelf ? { nestedSelf: config.nestedSelf } : {}),
 			shareUrl,
 			gistUrl,
 			shareError,
@@ -4476,6 +4478,8 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 			runId: config.id,
 			mode: config.resultMode ?? (config.steps.length > 1 ? "chain" : "single"),
 			cwd: config.cwd,
+			...(config.nestedRoute ? { nestedRoute: config.nestedRoute, nestedRouteRequired: true as const } : {}),
+			...(config.nestedSelf ? { nestedSelf: config.nestedSelf } : {}),
 			steps: config.steps.flatMap((step) => isParallelGroup(step) ? step.parallel.map((child) => ({ agent: child.agent, status: "failed" })) : isDynamicRunnerGroup(step) ? [{ agent: `expand:${step.parallel.agent}`, status: "failed" }] : [{ agent: step.agent, status: "failed" }]),
 		};
 	}
@@ -4488,6 +4492,8 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 		|| existing?.teardownUnproven === true
 		|| existingResults.some((child: Record<string, any>) => child.teardownUnproven === true);
 	fs.mkdirSync(config.asyncDir, { recursive: true });
+	if (config.nestedRoute) { status.nestedRoute = config.nestedRoute; status.nestedRouteRequired = true; }
+	if (config.nestedSelf) status.nestedSelf = config.nestedSelf;
 	status.teardownUnproven = teardownUnproven ? true : undefined;
 	status.state = teardownUnproven ? "running" : "failed";
 	status.error = status.error ? `${status.error}\n${terminalError}` : terminalError;
@@ -4575,6 +4581,8 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 		asyncDir: config.asyncDir,
 		...(config.sessionId ? { sessionId: config.sessionId } : {}),
 		...(config.controlIntercomTarget ? { intercomTarget: config.controlIntercomTarget } : {}),
+		...(config.nestedRoute ? { nestedRoute: config.nestedRoute, nestedRouteRequired: true as const } : {}),
+		...(config.nestedSelf ? { nestedSelf: config.nestedSelf } : {}),
 		worktreeExecutionError: status.worktreeExecutionError,
 		...(teardownUnproven ? { teardownUnproven: true } : {}),
 	};

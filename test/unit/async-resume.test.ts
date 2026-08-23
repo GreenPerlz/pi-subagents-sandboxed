@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
+import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
+import { RESULTS_DIR, TEMP_ROOT_DIR } from "../../src/shared/types.ts";
 
 function writeJson(filePath: string, value: object): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -39,6 +41,40 @@ describe("async resume lookup", () => {
 			assert.equal(target.intercomTarget, "subagent-worker-run-abc-1");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("restores authenticated nested route and ancestry and rejects missing nested metadata", () => {
+		const rootRunId = `resume-root-${Date.now().toString(36)}`;
+		const route = createNestedRoute(rootRunId);
+		const asyncRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootRunId);
+		const resultsRoot = path.join(RESULTS_DIR, "nested", rootRunId);
+		const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-nested-session-"));
+		const sessionFile = path.join(sessionRoot, "session.jsonl");
+		fs.writeFileSync(sessionFile, "", "utf8");
+		try {
+			const nestedSelf = { parentRunId: "parent-run", parentStepIndex: 2, depth: 2, path: [{ runId: "root-run", stepIndex: 0 }, { runId: "parent-run", stepIndex: 2 }] };
+			writeJson(path.join(asyncRoot, "nested-child", "status.json"), {
+				runId: "nested-child", mode: "single", state: "complete", cwd: sessionRoot, sessionFile,
+				nestedRoute: route, nestedSelf, steps: [{ flatIndex: 3, agent: "worker", status: "complete", sessionFile }],
+			});
+			const target = resolveAsyncResumeTarget({ id: "nested-child", dir: path.join(asyncRoot, "nested-child"), index: 3 }, { asyncDirRoot: asyncRoot, resultsDir: resultsRoot });
+			assert.equal(target.kind, "revive");
+			assert.equal(target.index, 3);
+			assert.deepEqual(target.nestedRoute, route);
+			assert.deepEqual(target.nestedSelf, nestedSelf);
+			assert.equal(target.cwd, sessionRoot);
+
+			writeJson(path.join(asyncRoot, "missing-route", "status.json"), {
+				runId: "missing-route", mode: "single", state: "complete", cwd: sessionRoot, sessionFile,
+				steps: [{ agent: "worker", status: "complete", sessionFile }],
+			});
+			assert.throws(() => resolveAsyncResumeTarget({ id: "missing-route", dir: path.join(asyncRoot, "missing-route") }, { asyncDirRoot: asyncRoot, resultsDir: resultsRoot }), /requires persisted nested route metadata/);
+		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			fs.rmSync(asyncRoot, { recursive: true, force: true });
+			fs.rmSync(resultsRoot, { recursive: true, force: true });
+			fs.rmSync(sessionRoot, { recursive: true, force: true });
 		}
 	});
 
@@ -297,6 +333,33 @@ describe("async resume lookup", () => {
 			const target = resolveAsyncResumeTarget({ id: "indexed", index: 1 }, { asyncDirRoot: path.join(root, "runs"), resultsDir });
 			assert.equal(target.agent, "second");
 			assert.equal(target.index, 1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects malformed, duplicate, and drifting canonical status indexes", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-index-validation-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "worker.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf8");
+			writeJson(path.join(asyncRoot, "malformed", "status.json"), { runId: "malformed", state: "complete", steps: [{ flatIndex: 0.5, agent: "worker", status: "complete", sessionFile }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "malformed" }, { asyncDirRoot: asyncRoot, resultsDir }), /flatIndex must be a non-negative integer/);
+			writeJson(path.join(asyncRoot, "duplicate", "status.json"), { runId: "duplicate", state: "complete", steps: [{ flatIndex: 0, agent: "a", status: "complete", sessionFile }, { flatIndex: 0, agent: "b", status: "complete", sessionFile }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "duplicate", index: 0 }, { asyncDirRoot: asyncRoot, resultsDir }), /duplicate canonical flatIndex 0/);
+			writeJson(path.join(asyncRoot, "bypass", "status.json"), { runId: "bypass", state: "complete", steps: [{ flatIndex: 0, agent: "a", groupId: 7, unindexed: "yes", status: "complete", sessionFile }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "bypass" }, { asyncDirRoot: asyncRoot, resultsDir }), /groupId must be a string|unindexed must be a boolean/);
+			writeJson(path.join(asyncRoot, "drift", "status.json"), { runId: "drift", state: "complete", steps: [{ flatIndex: 0, agent: "a", status: "complete", sessionFile }] });
+			writeJson(path.join(resultsDir, "drift.json"), { id: "drift", state: "complete", success: true, results: [{ flatIndex: 0, agent: "b", success: true, sessionFile }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "drift", index: 0 }, { asyncDirRoot: asyncRoot, resultsDir }), /differs between status and result files/);
+			writeJson(path.join(asyncRoot, "orphan", "status.json"), { runId: "orphan", state: "complete", steps: [{ flatIndex: 0, agent: "a", status: "complete", sessionFile }] });
+			writeJson(path.join(resultsDir, "orphan.json"), { id: "orphan", state: "complete", success: true, results: [{ flatIndex: 1, agent: "a", success: true, sessionFile }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "orphan", index: 0 }, { asyncDirRoot: asyncRoot, resultsDir }), /canonical child indexes differ/);
+			writeJson(path.join(asyncRoot, "cwd-drift", "status.json"), { runId: "cwd-drift", state: "complete", cwd: path.join(root, "a"), steps: [{ flatIndex: 0, agent: "a", status: "complete", sessionFile }] });
+			writeJson(path.join(resultsDir, "cwd-drift.json"), { id: "cwd-drift", state: "complete", cwd: path.join(root, "b"), success: true, results: [{ flatIndex: 0, agent: "a", success: true, sessionFile }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "cwd-drift", index: 0 }, { asyncDirRoot: asyncRoot, resultsDir }), /cwd differs between status and result/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

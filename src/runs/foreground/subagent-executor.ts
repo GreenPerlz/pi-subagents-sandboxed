@@ -60,7 +60,7 @@ import {
 	stripDetailsOutputsForIntercomReceipt,
 } from "../../intercom/result-intercom.ts";
 import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../background/async-resume.ts";
-import { createNestedRoute, projectNestedEvents, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateAsyncJobNestedProjection, updateForegroundNestedProjection, waitForNestedDescendantsToStop, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { createNestedRoute, projectNestedEvents, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateAsyncJobNestedProjection, updateForegroundNestedProjection, validateNestedRouteForRevival, waitForNestedDescendantsToStop, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { registerForegroundInterrupt } from "../shared/foreground-control.ts";
 import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_INTERCOM_EXTENSION_DIR_ENV, SUBAGENT_INTERCOM_STATE_DIR_ENV, SUBAGENT_SCOPED_GIT_ENDPOINT_ENV } from "../shared/pi-args.ts";
 import { delegateScopedGitWriterDescriptor, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, validateScopedGitChildDescriptor, type IsolatedGitCapability, type ScopedGitEndpointDescriptor } from "../../sandbox/isolated-git.ts";
@@ -116,6 +116,8 @@ import {
 	type TokenUsage,
 	DEFAULT_ARTIFACT_CONFIG,
 	FOREGROUND_DIR,
+	RESULTS_DIR,
+	TEMP_ROOT_DIR,
 	SUBAGENT_ACTIONS,
 	SUBAGENT_CONTROL_EVENT,
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
@@ -554,6 +556,8 @@ type NestedResumeSourceTarget = {
 	intercomTarget: string;
 	cwd?: string;
 	sessionFile: string;
+	nestedRoute?: NestedRouteInfo;
+	nestedSelf?: AsyncStatus["nestedSelf"];
 };
 type ResumeSourceTarget = AsyncResumeSourceTarget | ForegroundResumeSourceTarget | NestedResumeSourceTarget;
 
@@ -709,12 +713,17 @@ function interruptAsyncRun(state: SubagentState, runId: string | undefined, veri
 	}
 }
 
-function nestedRunSessionFile(run: NestedRunSummary): string | undefined {
-	return run.sessionFile ?? (run.steps?.length === 1 ? run.steps[0]?.sessionFile : undefined);
+function nestedRunSessionFile(run: NestedRunSummary, index: number): string | undefined {
+	const indexedStep = run.steps?.find((step, position) => (step.flatIndex ?? position) === index);
+	if (indexedStep) return indexedStep.sessionFile;
+	const isSingleChild = (run.steps?.length ?? run.agents?.length ?? run.chainStepCount ?? 1) === 1;
+	return index === 0 && isSingleChild ? run.sessionFile : undefined;
 }
 
-function nestedRunAgent(run: NestedRunSummary): string | undefined {
-	return run.agent ?? run.agents?.[0] ?? (run.steps?.length === 1 ? run.steps[0]?.agent : undefined);
+function nestedRunAgent(run: NestedRunSummary, index: number): string | undefined {
+	return run.steps?.find((step, position) => (step.flatIndex ?? position) === index)?.agent
+		?? run.agents?.[index]
+		?? (index === 0 ? run.agent : undefined);
 }
 
 function pathWithin(base: string, candidate: string): boolean {
@@ -723,8 +732,8 @@ function pathWithin(base: string, candidate: string): boolean {
 	return resolvedCandidate === resolvedBase || resolvedCandidate.startsWith(`${resolvedBase}${path.sep}`);
 }
 
-function validateNestedSessionFile(run: NestedRunSummary, trustedSessionRoots: string[]): string {
-	const sessionFile = nestedRunSessionFile(run);
+function validateNestedSessionFile(run: NestedRunSummary, index: number, trustedSessionRoots: string[]): string {
+	const sessionFile = nestedRunSessionFile(run, index);
 	if (!sessionFile) throw new Error(`Nested run '${run.id}' does not have a persisted session file to resume from.`);
 	if (path.extname(sessionFile) !== ".jsonl") throw new Error(`Nested run '${run.id}' session file must be a .jsonl file: ${sessionFile}`);
 	const resolved = path.resolve(sessionFile);
@@ -739,29 +748,51 @@ function validateNestedSessionFile(run: NestedRunSummary, trustedSessionRoots: s
 	if (!trustedRoots.some((root) => pathWithin(root, realSessionFile))) {
 		throw new Error(`Nested run '${run.id}' session file is outside trusted nested session roots: ${sessionFile}`);
 	}
-	if (!realSessionFile.split(path.sep).includes(run.id)) {
-		throw new Error(`Nested run '${run.id}' session file is not under that nested run's session directory: ${sessionFile}`);
+	const authorizedSessionRunIds = new Set([run.id, ...run.path.map((entry) => entry.runId)]);
+	if (!realSessionFile.split(path.sep).some((segment) => authorizedSessionRunIds.has(segment))) {
+		throw new Error(`Nested run '${run.id}' session file is not under its authenticated run lineage: ${sessionFile}`);
 	}
 	return realSessionFile;
 }
 
-function resolveNestedResumeTarget(match: ResolvedSubagentRunId & { kind: "nested" }, trustedSessionRoots: string[]): NestedResumeSourceTarget {
+function sameNestedRoute(left: NestedRouteInfo, right: NestedRouteInfo): boolean {
+	return left.rootRunId === right.rootRunId && left.eventSink === right.eventSink && left.controlInbox === right.controlInbox && left.capabilityToken === right.capabilityToken;
+}
+
+function resolveNestedResumeTarget(match: ResolvedSubagentRunId & { kind: "nested" }, trustedSessionRoots: string[], requestedIndex?: number): NestedResumeSourceTarget {
 	const run = match.match.run;
 	if (run.state === "running" || run.state === "queued") throw new Error(`Nested run '${run.id}' is live; route the follow-up to the owner process instead.`);
-	const agent = nestedRunAgent(run);
-	if (!agent) throw new Error(`Could not determine child agent for nested run '${run.id}'.`);
-	const state = run.state === "complete" || run.state === "failed" || run.state === "paused" || run.state === "cancelled" ? run.state : "failed";
+	const registryChildCount = run.steps?.length ?? run.agents?.length ?? run.chainStepCount ?? 1;
+	const singleChildSession = registryChildCount === 1 ? validateNestedSessionFile(run, 0, trustedSessionRoots) : undefined;
 	const asyncDir = resolveNestedAsyncDir(match.match.rootRunId, run);
+	if (!asyncDir) throw new Error(`Nested run '${run.id}' has no trusted persisted async directory.`);
+	const nestedRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", match.match.rootRunId);
+	const persisted = resolveAsyncResumeTarget(
+		{ id: run.id, dir: asyncDir, ...(requestedIndex !== undefined ? { index: requestedIndex } : {}) },
+		{ asyncDirRoot: nestedRoot, resultsDir: path.join(RESULTS_DIR, "nested", match.match.rootRunId) },
+	);
+	if (persisted.kind !== "revive") throw new Error(`Nested run '${run.id}' is still live; route the follow-up to the owner process instead.`);
+	const route = validateNestedRouteForRevival(match.match.route);
+	if (!persisted.nestedRoute || !sameNestedRoute(route, persisted.nestedRoute)) throw new Error(`Nested run '${run.id}' persisted route does not match its authenticated registry route.`);
+	const authenticatedAgent = nestedRunAgent(run, persisted.index);
+	if (!authenticatedAgent || persisted.agent !== authenticatedAgent) throw new Error(`Nested run '${run.id}' persisted agent does not match its authenticated registry entry.`);
+	if (!run.cwd || !persisted.cwd || path.resolve(run.cwd) !== path.resolve(persisted.cwd)) throw new Error(`Nested run '${run.id}' persisted cwd does not match its authenticated registry entry.`);
+	const sessionFile = persisted.index === 0 && singleChildSession
+		? singleChildSession
+		: validateNestedSessionFile(run, persisted.index, trustedSessionRoots);
+	if (persisted.sessionFile && path.resolve(persisted.sessionFile) !== path.resolve(sessionFile)) throw new Error(`Nested run '${run.id}' persisted session does not match its authenticated registry entry.`);
+	const lineage = run.path.at(-1)?.runId === run.id ? run.path : [...run.path, { runId: run.id, ...(run.parentStepIndex !== undefined ? { stepIndex: run.parentStepIndex } : {}), ...(persisted.agent ? { agent: persisted.agent } : {}) }];
 	return {
-		kind: "revive",
+		...persisted,
 		source: "nested",
-		runId: run.id,
-		state,
-		agent,
-		index: 0,
-		intercomTarget: resolveSubagentIntercomTarget(run.id, agent, 0),
-		cwd: asyncDir ? path.dirname(asyncDir) : undefined,
-		sessionFile: validateNestedSessionFile(run, trustedSessionRoots),
+		sessionFile,
+		nestedRoute: route,
+		nestedSelf: {
+			parentRunId: run.parentRunId,
+			...(run.parentStepIndex !== undefined ? { parentStepIndex: run.parentStepIndex } : {}),
+			depth: run.depth,
+			path: lineage,
+		},
 	};
 }
 
@@ -944,6 +975,7 @@ async function resumeAsyncRun(input: {
 	requestCwd: string;
 	ctx: ExtensionContext;
 	deps: ExecutorDeps;
+	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
 }): Promise<AgentToolResult<Details>> {
 	const followUp = (input.params.message ?? input.params.task ?? "").trim();
 	if (!followUp) {
@@ -967,7 +999,7 @@ async function resumeAsyncRun(input: {
 				...(input.deps.config.defaultSessionDir ? [path.resolve(input.deps.expandTilde(input.deps.config.defaultSessionDir))] : []),
 				...(parentSessionFile ? [input.deps.getSubagentSessionRoot(parentSessionFile)] : []),
 			];
-			target = resolveNestedResumeTarget(resolved, trustedSessionRoots);
+			target = resolveNestedResumeTarget(resolved, trustedSessionRoots, input.params.index);
 		} else {
 			target = resolveResumeTarget(input.params, input.deps.state);
 		}
@@ -1037,6 +1069,15 @@ async function resumeAsyncRun(input: {
 	const runId = randomUUID().slice(0, 8);
 	const artifactConfig: ArtifactConfig = { ...DEFAULT_ARTIFACT_CONFIG, enabled: input.params.artifacts !== false };
 	const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const sandbox = resolveSandboxConfig({ agent: agentConfig, run: input.params.sandbox });
+	let scopedGitEndpoint: ScopedGitEndpointDescriptor | undefined;
+	try {
+		scopedGitEndpoint = target.nestedSelf
+			? await reserveAsyncScopedEndpoint(input.scopedGitEndpoint, effectiveCwd, isolatedGitCommitRequired(followUp, agentConfig, sandbox))
+			: undefined;
+	} catch (error) {
+		return { content: [{ type: "text", text: `Scoped Git endpoint preflight rejected: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "management", results: [] } };
+	}
 	const result = executeAsyncSingle(runId, {
 		agent: target.agent,
 		task: buildRevivedAsyncTask(target, followUp),
@@ -1061,7 +1102,12 @@ async function resumeAsyncRun(input: {
 		controlIntercomTarget: intercomBridge.active ? intercomBridge.orchestratorTarget : undefined,
 		childIntercomTarget: intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(runId, agent, index) : undefined,
 		availableModels,
+		nestedRoute: target.nestedRoute,
+		...(target.nestedSelf ? { nestedSelf: target.nestedSelf } : {}),
+		sandbox,
+		scopedGitEndpoint,
 	});
+	bindAsyncScopedWriter(scopedGitEndpoint, result);
 	if (result.isError) return result;
 
 	const revivedId = result.details.asyncId ?? runId;
@@ -4394,7 +4440,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				return inspectSubagentStatus(paramsWithResolvedCwd, { state: deps.state, nested: nestedResolutionScopeForExecutor(deps) });
 			}
 			if (params.action === "resume") {
-				return resumeAsyncRun({ params: paramsWithResolvedCwd, requestCwd, ctx, deps });
+				return resumeAsyncRun({ params: paramsWithResolvedCwd, requestCwd, ctx, deps, scopedGitEndpoint: preAuthenticatedEndpoint });
 			}
 			if (params.action === "interrupt") {
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;

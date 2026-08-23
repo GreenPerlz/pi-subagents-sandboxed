@@ -18,6 +18,7 @@ import { discoverAgents } from "../../src/agents/agents.ts";
 import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { isExpectedAsyncRunnerPid } from "../../src/runs/background/pid-identity.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV, SUBAGENT_PARENT_CONTROL_INBOX_ENV, SUBAGENT_PARENT_DEPTH_ENV, SUBAGENT_PARENT_EVENT_SINK_ENV, SUBAGENT_PARENT_PATH_ENV, SUBAGENT_PARENT_ROOT_RUN_ID_ENV, SUBAGENT_PARENT_RUN_ID_ENV } from "../../src/runs/shared/pi-args.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, teardownIsolatedGitRuntimeForTests } from "../../src/sandbox/isolated-git.ts";
 import { SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
@@ -348,6 +349,44 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.equal(status.mode, "single");
 		} finally {
 			removeTempDir(dir);
+		}
+	});
+
+	it("keeps an explicit root route separate from ambient ancestry for async chains", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const id = `async-chain-explicit-root-${Date.now().toString(36)}`;
+		const route = createNestedRoute(id);
+		const ambientRoute = createNestedRoute(`ambient-${id}`);
+		const keys = [SUBAGENT_PARENT_EVENT_SINK_ENV, SUBAGENT_PARENT_CONTROL_INBOX_ENV, SUBAGENT_PARENT_ROOT_RUN_ID_ENV, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV, SUBAGENT_PARENT_RUN_ID_ENV, SUBAGENT_PARENT_DEPTH_ENV, SUBAGENT_PARENT_PATH_ENV] as const;
+		const saved = new Map(keys.map((key) => [key, process.env[key]]));
+		Object.assign(process.env, {
+			[SUBAGENT_PARENT_EVENT_SINK_ENV]: ambientRoute.eventSink,
+			[SUBAGENT_PARENT_CONTROL_INBOX_ENV]: ambientRoute.controlInbox,
+			[SUBAGENT_PARENT_ROOT_RUN_ID_ENV]: ambientRoute.rootRunId,
+			[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV]: ambientRoute.capabilityToken,
+			[SUBAGENT_PARENT_RUN_ID_ENV]: "ambient-owner",
+			[SUBAGENT_PARENT_DEPTH_ENV]: "1",
+			[SUBAGENT_PARENT_PATH_ENV]: JSON.stringify([{ runId: ambientRoute.rootRunId, stepIndex: 0 }]),
+		});
+		mockPi.onCall({ output: "chain done" });
+		try {
+			const launched = executeAsyncChain(id, {
+				chain: [{ agent: "worker", task: "continue root chain" }], agents: [makeAgent("worker")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, maxSubagentDepth: 2, nestedRoute: route,
+			});
+			assert.equal(launched.isError, undefined, launched.content[0]?.text);
+			const resultPath = await waitForAsyncResultFile(id, 10_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as { nestedRoute?: unknown; nestedSelf?: unknown };
+			assert.deepEqual(payload.nestedRoute, route);
+			assert.equal(payload.nestedSelf, undefined);
+			assert.equal(fs.existsSync(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", ambientRoute.rootRunId, id)), false);
+		} finally {
+			for (const key of keys) { const value = saved.get(key); if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			fs.rmSync(path.dirname(ambientRoute.eventSink), { recursive: true, force: true });
+			fs.rmSync(path.join(ASYNC_DIR, id), { recursive: true, force: true });
+			fs.rmSync(path.join(RESULTS_DIR, `${id}.json`), { force: true });
 		}
 	});
 

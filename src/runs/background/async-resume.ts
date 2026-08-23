@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ASYNC_DIR, RESULTS_DIR, type AsyncStatus } from "../../shared/types.ts";
+import { ASYNC_DIR, RESULTS_DIR, TEMP_ROOT_DIR, type AsyncStatus, type NestedRouteInfo } from "../../shared/types.ts";
+import { validateNestedRouteForRevival } from "../shared/nested-events.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
 
@@ -28,6 +29,8 @@ export type AsyncResumeTarget = {
 	intercomTarget: string;
 	cwd?: string;
 	sessionFile?: string;
+	nestedRoute?: NestedRouteInfo;
+	nestedSelf?: AsyncStatus["nestedSelf"];
 };
 
 interface AsyncResultChild {
@@ -52,6 +55,10 @@ interface AsyncResultFile {
 	worktreeExecutionError?: string;
 	cwd?: string;
 	sessionFile?: string;
+	asyncDir?: string;
+	nestedRoute?: NestedRouteInfo;
+	nestedRouteRequired?: true;
+	nestedSelf?: AsyncStatus["nestedSelf"];
 	results?: AsyncResultChild[];
 }
 
@@ -111,6 +118,9 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 	const success = data.success;
 	if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': success must be a boolean.`);
 	const worktreeExecutionError = validateOptionalString(data, "worktreeExecutionError", resultPath);
+	const nestedRoute = data.nestedRoute === undefined ? undefined : validateNestedRouteForRevival(data.nestedRoute);
+	if (data.nestedRouteRequired !== undefined && data.nestedRouteRequired !== true) throw new Error(`Invalid async result file '${resultPath}': nestedRouteRequired must be true.`);
+	const nestedSelf = data.nestedSelf === undefined ? undefined : validateNestedSelf(data.nestedSelf, resultPath);
 	return {
 		id: validateOptionalString(data, "id", resultPath),
 		runId: validateOptionalString(data, "runId", resultPath),
@@ -119,6 +129,10 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 		state: validateOptionalString(data, "state", resultPath),
 		cwd: validateOptionalString(data, "cwd", resultPath),
 		sessionFile: validateOptionalString(data, "sessionFile", resultPath),
+		asyncDir: validateOptionalString(data, "asyncDir", resultPath),
+		...(nestedRoute ? { nestedRoute } : {}),
+		...(data.nestedRouteRequired === true ? { nestedRouteRequired: true as const } : {}),
+		...(nestedSelf ? { nestedSelf } : {}),
 		...(typeof success === "boolean" ? { success } : {}),
 		...(data.teardownUnproven === true ? { teardownUnproven: true } : {}),
 		...(worktreeExecutionError ? { worktreeExecutionError } : {}),
@@ -242,18 +256,56 @@ function resultState(result: AsyncResultFile): AsyncStatus["state"] {
 	return result.success ? "complete" : "failed";
 }
 
+function validateNestedSelf(value: unknown, source: string): NonNullable<AsyncStatus["nestedSelf"]> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid nested ancestry '${source}': nestedSelf must be an object.`);
+	const raw = value as Record<string, unknown>;
+	const safeId = (candidate: unknown, field: string): string => {
+		if (typeof candidate !== "string" || !/^[A-Za-z0-9._-]+$/u.test(candidate)) throw new Error(`Invalid nested ancestry '${source}': ${field} must be a safe id.`);
+		return candidate;
+	};
+	const parentRunId = safeId(raw.parentRunId, "parentRunId");
+	if (raw.parentStepIndex !== undefined && (!Number.isInteger(raw.parentStepIndex) || (raw.parentStepIndex as number) < 0)) throw new Error(`Invalid nested ancestry '${source}': parentStepIndex must be a non-negative integer.`);
+	if (typeof raw.depth !== "number" || !Number.isInteger(raw.depth) || raw.depth < 1) throw new Error(`Invalid nested ancestry '${source}': depth must be a positive integer.`);
+	if (!Array.isArray(raw.path) || raw.path.length === 0) throw new Error(`Invalid nested ancestry '${source}': path must be a non-empty array.`);
+	const nestedPath = raw.path.map((entry, index) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`Invalid nested ancestry '${source}': path[${index}] must be an object.`);
+		const item = entry as Record<string, unknown>;
+		const runId = safeId(item.runId, `path[${index}].runId`);
+		if (item.stepIndex !== undefined && (!Number.isInteger(item.stepIndex) || (item.stepIndex as number) < 0)) throw new Error(`Invalid nested ancestry '${source}': path[${index}].stepIndex must be a non-negative integer.`);
+		if (item.agent !== undefined && (typeof item.agent !== "string" || item.agent.length === 0 || item.agent.length > 256)) throw new Error(`Invalid nested ancestry '${source}': path[${index}].agent must be a bounded string.`);
+		return { runId, ...(item.stepIndex !== undefined ? { stepIndex: item.stepIndex as number } : {}), ...(typeof item.agent === "string" ? { agent: item.agent } : {}) };
+	});
+	return { parentRunId, ...(raw.parentStepIndex !== undefined ? { parentStepIndex: raw.parentStepIndex as number } : {}), depth: raw.depth, path: nestedPath };
+}
+
+function sameNestedRoute(left: NestedRouteInfo, right: NestedRouteInfo): boolean {
+	return left.rootRunId === right.rootRunId && left.eventSink === right.eventSink && left.controlInbox === right.controlInbox && left.capabilityToken === right.capabilityToken;
+}
+
 function validateStatusForResume(status: AsyncStatus | null, source: string): void {
 	if (!status) return;
 	if (typeof status.runId !== "string") throw new Error(`Invalid async status '${source}': runId must be a string.`);
 	if (status.sessionId !== undefined && typeof status.sessionId !== "string") throw new Error(`Invalid async status '${source}': sessionId must be a string.`);
 	if (status.cwd !== undefined && typeof status.cwd !== "string") throw new Error(`Invalid async status '${source}': cwd must be a string.`);
 	if (status.sessionFile !== undefined && typeof status.sessionFile !== "string") throw new Error(`Invalid async status '${source}': sessionFile must be a string.`);
+	if (status.nestedRoute !== undefined) validateNestedRouteForRevival(status.nestedRoute);
+	if (status.nestedRouteRequired !== undefined && status.nestedRouteRequired !== true) throw new Error(`Invalid async status '${source}': nestedRouteRequired must be true.`);
+	if (status.nestedSelf !== undefined) validateNestedSelf(status.nestedSelf, source);
 	if (status.steps !== undefined) {
 		if (!Array.isArray(status.steps)) throw new Error(`Invalid async status '${source}': steps must be an array.`);
+		const canonicalIndexes = new Set<number>();
 		status.steps.forEach((step, index) => {
 			if (!step || typeof step !== "object" || Array.isArray(step)) throw new Error(`Invalid async status '${source}': steps[${index}] must be an object.`);
 			if (typeof step.agent !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].agent must be a string.`);
 			if (step.sessionFile !== undefined && typeof step.sessionFile !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].sessionFile must be a string.`);
+			if (step.groupId !== undefined && typeof step.groupId !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].groupId must be a string.`);
+			if ((step as { unindexed?: unknown }).unindexed !== undefined && typeof (step as { unindexed?: unknown }).unindexed !== "boolean") throw new Error(`Invalid async status '${source}': steps[${index}].unindexed must be a boolean.`);
+			if (step.flatIndex !== undefined && (!Number.isInteger(step.flatIndex) || step.flatIndex < 0)) throw new Error(`Invalid async status '${source}': steps[${index}].flatIndex must be a non-negative integer.`);
+			if (!step.groupId && !(step as { unindexed?: boolean }).unindexed) {
+				const flatIndex = step.flatIndex ?? index;
+				if (canonicalIndexes.has(flatIndex)) throw new Error(`Invalid async status '${source}': duplicate canonical flatIndex ${flatIndex}.`);
+				canonicalIndexes.add(flatIndex);
+			}
 		});
 	}
 }
@@ -279,6 +331,18 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const status = reconciliation?.status ?? null;
 	validateStatusForResume(status, location.asyncDir ? path.join(location.asyncDir, "status.json") : "status.json");
 	const result = location.resultPath ? readResultFile(location.resultPath) : undefined;
+	if (status?.cwd && result?.cwd && path.resolve(status.cwd) !== path.resolve(result.cwd)) throw new Error("Persisted async cwd differs between status and result files.");
+	if (status?.sessionFile && result?.sessionFile && path.resolve(status.sessionFile) !== path.resolve(result.sessionFile)) throw new Error("Persisted async session differs between status and result files.");
+	const persistedRoute = status?.nestedRoute ?? result?.nestedRoute;
+	const routeRequired = status?.nestedRouteRequired === true || result?.nestedRouteRequired === true;
+	if (routeRequired && !persistedRoute) throw new Error("Async revival requires persisted nested route metadata, but the authenticated route is missing.");
+	if (status?.nestedRoute && result?.nestedRoute && !sameNestedRoute(status.nestedRoute, result.nestedRoute)) throw new Error("Persisted nested route metadata differs between async status and result files.");
+	const statusNestedSelf = status?.nestedSelf ? validateNestedSelf(status.nestedSelf, "status.json") : undefined;
+	const persistedNestedSelf = statusNestedSelf ?? result?.nestedSelf;
+	if (statusNestedSelf && result?.nestedSelf && JSON.stringify(statusNestedSelf) !== JSON.stringify(result.nestedSelf)) throw new Error("Persisted nested ancestry differs between async status and result files.");
+	const nestedRoot = path.resolve(TEMP_ROOT_DIR, "nested-subagent-runs");
+	const nestedLocation = location.asyncDir ? path.resolve(location.asyncDir).startsWith(`${nestedRoot}${path.sep}`) : Boolean(result?.asyncDir && path.resolve(result.asyncDir).startsWith(`${nestedRoot}${path.sep}`));
+	if (nestedLocation && !persistedRoute) throw new Error("Nested async revival requires persisted nested route metadata.");
 	const runId = status?.runId ?? result?.runId ?? result?.id ?? location.resolvedId ?? (location.asyncDir ? path.basename(location.asyncDir) : "unknown");
 	const state = status?.state ?? (result ? resultState(result) : undefined);
 	if (!state) throw new Error(`Status file not found for async run '${runId}'.`);
@@ -293,6 +357,18 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	// canonical flat indexes, never from raw array positions.
 	const statusSteps = (status?.steps ?? []).filter((step) => !step.groupId && !(step as { unindexed?: boolean }).unindexed).map((step, position) => ({ step, index: step.flatIndex ?? position }));
 	const resultSteps = (result?.results ?? []).filter((step) => !(step as { groupId?: string; unindexed?: boolean }).groupId && !(step as { unindexed?: boolean }).unindexed).map((step, position) => ({ step, index: (step as { flatIndex?: number }).flatIndex ?? position }));
+	const resultIndexes = new Set<number>();
+	for (const entry of resultSteps) {
+		if (resultIndexes.has(entry.index)) throw new Error(`Invalid async result: duplicate canonical flatIndex ${entry.index}.`);
+		resultIndexes.add(entry.index);
+		const persistedStatus = statusSteps.find((candidate) => candidate.index === entry.index)?.step;
+		if (persistedStatus && entry.step.agent && persistedStatus.agent !== entry.step.agent) throw new Error(`Persisted async child ${entry.index} differs between status and result files.`);
+		if (persistedStatus?.sessionFile && entry.step.sessionFile && path.resolve(persistedStatus.sessionFile) !== path.resolve(entry.step.sessionFile)) throw new Error(`Persisted async child ${entry.index} session differs between status and result files.`);
+	}
+	if (status?.steps !== undefined && result?.results !== undefined) {
+		const statusIndexes = new Set(statusSteps.map((entry) => entry.index));
+		if (statusIndexes.size !== resultIndexes.size || [...statusIndexes].some((index) => !resultIndexes.has(index))) throw new Error("Persisted canonical child indexes differ between async status and result files.");
+	}
 	const stepCount = Math.max(statusSteps.length ? Math.max(...statusSteps.map(({ index }) => index + 1)) : 0, resultSteps.length ? Math.max(...resultSteps.map(({ index }) => index + 1)) : 0, result?.agent ? 1 : 0);
 	const requestedIndex = params.index;
 	if (requestedIndex !== undefined && !Number.isInteger(requestedIndex)) throw new Error(`Async run '${runId}' index must be an integer.`);
@@ -314,6 +390,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 					intercomTarget: resolveSubagentIntercomTarget(runId, selectedStep.agent, requestedIndex),
 					cwd: status?.cwd ?? result?.cwd,
 					sessionFile: selectedStep.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
+					...(persistedRoute ? { nestedRoute: persistedRoute } : {}),
+					...(persistedNestedSelf ? { nestedSelf: persistedNestedSelf } : {}),
 				};
 			}
 			if (selectedStep?.status === "pending") throw new Error(`Async run '${runId}' child ${requestedIndex} is pending and has not started yet. Wait for it to run or complete before resuming.`);
@@ -334,6 +412,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 				intercomTarget: resolveSubagentIntercomTarget(runId, selected.step.agent, selected.index),
 				cwd: status?.cwd ?? result?.cwd,
 				sessionFile: selected.step.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
+				...(persistedRoute ? { nestedRoute: persistedRoute } : {}),
+				...(persistedNestedSelf ? { nestedSelf: persistedNestedSelf } : {}),
 			};
 		}
 	}
@@ -364,6 +444,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		intercomTarget: resolveSubagentIntercomTarget(runId, agent, index),
 		cwd: status?.cwd ?? result?.cwd,
 		sessionFile: resolvedSessionFile,
+		...(persistedRoute ? { nestedRoute: persistedRoute } : {}),
+		...(persistedNestedSelf ? { nestedSelf: persistedNestedSelf } : {}),
 	};
 }
 

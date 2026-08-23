@@ -7,7 +7,7 @@ import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
-import { readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
+import { ackNestedControlRequest, readNestedControlRequests, resolveNestedRouteFromEnv, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
@@ -118,8 +118,11 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState)
 							return;
 						}
 						pendingResults.delete(request.requestId);
+						ackNestedControlRequest(route, request.requestId, request.filePath);
 						seen.add(request.requestId);
-						try { fs.unlinkSync(request.filePath); } catch {}
+						// ackNestedControlRequest retains journal evidence and only unlinks
+						// legacy request files for compatibility.
+						try { if (path.basename(request.filePath) !== "control-requests.journal") fs.unlinkSync(request.filePath); } catch {}
 					} finally {
 						inFlight.delete(request.requestId);
 					}

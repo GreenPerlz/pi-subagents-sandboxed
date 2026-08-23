@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -26,7 +26,6 @@ import {
 	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
 	SUBAGENT_PARENT_RUN_ID_ENV,
 } from "./pi-args.ts";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
 
 export const NESTED_EVENTS_DIR = path.join(TEMP_ROOT_DIR, "nested-subagent-events");
 const ROUTE_FILE = "route.json";
@@ -35,6 +34,20 @@ const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_STEPS = 12;
 const MAX_CHILDREN = 16;
 const MAX_DEPTH = 3;
+// Journals are framed rather than newline-delimited so a torn write can never
+// be mistaken for a valid event.  The fixed header also lets readers advance
+// by byte offset without enumerating historical files.
+const JOURNAL_MAGIC = Buffer.from("PISJRN01", "ascii");
+const JOURNAL_VERSION = 1;
+const JOURNAL_HEADER_BYTES = 56; // magic(8), version/kind/reserved(4), seq(8), len(4), sha256(32)
+const JOURNAL_MAX_BODY_BYTES = MAX_EVENT_BYTES;
+const EVENT_JOURNAL = "events.journal";
+const CONTROL_JOURNAL = "control-requests.journal";
+const RESULT_JOURNAL = "control-results.journal";
+const JOURNAL_STATE = ".journal-state.json";
+const LEGACY_MANIFEST = ".legacy-import-manifest.json";
+const ROUTE_LOCK = ".route.lock";
+const COMPACTION_BYTES = 4 * 1024 * 1024;
 
 type NestedStatusEventType = "subagent.nested.started" | "subagent.nested.updated" | "subagent.nested.completed";
 type NestedControlResultEventType = "subagent.nested.control-result";
@@ -171,7 +184,10 @@ export function createNestedRoute(rootRunId: string): NestedRoute {
 	const controlInbox = path.join(routeRoot, "controls");
 	fs.mkdirSync(eventSink, { recursive: true, mode: 0o700 });
 	fs.mkdirSync(controlInbox, { recursive: true, mode: 0o700 });
-	fs.writeFileSync(path.join(routeRoot, ROUTE_FILE), `${JSON.stringify({ rootRunId, capabilityToken, createdAt: Date.now() })}\n`, { mode: 0o600 });
+	const routeFile = path.join(routeRoot, ROUTE_FILE);
+	const routeFd = fs.openSync(routeFile, "wx", 0o600);
+	try { fs.writeFileSync(routeFd, `${JSON.stringify({ rootRunId, capabilityToken, createdAt: Date.now() })}\n`, "utf8"); fs.fsyncSync(routeFd); } finally { fs.closeSync(routeFd); }
+	fsyncDirectory(routeRoot);
 	return { rootRunId, eventSink, controlInbox, capabilityToken };
 }
 
@@ -442,353 +458,352 @@ export function applyNestedEvent(registry: NestedRegistry, event: NestedEventRec
 	};
 }
 
-function registryPath(route: NestedRoute): string {
-	return path.join(commonRouteRoot(route), REGISTRY_FILE);
+function parseControlRequest(content: string, route: NestedRoute): NestedControlRequestRecord | undefined {
+	if (Buffer.byteLength(content, "utf-8") > MAX_EVENT_BYTES) return undefined; let parsed: unknown; try { parsed = JSON.parse(content); } catch { return undefined; }
+	if (!parsed || typeof parsed !== "object") return undefined; const raw = parsed as Record<string, unknown>;
+	if (raw.type !== "subagent.nested.control-request" || raw.rootRunId !== route.rootRunId || raw.capabilityToken !== route.capabilityToken) return undefined;
+	if (!isSafeNestedId(raw.requestId) || !isSafeNestedId(raw.targetRunId) || (raw.action !== "interrupt" && raw.action !== "resume")) return undefined; const ts = clampNumber(raw.ts); if (ts === undefined) return undefined;
+	return { type: "subagent.nested.control-request", ts, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken, requestId: raw.requestId, targetRunId: raw.targetRunId, action: raw.action, ...(stringValue(raw.message, 16_000) ? { message: stringValue(raw.message, 16_000) } : {}) };
 }
-
-export function findNestedRouteForRootId(rootRunId: string): NestedRoute | undefined {
-	assertSafeId("rootRunId", rootRunId);
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(NESTED_EVENTS_DIR);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		throw error;
-	}
-	for (const entry of entries) {
-		if (!entry.startsWith(`${rootRunId}-`)) continue;
-		const routeRoot = path.join(NESTED_EVENTS_DIR, entry);
-		try {
-			const metadata = JSON.parse(fs.readFileSync(path.join(routeRoot, ROUTE_FILE), "utf-8")) as { rootRunId?: unknown; capabilityToken?: unknown };
-			if (metadata.rootRunId !== rootRunId || typeof metadata.capabilityToken !== "string") continue;
-			const route = {
-				rootRunId,
-				eventSink: path.join(routeRoot, "events"),
-				controlInbox: path.join(routeRoot, "controls"),
-				capabilityToken: metadata.capabilityToken,
-			};
-			validateRouteShape(route);
-			return route;
-		} catch {
-			continue;
-		}
-	}
-	return undefined;
+function parseControlResult(content: string, route: NestedRoute): NestedControlResultRecord | undefined {
+	if (Buffer.byteLength(content, "utf-8") > MAX_EVENT_BYTES) return undefined; let parsed: unknown; try { parsed = JSON.parse(content); } catch { return undefined; }
+	if (!parsed || typeof parsed !== "object") return undefined; const raw = parsed as Record<string, unknown>;
+	if (raw.type !== "subagent.nested.control-result" || raw.rootRunId !== route.rootRunId || raw.capabilityToken !== route.capabilityToken) return undefined;
+	if (!isSafeNestedId(raw.requestId) || !isSafeNestedId(raw.targetRunId) || typeof raw.ok !== "boolean") return undefined; const ts = clampNumber(raw.ts); if (ts === undefined) return undefined;
+	return { type: "subagent.nested.control-result", ts, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken, requestId: raw.requestId, targetRunId: raw.targetRunId, ok: raw.ok, message: stringValue(raw.message, 16_000) ?? (raw.ok ? "Control request completed." : "Control request failed.") };
 }
-
-export function projectNestedRegistryForRoot(rootRunId: string): NestedRegistry | undefined {
-	const route = findNestedRouteForRootId(rootRunId);
-	return route ? projectNestedEvents(route) : undefined;
-}
-
-export function findNestedRun(children: NestedRunSummary[] | undefined, id: string): NestedRunSummary | undefined {
-	if (!children?.length) return undefined;
-	for (const child of children) {
-		if (child.id === id) return child;
-		const nested = findNestedRun(child.children, id) ?? findNestedRun(child.steps?.flatMap((step) => step.children ?? []), id);
-		if (nested) return nested;
-	}
-	return undefined;
-}
-
 export interface NestedRunMatch {
 	rootRunId: string;
 	route: NestedRoute;
 	run: NestedRunSummary;
 }
-
 export interface NestedRunResolutionScope {
 	routes: NestedRoute[];
 	descendantOf?: { parentRunId: string; parentStepIndex?: number };
 }
-
-function collectNestedRuns(children: NestedRunSummary[] | undefined, output: NestedRunSummary[] = []): NestedRunSummary[] {
-	for (const child of children ?? []) {
-		output.push(child);
-		collectNestedRuns(child.children, output);
-		collectNestedRuns(child.steps?.flatMap((step) => step.children ?? []), output);
+export function findNestedRouteForRootId(rootRunId: string): NestedRoute | undefined {
+	assertSafeId("rootRunId", rootRunId); let entries: string[];
+	try { entries = fs.readdirSync(NESTED_EVENTS_DIR); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+	for (const entry of entries) { if (!entry.startsWith(`${rootRunId}-`)) continue; const routeRoot = path.join(NESTED_EVENTS_DIR, entry);
+		try { assertTrustedRouteEntry(routeRoot, "directory"); const metadata = JSON.parse(fs.readFileSync(path.join(routeRoot, ROUTE_FILE), "utf8")) as { rootRunId?: unknown; capabilityToken?: unknown }; if (metadata.rootRunId !== rootRunId || typeof metadata.capabilityToken !== "string") continue; const route = { rootRunId, eventSink: path.join(routeRoot, "events"), controlInbox: path.join(routeRoot, "controls"), capabilityToken: metadata.capabilityToken }; validateRouteShape(route); return route; } catch { continue; }
 	}
-	return output;
+	return undefined;
 }
-
+export function projectNestedRegistryForRoot(rootRunId: string): NestedRegistry | undefined { const route = findNestedRouteForRootId(rootRunId); return route ? projectNestedEvents(route) : undefined; }
+export function findNestedRun(children: NestedRunSummary[] | undefined, id: string): NestedRunSummary | undefined {
+	for (const child of children ?? []) { if (child.id === id) return child; const nested = findNestedRun(child.children, id) ?? findNestedRun(child.steps?.flatMap((step) => step.children ?? []), id); if (nested) return nested; } return undefined;
+}
+function collectNestedRuns(children: NestedRunSummary[] | undefined, output: NestedRunSummary[] = []): NestedRunSummary[] { for (const child of children ?? []) { output.push(child); collectNestedRuns(child.children, output); collectNestedRuns(child.steps?.flatMap((step) => step.children ?? []), output); } return output; }
 function collectScopedNestedRuns(children: NestedRunSummary[] | undefined, scope: NestedRunResolutionScope["descendantOf"], output: NestedRunSummary[] = []): NestedRunSummary[] {
 	if (!scope) return collectNestedRuns(children, output);
-	for (const child of children ?? []) {
-		if (child.parentRunId === scope.parentRunId && (scope.parentStepIndex === undefined || child.parentStepIndex === scope.parentStepIndex)) {
-			collectNestedRuns([child], output);
-			continue;
-		}
-		collectScopedNestedRuns(child.children, scope, output);
-		collectScopedNestedRuns(child.steps?.flatMap((step) => step.children ?? []), scope, output);
-	}
+	for (const child of children ?? []) { if (child.parentRunId === scope.parentRunId && (scope.parentStepIndex === undefined || child.parentStepIndex === scope.parentStepIndex)) { collectNestedRuns([child], output); continue; } collectScopedNestedRuns(child.children, scope, output); collectScopedNestedRuns(child.steps?.flatMap((step) => step.children ?? []), scope, output); }
 	return output;
 }
-
 function listNestedRoutes(): NestedRoute[] {
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(NESTED_EVENTS_DIR);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw error;
-	}
-	const routes: NestedRoute[] = [];
-	for (const entry of entries) {
-		const routeRoot = path.join(NESTED_EVENTS_DIR, entry);
-		try {
-			const metadata = JSON.parse(fs.readFileSync(path.join(routeRoot, ROUTE_FILE), "utf-8")) as { rootRunId?: unknown; capabilityToken?: unknown };
-			if (typeof metadata.rootRunId !== "string" || typeof metadata.capabilityToken !== "string") continue;
-			const route = {
-				rootRunId: metadata.rootRunId,
-				eventSink: path.join(routeRoot, "events"),
-				controlInbox: path.join(routeRoot, "controls"),
-				capabilityToken: metadata.capabilityToken,
-			};
-			validateRouteShape(route);
-			routes.push(route);
-		} catch {
-			continue;
-		}
-	}
-	return routes;
+	let entries: string[]; try { entries = fs.readdirSync(NESTED_EVENTS_DIR); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+	const routes: NestedRoute[] = []; for (const entry of entries) { const routeRoot = path.join(NESTED_EVENTS_DIR, entry); try { assertTrustedRouteEntry(routeRoot, "directory"); const metadata = JSON.parse(fs.readFileSync(path.join(routeRoot, ROUTE_FILE), "utf8")) as { rootRunId?: unknown; capabilityToken?: unknown }; if (typeof metadata.rootRunId !== "string" || typeof metadata.capabilityToken !== "string") continue; const route = { rootRunId: metadata.rootRunId, eventSink: path.join(routeRoot, "events"), controlInbox: path.join(routeRoot, "controls"), capabilityToken: metadata.capabilityToken }; validateRouteShape(route); routes.push(route); } catch { continue; } } return routes;
 }
-
 export function findNestedRunMatchesById(id: string, options: { prefix?: boolean; scope?: NestedRunResolutionScope } = {}): NestedRunMatch[] {
-	assertSafeId("id", id);
-	const matches: NestedRunMatch[] = [];
-	for (const route of options.scope?.routes ?? listNestedRoutes()) {
-		try {
-			const registry = projectNestedEvents(route);
-			for (const run of collectScopedNestedRuns(registry.children, options.scope?.descendantOf)) {
-				if (options.prefix ? run.id.startsWith(id) : run.id === id) matches.push({ rootRunId: route.rootRunId, route, run });
-			}
-		} catch {
-			continue;
-		}
-	}
-	return matches;
+	assertSafeId("id", id); const matches: NestedRunMatch[] = []; for (const route of options.scope?.routes ?? listNestedRoutes()) { try { const registry = projectNestedEvents(route); for (const run of collectScopedNestedRuns(registry.children, options.scope?.descendantOf)) if (options.prefix ? run.id.startsWith(id) : run.id === id) matches.push({ rootRunId: route.rootRunId, route, run }); } catch { continue; } } return matches;
+}
+export function findNestedRunById(id: string): { rootRunId: string; run: NestedRunSummary } | undefined { const match = findNestedRunMatchesById(id)[0]; return match ? { rootRunId: match.rootRunId, run: match.run } : undefined; }
+
+function registryPath(route: NestedRoute): string {
+	return path.join(commonRouteRoot(route), REGISTRY_FILE);
 }
 
-export function findNestedRunById(id: string): { rootRunId: string; run: NestedRunSummary } | undefined {
-	const match = findNestedRunMatchesById(id)[0];
-	return match ? { rootRunId: match.rootRunId, run: match.run } : undefined;
+function routeRoot(route: NestedRoute): string { return commonRouteRoot(route); }
+function journalPath(route: NestedRoute, kind: "event" | "control" | "result"): string {
+	return kind === "control"
+		? path.join(route.controlInbox, CONTROL_JOURNAL)
+		: path.join(route.eventSink, kind === "event" ? EVENT_JOURNAL : RESULT_JOURNAL);
+}
+function statePath(route: NestedRoute): string { return path.join(routeRoot(route), JOURNAL_STATE); }
+function manifestPath(route: NestedRoute): string { return path.join(routeRoot(route), LEGACY_MANIFEST); }
+
+interface JournalState {
+	version: 1;
+	generation: number;
+	eventReadOffset: number;
+	eventWriteOffset: number;
+	eventSequence: number;
+	eventReadSequence: number;
+	controlReadOffset: number;
+	controlWriteOffset: number;
+	controlSequence: number;
+	controlReadSequence: number;
+	resultReadOffset: number;
+	resultWriteOffset: number;
+	resultSequence: number;
+	resultReadSequence: number;
+	pendingRequests: Record<string, NestedControlRequestRecord>;
+	ackedRequests: string[];
+	results: Record<string, NestedControlResultRecord>;
+	deliveredResults: string[];
+}
+
+function emptyJournalState(): JournalState {
+	return { version: 1, generation: 0, eventReadOffset: 0, eventWriteOffset: 0, eventSequence: 0, eventReadSequence: 0, controlReadOffset: 0, controlWriteOffset: 0, controlSequence: 0, controlReadSequence: 0, resultReadOffset: 0, resultWriteOffset: 0, resultSequence: 0, resultReadSequence: 0, pendingRequests: {}, ackedRequests: [], results: {}, deliveredResults: [] };
+}
+
+function fsyncDirectory(dir: string): void {
+	try { const fd = fs.openSync(dir, "r"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } } catch { /* directory fsync is unavailable on some platforms */ }
+}
+function durableWrite(file: string, content: string, mode = 0o600): void {
+	const dir = path.dirname(file);
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const tmp = path.join(dir, `.${path.basename(file)}.${randomUUID()}.tmp`);
+	const fd = fs.openSync(tmp, "wx", mode);
+	try { fs.writeFileSync(fd, content, "utf8"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+	fs.renameSync(tmp, file);
+	fsyncDirectory(dir);
+}
+function trustedDataFile(file: string): void {
+	if (!fs.existsSync(file)) return;
+	assertTrustedRouteEntry(file, "file");
+	const stat = fs.statSync(file);
+	if (stat.size > 64 * 1024 * 1024) throw new Error(`Nested journal/state is too large: ${file}`);
+}
+function readState(route: NestedRoute): JournalState {
+	const file = statePath(route);
+	if (!fs.existsSync(file)) return emptyJournalState();
+	trustedDataFile(file);
+	try {
+		const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+		if (raw.version !== 1 || typeof raw.generation !== "number") throw new Error("invalid journal state version");
+		const number = (key: string) => typeof raw[key] === "number" && Number.isSafeInteger(raw[key]) && (raw[key] as number) >= 0 ? raw[key] as number : 0;
+		const pending: Record<string, NestedControlRequestRecord> = {};
+		if (raw.pendingRequests && typeof raw.pendingRequests === "object") for (const [id, value] of Object.entries(raw.pendingRequests as Record<string, unknown>)) {
+			const request = parseControlRequest(JSON.stringify(value), route); if (request) pending[id] = request;
+		}
+		const results: Record<string, NestedControlResultRecord> = {};
+		if (raw.results && typeof raw.results === "object") for (const [id, value] of Object.entries(raw.results as Record<string, unknown>)) {
+			const result = parseControlResult(JSON.stringify(value), route); if (result) results[id] = result;
+		}
+		return {
+			version: 1, generation: number("generation"), eventReadOffset: number("eventReadOffset"), eventWriteOffset: number("eventWriteOffset"), eventSequence: number("eventSequence"), eventReadSequence: number("eventReadSequence"),
+			controlReadOffset: number("controlReadOffset"), controlWriteOffset: number("controlWriteOffset"), controlSequence: number("controlSequence"), controlReadSequence: number("controlReadSequence"),
+			resultReadOffset: number("resultReadOffset"), resultWriteOffset: number("resultWriteOffset"), resultSequence: number("resultSequence"), resultReadSequence: number("resultReadSequence"),
+			pendingRequests: pending,
+			ackedRequests: Array.isArray(raw.ackedRequests) ? raw.ackedRequests.filter((v): v is string => isSafeNestedId(v)).slice(-4096) : [],
+			results,
+			deliveredResults: Array.isArray(raw.deliveredResults) ? raw.deliveredResults.filter((v): v is string => isSafeNestedId(v)).slice(-4096) : [],
+		};
+	} catch (error) { throw new Error(`Nested journal state is invalid: ${error instanceof Error ? error.message : String(error)}`); }
+}
+function writeState(route: NestedRoute, state: JournalState): void { durableWrite(statePath(route), `${JSON.stringify(state)}\n`); }
+
+function linuxStartToken(pid: number): string | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) return undefined;
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		const fields = stat.slice(close + 2).trim().split(/\s+/);
+		return fields[19]; // field 22, after pid and comm
+	} catch { return undefined; }
+}
+function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
+	const lock = path.join(routeRoot(route), ROUTE_LOCK);
+	const identity = { pid: process.pid, uid: typeof process.getuid === "function" ? process.getuid() : 0, startToken: linuxStartToken(process.pid) ?? `${process.pid}-${process.ppid}` };
+	for (;;) {
+		try {
+			fs.mkdirSync(lock, { mode: 0o700 });
+			try { fs.writeFileSync(path.join(lock, "owner"), `${JSON.stringify(identity)}\n`, { flag: "wx", mode: 0o600 }); } catch { fs.rmSync(lock, { recursive: true, force: true }); throw new Error("Unable to publish nested route lock identity."); }
+			try { return fn(); } finally { fs.rmSync(lock, { recursive: true, force: true }); fsyncDirectory(routeRoot(route)); }
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			let stale = false;
+			try {
+				const st = fs.lstatSync(lock); if (!st.isDirectory() || (st.mode & 0o077) !== 0 || (typeof process.getuid === "function" && st.uid !== process.getuid())) throw new Error("Nested route lock is not trusted.");
+				const ownerFile = path.join(lock, "owner");
+				const ownerStat = fs.lstatSync(ownerFile);
+				if (ownerStat.isSymbolicLink() || !ownerStat.isFile() || (ownerStat.mode & 0o077) !== 0 || (typeof process.getuid === "function" && ownerStat.uid !== process.getuid())) throw new Error("Nested route lock owner is not trusted.");
+				const raw = JSON.parse(fs.readFileSync(ownerFile, "utf8")) as { pid?: unknown; uid?: unknown; startToken?: unknown };
+				if (typeof raw.pid !== "number" || typeof raw.uid !== "number" || typeof raw.startToken !== "string") throw new Error("Nested route lock identity is ambiguous.");
+				if (raw.uid !== identity.uid) throw new Error("Nested route lock belongs to another user.");
+				stale = linuxStartToken(raw.pid) !== raw.startToken;
+			} catch (lockError) { throw lockError instanceof Error ? lockError : new Error(String(lockError)); }
+			if (!stale) throw new Error("Nested route is busy.");
+			fs.rmSync(lock, { recursive: true, force: false });
+		}
+	}
+}
+
+function frameKind(kind: "event" | "control" | "result"): number { return kind === "event" ? 1 : kind === "control" ? 2 : 3; }
+function makeFrame(kind: "event" | "control" | "result", sequence: number, record: object): Buffer {
+	const body = Buffer.from(JSON.stringify(record), "utf8");
+	if (body.length > JOURNAL_MAX_BODY_BYTES) throw new Error("Nested journal record exceeds the maximum size.");
+	const header = Buffer.alloc(JOURNAL_HEADER_BYTES);
+	JOURNAL_MAGIC.copy(header, 0); header.writeUInt8(JOURNAL_VERSION, 8); header.writeUInt8(frameKind(kind), 9); header.writeUInt16BE(0, 10);
+	header.writeBigUInt64BE(BigInt(sequence), 12); header.writeUInt32BE(body.length, 20); createHash("sha256").update(body).digest().copy(header, 24);
+	return Buffer.concat([header, body]);
+}
+function ensureJournal(file: string): void {
+	if (fs.existsSync(file)) { trustedDataFile(file); return; }
+	const fd = fs.openSync(file, "wx", 0o600); fs.closeSync(fd); fsyncDirectory(path.dirname(file));
+}
+function appendJournal(route: NestedRoute, kind: "event" | "control" | "result", record: object, sequence: number): number {
+	const file = journalPath(route, kind); ensureJournal(file); const frame = makeFrame(kind, sequence, record);
+	const fd = fs.openSync(file, "a", 0o600); try { fs.writeFileSync(fd, frame); if (typeof fs.fdatasyncSync === "function") fs.fdatasyncSync(fd); else fs.fsyncSync(fd); } finally { fs.closeSync(fd); } fsyncDirectory(routeRoot(route));
+	return frame.length;
+}
+interface Framed<T> { sequence: number; record: T; nextOffset: number; }
+function readFrames<T>(route: NestedRoute, kind: "event" | "control" | "result", offset: number, expectedSequence: number): { frames: Framed<T>[]; end: number; sequence: number } {
+	const file = journalPath(route, kind); if (!fs.existsSync(file)) return { frames: [], end: 0, sequence: expectedSequence };
+	trustedDataFile(file); const stat = fs.statSync(file); if (offset > stat.size) throw new Error("Nested journal cursor is ahead of its journal.");
+	const fd = fs.openSync(file, "r"); const frames: Framed<T>[] = []; let position = offset; let sequence = expectedSequence; let badAt: number | undefined;
+	try {
+		while (position < stat.size) {
+			if (stat.size - position < JOURNAL_HEADER_BYTES) { badAt = position; break; }
+			const header = Buffer.alloc(JOURNAL_HEADER_BYTES); fs.readSync(fd, header, 0, header.length, position);
+			const length = header.readUInt32BE(20); const seqBig = header.readBigUInt64BE(12); const seq = Number(seqBig);
+			if (!header.subarray(0, 8).equals(JOURNAL_MAGIC) || header.readUInt8(8) !== JOURNAL_VERSION || header.readUInt8(9) !== frameKind(kind) || !Number.isSafeInteger(seq) || seq !== sequence + 1 || length > JOURNAL_MAX_BODY_BYTES) { badAt = position; break; }
+			const next = position + JOURNAL_HEADER_BYTES + length; if (next > stat.size) { badAt = position; break; }
+			const body = Buffer.alloc(length); fs.readSync(fd, body, 0, length, position + JOURNAL_HEADER_BYTES);
+			if (!createHash("sha256").update(body).digest().equals(header.subarray(24, 56))) { badAt = position; break; }
+			try { frames.push({ sequence: seq, record: JSON.parse(body.toString("utf8")) as T, nextOffset: next }); } catch { badAt = position; break; }
+			sequence = seq; position = next;
+		}
+	} finally { fs.closeSync(fd); }
+	if (badAt !== undefined) {
+		// Preserve every ambiguous byte as immutable evidence, then repair the
+		// active journal to the last verified frame. This is safe at restart and
+		// permits the next append to make progress without replaying a torn tail.
+		const evidence = `${file}.torn.${Date.now()}-${randomUUID()}`;
+		const raw = fs.readFileSync(file).subarray(badAt);
+		if (raw.length) durableWrite(evidence, raw.toString("base64") + "\n");
+		const truncate = fs.openSync(file, "r+"); try { fs.ftruncateSync(truncate, badAt); fs.fsyncSync(truncate); } finally { fs.closeSync(truncate); } fsyncDirectory(routeRoot(route));
+		position = badAt;
+	}
+	return { frames, end: position, sequence };
+}
+
+function legacyRecords(route: NestedRoute, kind: "event" | "control" | "result"): Array<NestedEventRecord | NestedControlRequestRecord | NestedControlResultRecord> {
+	const dir = kind === "event" || kind === "result" ? route.eventSink : route.controlInbox;
+	let entries: string[]; try { entries = fs.readdirSync(dir).filter((entry) => entry.endsWith(".json") || entry.endsWith(".jsonl")).sort(); } catch { return []; }
+	const records: Array<NestedEventRecord | NestedControlRequestRecord | NestedControlResultRecord> = [];
+	for (const entry of entries) {
+		const file = path.join(dir, entry); if (!containedPath(dir, file)) continue;
+		try { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.size > MAX_EVENT_BYTES) continue; const content = fs.readFileSync(file, "utf8");
+			const lines = content.includes("\n") ? content.split("\n").filter((line) => line.trim()) : [content];
+			for (const line of lines) { const parsed = kind === "event" ? parseRecord(line, route) : kind === "control" ? parseControlRequest(line, route) : parseControlResult(line, route); if (parsed) records.push(parsed); }
+		} catch { /* malformed legacy evidence is left untouched */ }
+	}
+	return records;
+}
+function importLegacy(route: NestedRoute): void {
+	if (fs.existsSync(manifestPath(route))) { trustedDataFile(manifestPath(route)); return; }
+	withRouteLock(route, () => {
+		if (fs.existsSync(manifestPath(route))) return;
+		let state = readState(route);
+		for (const [kind, records] of [["event", legacyRecords(route, "event")], ["control", legacyRecords(route, "control")], ["result", legacyRecords(route, "result")]] as const) {
+			for (const record of records) {
+				if (kind === "event") { state.eventSequence++; state.eventWriteOffset += appendJournal(route, kind, record, state.eventSequence); }
+				else if (kind === "control") { state.controlSequence++; state.controlWriteOffset += appendJournal(route, kind, record, state.controlSequence); }
+				else { state.resultSequence++; state.resultWriteOffset += appendJournal(route, kind, record, state.resultSequence); }
+			}
+		}
+		writeState(route, state); durableWrite(manifestPath(route), `${JSON.stringify({ version: 1, importedAt: Date.now(), legacyFilesUntouched: true })}\n`);
+	});
 }
 
 export function readNestedRegistry(route: NestedRoute): NestedRegistry {
 	validateRouteShape(route);
 	try {
-		const parsed = JSON.parse(fs.readFileSync(registryPath(route), "utf-8")) as NestedRegistry;
-		return {
-			rootRunId: route.rootRunId,
-			updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
-			children: Array.isArray(parsed.children) ? parsed.children.map((child) => sanitizeSummary(child)).filter((child): child is NestedRunSummary => Boolean(child)) : [],
-			processedEvents: Array.isArray(parsed.processedEvents) ? parsed.processedEvents.filter((item): item is string => typeof item === "string") : [],
-		};
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		return { rootRunId: route.rootRunId, updatedAt: 0, children: [], processedEvents: [] };
-	}
+		trustedDataFile(registryPath(route));
+		const parsed = JSON.parse(fs.readFileSync(registryPath(route), "utf8")) as NestedRegistry;
+		return { rootRunId: route.rootRunId, updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0, children: Array.isArray(parsed.children) ? parsed.children.map((child) => sanitizeSummary(child)).filter((child): child is NestedRunSummary => Boolean(child)) : [], processedEvents: Array.isArray(parsed.processedEvents) ? parsed.processedEvents.filter((item): item is string => typeof item === "string") : [] };
+	} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return { rootRunId: route.rootRunId, updatedAt: 0, children: [], processedEvents: [] }; }
 }
 
 export function projectNestedEvents(route: NestedRoute): NestedRegistry {
-	validateRouteShape(route);
-	let registry = readNestedRegistry(route);
-	const seen = new Set(registry.processedEvents);
-	let changed = false;
-	let entries: string[] = [];
-	try {
-		entries = fs.readdirSync(route.eventSink).filter((entry) => entry.endsWith(".json") || entry.endsWith(".jsonl")).sort();
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-	for (const entry of entries) {
-		if (seen.has(entry)) continue;
-		const eventPath = path.join(route.eventSink, entry);
-		if (!containedPath(route.eventSink, eventPath)) continue;
-		let content: string;
-		try {
-			const stat = fs.statSync(eventPath);
-			if (!stat.isFile() || stat.size > MAX_EVENT_BYTES) continue;
-			content = fs.readFileSync(eventPath, "utf-8");
-		} catch {
-			continue;
+	validateRouteShape(route); assertTrustedRouteEntry(route.eventSink, "directory"); importLegacy(route);
+	return withRouteLock(route, () => {
+		let state = readState(route); let registry = readNestedRegistry(route); let changed = false;
+		// The reader cursor is independent from the writer sequence: an active
+		// parent commonly polls while children append. This bounded pass starts at
+		// the persisted byte offset and never enumerates or reparses old frames.
+		const delta = readFramesRelaxed<NestedEventRecord>(route, "event", state.eventReadOffset, state.eventReadSequence);
+		const frames = delta.frames;
+		state.eventReadOffset = delta.end;
+		if (frames.length) { state.eventSequence = Math.max(state.eventSequence, ...frames.map((frame) => frame.sequence)); state.eventReadSequence = frames[frames.length - 1]!.sequence; }
+		state.eventWriteOffset = Math.max(state.eventWriteOffset, statSize(journalPath(route, "event")));
+		for (const frame of frames) {
+			const event = parseRecord(JSON.stringify(frame.record), route); if (!event) continue; registry = applyNestedEvent(registry, event); changed = true;
 		}
-		for (const event of parseNestedEventRecords(content, route)) {
-			registry = applyNestedEvent(registry, event);
-			changed = true;
-		}
-		seen.add(entry);
-		changed = true;
-	}
-	if (changed) {
-		registry = { ...registry, processedEvents: [...seen].slice(-1000) };
-		// Parent projection is the only writer to this sidecar registry. Child and
-		// runner processes only create immutable event files, so parent status.json
-		// remains owned by the existing runner writer and is never rewritten here.
-		writeAtomicJson(registryPath(route), registry);
-	}
-	return registry;
+		if (state.eventReadOffset !== state.eventWriteOffset) { state.eventWriteOffset = Math.max(state.eventWriteOffset, state.eventReadOffset); }
+		if (changed) { registry = { ...registry, processedEvents: [] }; durableWrite(registryPath(route), `${JSON.stringify(registry)}\n`); }
+		writeState(route, state);
+		if (statSize(journalPath(route, "event")) >= COMPACTION_BYTES && state.eventReadOffset === state.eventWriteOffset) compactEvents(route, state, registry);
+		return registry;
+	});
 }
-
-function writeRouteRecord(dir: string, ts: number, payload: object): string {
-	const content = `${JSON.stringify(payload)}\n`;
-	if (Buffer.byteLength(content, "utf-8") > MAX_EVENT_BYTES) throw new Error("Nested route record exceeds the maximum size.");
-	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-	const name = `${String(ts).padStart(13, "0")}-${randomUUID()}.json`;
-	const tmp = path.join(dir, `.${name}.tmp`);
-	const finalPath = path.join(dir, name);
-	fs.writeFileSync(tmp, content, { mode: 0o600 });
-	fs.renameSync(tmp, finalPath);
-	return finalPath;
+function statSize(file: string): number { try { return fs.statSync(file).size; } catch { return 0; } }
+function readFramesRelaxed<T>(route: NestedRoute, kind: "event" | "control" | "result", offset: number, expectedSequence = 0): { frames: Framed<T>[]; end: number } {
+	const file = journalPath(route, kind); if (!fs.existsSync(file)) return { frames: [], end: 0 }; trustedDataFile(file); const stat = fs.statSync(file); if (offset > stat.size) throw new Error("journal cursor ahead");
+	const fd = fs.openSync(file, "r"); const frames: Framed<T>[] = []; let position = offset; let previous = expectedSequence; let badAt: number | undefined;
+	try {
+		while (position < stat.size) {
+			if (stat.size - position < JOURNAL_HEADER_BYTES) { badAt = position; break; }
+			const h = Buffer.alloc(JOURNAL_HEADER_BYTES); fs.readSync(fd, h, 0, h.length, position); const length = h.readUInt32BE(20); const seq = Number(h.readBigUInt64BE(12)); const next = position + JOURNAL_HEADER_BYTES + length;
+			if (!h.subarray(0, 8).equals(JOURNAL_MAGIC) || h.readUInt8(8) !== JOURNAL_VERSION || h.readUInt8(9) !== frameKind(kind) || !Number.isSafeInteger(seq) || seq <= previous || length > JOURNAL_MAX_BODY_BYTES || next > stat.size) { badAt = position; break; }
+			const body = Buffer.alloc(length); fs.readSync(fd, body, 0, length, position + JOURNAL_HEADER_BYTES); if (!createHash("sha256").update(body).digest().equals(h.subarray(24, 56))) { badAt = position; break; }
+			let record: T; try { record = JSON.parse(body.toString("utf8")) as T; } catch { badAt = position; break; }
+			frames.push({ sequence: seq, record, nextOffset: next }); previous = seq; position = next;
+		}
+	} finally { fs.closeSync(fd); }
+	if (badAt !== undefined) {
+		const tail = fs.readFileSync(file).subarray(badAt); if (tail.length) durableWrite(`${file}.torn.${Date.now()}-${randomUUID()}`, tail.toString("base64") + "\n");
+		const truncate = fs.openSync(file, "r+"); try { fs.ftruncateSync(truncate, badAt); fs.fsyncSync(truncate); } finally { fs.closeSync(truncate); } fsyncDirectory(routeRoot(route)); position = badAt;
+	}
+	return { frames, end: position };
+}
+function reconcileWriterCursor(route: NestedRoute, state: JournalState, kind: "event" | "control" | "result"): void {
+	const offsetKey = kind === "event" ? "eventWriteOffset" : kind === "control" ? "controlWriteOffset" : "resultWriteOffset";
+	const sequenceKey = kind === "event" ? "eventSequence" : kind === "control" ? "controlSequence" : "resultSequence";
+	const offset = state[offsetKey]; const size = statSize(journalPath(route, kind));
+	if (size <= offset) return;
+	const delta = readFramesRelaxed<Record<string, unknown>>(route, kind, offset, state[sequenceKey]);
+	state[offsetKey] = delta.end; if (delta.frames.length) state[sequenceKey] = delta.frames[delta.frames.length - 1]!.sequence;
+	for (const frame of delta.frames) {
+		if (kind === "control") { const request = parseControlRequest(JSON.stringify(frame.record), route); if (request) state.pendingRequests[request.requestId] = request; }
+		if (kind === "result") { const result = parseControlResult(JSON.stringify(frame.record), route); if (result) state.results[result.requestId] ??= result; }
+	}
+}
+function compactEvents(route: NestedRoute, state: JournalState, registry: NestedRegistry): void {
+	const file = journalPath(route, "event"); if (!fs.existsSync(file)) return; trustedDataFile(file);
+	const sealed = `${file}.sealed.${state.generation + 1}`; fs.renameSync(file, sealed); fsyncDirectory(routeRoot(route)); ensureJournal(file);
+	state.generation++; state.eventReadOffset = 0; state.eventWriteOffset = 0; writeState(route, state); fsyncDirectory(routeRoot(route));
 }
 
 export function writeNestedEvent(route: NestedRoute, event: Omit<NestedEventRecord, "rootRunId" | "capabilityToken">): void {
-	validateRouteShape(route);
-	const record: NestedEventRecord = {
-		...event,
-		rootRunId: route.rootRunId,
-		capabilityToken: route.capabilityToken,
-	};
-	const sanitized = parseRecord(JSON.stringify(record), route);
-	if (!sanitized) throw new Error("Nested event record failed validation.");
-	writeRouteRecord(route.eventSink, sanitized.ts, sanitized);
-}
-
-function parseControlRequest(content: string, route: NestedRoute): NestedControlRequestRecord | undefined {
-	if (Buffer.byteLength(content, "utf-8") > MAX_EVENT_BYTES) return undefined;
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(content);
-	} catch {
-		return undefined;
-	}
-	if (!parsed || typeof parsed !== "object") return undefined;
-	const raw = parsed as Record<string, unknown>;
-	if (raw.type !== "subagent.nested.control-request") return undefined;
-	if (raw.rootRunId !== route.rootRunId || raw.capabilityToken !== route.capabilityToken) return undefined;
-	if (!isSafeNestedId(raw.requestId) || !isSafeNestedId(raw.targetRunId)) return undefined;
-	if (raw.action !== "interrupt" && raw.action !== "resume") return undefined;
-	const ts = clampNumber(raw.ts);
-	if (ts === undefined) return undefined;
-	return {
-		type: "subagent.nested.control-request",
-		ts,
-		rootRunId: route.rootRunId,
-		capabilityToken: route.capabilityToken,
-		requestId: raw.requestId,
-		targetRunId: raw.targetRunId,
-		action: raw.action,
-		...(stringValue(raw.message, 16_000) ? { message: stringValue(raw.message, 16_000) } : {}),
-	};
-}
-
-function parseControlResult(content: string, route: NestedRoute): NestedControlResultRecord | undefined {
-	if (Buffer.byteLength(content, "utf-8") > MAX_EVENT_BYTES) return undefined;
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(content);
-	} catch {
-		return undefined;
-	}
-	if (!parsed || typeof parsed !== "object") return undefined;
-	const raw = parsed as Record<string, unknown>;
-	if (raw.type !== "subagent.nested.control-result") return undefined;
-	if (raw.rootRunId !== route.rootRunId || raw.capabilityToken !== route.capabilityToken) return undefined;
-	if (!isSafeNestedId(raw.requestId) || !isSafeNestedId(raw.targetRunId)) return undefined;
-	const ts = clampNumber(raw.ts);
-	if (ts === undefined || typeof raw.ok !== "boolean") return undefined;
-	return {
-		type: "subagent.nested.control-result",
-		ts,
-		rootRunId: route.rootRunId,
-		capabilityToken: route.capabilityToken,
-		requestId: raw.requestId,
-		targetRunId: raw.targetRunId,
-		ok: raw.ok,
-		message: stringValue(raw.message, 16_000) ?? (raw.ok ? "Control request completed." : "Control request failed."),
-	};
+	validateRouteShape(route); assertTrustedRouteEntry(route.eventSink, "directory"); const record: NestedEventRecord = { ...event, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken }; const sanitized = parseRecord(JSON.stringify(record), route); if (!sanitized) throw new Error("Nested event record failed validation.");
+	withRouteLock(route, () => { const state = readState(route); reconcileWriterCursor(route, state, "event"); state.eventSequence++; state.eventWriteOffset += appendJournal(route, "event", sanitized, state.eventSequence); writeState(route, state); });
 }
 
 export function writeNestedControlRequest(route: NestedRoute, request: Omit<NestedControlRequestRecord, "type" | "rootRunId" | "capabilityToken">): string {
-	validateRouteShape(route);
-	assertSafeId("requestId", request.requestId);
-	assertSafeId("targetRunId", request.targetRunId);
-	const record: NestedControlRequestRecord = {
-		type: "subagent.nested.control-request",
-		...request,
-		rootRunId: route.rootRunId,
-		capabilityToken: route.capabilityToken,
-	};
-	const sanitized = parseControlRequest(JSON.stringify(record), route);
-	if (!sanitized) throw new Error("Nested control request failed validation.");
-	return writeRouteRecord(route.controlInbox, sanitized.ts, sanitized);
+	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); assertSafeId("requestId", request.requestId); assertSafeId("targetRunId", request.targetRunId); const record: NestedControlRequestRecord = { type: "subagent.nested.control-request", ...request, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken }; const sanitized = parseControlRequest(JSON.stringify(record), route); if (!sanitized) throw new Error("Nested control request failed validation.");
+	return withRouteLock(route, () => { const state = readState(route); reconcileWriterCursor(route, state, "control"); const existing = state.pendingRequests[sanitized.requestId]; if (existing && JSON.stringify(existing) !== JSON.stringify(sanitized)) throw new Error("Conflicting nested control request for requestId."); if (!existing && !state.ackedRequests.includes(sanitized.requestId)) { state.controlSequence++; const bytes = appendJournal(route, "control", sanitized, state.controlSequence); state.controlWriteOffset += bytes; state.pendingRequests[sanitized.requestId] = sanitized; writeState(route, state); } const marker = path.join(route.controlInbox, `${sanitized.requestId}.compat`); let markerFd: number; try { markerFd = fs.openSync(marker, "wx", 0o600); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; return marker; } try { fs.writeFileSync(markerFd, "journal-request\\n", "utf8"); fs.fsyncSync(markerFd); } finally { fs.closeSync(markerFd); } fsyncDirectory(route.controlInbox); return marker; });
 }
 
 export function readNestedControlRequests(route: NestedRoute): Array<NestedControlRequestRecord & { filePath: string }> {
-	validateRouteShape(route);
-	let entries: string[] = [];
-	try {
-		entries = fs.readdirSync(route.controlInbox).filter((entry) => entry.endsWith(".json")).sort();
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-	const requests: Array<NestedControlRequestRecord & { filePath: string }> = [];
-	for (const entry of entries) {
-		const filePath = path.join(route.controlInbox, entry);
-		if (!containedPath(route.controlInbox, filePath)) continue;
-		try {
-			const stat = fs.statSync(filePath);
-			if (!stat.isFile() || stat.size > MAX_EVENT_BYTES) continue;
-			const request = parseControlRequest(fs.readFileSync(filePath, "utf-8"), route);
-			if (request) requests.push({ ...request, filePath });
-		} catch {
-			continue;
-		}
-	}
-	return requests;
+	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); importLegacy(route);
+	return withRouteLock(route, () => { const state = readState(route); const delta = readFramesRelaxed<NestedControlRequestRecord>(route, "control", state.controlReadOffset, state.controlReadSequence); state.controlReadOffset = delta.end; if (delta.frames.length) state.controlReadSequence = delta.frames[delta.frames.length - 1]!.sequence; for (const frame of delta.frames) { const request = parseControlRequest(JSON.stringify(frame.record), route); if (request && !state.ackedRequests.includes(request.requestId)) state.pendingRequests[request.requestId] = request; } writeState(route, state); return Object.values(state.pendingRequests).filter((request) => !state.ackedRequests.includes(request.requestId)).sort((a, b) => a.ts - b.ts).map((request) => ({ ...request, filePath: path.join(route.controlInbox, `${request.requestId}.compat`) })); });
 }
 
 export function writeNestedControlResult(route: NestedRoute, result: Omit<NestedControlResultRecord, "type" | "rootRunId" | "capabilityToken">): void {
-	validateRouteShape(route);
-	assertSafeId("requestId", result.requestId);
-	assertSafeId("targetRunId", result.targetRunId);
-	const record: NestedControlResultRecord = {
-		type: "subagent.nested.control-result",
-		...result,
-		rootRunId: route.rootRunId,
-		capabilityToken: route.capabilityToken,
-	};
-	const sanitized = parseControlResult(JSON.stringify(record), route);
-	if (!sanitized) throw new Error("Nested control result failed validation.");
-	writeRouteRecord(route.eventSink, sanitized.ts, sanitized);
+	validateRouteShape(route); assertSafeId("requestId", result.requestId); assertSafeId("targetRunId", result.targetRunId); const record: NestedControlResultRecord = { type: "subagent.nested.control-result", ...result, rootRunId: route.rootRunId, capabilityToken: route.capabilityToken }; const sanitized = parseControlResult(JSON.stringify(record), route); if (!sanitized) throw new Error("Nested control result failed validation.");
+	withRouteLock(route, () => { const state = readState(route); reconcileWriterCursor(route, state, "result"); const prior = state.results[sanitized.requestId]; if (prior) { if (JSON.stringify(prior) !== JSON.stringify(sanitized)) throw new Error("Conflicting nested control result for requestId."); return; } state.resultSequence++; state.resultWriteOffset += appendJournal(route, "result", sanitized, state.resultSequence); state.results[sanitized.requestId] = sanitized; writeState(route, state); });
+}
+
+/** A result must be durable before a request is acknowledged. */
+export function ackNestedControlRequest(route: NestedRoute, requestId: string, legacyFilePath?: string): void {
+	validateRouteShape(route); assertTrustedRouteEntry(route.controlInbox, "directory"); assertSafeId("requestId", requestId); withRouteLock(route, () => { const state = readState(route); if (!state.ackedRequests.includes(requestId)) state.ackedRequests.push(requestId); delete state.pendingRequests[requestId]; state.ackedRequests = state.ackedRequests.slice(-4096); writeState(route, state); if (legacyFilePath && path.basename(legacyFilePath) !== CONTROL_JOURNAL && containedPath(route.controlInbox, legacyFilePath)) { try { const stat = fs.lstatSync(legacyFilePath); if (stat.isFile()) fs.unlinkSync(legacyFilePath); } catch { /* evidence may already have been removed */ } } });
 }
 
 export function readNestedControlResults(route: NestedRoute): NestedControlResultRecord[] {
-	validateRouteShape(route);
-	let entries: string[] = [];
-	try {
-		entries = fs.readdirSync(route.eventSink).filter((entry) => entry.endsWith(".json") || entry.endsWith(".jsonl")).sort();
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-	const results: NestedControlResultRecord[] = [];
-	for (const entry of entries) {
-		const eventPath = path.join(route.eventSink, entry);
-		if (!containedPath(route.eventSink, eventPath)) continue;
-		try {
-			const stat = fs.statSync(eventPath);
-			if (!stat.isFile() || stat.size > MAX_EVENT_BYTES) continue;
-			const content = fs.readFileSync(eventPath, "utf-8");
-			const lines = content.includes("\n") ? content.split("\n").filter((line) => line.trim()) : [content];
-			for (const line of lines) {
-				const result = parseControlResult(line, route);
-				if (result) results.push(result);
-			}
-		} catch {
-			continue;
-		}
-	}
-	return results;
+	validateRouteShape(route); assertTrustedRouteEntry(route.eventSink, "directory"); importLegacy(route);
+	return withRouteLock(route, () => { const state = readState(route); const delta = readFramesRelaxed<NestedControlResultRecord>(route, "result", state.resultReadOffset, state.resultReadSequence); state.resultReadOffset = delta.end; if (delta.frames.length) state.resultReadSequence = delta.frames[delta.frames.length - 1]!.sequence; for (const frame of delta.frames) { const result = parseControlResult(JSON.stringify(frame.record), route); if (result) state.results[result.requestId] ??= result; } writeState(route, state); return Object.values(state.results); });
 }
 
 export function nestedRouteEnv(route: NestedRoute): Record<string, string> {

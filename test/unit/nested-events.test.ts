@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import type { AsyncJobState, SubagentState } from "../../src/shared/types.ts";
 import {
+	ackNestedControlRequest,
 	createNestedRoute,
 	hasLiveNestedDescendants,
 	hasLiveNestedDescendantsForParent,
@@ -17,7 +18,11 @@ import {
 	updateForegroundNestedProjection,
 	validateNestedRouteForRevival,
 	waitForNestedDescendantsToStop,
+	writeNestedControlRequest,
+	writeNestedControlResult,
 	writeNestedEvent,
+	readNestedControlRequests,
+	readNestedControlResults,
 } from "../../src/runs/shared/nested-events.ts";
 import {
 	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
@@ -675,5 +680,32 @@ describe("nested descendant termination fence", () => {
 		} finally {
 			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 		}
+	});
+});
+
+describe("framed nested journals", () => {
+	it("repairs a torn tail while retaining immutable evidence and resumes at the next frame", () => {
+		const route = trackRoute("framed-tail");
+		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("framed-child", "running", 1) });
+		projectNestedEvents(route);
+		const journal = path.join(route.eventSink, "events.journal");
+		fs.appendFileSync(journal, Buffer.from([0x50, 0x49, 0x53]));
+		projectNestedEvents(route);
+		assert.ok(fs.readdirSync(route.eventSink).some((entry) => entry.includes(".torn.")));
+		writeNestedEvent(route, { type: "subagent.nested.completed", ts: 2, parentRunId: route.rootRunId, child: child("framed-child", "complete", 2) });
+		assert.equal(projectNestedEvents(route).children[0]?.state, "complete");
+	});
+
+	it("keeps control retries idempotent and advances request acknowledgement durably", () => {
+		const route = trackRoute("framed-control");
+		const request = { ts: 1, requestId: "framed-request", targetRunId: "nested-child", action: "interrupt" as const };
+		writeNestedControlRequest(route, request);
+		writeNestedControlRequest(route, request);
+		assert.equal(readNestedControlRequests(route).length, 1);
+		writeNestedControlResult(route, { ts: 2, requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "done" });
+		writeNestedControlResult(route, { ts: 2, requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "done" });
+		assert.equal(readNestedControlResults(route).length, 1);
+		ackNestedControlRequest(route, request.requestId);
+		assert.equal(readNestedControlRequests(route).length, 0);
 	});
 });

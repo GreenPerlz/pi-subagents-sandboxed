@@ -12,6 +12,7 @@ import * as os from "node:os";
 import { collectRunTree, projectPersistedResultForTests, type OverlayRun } from "../../src/tui/run-tree-collector.ts";
 import { resolveSessionPath } from "../../src/tui/session-reader.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { listPersistedForegroundRuns } from "../../src/runs/foreground/foreground-status.ts";
 import type { SubagentState, AsyncJobState, NestedRunSummary } from "../../src/shared/types.ts";
 
 function baseState(overrides: Partial<SubagentState> = {}): SubagentState {
@@ -964,6 +965,32 @@ describe("collectRunTree", () => {
 		}
 	});
 
+	it("classifies cleaned persisted foreground routes as unavailable and forged routes as invalid", () => {
+		const { root, foregroundDirRoot } = makePersistedRoots();
+		const route = createNestedRoute("fg-route-classification");
+		let forgedRoute: ReturnType<typeof createNestedRoute> | undefined;
+		try {
+			writePersistedForegroundStatus(foregroundDirRoot, "fg-route-classification", {
+				runId: "fg-route-classification", mode: "single", state: "complete", updatedAt: 10,
+				children: [], nestedRoute: route,
+			});
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			const cleaned = listPersistedForegroundRuns(foregroundDirRoot)[0];
+			assert.strictEqual(cleaned?.nestedRouteValidity, "unavailable");
+			forgedRoute = createNestedRoute("fg-route-classification");
+			fs.writeFileSync(path.join(foregroundDirRoot, "fg-route-classification", "status.json"), JSON.stringify({
+				runId: "fg-route-classification", mode: "single", state: "complete", updatedAt: 10, children: [],
+				nestedRoute: { ...forgedRoute, capabilityToken: "forged-token" },
+			}));
+			const forged = listPersistedForegroundRuns(foregroundDirRoot)[0];
+			assert.strictEqual(forged?.nestedRouteValidity, "invalid");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			if (forgedRoute) fs.rmSync(path.dirname(forgedRoute.eventSink), { recursive: true, force: true });
+		}
+	});
+
 	it("preserves persisted foreground session files for detail view resolution", () => {
 		const { root, foregroundDirRoot, resultsDir } = makePersistedRoots();
 		try {
@@ -1238,7 +1265,7 @@ describe("collectRunTree", () => {
 	it("hydrates completed persisted async nested children from nested route events", () => {
 		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
 		const state = baseState();
-		const route = createNestedRoute("persisted-nested-root");
+		const route = createNestedRoute("persisted-parent");
 		try {
 			writeNestedEvent(route, {
 				type: "subagent.nested.completed",

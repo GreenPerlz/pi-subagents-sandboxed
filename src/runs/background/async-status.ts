@@ -148,20 +148,18 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	const chainStepCount = status.chainStepCount ?? steps.length;
 	const parallelGroups = normalizeParallelGroups(status.parallelGroups, steps.length, chainStepCount);
 	let nestedChildren: NestedRunSummary[] = status.nestedChildren ?? [];
-	let nestedRouteValidity: NestedRouteValidity = status.nestedRoute !== undefined ? "invalid" : "legacy";
-	if (nestedWarnings.length === 0) {
-		const rootRunId = status.runId || path.basename(asyncDir);
-		const resolution = resolveNestedRoute(rootRunId, status.nestedRoute);
-		nestedRouteValidity = resolution.validity;
-		if (resolution.error) nestedWarnings.push(`Nested status unavailable: ${resolution.error}`);
-		if (resolution.route) {
-			try {
-				const routeChildren = options?.readOnly ? readNestedRegistry(resolution.route).children : projectNestedEvents(resolution.route).children;
-				nestedChildren = mergeNestedRunSnapshots(nestedChildren, routeChildren);
-			} catch (error) {
-				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
-				nestedRouteValidity = "unavailable";
-			}
+	let nestedRouteValidity: NestedRouteValidity = "legacy";
+	const rootRunId = status.runId || path.basename(asyncDir);
+	const resolution = resolveNestedRoute(rootRunId, status.nestedRoute, { routeRequired: status.nestedRouteRequired === true });
+	nestedRouteValidity = resolution.validity;
+	if (resolution.error) nestedWarnings.push(`Nested status unavailable: ${resolution.error}`);
+	if (resolution.route) {
+		try {
+			const routeChildren = options?.readOnly ? readNestedRegistry(resolution.route).children : projectNestedEvents(resolution.route).children;
+			nestedChildren = mergeNestedRunSnapshots(nestedChildren, routeChildren);
+		} catch (error) {
+			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+			nestedRouteValidity = "unavailable";
 		}
 	}
 	const summarizedSteps = steps.map((step, index) => {
@@ -312,7 +310,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		// itself because tests require orphan listing to stay side-effect-free.
 		if (reconciliation?.repaired) {
 			try {
-				const nestedRoute = resolveExactNestedRoute(status.runId || path.basename(asyncDir), status.nestedRoute);
+				const nestedRoute = resolveExactNestedRoute(status.runId || path.basename(asyncDir), status.nestedRoute, { routeRequired: status.nestedRouteRequired === true });
 				if (nestedRoute) {
 					reconcileNestedAsyncDescendants(nestedRoute, {
 						resultsDir: options.resultsDir,
@@ -329,7 +327,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		if (allowedStates && !allowedStates.has(status.state)) continue;
 		if (options.reconcile !== false && !reconciliation?.repaired) {
 			try {
-				const nestedRoute = resolveExactNestedRoute(status.runId || path.basename(asyncDir), status.nestedRoute);
+				const nestedRoute = resolveExactNestedRoute(status.runId || path.basename(asyncDir), status.nestedRoute, { routeRequired: status.nestedRouteRequired === true });
 				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, {
 					resultsDir: options.resultsDir,
 					kill: options.kill,

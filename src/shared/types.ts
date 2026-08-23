@@ -861,6 +861,9 @@ export interface SubagentState {
 		currentFastMode?: FastModeStatus;
 		sessionFile?: string;
 		nestedRoute?: NestedRouteInfo;
+		nestedRouteRequired?: true;
+		nestedRouteValidity?: NestedRouteValidity;
+		nestedRouteError?: string;
 		nestedChildren?: NestedRunSummary[];
 		interrupt?: () => boolean;
 		interruptRequested?: boolean;

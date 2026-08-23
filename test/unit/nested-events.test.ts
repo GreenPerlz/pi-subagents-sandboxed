@@ -119,6 +119,13 @@ describe("nested snapshot fidelity and route authority", () => {
 		assert.equal(merged.children?.[0]?.id, "fresh-child");
 	});
 
+	it("rejects a valid route from another root and never substitutes it", () => {
+		const foreign = trackRoute("foreign-root");
+		const resolution = resolveNestedRoute("requested-root", foreign);
+		assert.equal(resolution.validity, "invalid");
+		assert.equal(resolution.route, undefined);
+	});
+
 	it("classifies cleaned trusted routes as unavailable and forged routes as invalid", () => {
 		const route = trackRoute("authority-root");
 		const trusted = resolveNestedRoute("authority-root", route);
@@ -128,6 +135,14 @@ describe("nested snapshot fidelity and route authority", () => {
 		const ambient = trackRoute("authority-root");
 		const forged = { ...ambient, capabilityToken: "forged-token" };
 		assert.equal(resolveNestedRoute("authority-root", forged).validity, "invalid");
+	});
+
+	it("treats required missing metadata as unavailable without ambient fallback", () => {
+		const ambient = trackRoute("required-root");
+		const resolution = resolveNestedRoute("required-root", undefined, { routeRequired: true });
+		assert.equal(resolution.validity, "unavailable");
+		assert.equal(resolution.route, undefined);
+		fs.rmSync(path.dirname(ambient.eventSink), { recursive: true, force: true });
 	});
 });
 
@@ -197,6 +212,19 @@ describe("nested event route validation", () => {
 });
 
 describe("nested event parsing and projection", () => {
+	it("preserves bounded parallel groups through durable started and completed projection", () => {
+		const route = trackRoute();
+		const groups = [{ start: 0, count: 2, stepIndex: 0 }, { start: 2, count: 1, stepIndex: 1 }];
+		const started = { ...child("parallel-roundtrip", "running", 100), mode: "chain" as const,
+			chainStepCount: 2, parallelGroups: groups, steps: [{ agent: "a", status: "running" as const }, { agent: "b", status: "pending" as const }, { agent: "c", status: "pending" as const }] };
+		writeNestedEvent(route, { type: "subagent.nested.started", ts: 100, parentRunId: "root-run", child: started });
+		writeNestedEvent(route, { type: "subagent.nested.completed", ts: 200, parentRunId: "root-run", child: { ...started, state: "complete", lastUpdate: 200,
+			parallelGroups: [...groups, { start: -1, count: 99, stepIndex: 99 } as any] } });
+		const projected = projectNestedEvents(route).children[0];
+		assert.equal(projected?.state, "complete");
+		assert.deepEqual(projected?.parallelGroups, groups);
+	});
+
 	it("projects started, updated, and completed records into async and foreground parent state", () => {
 		const route = trackRoute();
 		writeNestedEvent(route, {

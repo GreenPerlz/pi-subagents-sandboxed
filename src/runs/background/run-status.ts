@@ -209,7 +209,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			let nestedChildren: NestedRunSummary[] = status.nestedChildren ?? [];
 			let nestedWarning: string | undefined;
 			const persistedChildren = mergeNestedRunSnapshots(status.nestedChildren, ...(status.steps ?? []).map((step) => step.children));
-			const resolution = resolveNestedRoute(status.runId, status.nestedRoute);
+			const resolution = resolveNestedRoute(status.runId, status.nestedRoute, { routeRequired: status.nestedRouteRequired === true });
 			if (resolution.error) nestedWarning = resolution.error;
 			try {
 				if (resolution.route) {

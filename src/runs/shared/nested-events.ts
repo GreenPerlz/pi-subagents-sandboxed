@@ -294,6 +294,25 @@ function sanitizeState(value: unknown, fallback: NestedRunState): NestedRunState
 		: fallback;
 }
 
+function sanitizeParallelGroups(value: unknown, stepCount = MAX_STEPS, chainStepCount = MAX_STEPS): NestedRunSummary["parallelGroups"] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const boundedStepCount = Math.min(MAX_STEPS, Math.max(0, Math.floor(stepCount)));
+	const boundedChainStepCount = Math.min(MAX_STEPS, Math.max(0, Math.floor(chainStepCount)));
+	const groups = value.slice(0, MAX_STEPS).flatMap((item) => {
+		if (!item || typeof item !== "object") return [];
+		const raw = item as Record<string, unknown>;
+		const start = raw.start;
+		const count = raw.count;
+		const stepIndex = raw.stepIndex;
+		if (typeof start !== "number" || typeof count !== "number" || typeof stepIndex !== "number"
+			|| !Number.isSafeInteger(start) || !Number.isSafeInteger(count) || !Number.isSafeInteger(stepIndex)
+			|| start < 0 || count <= 0 || stepIndex < 0 || stepIndex >= boundedChainStepCount
+			|| start + count > boundedStepCount) return [];
+		return [{ start, count, stepIndex }];
+	});
+	return groups.length ? groups.sort((left, right) => left.stepIndex - right.stepIndex || left.start - right.start) : undefined;
+}
+
 function sanitizeGroupDiagnostics(value: unknown): NestedRunSummary["groupDiagnostics"] | undefined {
 	if (!Array.isArray(value)) return undefined;
 	return value.slice(0, MAX_STEPS).flatMap((item) => {
@@ -386,6 +405,7 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(Array.isArray(raw.agents) ? { agents: raw.agents.map((agent) => stringValue(agent, 128)).filter((agent): agent is string => Boolean(agent)).slice(0, MAX_STEPS) } : {}),
 		...(clampNumber(raw.currentStep) !== undefined ? { currentStep: clampNumber(raw.currentStep) } : {}),
 		...(clampNumber(raw.chainStepCount) !== undefined ? { chainStepCount: clampNumber(raw.chainStepCount) } : {}),
+		...(sanitizeParallelGroups(raw.parallelGroups, steps?.length ?? MAX_STEPS, clampNumber(raw.chainStepCount) ?? MAX_STEPS) ? { parallelGroups: sanitizeParallelGroups(raw.parallelGroups, steps?.length ?? MAX_STEPS, clampNumber(raw.chainStepCount) ?? MAX_STEPS) } : {}),
 		...(raw.activityState === "active_long_running" || raw.activityState === "needs_attention" ? { activityState: raw.activityState } : {}),
 		...(clampNumber(raw.lastActivityAt) !== undefined ? { lastActivityAt: clampNumber(raw.lastActivityAt) } : {}),
 		...(stringValue(raw.currentTool, 128) ? { currentTool: stringValue(raw.currentTool, 128) } : {}),
@@ -638,12 +658,16 @@ export interface NestedRouteResolution {
 	validity: NestedRouteValidity;
 	error?: string;
 }
-export function resolveNestedRoute(rootRunId: string, persisted?: NestedRouteInfo): NestedRouteResolution {
+export function resolveNestedRoute(rootRunId: string, persisted?: NestedRouteInfo, options: { routeRequired?: boolean } = {}): NestedRouteResolution {
 	if (persisted === undefined) {
+		if (options.routeRequired) return { validity: "unavailable", error: "Persisted nested route metadata is required but unavailable." };
+		// Ambient lookup is retained only for genuinely legacy statuses that did
+		// not persist or require a route binding.
 		const route = findNestedRouteForRootId(rootRunId);
 		return { route, validity: route ? "trusted" : "legacy" };
 	}
 	try {
+		if (persisted.rootRunId !== rootRunId) throw new Error("Persisted nested route root does not match the requested run root.");
 		// First validate coordinates and route identity even when the route was
 		// cleaned up. A correctly shaped but absent route is unavailable, not forged.
 		validateRouteShape(persisted);
@@ -653,12 +677,12 @@ export function resolveNestedRoute(rootRunId: string, persisted?: NestedRouteInf
 		return { route: persisted, validity: "trusted" };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		if (message.includes("route root does not exist") || message.includes("route directories do not exist")) return { validity: "unavailable", error: message };
+		if (message.includes("ENOENT") || message.includes("route root does not exist") || message.includes("route directories do not exist")) return { validity: "unavailable", error: message };
 		return { validity: "invalid", error: message };
 	}
 }
-export function resolveExactNestedRoute(rootRunId: string, persisted?: NestedRouteInfo): NestedRoute | undefined {
-	const result = resolveNestedRoute(rootRunId, persisted);
+export function resolveExactNestedRoute(rootRunId: string, persisted?: NestedRouteInfo, options: { routeRequired?: boolean } = {}): NestedRoute | undefined {
+	const result = resolveNestedRoute(rootRunId, persisted, options);
 	if (result.validity === "invalid") throw new Error(result.error ?? "Persisted nested route is invalid.");
 	return result.route;
 }
@@ -1265,9 +1289,24 @@ export function updateAsyncJobNestedProjection(job: AsyncJobState): void {
 }
 
 export function updateForegroundNestedProjection(control: SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never): void {
-	if (!control.nestedRoute) return;
-	const registry = projectNestedEvents(control.nestedRoute);
-	control.nestedChildren = mergeNestedRunSnapshots(control.nestedChildren, registry.children);
+	if (!control.nestedRoute) {
+		control.nestedRouteValidity = control.nestedRouteRequired ? "unavailable" : "legacy";
+		control.nestedRouteError = control.nestedRouteRequired ? "Persisted nested route metadata is required but unavailable." : undefined;
+		return;
+	}
+	const resolution = resolveNestedRoute(control.runId, control.nestedRoute, { routeRequired: control.nestedRouteRequired === true });
+	control.nestedRouteValidity = resolution.validity;
+	control.nestedRouteError = resolution.error;
+	if (!resolution.route) return;
+	try {
+		const registry = projectNestedEvents(resolution.route);
+		control.nestedChildren = mergeNestedRunSnapshots(control.nestedChildren, registry.children);
+	} catch (error) {
+		// Keep the last persisted children visible, but retain the failed read as
+		// explicit evidence so overlays never fall back to ambient lookup.
+		control.nestedRouteValidity = "unavailable";
+		control.nestedRouteError = error instanceof Error ? error.message : String(error);
+	}
 }
 
 export function hasLiveNestedDescendants(children: NestedRunSummary[] | undefined): boolean {
@@ -1365,7 +1404,7 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		mode: status.mode ?? fallback.mode,
 		state: status.state,
 		...(status.steps?.length ? { agents: status.steps.map((step) => step.agent).slice(0, MAX_STEPS) } : {}),
-		...(status.parallelGroups?.length ? { parallelGroups: status.parallelGroups.slice(0, MAX_STEPS) } : {}),
+		...(sanitizeParallelGroups(status.parallelGroups, status.steps?.length ?? MAX_STEPS, status.chainStepCount ?? MAX_STEPS) ? { parallelGroups: sanitizeParallelGroups(status.parallelGroups, status.steps?.length ?? MAX_STEPS, status.chainStepCount ?? MAX_STEPS) } : {}),
 		...(status.currentStep !== undefined ? { currentStep: status.currentStep } : {}),
 		...(status.chainStepCount !== undefined ? { chainStepCount: status.chainStepCount } : {}),
 		...(status.activityState ? { activityState: status.activityState } : {}),

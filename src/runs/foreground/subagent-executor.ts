@@ -297,6 +297,7 @@ function foregroundStatusResult(control: SubagentState["foregroundControls"] ext
 	let nestedWarning: string | undefined;
 	try {
 		updateForegroundNestedProjection(control);
+		if (control.nestedRouteError) nestedWarning = `Nested status unavailable: ${control.nestedRouteError}`;
 	} catch (error) {
 		nestedWarning = `Nested status unavailable: ${error instanceof Error ? error.message : String(error)}`;
 	}

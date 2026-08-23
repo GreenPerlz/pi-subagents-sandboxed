@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import type { ForegroundResumeChild, GitBundleResult, NestedRouteInfo, NestedRunSummary, NestedRouteValidity, SubagentRunMode } from "../../shared/types.ts";
-import { validateNestedRouteForRevival } from "../shared/nested-events.ts";
+import { resolveNestedRoute } from "../shared/nested-events.ts";
 import type { FastModeStatus } from "../../shared/fast-mode.ts";
 
 export type PersistedForegroundState = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
@@ -93,8 +93,9 @@ function readPersistedForegroundStatus(statusFile: string): PersistedForegroundS
 		let nestedRouteError: string | undefined;
 		if (raw.nestedRoute !== undefined) {
 			nestedRoute = raw.nestedRoute as NestedRouteInfo;
-			try { nestedRoute = validateNestedRouteForRevival(raw.nestedRoute); nestedRouteValidity = "trusted"; }
-			catch (error) { nestedRouteValidity = "invalid"; nestedRouteError = error instanceof Error ? error.message : String(error); }
+			const resolution = resolveNestedRoute(raw.runId, nestedRoute);
+			nestedRouteValidity = resolution.validity;
+			nestedRouteError = resolution.error;
 		}
 		return {
 			runId: raw.runId,

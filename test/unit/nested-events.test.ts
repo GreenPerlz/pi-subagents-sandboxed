@@ -102,7 +102,7 @@ describe("nested snapshot fidelity and route authority", () => {
 		started.totalTokens = { input: 2, output: 3, total: 5 };
 		started.summary = "started summary";
 		started.steps = [{ agent: "same", status: "running", model: "model-a", startedAt: 10 }, { agent: "same", status: "running", model: "model-b", startedAt: 11 }];
-		const completed = { ...child("partial", "complete", 20), endedAt: 20, steps: [{ agent: "same", status: "complete", endedAt: 20 }] } as any;
+		const completed = { ...child("partial", "complete", 20), endedAt: 20, steps: [{ agent: "same", status: "complete" }] } as any;
 		const [merged] = mergeNestedRunSnapshots([started], [completed]);
 		assert.equal(merged.cwd, "/work");
 		assert.equal(merged.model, "model-a");

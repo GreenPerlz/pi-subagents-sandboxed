@@ -495,7 +495,7 @@ function mergeNestedRunSummary(existing: NestedRunSummary | undefined, incoming:
 		const next = incoming.steps?.[index];
 		const previous = existing.steps?.[index];
 		if (!next) return previous!;
-		return mergeNestedStepSnapshots(previous, next);
+		return mergeNestedStepSnapshots(previous, next, incomingUpdate);
 	}).filter((step): step is NestedStepSummary => Boolean(step)) : undefined;
 	const children = mergeNestedRunSnapshots(existing.children, incoming.children);
 	const stepChildren = steps?.flatMap((step) => step.children ?? []) ?? [];
@@ -511,10 +511,10 @@ function mergeNestedRunSummary(existing: NestedRunSummary | undefined, incoming:
 	};
 }
 
-function mergeNestedStepSnapshots(existing: NestedStepSummary | undefined, incoming: NestedStepSummary): NestedStepSummary {
+function mergeNestedStepSnapshots(existing: NestedStepSummary | undefined, incoming: NestedStepSummary, sourceUpdate = 0): NestedStepSummary {
 	if (!existing) return incoming;
 	const existingUpdate = Math.max(existing.startedAt ?? 0, existing.endedAt ?? 0, existing.lastActivityAt ?? 0);
-	const incomingUpdate = Math.max(incoming.startedAt ?? 0, incoming.endedAt ?? 0, incoming.lastActivityAt ?? 0);
+	const incomingUpdate = Math.max(sourceUpdate, incoming.startedAt ?? 0, incoming.endedAt ?? 0, incoming.lastActivityAt ?? 0);
 	const incomingIsNewer = incomingUpdate >= existingUpdate;
 	const existingTerminal = nestedTerminal(existing.status as NestedRunState, existing.teardownUnproven);
 	const incomingTerminal = nestedTerminal(incoming.status as NestedRunState, incoming.teardownUnproven);

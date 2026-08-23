@@ -293,6 +293,7 @@ describe("subagent sandbox mount policy", () => {
 		const extensionPath = writeFile(path.join(extensionRoot, "src", "extension", "index.ts"));
 		const packageJson = writeFile(path.join(extensionRoot, "package.json"), JSON.stringify({ name: "project-extension" }));
 		const nodeModules = mkdirp(path.join(extensionRoot, "node_modules"));
+		const agents = mkdirp(path.join(extensionRoot, "agents"));
 		fs.symlinkSync(path.join(extensionRoot, ".git"), path.join(extensionRoot, "git-alias"), "dir");
 		fs.symlinkSync(extensionRoot, path.join(extensionRoot, "root-alias"), "dir");
 
@@ -302,6 +303,7 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, path.join(extensionRoot, "src")), "ro");
 		assert.equal(mountMode(mounts, packageJson), "ro");
 		assert.equal(mountMode(mounts, nodeModules), "ro");
+		assert.equal(mountMode(mounts, agents), "ro");
 		assert.equal(mountMode(mounts, path.join(extensionRoot, ".git")), undefined);
 
 		const directoryMounts = buildSubagentSandboxMounts({ cwd, includeCwd: false, piArgs: ["--extension", extensionRoot] });

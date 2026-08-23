@@ -203,7 +203,7 @@ function addGitPackageRuntimeMounts(mounts: SandboxMount[], seen: Map<string, Sa
 			const candidate = path.join(resolvedRoot, topLevel);
 			if (!lstatSync(candidate).isSymbolicLink()) addSandboxMount(mounts, seen, candidate, "ro");
 		}
-		for (const dependency of ["package.json", "node_modules"]) {
+		for (const dependency of ["package.json", "node_modules", "agents"]) {
 			const candidate = path.join(resolvedRoot, dependency);
 			if (existsSync(candidate)) addSandboxMount(mounts, seen, candidate, "ro");
 		}

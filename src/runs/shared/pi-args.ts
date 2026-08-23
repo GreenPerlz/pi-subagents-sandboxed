@@ -213,21 +213,26 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	);
 	const explicitParentRoute = input.parentEventSink !== undefined || input.parentControlInbox !== undefined || input.parentRootRunId !== undefined || input.parentCapabilityToken !== undefined;
 	const routeInherited = inheritedNestedRoute && !explicitParentRoute;
+	// A child process may receive the same route explicitly from its runner while
+	// also carrying its authenticated ancestry coordinates in the environment.
+	// Top-level callers are not marked as children, so their explicit route still
+	// suppresses ambient ancestry (#68).
+	const useAmbientAncestry = inheritedNestedRoute && (routeInherited || process.env[SUBAGENT_CHILD_ENV] === "1");
 	const routeEventSink = input.parentEventSink ?? (routeInherited ? process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] : undefined) ?? "";
 	const routeControlInbox = input.parentControlInbox ?? (routeInherited ? process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] : undefined) ?? "";
 	const routeRootRunId = input.parentRootRunId ?? (routeInherited ? process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] : undefined) ?? "";
 	const routeCapabilityToken = input.parentCapabilityToken ?? (routeInherited ? process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] : undefined) ?? "";
 	const routeInheritedAncestry = routeInherited || explicitParentRoute;
-	const parentRunId = input.parentRunId ?? input.runId ?? (routeInherited ? process.env[SUBAGENT_RUN_ID_ENV] : undefined) ?? (routeInherited ? process.env[SUBAGENT_PARENT_RUN_ID_ENV] : undefined) ?? "";
+	const parentRunId = input.parentRunId ?? input.runId ?? (useAmbientAncestry ? process.env[SUBAGENT_RUN_ID_ENV] : undefined) ?? (useAmbientAncestry ? process.env[SUBAGENT_PARENT_RUN_ID_ENV] : undefined) ?? "";
 	const parentChildIndex = input.parentChildIndex !== undefined
 		? String(input.parentChildIndex)
 		: input.childIndex !== undefined
 			? String(input.childIndex)
-			: routeInherited ? process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] ?? "" : "";
+			: useAmbientAncestry ? process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] ?? "" : "";
 	const inheritedDepth = Number(process.env[SUBAGENT_PARENT_DEPTH_ENV]);
-	const parentDepth = input.parentDepth ?? (routeInherited && Number.isFinite(inheritedDepth) ? inheritedDepth + 1 : 1);
+	const parentDepth = input.parentDepth ?? (useAmbientAncestry && Number.isFinite(inheritedDepth) ? inheritedDepth + 1 : 1);
 	const parentPath = input.parentPath ?? (routeInheritedAncestry ? [
-		...parseNestedPathEnv(routeInherited ? process.env[SUBAGENT_PARENT_PATH_ENV] : undefined),
+		...parseNestedPathEnv(useAmbientAncestry ? process.env[SUBAGENT_PARENT_PATH_ENV] : undefined),
 		...(parentRunId ? [{
 			runId: parentRunId,
 			...(parentChildIndex && /^\d+$/.test(parentChildIndex) ? { stepIndex: Number(parentChildIndex) } : {}),

@@ -735,6 +735,18 @@ describe("bounded journals and recovery seams", () => {
 		assert.equal(getNestedJournalWorkCounters().readdir, 0);
 	});
 
+	it("does not reread historical event frames after a 10k checkpoint", () => {
+		const route = trackRoute("bounded-events-10k");
+		for (let index = 0; index < 10_000; index++) writeNestedEvent(route, { type: "subagent.nested.updated", ts: index, parentRunId: route.rootRunId, child: child("event-child", "running", index) });
+		projectNestedEvents(route);
+		resetNestedJournalWorkCounters();
+		projectNestedEvents(route);
+		assert.deepEqual(getNestedJournalWorkCounters(), { frames: 0, bytes: 0, readdir: 0 });
+		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 10_001, parentRunId: route.rootRunId, child: child("event-child", "running", 10_001) });
+		projectNestedEvents(route);
+		assert.equal(getNestedJournalWorkCounters().frames, 1);
+	});
+
 	it("requires a matching durable result and fails closed after an ambiguous claim", () => {
 		const route = trackRoute("ambiguous-control");
 		writeNestedControlRequest(route, { ts: 1, requestId: "ambiguous-request", targetRunId: "nested-child", action: "interrupt" });

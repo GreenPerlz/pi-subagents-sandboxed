@@ -7,6 +7,35 @@ const DEFAULT_BWRAP_COMMAND = "bwrap";
 const SANDBOX_DOCS_REFERENCE = "See the README Sandboxed subagents section (README.md#sandboxed-subagents) and docs/prd/sandboxed-subagents.md for Bubblewrap setup, network/auth modes, and fallback configuration.";
 const HOST_TOOLCHAIN_READONLY_PATHS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"];
 
+export interface PinnedSandboxMounts {
+	mounts: SandboxMount[];
+	fds: number[];
+}
+
+/** Pin read-only mount sources to open inodes until Bubblewrap starts. */
+export function pinReadonlySandboxMounts(mounts: readonly SandboxMount[], firstChildFd = 3): PinnedSandboxMounts {
+	const fds: number[] = [];
+	try {
+		const pinned = mounts.map((mount) => {
+			if (mount.mode !== "ro") return mount;
+			const target = mount.target ?? mount.source;
+			const canonicalSource = fs.realpathSync.native(mount.source);
+			const fd = fs.openSync(canonicalSource, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			const childFd = firstChildFd + fds.length;
+			fds.push(fd);
+			return { source: `/proc/self/fd/${childFd}`, target, mode: "ro" as const };
+		});
+		return { mounts: pinned, fds };
+	} catch (error) {
+		for (const fd of fds) { try { fs.closeSync(fd); } catch {} }
+		throw error;
+	}
+}
+
+export function closePinnedSandboxFds(fds: readonly number[] | undefined): void {
+	for (const fd of fds ?? []) { try { fs.closeSync(fd); } catch {} }
+}
+
 export interface BubblewrapProviderDeps {
 	bwrapCommand?: string;
 	isBubblewrapAvailable?: () => boolean;
@@ -131,6 +160,11 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		}
 
 		const args: string[] = [];
+		const pinned = input.invocation.pinReadonlyMounts
+			? pinReadonlySandboxMounts(input.mounts ?? [], 3 + (input.invocation.inheritedFds?.length ?? 0))
+			: { mounts: input.mounts ?? [], fds: [] };
+		const inheritedFds = [...(input.invocation.inheritedFds ?? []), ...pinned.fds];
+		try {
 		const seenMounts = new Set<string>();
 		const diagnosticMounts: SandboxMount[] = [];
 		for (const source of HOST_TOOLCHAIN_READONLY_PATHS) {
@@ -149,7 +183,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		}
 		const nodeRoot = nodeInstallRoot(input.invocation.command);
 		if (nodeRoot && this.pathExists(nodeRoot)) addMount(args, { source: nodeRoot, mode: "ro" }, seenMounts, diagnosticMounts);
-		for (const mount of input.mounts ?? []) {
+		for (const mount of pinned.mounts) {
 			addMount(args, mount, seenMounts, diagnosticMounts);
 		}
 		if (network === "none") args.push("--unshare-net");
@@ -162,10 +196,15 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 				command: this.bwrapCommand,
 				args,
 				...(input.invocation.cwd !== undefined ? { cwd: input.invocation.cwd } : {}),
+				...(inheritedFds.length ? { inheritedFds } : {}),
 			},
 			diagnostics: [],
 			fallbackOccurred: false,
 			mounts: diagnosticMounts.map((mount) => ({ path: mount.source, mode: mount.mode })),
 		};
+		} catch (error) {
+			closePinnedSandboxFds(pinned.fds);
+			throw error;
+		}
 	}
 }

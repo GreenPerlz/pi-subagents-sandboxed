@@ -285,6 +285,46 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, extensionRoot), "ro");
 	});
 
+	it("mounts a project-local extension without exposing its repository metadata", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "isolated-worktree"));
+		const extensionRoot = mkdirp(path.join(root, "extension-repo"));
+		mkdirp(path.join(extensionRoot, ".git"));
+		const extensionPath = writeFile(path.join(extensionRoot, "src", "extension", "index.ts"));
+		const packageJson = writeFile(path.join(extensionRoot, "package.json"), JSON.stringify({ name: "project-extension" }));
+		const nodeModules = mkdirp(path.join(extensionRoot, "node_modules"));
+		fs.symlinkSync(path.join(extensionRoot, ".git"), path.join(extensionRoot, "git-alias"), "dir");
+		fs.symlinkSync(extensionRoot, path.join(extensionRoot, "root-alias"), "dir");
+
+		const mounts = buildSubagentSandboxMounts({ cwd, includeCwd: false, piArgs: ["--extension", extensionPath] });
+
+		assert.equal(mountMode(mounts, extensionRoot), undefined);
+		assert.equal(mountMode(mounts, path.join(extensionRoot, "src")), "ro");
+		assert.equal(mountMode(mounts, packageJson), "ro");
+		assert.equal(mountMode(mounts, nodeModules), "ro");
+		assert.equal(mountMode(mounts, path.join(extensionRoot, ".git")), undefined);
+
+		const directoryMounts = buildSubagentSandboxMounts({ cwd, includeCwd: false, piArgs: ["--extension", extensionRoot] });
+		assert.equal(mountMode(directoryMounts, extensionRoot), undefined);
+		assert.equal(mountMode(directoryMounts, path.join(extensionRoot, "src")), "ro");
+		assert.equal(mountMode(directoryMounts, path.join(extensionRoot, ".git")), undefined);
+		assert.equal(mountMode(directoryMounts, path.join(extensionRoot, "git-alias")), undefined);
+		assert.equal(mountMode(directoryMounts, path.join(extensionRoot, "root-alias")), undefined);
+
+		const packageMounts = buildSubagentSandboxMounts({ cwd, includeCwd: false, packageRoots: [extensionRoot], protectedGitPaths: [path.join(extensionRoot, ".git")] });
+		assert.equal(mountMode(packageMounts, extensionRoot), undefined);
+		assert.equal(mountMode(packageMounts, path.join(extensionRoot, "src")), "ro");
+		assert.equal(mountMode(packageMounts, nodeModules), "ro");
+		assert.equal(mountMode(packageMounts, path.join(extensionRoot, ".git")), undefined);
+
+		const extensionLink = path.join(root, "extension-link");
+		fs.symlinkSync(extensionRoot, extensionLink, "dir");
+		const symlinkMounts = buildSubagentSandboxMounts({ cwd, includeCwd: false, piArgs: ["--extension", extensionLink] });
+		assert.equal(mountMode(symlinkMounts, extensionLink), undefined);
+		assert.equal(mountMode(symlinkMounts, path.join(extensionLink, "src")), "ro");
+		assert.equal(mountMode(symlinkMounts, path.join(extensionLink, ".git")), undefined);
+	});
+
 	it("mounts absolute sandbox spawn runtime paths so bwrap can exec child Pi without PATH wrappers", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "project"));

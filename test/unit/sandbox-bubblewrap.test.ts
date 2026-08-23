@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { BubblewrapSandboxProvider } from "../../src/sandbox/bubblewrap.ts";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { BubblewrapSandboxProvider, closePinnedSandboxFds } from "../../src/sandbox/bubblewrap.ts";
 import { createSandboxProvider, SandboxUnavailableError } from "../../src/sandbox/provider.ts";
 import type { ResolvedSandboxConfig } from "../../src/sandbox/types.ts";
 
@@ -70,6 +73,34 @@ describe("Bubblewrap sandbox provider", () => {
 		const args = result.invocation.args;
 		assert.deepEqual(args.slice(args.indexOf("/opt/node") - 1, args.indexOf("/opt/node") + 2), ["--ro-bind", "/opt/node", "/opt/node"]);
 		assert.equal(args.filter((arg) => arg === "/opt/node").length, 2, "node install root should only be bound once");
+	});
+
+	it("pins read-only mount inodes across pathname replacement", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bwrap-pin-"));
+		const runtime = path.join(root, "runtime");
+		const replacement = path.join(root, "replacement");
+		fs.mkdirSync(runtime);
+		fs.mkdirSync(replacement);
+		fs.writeFileSync(path.join(runtime, "marker"), "safe");
+		fs.writeFileSync(path.join(replacement, "marker"), "metadata");
+		const result = availableProvider().wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: { command: "pi", args: [], pinReadonlyMounts: true },
+			mounts: [{ source: runtime, mode: "ro" }],
+		});
+		try {
+			assert.equal(result.invocation.inheritedFds?.length, 1);
+			const fd = result.invocation.inheritedFds![0]!;
+			fs.renameSync(runtime, `${runtime}-old`);
+			fs.symlinkSync(replacement, runtime, "dir");
+			assert.equal(fs.readFileSync(`/proc/self/fd/${fd}/marker`, "utf8"), "safe");
+			const sourceIndex = result.invocation.args.indexOf("/proc/self/fd/3");
+			assert.equal(result.invocation.args[sourceIndex - 1], "--ro-bind");
+			assert.equal(result.invocation.args[sourceIndex + 1], runtime);
+		} finally {
+			closePinnedSandboxFds(result.invocation.inheritedFds);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("defaults to host networking and uses Bubblewrap network isolation when network is none", () => {

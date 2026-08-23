@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { detectGitWorktreePointerGitdir } from "./preflight.ts";
@@ -194,16 +194,52 @@ function addReadonlyRuntimePath(mounts: SandboxMount[], seen: Map<string, Sandbo
 	addSandboxMount(mounts, seen, filePath, "ro");
 }
 
+function addGitPackageRuntimeMounts(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, packageRoot: string, requestedPath?: string): void {
+	const resolvedRoot = path.resolve(packageRoot);
+	const resolvedRequested = requestedPath ? path.resolve(requestedPath) : resolvedRoot;
+	if (resolvedRequested !== resolvedRoot) {
+		const topLevel = path.relative(resolvedRoot, resolvedRequested).split(path.sep).find(Boolean);
+		if (topLevel && topLevel !== ".git") {
+			const candidate = path.join(resolvedRoot, topLevel);
+			if (!lstatSync(candidate).isSymbolicLink()) addSandboxMount(mounts, seen, candidate, "ro");
+		}
+		for (const dependency of ["package.json", "node_modules"]) {
+			const candidate = path.join(resolvedRoot, dependency);
+			if (existsSync(candidate)) addSandboxMount(mounts, seen, candidate, "ro");
+		}
+		return;
+	}
+	for (const entry of readdirSync(resolvedRoot)) {
+		if (entry === ".git") continue;
+		const candidate = path.join(resolvedRoot, entry);
+		// Generated package resources are not caller-authorized mounts. Refuse
+		// top-level symlinks rather than letting aliases bypass the .git split or
+		// expose arbitrary host paths through a scoped endpoint descendant.
+		if (lstatSync(candidate).isSymbolicLink()) continue;
+		addSandboxMount(mounts, seen, candidate, "ro");
+	}
+}
+
+function addReadonlyPackageRuntimePath(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, packageRoot: string): void {
+	const resolved = path.resolve(packageRoot);
+	if (existsSync(path.join(resolved, ".git"))) addGitPackageRuntimeMounts(mounts, seen, resolved);
+	else addSandboxMount(mounts, seen, resolved, "ro");
+}
+
 function addReadonlyExtensionRuntimePath(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, extensionPath: string | undefined): void {
 	if (!extensionPath || !path.isAbsolute(extensionPath)) return;
 	const resolvedExtensionPath = path.resolve(extensionPath);
 	if (existsSync(path.join(resolvedExtensionPath, "package.json"))) {
-		addSandboxMount(mounts, seen, resolvedExtensionPath, "ro");
+		addReadonlyPackageRuntimePath(mounts, seen, resolvedExtensionPath);
 		return;
 	}
 	const packageRoot = nearestPackageRoot(extensionPath);
 	if (packageRoot) {
-		addSandboxMount(mounts, seen, packageRoot, "ro");
+		// A project-local extension package may itself be the parent repository.
+		// Mounting that package root would also expose its .git entry and defeats
+		// isolated Git before the child starts. Mount only runtime resources.
+		if (existsSync(path.join(packageRoot, ".git"))) addGitPackageRuntimeMounts(mounts, seen, packageRoot, resolvedExtensionPath);
+		else addSandboxMount(mounts, seen, packageRoot, "ro");
 		return;
 	}
 	addReadonlyRuntimePath(mounts, seen, extensionPath);
@@ -361,8 +397,12 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 	// Validate caller-supplied resources before any generated parent/resource
 	// directory is created by the mount assembly below. Read-only resources are
 	// checked too: they can still expose private Git policy/metadata.
-	for (const resource of [...(input.extraReadOnlyMounts ?? []), ...(input.extraWritableMounts ?? []), ...(input.packageRoots ?? [])]) {
+	for (const resource of [...(input.extraReadOnlyMounts ?? []), ...(input.extraWritableMounts ?? [])]) {
 		validateWritableGitMount(protectedGitPaths, path.resolve(expandTilde(resource)));
+	}
+	for (const packageRoot of input.packageRoots ?? []) {
+		const resolved = path.resolve(expandTilde(packageRoot));
+		if (!existsSync(path.join(resolved, ".git"))) validateWritableGitMount(protectedGitPaths, resolved);
 	}
 	validateWritableMountCandidates(protectedGitPaths, input);
 	addSandboxMount(mounts, seen, input.tempDir, "ro");
@@ -375,7 +415,7 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 	for (const statusPath of input.statusPaths ?? []) addSandboxMountParent(mounts, seen, statusPath, "rw", protectedGitPaths);
 	addSandboxMountParent(mounts, seen, input.structuredOutput?.schemaPath, "ro");
 	addSandboxMountParent(mounts, seen, input.structuredOutput?.outputPath, "rw", protectedGitPaths);
-	for (const packageRoot of input.packageRoots ?? []) addSandboxMount(mounts, seen, packageRoot, "ro");
+	for (const packageRoot of input.packageRoots ?? []) addReadonlyPackageRuntimePath(mounts, seen, packageRoot);
 	addSandboxExtensionMountParents(mounts, seen, input.piArgs);
 	addSandboxSpawnMounts(mounts, seen, input.spawnCommand, input.spawnArgs);
 	addSandboxAuthMounts(mounts, seen, input.authMode, input.agentDir);

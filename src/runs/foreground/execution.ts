@@ -50,6 +50,7 @@ import {
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { getPiSpawnCommand, getPiSpawnEntrypointOverrideForTests } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
+import { closePinnedSandboxFds } from "../../sandbox/bubblewrap.ts";
 import { cancelScopedGitChildDescriptor, delegateScopedGitWriterDescriptor, exportIsolatedGitBundle, isInheritedIsolatedGitRuntime, mapIsolatedGitCwd, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, scopedGitDescriptorMounts, validateScopedGitChildDescriptor, waitForScopedGitChildRelease, waitForScopedGitProcessGone, type ScopedGitEndpointDescriptor } from "../../sandbox/isolated-git.ts";
 import { resolveGitMode } from "../../sandbox/config.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
@@ -348,6 +349,7 @@ async function runSingleAttempt(
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
 	let observedMutationAttempt = false;
 	let spawnSpec: SpawnableInvocation;
+	let pinnedSandboxFds: number[] | undefined;
 	let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
 	try {
 		const piSpawnSpec = getPiSpawnCommand(args, {
@@ -397,13 +399,15 @@ async function runSingleAttempt(
 				intercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
 				nestedRoute: options.nestedRoute,
 			});
-			const wrapped = options.isolatedGit.runtime.wrapInvocation(options.isolatedGitCapability, piInvocation, effectiveSandboxMounts, options.sandbox);
+			const wrapped = options.isolatedGit.runtime.wrapInvocation(options.isolatedGitCapability, { ...piInvocation, pinReadonlyMounts: true }, effectiveSandboxMounts, options.sandbox);
 			spawnSpec = {
 				command: wrapped.command,
 				args: wrapped.args,
 				cwd: wrapped.cwd ?? childCwd,
 				env: wrapped.env ?? spawnEnv,
+				inheritedFds: wrapped.inheritedFds,
 			};
+			pinnedSandboxFds = wrapped.inheritedFds;
 		} else if (options.isolatedGitEndpoint) {
 			if (!options.sandbox || options.sandbox.provider !== "bubblewrap" || resolveGitMode(options.sandbox) !== "isolated") throw new Error("scoped Git endpoint requires Bubblewrap isolated mode");
 			result.sandbox = sandboxResultDetails(options.sandbox);
@@ -430,8 +434,9 @@ async function runSingleAttempt(
 				nestedRoute: options.nestedRoute,
 			});
 			const provider = createSandboxProvider(options.sandbox);
-			const wrapped = provider.wrapInvocation({ config: options.sandbox, invocation: piInvocation, mounts: [...effectiveSandboxMounts, ...scopedGitDescriptorMounts(scopedGitEndpoint!)] });
-			spawnSpec = { command: wrapped.invocation.command, args: wrapped.invocation.args, cwd: wrapped.invocation.cwd ?? childCwd, env: wrapped.invocation.env ?? spawnEnv };
+			const wrapped = provider.wrapInvocation({ config: options.sandbox, invocation: { ...piInvocation, pinReadonlyMounts: true }, mounts: [...effectiveSandboxMounts, ...scopedGitDescriptorMounts(scopedGitEndpoint!)] });
+			spawnSpec = { command: wrapped.invocation.command, args: wrapped.invocation.args, cwd: wrapped.invocation.cwd ?? childCwd, env: wrapped.invocation.env ?? spawnEnv, inheritedFds: wrapped.invocation.inheritedFds };
+			pinnedSandboxFds = wrapped.invocation.inheritedFds;
 		} else if (options.sandbox) {
 			result.sandbox = sandboxResultDetails(options.sandbox);
 			const provider = createSandboxProvider(options.sandbox);
@@ -497,6 +502,7 @@ async function runSingleAttempt(
 		}
 	} catch (error) {
 		await cancelUnboundScopedWriter();
+		closePinnedSandboxFds(pinnedSandboxFds);
 		cleanupTempDir(tempDir);
 		const message = error instanceof Error ? error.message : String(error);
 		if (options.sandbox) result.sandbox = sandboxResultDetails(options.sandbox);
@@ -516,7 +522,7 @@ async function runSingleAttempt(
 			proc = spawn(spawnSpec.command, spawnSpec.args, {
 				cwd: spawnSpec.cwd ?? childCwd,
 				env: spawnSpec.env ?? spawnEnv,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", "pipe", ...(spawnSpec.inheritedFds ?? [])],
 				// Keep the child tree in a private process group so interrupts do not
 				// leave shells or tool workers behind.
 				detached: process.platform === "linux",
@@ -524,6 +530,7 @@ async function runSingleAttempt(
 			});
 		} catch (error) {
 			void cancelUnboundScopedWriter();
+			closePinnedSandboxFds(pinnedSandboxFds);
 			cleanupTempDir(tempDir);
 			result.exitCode = 1;
 			result.error = error instanceof Error ? error.message : String(error);
@@ -534,6 +541,8 @@ async function runSingleAttempt(
 			resolve(1);
 			return;
 		}
+		closePinnedSandboxFds(pinnedSandboxFds);
+		pinnedSandboxFds = undefined;
 		// A nested writer is bound only after the child process identity is
 		// independently proven. The foreground result is held until both binding
 		// and exact reservation release are observable; a fast child cannot win

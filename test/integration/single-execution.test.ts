@@ -2410,9 +2410,10 @@ process.exit(${exitCode});
 			assert.equal(setup.status, 0, setup.stderr);
 		}
 		const before = spawnSync("git", ["-C", repo, "status", "--porcelain=v1"], { encoding: "utf8" }).stdout;
+		const expectedAgentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
 		mockPi.onCall({
 			output: "isolated executor complete",
-			commands: ["printf 'child\\n' > child.txt && git add child.txt && git commit -m 'isolated executor commit'"],
+			commands: [`test "$PI_CODING_AGENT_DIR" = '${expectedAgentDir}' && printf 'child\\n' > child.txt && git add child.txt && git commit -m 'isolated executor commit'`],
 		});
 		const executor = makeExecutor([makeAgent("worker", { tools: ["read", "bash"] })]);
 		const result = await executor.execute(

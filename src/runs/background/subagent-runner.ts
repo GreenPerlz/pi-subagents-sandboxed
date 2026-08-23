@@ -9,6 +9,7 @@ import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { resolveProjectLocalPiPackageResources } from "../../agents/pi-packages.ts";
 import { PI_CHILD_RUNTIME_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { createSandboxProvider } from "../../sandbox/provider.ts";
+import { closePinnedSandboxFds } from "../../sandbox/bubblewrap.ts";
 import { resolveGitMode } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, isInheritedIsolatedGitRuntime, mapIsolatedGitCwd, stripIsolatedGitExportDiagnostics, type IsolatedGitCapability, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
@@ -384,6 +385,7 @@ function runPiStreaming(
 			};
 		}
 		let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
+		let pinnedSandboxFds: number[] | undefined;
 		let scopedGitWriterBound = false;
 		const cancelScopedWriter = async () => {
 			if (!sandbox?.scopedGitWriter || scopedGitWriterBound || !sandbox.scopedGitEndpoint || !sandbox.scopedGitOwnerEndpoint) return;
@@ -435,9 +437,10 @@ function runPiStreaming(
 					? { invocation: sandbox.isolatedGit.runtime.wrapInvocation(sandbox.isolatedGitCapability!, { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd }, effectiveSandboxMounts, sandbox.config), diagnostics: [] }
 					: createSandboxProvider(sandbox.config).wrapInvocation({
 						config: sandbox.config,
-						invocation: { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd },
+						invocation: { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd, pinReadonlyMounts: Boolean(sandbox.scopedGitEndpoint) },
 						mounts: effectiveSandboxMounts,
 					});
+				pinnedSandboxFds = wrapped.invocation.inheritedFds;
 				if (wrapped.mounts?.length) {
 					const seenDiagnosticMounts = new Set(effectiveSandboxMounts.map((mount) => `${mount.mode}:${mount.source}`));
 					for (const mount of wrapped.mounts) {
@@ -453,6 +456,7 @@ function runPiStreaming(
 					args: wrapped.invocation.args,
 					cwd: wrapped.invocation.cwd ?? cwd,
 					env: wrapped.invocation.env ?? spawnEnv,
+					inheritedFds: wrapped.invocation.inheritedFds,
 				};
 			} else {
 				// No-sandbox execution still needs the resolved Pi command. The
@@ -468,6 +472,7 @@ function runPiStreaming(
 		} catch (setupError) {
 			const message = setupError instanceof Error ? setupError.message : String(setupError);
 			cancelScopedWriter();
+			closePinnedSandboxFds(pinnedSandboxFds);
 			cleanupTempDir(sandbox?.tempDir);
 			outputStream?.end();
 			resolve({
@@ -492,6 +497,7 @@ function runPiStreaming(
 		} catch (resolveError) {
 			const message = resolveError instanceof Error ? resolveError.message : String(resolveError);
 			cancelScopedWriter();
+			closePinnedSandboxFds(spawnSpec.inheritedFds);
 			cleanupTempDir(sandbox?.tempDir);
 			resolve({ stderr: message, exitCode: 1, messages: [], usage: emptyUsage(), error: message, finalOutput: "", ...(sandboxDetails ? { sandbox: sandboxDetails } : {}) });
 			return;
@@ -499,6 +505,7 @@ function runPiStreaming(
 		const processControlError = processControlUnsupported();
 		if (processControlError) {
 			cancelScopedWriter();
+			closePinnedSandboxFds(spawnSpec.inheritedFds);
 			cleanupTempDir(sandbox?.tempDir);
 			outputStream?.end();
 			resolve({
@@ -516,7 +523,7 @@ function runPiStreaming(
 		try {
 			child = spawn(spawnSpec.command, spawnSpec.args, {
 				cwd: spawnSpec.cwd ?? cwd,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", "pipe", ...(spawnSpec.inheritedFds ?? [])],
 				env: spawnSpec.env ?? spawnEnv,
 				// Give every subagent its own process group so interruption also
 				// terminates Bubblewrap, shells, and tool descendants.
@@ -525,10 +532,13 @@ function runPiStreaming(
 			});
 		} catch (spawnError) {
 			cancelScopedWriter();
+			closePinnedSandboxFds(spawnSpec.inheritedFds);
 			cleanupTempDir(sandbox?.tempDir);
 			resolve({ stderr: String(spawnError), exitCode: 1, messages: [], usage: emptyUsage(), error: spawnError instanceof Error ? spawnError.message : String(spawnError), finalOutput: "" });
 			return;
 		}
+		closePinnedSandboxFds(pinnedSandboxFds);
+		pinnedSandboxFds = undefined;
 		let scopedGitBindError: string | undefined;
 		let scopedGitBindingReady = !Boolean(sandbox?.scopedGitWriter && sandbox.scopedGitEndpoint);
 		let pendingScopedClose: { kind: "close"; exitCode: number | null; signal?: NodeJS.Signals } | { kind: "error"; error: Error } | undefined;

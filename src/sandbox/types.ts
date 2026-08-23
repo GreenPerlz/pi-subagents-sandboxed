@@ -55,6 +55,10 @@ export interface SpawnableInvocation {
 	args: string[];
 	cwd?: string;
 	env?: Record<string, string | undefined>;
+	/** Host descriptors inherited by the immediate sandbox wrapper only. */
+	inheritedFds?: number[];
+	/** Internal request to pin read-only mount sources across wrapper spawn. */
+	pinReadonlyMounts?: boolean;
 }
 
 export type SandboxMountMode = "ro" | "rw";

@@ -16,6 +16,7 @@
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 
 ### Fixed
+- Isolated packaged writers now mount project-local extension runtime subtrees without exposing the parent repository root or `.git`, while explicit unsafe ancestor mounts remain rejected.
 - Reviving terminal async runs now restores their authenticated nested route, selected child session, cwd, ancestry, control visibility, and scoped Git endpoint; repeated and nested-chain revivals fail closed on stale, forged, or mismatched durable metadata.
 - Orchestrator explore/work/review loop children now stay foreground when `asyncByDefault` is enabled, preserving the inline result needed for each parent-built handoff.
 - Acceptance finalization keeps the configured provider-qualified model (including OpenRouter routes) instead of replacing it with provider-local child telemetry.

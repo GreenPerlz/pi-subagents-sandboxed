@@ -10,6 +10,7 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 import type { AgentConfig } from "../../agents/agents.ts";
 import type { ResolvedStepBehavior } from "../../shared/settings.ts";
+import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
 import { resolveModelCandidate, splitThinkingSuffix } from "../shared/model-fallback.ts";
 import { findModelInfo, getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../../shared/model-info.ts";
 
@@ -22,6 +23,13 @@ export interface BehaviorOverride {
 	model?: string;
 	fastMode?: boolean;
 	skills?: string[] | false;
+}
+
+export interface ChainClarifyPolicy {
+	sandbox?: ResolvedSandboxConfig;
+	worktree: "isolated" | "inherited" | "host";
+	canOptOutOfWorktree?: boolean;
+	canOptOutOfSandbox?: boolean;
 }
 
 export interface ChainClarifyResult {
@@ -232,6 +240,7 @@ export class ChainClarifyComponent implements Component {
 	private availableSkills: Array<{ name: string; source: string; description?: string }>;
 	private done: (result: ChainClarifyResult) => void;
 	private mode: ClarifyMode;
+	private policies: ChainClarifyPolicy[];
 
 	constructor(
 		tui: TUI,
@@ -246,6 +255,7 @@ export class ChainClarifyComponent implements Component {
 		availableSkills: Array<{ name: string; source: string; description?: string }>,
 		done: (result: ChainClarifyResult) => void,
 		mode: ClarifyMode = 'chain',
+		policies: ChainClarifyPolicy[] = [],
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -259,6 +269,7 @@ export class ChainClarifyComponent implements Component {
 		this.availableSkills = availableSkills;
 		this.done = done;
 		this.mode = mode;
+		this.policies = policies;
 		this.filteredModels = [...availableModels];
 		this.filteredSkills = [...availableSkills];
 	}
@@ -1107,6 +1118,23 @@ export class ChainClarifyComponent implements Component {
 		return lines;
 	}
 
+	private renderPolicy(stepIndex: number): string[] {
+		const policy = this.policies[stepIndex];
+		if (!policy) return [];
+		const sandbox = policy.sandbox;
+		const sandboxText = sandbox
+			? `${sandbox.provider} · git:${sandbox.gitMode}`
+			: "inherited/default";
+		const controls = [
+			policy.canOptOutOfWorktree === true ? "worktree opt-out authorized" : "worktree opt-out denied",
+			policy.canOptOutOfSandbox === true ? "sandbox opt-out authorized" : "sandbox opt-out denied",
+		].join(" · ");
+		return [
+			this.row(`     ${this.theme.fg("dim", "policy: ")}Git ${policy.worktree} · sandbox ${sandboxText}`),
+			this.row(`     ${this.theme.fg("dim", "controls: ")}${controls}`),
+		];
+	}
+
 	private getFooterText(): string {
 		const bgLabel = this.runInBackground ? '[b]g:ON' : '[b]g';
 		switch (this.mode) {
@@ -1166,6 +1194,7 @@ export class ChainClarifyComponent implements Component {
 			: (behavior.skills?.length ? behavior.skills.join(", ") : th.fg("dim", "(none)"));
 		const skillsLabel = th.fg("dim", "skills: ");
 		lines.push(this.row(`     ${skillsLabel}${truncateToWidth(skillsValue, innerW - 14)}`));
+		lines.push(...this.renderPolicy(0));
 
 		lines.push(this.row(""));
 
@@ -1217,6 +1246,7 @@ export class ChainClarifyComponent implements Component {
 				: (behavior.skills?.length ? behavior.skills.join(", ") : th.fg("dim", "(none)"));
 			const skillsLabel = th.fg("dim", "skills: ");
 			lines.push(this.row(`     ${skillsLabel}${truncateToWidth(skillsValue, innerW - 14)}`));
+			lines.push(...this.renderPolicy(i));
 
 			lines.push(this.row(""));
 		}
@@ -1303,6 +1333,8 @@ export class ChainClarifyComponent implements Component {
 				: (behavior.skills?.length ? behavior.skills.join(", ") : th.fg("dim", "(none)"));
 			const skillsLabel = th.fg("dim", "skills: ");
 			lines.push(this.row(`     ${skillsLabel}${truncateToWidth(skillsValue, innerW - 14)}`));
+
+			lines.push(...this.renderPolicy(i));
 
 			if (progressEnabled) {
 				const isFirstStep = i === 0;

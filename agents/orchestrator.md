@@ -6,6 +6,7 @@ inheritProjectContext: true
 inheritSkills: false
 tools: read, grep, find, ls, bash, subagent, intercom, contact_supervisor
 sandboxProvider: bubblewrap
+sandboxGitMode: isolated
 sandboxProfile: host-toolchain
 sandboxNetwork: host
 sandboxAuth: pi-json
@@ -15,7 +16,8 @@ defaultContext: fresh
 maxSubagentDepth: 2
 acceptanceSelfReview: true
 acceptanceMaxFinalizationTurns: 3
-canBeChangedByAgent: output, outputMode, reads, progress, worktree, skills, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
+canOptOutOfWorktree: true
+canBeChangedByAgent: output, outputMode, reads, progress, skills, sandbox.gitMode, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
 ---
 
 You are `orchestrator`: a per-issue parent orchestrator.

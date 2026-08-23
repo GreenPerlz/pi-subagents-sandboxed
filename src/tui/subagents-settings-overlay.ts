@@ -9,6 +9,7 @@ import {
 	type AgentConfig,
 	type BuiltinAgentOverrideBase,
 } from "../agents/agents.ts";
+import { resolvePackagedAgentRole } from "../runs/shared/agent-role.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
 import { effectiveModelDisplay, findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, THINKING_LEVELS as SUPPORTED_THINKING_LEVELS, type ModelInfo } from "../shared/model-info.ts";
 import { fastModeSupportForModel, type FastModeSupport } from "../shared/fast-mode.ts";
@@ -193,6 +194,24 @@ export function getShadowingBuiltinWarning(agent: AgentConfig, builtinAgentNames
 	return ["shadows builtin agent"];
 }
 
+function effectivePolicyLabel(agent: AgentConfig): { source: string; role: string; git: string; sandbox: string } {
+	const role = agent.source === "builtin"
+		? (resolvePackagedAgentRole(agent.name, agent.source) ?? (agent.name.split(".").at(-1)?.toLowerCase() === "orchestrator" ? "orchestrator" : "observer"))
+		: "custom";
+	const isolatedByRole = agent.source === "builtin" && (role === "work" || role === "orchestrator");
+	return {
+		source: agent.source,
+		role,
+		git: agent.sandbox?.gitMode ?? (isolatedByRole ? "isolated" : "read-only"),
+		sandbox: agent.sandbox?.provider ?? "bubblewrap",
+	};
+}
+
+function formatEffectivePolicy(agent: AgentConfig): string {
+	const policy = effectivePolicyLabel(agent);
+	return `source ${policy.source} · role ${policy.role} · Git ${policy.git} · sandbox ${policy.sandbox}`;
+}
+
 export function renderSubagentsSettingsOverlay(input: {
 	view: SettingsView;
 	rows: Row[];
@@ -214,6 +233,13 @@ export function renderSubagentsSettingsOverlay(input: {
 	lines.push("Tab/←/→ switch views · ↑/↓ move · Enter edit · t cycle thinking · Esc close");
 	if (input.message) lines.push(input.theme.fg("dim", input.message));
 	if (input.picker) {
+		const selectedRow = input.rows[input.selected];
+		if (selectedRow) {
+			lines.push("");
+			lines.push(input.theme.bold(`${selectedRow.agent.name} · policy`));
+			lines.push(input.theme.fg("dim", `  policy: ${formatEffectivePolicy(selectedRow.agent)}`));
+			lines.push(input.theme.fg("dim", `  controls: worktree opt-out ${selectedRow.agent.canOptOutOfWorktree === true ? "authorized" : "denied"} · sandbox opt-out requires trusted user permission`));
+		}
 		lines.push("");
 		lines.push(input.theme.bold(input.picker.title));
 		lines.push(input.picker.multi ? "Space toggles · t cycles highlighted thinking · Enter saves · Esc saves & backs" : "Enter selects · Esc cancels");
@@ -243,6 +269,8 @@ export function renderSubagentsSettingsOverlay(input: {
 							? ` · ${row.agent.override.scope} override`
 							: "";
 				lines.push(input.theme.bold(`${row.agent.name}${source}`));
+				lines.push(input.theme.fg("dim", `  policy: ${formatEffectivePolicy(row.agent)}`));
+				lines.push(input.theme.fg("dim", `  controls: worktree opt-out ${row.agent.canOptOutOfWorktree === true ? "authorized" : "denied"} · sandbox opt-out requires trusted user permission`));
 				for (const warning of getBuiltinShadowingWarning(row.agent, input.shadowingAgents?.get(row.agent.name))) {
 					lines.push(input.theme.fg("warning", warning));
 				}

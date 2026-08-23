@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
+import { discoverAgents } from "../../src/agents/agents.ts";
 import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { isExpectedAsyncRunnerPid } from "../../src/runs/background/pid-identity.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
@@ -288,6 +289,14 @@ function assertBind(args: string[], source: string): void {
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
+	let previousFixtureAgentDir: string | undefined;
+
+	function enableTrustedSandboxOptOut(allowWorktreeOptOut = false): void {
+		const trustedDir = path.join(tempDir, "trusted-user-settings");
+		fs.mkdirSync(trustedDir, { recursive: true });
+		fs.writeFileSync(path.join(trustedDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true, ...(allowWorktreeOptOut ? { allowWorktreeOptOut: true } : {}) } } }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = trustedDir;
+	}
 
 	before(() => {
 		mockPi = createMockPi();
@@ -300,10 +309,13 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 	beforeEach(() => {
 		tempDir = createTempDir();
+		previousFixtureAgentDir = process.env.PI_CODING_AGENT_DIR;
 		mockPi.reset();
 	});
 
 	afterEach(() => {
+		if (previousFixtureAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousFixtureAgentDir;
 		removeTempDir(tempDir);
 	});
 	it("reports jiti availability as boolean", () => {
@@ -442,6 +454,123 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			const recorded = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { env?: { PI_SUBAGENT_FAST_MODE?: string | null } };
 			assert.equal(recorded.env?.PI_SUBAGENT_FAST_MODE, requested ? "1" : "0");
 			assert.ok(call.length > 0);
+		}
+	});
+
+	it("authorizes async packaged worktree opt-out as writable checkout with read-only Git", { skip: !isAsyncAvailable() || !createSubagentExecutor || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap and detached runtime are required" : undefined }, async () => {
+		enableTrustedSandboxOptOut(true);
+		const repo = createRepo("pi-async-packaged-optout-");
+		fs.mkdirSync(path.join(repo, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(repo, ".pi", "settings.json"), JSON.stringify({ subagents: { sandbox: { extraWritableMounts: [mockPi.dir] } } }), "utf-8");
+		const work = discoverAgents(repo, "project").agents.find((agent) => agent.name === "work");
+		assert.ok(work?.canOptOutOfWorktree, "packaged work must authorize the dedicated parent opt-out");
+		const baseHead = git(repo, ["rev-parse", "HEAD"]);
+		const runtimeBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		mockPi.onCall({ output: "async opt-out wrote checkout", commands: ["printf 'async opt-out\\n' > async-optout.txt && if git config --local sandbox.async-optout blocked; then exit 42; else exit 0; fi"] });
+		try {
+			const executor = createSubagentExecutor!({
+				pi: { events: createEventBus(), getSessionName: () => undefined },
+				state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+				config: {}, asyncByDefault: false, tempArtifactsDir: tempDir, getSubagentSessionRoot: () => tempDir, expandTilde: (p: string) => p,
+				discoverAgents: () => ({ agents: [work] }),
+			});
+			const response = await executor.execute("async-packaged-worktree-optout", { agent: "work", task: "Write a checkout file without changing Git metadata.", async: true, worktree: false }, new AbortController().signal, undefined, makeMinimalCtx(repo));
+			const asyncId = response.details?.asyncId;
+			assert.ok(asyncId, response.content[0]?.text);
+			const resultPath = await waitForAsyncResultFile(asyncId, 30_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true, JSON.stringify(payload));
+			assert.equal(payload.results[0]?.sandbox?.provider, "bubblewrap");
+			assert.equal(payload.results[0]?.gitBundle, undefined, "read-only Git opt-out must not export an isolated bundle");
+			assert.equal(fs.readFileSync(path.join(repo, "async-optout.txt"), "utf8"), "async opt-out\n", "the checkout remains writable");
+			assert.equal(git(repo, ["rev-parse", "HEAD"]), baseHead);
+			assert.equal(spawnSync("git", ["-C", repo, "config", "--local", "--get", "sandbox.async-optout"], { encoding: "utf8" }).status, 1, "parent Git metadata remains unchanged");
+			assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimeBefore.has(entry)), [], "async opt-out must not leave an isolated runtime");
+		} finally {
+			removeTempDir(repo);
+		}
+	});
+
+	it("propagates authorized worktree opt-out through async static and dynamic chain groups", { skip: !isAsyncAvailable() || process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap and detached runtime are required" : undefined }, async () => {
+		const repo = createRepo("pi-async-chain-optout-");
+		const isolatedSandbox = { provider: "bubblewrap" as const, gitMode: "isolated" as const, extraWritableMounts: [mockPi.dir] };
+		const writer = makeAgent("writer", { tools: ["read", "write", "bash"], canOptOutOfWorktree: true, sandbox: isolatedSandbox });
+		const runtimeBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		try {
+			mockPi.onCall({ output: "static opt-out", commands: ["printf 'static\\n' > static-optout.txt"] });
+			const staticId = `async-static-optout-${Date.now().toString(36)}`;
+			const staticLaunch = executeAsyncChain(staticId, {
+				chain: [{ parallel: [{ agent: "writer", task: "Write static checkout state" }], worktree: false }], agents: [writer],
+				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "async-static-optout" }, artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 }, shareEnabled: false, maxSubagentDepth: 2,
+				sandboxSettings: { allowWorktreeOptOut: true },
+			});
+			assert.equal(staticLaunch.isError, undefined, staticLaunch.content[0]?.text);
+			const staticPayload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(staticId, 30_000), "utf8")) as AsyncResultPayload;
+			assert.equal(staticPayload.success, true, JSON.stringify(staticPayload));
+			assert.equal(staticPayload.results[0]?.gitBundle, undefined);
+			assert.equal(fs.readFileSync(path.join(repo, "static-optout.txt"), "utf8"), "static\n");
+
+			mockPi.reset();
+			mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "dynamic-optout.txt" }] } });
+			mockPi.onCall({ output: "dynamic opt-out", commands: ["printf 'dynamic\\n' > dynamic-optout.txt"] });
+			const dynamicId = `async-dynamic-optout-${Date.now().toString(36)}`;
+			const dynamicLaunch = executeAsyncChain(dynamicId, {
+				chain: [
+					{ agent: "producer", task: "Produce one target", as: "targets", outputSchema: { type: "object" } },
+					{ expand: { from: { output: "targets", path: "/items" }, item: "target", maxItems: 1 }, parallel: { agent: "writer", task: "Write {target.path}" }, collect: { as: "written" }, worktree: false },
+				], agents: [makeAgent("producer", { tools: ["read"], sandbox: { provider: "bubblewrap", gitMode: "read-only", extraWritableMounts: [mockPi.dir] } }), writer],
+				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "async-dynamic-optout" }, artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 }, shareEnabled: false, maxSubagentDepth: 2,
+				sandboxSettings: { allowWorktreeOptOut: true },
+			});
+			assert.equal(dynamicLaunch.isError, undefined, dynamicLaunch.content[0]?.text);
+			const dynamicPayload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(dynamicId, 30_000), "utf8")) as AsyncResultPayload;
+			assert.equal(dynamicPayload.success, true, JSON.stringify(dynamicPayload));
+			assert.ok(dynamicPayload.results.every((result) => result.gitBundle === undefined));
+			assert.equal(fs.readFileSync(path.join(repo, "dynamic-optout.txt"), "utf8"), "dynamic\n");
+
+			mockPi.reset();
+			const denied = executeAsyncChain(`async-dynamic-optout-denied-${Date.now().toString(36)}`, {
+				chain: [
+					{ agent: "producer", task: "Produce one target", as: "targets", outputSchema: { type: "object" } },
+					{ expand: { from: { output: "targets", path: "/items" }, maxItems: 1 }, parallel: { agent: "writer", task: "Write target" }, collect: { as: "written" }, worktree: false },
+				], agents: [makeAgent("producer", { tools: ["read"] }), writer],
+				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "async-dynamic-optout-denied" }, artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 }, shareEnabled: false, maxSubagentDepth: 2,
+			});
+			assert.equal(denied.isError, true);
+			assert.match(denied.content[0]?.text ?? "", /Worktree opt-out denied/);
+			assert.equal(mockPi.callCount(), 0, "unauthorized async opt-out fails before runner spawn");
+			assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimeBefore.has(entry)), [], "async chain opt-out must not create isolated runtimes");
+		} finally { removeTempDir(repo); }
+	});
+
+	it("background frontmatter provider:none carries prominent host-Git diagnostics", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const trustedDir = path.join(tempDir, "trusted-user-settings");
+		fs.mkdirSync(trustedDir, { recursive: true });
+		fs.writeFileSync(path.join(trustedDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = trustedDir;
+		try {
+			mockPi.onCall({ output: "background host git work completed" });
+			const ctx = makeMinimalCtx(tempDir);
+			const executor = createSubagentExecutor!({
+				pi: { events: createEventBus(), getSessionName: () => undefined },
+				state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+				config: {},
+				asyncByDefault: false,
+				tempArtifactsDir: tempDir,
+				getSubagentSessionRoot: () => tempDir,
+				expandTilde: (p: string) => p,
+				discoverAgents: () => ({ agents: [makeAgent("worker", { sandbox: { provider: "none" } })] }),
+			});
+			const response = await executor.execute("background-frontmatter-host-git", { agent: "worker", task: "Report host Git status", async: true }, new AbortController().signal, undefined, ctx);
+			const asyncId = response.details?.asyncId;
+			assert.ok(asyncId);
+			const resultPath = await waitForAsyncResultFile(asyncId, 10_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.match(payload.results[0]?.sandbox?.diagnostics?.[0]?.message ?? "", /NO ISOLATION/i);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
 	});
 
@@ -935,6 +1064,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	});
 
 	it("top-level async parallel conversion preserves output, reads, and progress", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		enableTrustedSandboxOptOut();
 		mockPi.onCall({ output: "Async top-level report" });
 		const executor = createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
@@ -1276,6 +1406,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	});
 
 	it("async executor run override tightens an inherited nested max depth", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		enableTrustedSandboxOptOut();
 		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"] });
 		const executor = createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
@@ -1317,6 +1448,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	});
 
 	it("top-level async chain suppresses progress for {task} review-only tasks", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		enableTrustedSandboxOptOut();
 		mockPi.onCall({ output: "Async review" });
 		const executor = createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
@@ -1640,6 +1772,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	});
 
 	it("top-level async worktree parallel resolves reads and output against the worktree cwd", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		enableTrustedSandboxOptOut();
 		const repoDir = createRepo("pi-subagent-async-worktree-");
 		try {
 			mockPi.onCall({ output: "Worktree report" });

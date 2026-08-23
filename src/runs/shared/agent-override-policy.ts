@@ -81,6 +81,8 @@ export interface AgentOverridePolicyParams {
 export interface AgentOverridePolicyTarget {
 	agent: AgentConfig;
 	paths: readonly string[];
+	/** Whether the raw request explicitly supplied worktree:false. */
+	worktreeOptOut?: boolean;
 }
 
 export interface AgentOverridePolicyViolation {
@@ -245,7 +247,7 @@ export function findAgentOverridePolicyViolations(
 	const violations: AgentOverridePolicyViolation[] = [];
 	for (const target of targets) {
 		const denied = [...new Set(target.paths)]
-			.filter((path) => !isAgentOverrideAllowed(target.agent, path))
+			.filter((path) => !(path === "worktree" && target.worktreeOptOut === true && target.agent.canOptOutOfWorktree === true) && !isAgentOverrideAllowed(target.agent, path))
 			.sort((a, b) => a.localeCompare(b));
 		if (denied.length > 0) {
 			violations.push({
@@ -266,7 +268,7 @@ export function validateAgentOverridePolicy(
 	const targets: AgentOverridePolicyTarget[] = [];
 	for (const [agentName, paths] of pathsByAgent) {
 		const agent = agents.find((candidate) => candidate.name === agentName);
-		if (agent) targets.push({ agent, paths: [...paths] });
+		if (agent) targets.push({ agent, paths: [...paths], ...(params.worktree === false ? { worktreeOptOut: true } : {}) });
 	}
 	return findAgentOverridePolicyViolations(targets);
 }
@@ -278,6 +280,7 @@ export function formatAgentOverridePolicyError(violations: readonly AgentOverrid
 		lines.push(`- ${violation.agent}: denied ${violation.paths.join(", ")}`);
 		lines.push(`  Allowed paths in this agent definition: ${violation.allowed.length > 0 ? violation.allowed.join(", ") : "(none; deny by default)"}`);
 	}
+	lines.push("Raw overrides are parent-authority preflight inputs; a child cannot use them to self-decontain or broaden inherited isolation.");
 	lines.push("The parent may remove the denied overrides or recommend an agent-definition change to the user.");
 	return lines.join("\n");
 }

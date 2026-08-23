@@ -59,7 +59,9 @@ This page is the compact reference for persistent extension settings, agent Mark
 ### Sandbox defaults
 
 - **`sandbox`** — Groups default sandbox behavior inherited by agents and runs. Agent frontmatter overrides these defaults, and run-level sandbox fields override the agent.
-- **`sandbox.defaultProvider`** — Sets the default sandbox provider, normally `bubblewrap`; omitting it also uses Bubblewrap, while an explicit run-level provider `none` opts out.
+- **`sandbox.defaultProvider`** — Sets the default sandbox provider, normally `bubblewrap`; omitting it also uses Bubblewrap.
+- **`sandbox.allowSandboxOptOut`** — Trusted user-global permission for an explicit `provider: "none"` host run. Project settings cannot enable this permission, and omission denies the opt-out.
+- **`sandbox.allowWorktreeOptOut`** — User-global ceiling for an explicit parent `worktree: false` request; a project may set it to false to narrow the ceiling but cannot set it true when the user has not enabled it.
 - **`sandbox.defaultProfile`** — Sets the default sandbox profile, normally `host-toolchain`. The profile determines the base mounts and runtime shape.
 - **`sandbox.network`** — Uses `host` for normal network access or `none` for an isolated network namespace. Model/API calls generally require `host`.
 - **`sandbox.auth`** — Uses `pi-json` to mount Pi auth files read-only or `env` to rely on inherited credentials. Prefer `pi-json` when supported.
@@ -108,16 +110,17 @@ Session logs, async status, and debug artifacts remain runtime/session data; the
 - **`acceptanceSelfReview`** — After the subagent says it is complete, it continues in the same session and checks or repairs its submission against the parent's acceptance criteria. It only runs when the launch has an acceptance contract and defaults to `true`; set it to `false` to opt an agent out.
 - **`acceptanceMaxFinalizationTurns`** — Sets the maximum number of same-session self-review/repair turns from `1` to `10`. It defaults to `3` for all agents.
 - **`canBeChangedByAgent`** — Lists which explicit run settings the parent agent may change for this target agent. Omitted or empty means deny all overrides, and denied values fail before any child starts.
+- **`canOptOutOfWorktree`** — Dedicated narrowing permission for a parent to request `worktree: false`; it never grants `worktree: true` or sandbox opt-out authority and cannot broaden inherited child rights.
 
 `canBeChangedByAgent` accepts exact paths and segment wildcards such as `model`, `acceptance.*`, `sandbox.*`, or the global `*`. Malformed or unsupported patterns fail closed, and management-created definitions reject patterns that cannot match a guarded setting.
 
-Guarded paths are `cwd`, `context`, `model`, `fastMode`, `skills`, `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, every `acceptance.<field>`, and every `sandbox.<field>`. A shared override in a multi-agent launch must be allowed by every affected agent; this includes a shared `worktree: true` request. The packaged `orchestrator` explicitly opts into `worktree`; other agents remain deny-by-default unless their definition opts in.
+Guarded paths are `cwd`, `context`, `model`, `fastMode`, `skills`, `output`, `outputMode`, `reads`, `progress`, `outputSchema`, `share`, `worktree`, `maxSubagentDepth`, every `acceptance.<field>`, and every `sandbox.<field>`. A shared override in a multi-agent launch must be allowed by every affected agent; shared `worktree: true` remains deny-by-default for packaged agents. Only a dedicated `canOptOutOfWorktree: true` permission, together with the trusted user-global ceiling, may authorize the narrowing `worktree: false` opt-out.
 
 ### Agent sandbox
 
 Detached async runs have no cancellation producer in the public settings/API today. `interrupt` pauses a run; `cancelled` is emitted by foreground `AbortSignal` paths and is supported as persisted/reconciled projection state.
 
-- **`sandboxGitMode`** — Uses `read-only` by default. Opt into `isolated` only with `sandboxProvider: bubblewrap`; the runtime creates a private Git metadata/object layer from the exact assigned base and exports one owner-only recovery bundle for every terminal outcome (success, failure, timeout, cancellation, interruption, or execution rejection). Dirty state is recorded as an internal recovery snapshot; ignored and runtime-synthetic paths are excluded. Isolated mode fails closed on ordinary checkouts, unsupported platforms/providers, missing Git identity, and unsafe writable mounts. A guarded `sandbox.gitMode` run override follows the same checks.
+- **`sandboxGitMode`** — Uses `read-only` by default for custom/read-only agents. Packaged `work` and `orchestrator` default to `isolated`; opt into `isolated` only with `sandboxProvider: bubblewrap`; the runtime creates a private Git metadata/object layer from the exact assigned base and exports one owner-only recovery bundle for every terminal outcome (success, failure, timeout, cancellation, interruption, or execution rejection). Dirty state is recorded as an internal recovery snapshot; ignored and runtime-synthetic paths are excluded. Isolated mode fails closed on ordinary checkouts, unsupported platforms/providers, missing Git identity, and unsafe writable mounts. A guarded `sandbox.gitMode` run override follows the same checks.
 - **`sandboxProvider`** — Sets this agent's sandbox provider, normally `bubblewrap`. It overrides the extension default.
 - **`sandboxProfile`** — Sets this agent's sandbox profile, normally `host-toolchain`. It controls the base sandbox environment.
 - **`sandboxNetwork`** — Sets this agent's network mode to values such as `host` or `none`. Offline mode prevents normal model/API access from inside the child process.

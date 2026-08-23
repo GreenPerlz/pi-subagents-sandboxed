@@ -24,8 +24,8 @@ Custom user/project agents and chains may still exist. Use `subagent({ action: "
 ## Core rules
 
 - Keep one parent decision-maker. Children inspect, research, implement, or review; the parent synthesizes and decides next actions.
-- Default issue orchestration owns one isolated worktree in the parent: `explore`, `work`, and fresh `review` run foreground with `async: false`, explorer findings return inline, the worker edits the same cwd without committing, and the reviewer inspects the current `git diff`.
-- Use one writer at a time against the active checkout. Parallel writers require `worktree: true`, and every affected agent must permit that guarded shared override.
+- Default issue orchestration owns one isolated worktree in the parent: `explore`, `work`, and fresh `review` run foreground with `async: false`, explorer findings return inline, the worker edits the inherited cwd without committing, and the reviewer inspects the current `git diff`.
+- Reuse the parent-owned isolated worktree for nested steps by omitting `worktree`; request a separate worktree only for explicitly authorized parallel writers.
 - Prefer fresh context for `review` and `research` runs unless inherited conversation state is explicitly needed.
 - Omit `output`, `outputMode: "file-only"`, `progress`, and `reads` by default. Results stay inline and no repo-local context/plan/progress/report Markdown is created unless one of those options is explicitly requested.
 - Use `work` for edits, `review` for adversarial checks, and `research` for external facts.
@@ -57,8 +57,7 @@ subagent({
   tasks: [{
     agent: "orchestrator",
     task: "Own exactly this issue in the assigned worktree. Explore inline, embed relevant findings in one same-cwd work task that must not commit, then give a fresh reviewer an abstract handoff and require it to inspect current git diff."
-  }],
-  worktree: true
+  }]
 })
 ```
 
@@ -103,9 +102,9 @@ sandbox: {
 }
 ```
 
-Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider: "none" }` only with a custom agent whose policy permits the requested `sandbox.provider` override and when the user explicitly approves an unsandboxed exception. Use `extraReadOnlyMounts` for narrow toolchain/input access and `extraWritableMounts` only for caches, outputs, or work directories. Do not invent new profile names in prompts or config; only implemented profiles work.
+Keep `fallback: "fail"` for safety-critical workflows. Use `sandbox: { provider: "none" }` only when trusted user-global `sandbox.allowSandboxOptOut: true` is configured; custom-agent permission or a per-run/user approval alone cannot authorize unsandboxed execution. Use `extraReadOnlyMounts` for narrow toolchain/input access and `extraWritableMounts` only for caches, outputs, or work directories. Do not invent new profile names in prompts or config; only implemented profiles work.
 
-Parallel sandboxed tasks with write-capable tools require `worktree: true`; otherwise use read-only review tasks in parallel.
+Parallel sandboxed tasks with write-capable tools require an explicitly authorized isolated worktree; otherwise use read-only review tasks in parallel.
 
 ## Per-issue orchestrators
 
@@ -118,7 +117,6 @@ subagent({
     label: "Issue #123",
     task: "Orchestrate exactly this issue in the assigned worktree. Keep explore findings inline, pass relevant findings to same-cwd work, forbid commits, and pass an abstract worker handoff to a fresh reviewer that inspects current git diff."
   }],
-  worktree: true,
   async: true
 })
 ```

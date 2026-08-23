@@ -98,6 +98,8 @@ describe("subagents settings overlay", () => {
 		assert.ok(text.includes("Choose default model"));
 		assert.ok(text.includes("openai/gpt-5"));
 		assert.ok(text.includes("anthropic/claude-sonnet"));
+		assert.ok(text.includes("policy: source builtin · role review · Git read-only · sandbox bubblewrap"));
+		assert.ok(text.includes("sandbox opt-out requires trusted user permission"));
 	});
 
 	it("shows subtle builtin shadowing warning with the shadowing path", () => {

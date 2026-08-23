@@ -61,6 +61,13 @@ describe("agent override policy", () => {
 		assert.match(formatAgentOverridePolicyError(violations), /remove the denied overrides or recommend an agent-definition change to the user/);
 	});
 
+	it("allows only the dedicated narrowing permission for worktree:false", () => {
+		const permitted = makeAgent("writer", { canBeChangedByAgent: [], canOptOutOfWorktree: true });
+		assert.deepEqual(validateAgentOverridePolicy({ agent: "writer", worktree: false }, [permitted]), []);
+		assert.notDeepEqual(validateAgentOverridePolicy({ agent: "writer", worktree: true }, [permitted]), []);
+		assert.notDeepEqual(validateAgentOverridePolicy({ agent: "writer", worktree: false }, [makeAgent("writer", { canBeChangedByAgent: [] })]), []);
+	});
+
 	it("requires a shared top-level worktree request from every affected agent", () => {
 		const params = { tasks: [{ agent: "one", task: "a" }, { agent: "two", task: "b" }], worktree: true };
 		const one = makeAgent("one", { canBeChangedByAgent: ["worktree"] });

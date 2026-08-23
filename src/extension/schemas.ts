@@ -37,7 +37,7 @@ const ReadsOverride = Type.Unsafe({
 
 const SandboxOverride = Type.Object({
 	gitMode: Type.Optional(Type.String({ enum: ["read-only", "isolated"], description: "Git access mode. Omit for the read-only default; isolated requires a runtime-managed worktree and Linux Bubblewrap." })),
-	provider: Type.Optional(Type.String({ description: "Sandbox provider, e.g. 'bubblewrap'. Omit for the Bubblewrap/read-only default, including unconfigured custom agents; use explicit 'none' to opt out." })),
+	provider: Type.Optional(Type.String({ description: "Sandbox provider, e.g. 'bubblewrap'. Omit for the Bubblewrap/read-only default, including unconfigured custom agents. Explicit 'none' opts out only when trusted user-global sandbox.allowSandboxOptOut=true; project settings and child requests cannot grant it." })),
 	profile: Type.Optional(Type.String({ description: "Sandbox profile, e.g. 'host-toolchain'." })),
 	network: Type.Optional(Type.String({ description: "Sandbox network policy, e.g. 'host' or 'none'." })),
 	trustProject: Type.Optional(Type.Boolean({ description: "Allow sandbox policy to trust project-local files/config." })),
@@ -222,7 +222,7 @@ const ChainItem = Type.Object({
 	concurrency: Type.Optional(Type.Number({ description: "Max concurrent tasks (default: 4)" })),
 	failFast: Type.Optional(Type.Boolean({ description: "Stop on first failure (default: false)" })),
 	worktree: Type.Optional(Type.Boolean({
-		description: "Create isolated git worktrees for each parallel task. Every affected agent must permit the shared worktree override."
+		description: "Create isolated git worktrees for each parallel task. Set false only as a dedicated, guarded parent-authorized opt-out; child agents cannot self-decontain. Every affected agent must permit the shared worktree override."
 	})),
 }, {
 	description: "Chain step: use {agent, task?, ...} for sequential, {parallel: [...]} for static concurrent execution, or {expand, parallel: {...}, collect} for dynamic fanout.",
@@ -278,12 +278,12 @@ export const SubagentParams = Type.Object({
 			{ type: "object", additionalProperties: true },
 			{ type: "string" },
 		],
-		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, fastMode, tools (comma-separated), extensions (comma-separated), skills, thinking, explicit output, reads, progress, maxSubagentDepth, acceptanceSelfReview, acceptanceMaxFinalizationTurns, canBeChangedByAgent (comma-separated). Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, fastMode?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. fastMode requests the provider priority service tier only for eligible resolved candidates and defaults to false. String values must be valid JSON."
+		description: "Agent or chain config for create/update. Agent: name, package (optional namespace; runtime name becomes package.name), description, scope ('user'|'project', default 'user'), systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext ('fresh'|'fork'), model, fastMode, tools (comma-separated), extensions (comma-separated), skills, thinking, explicit output, reads, progress, maxSubagentDepth, acceptanceSelfReview, acceptanceMaxFinalizationTurns, canOptOutOfWorktree, canBeChangedByAgent (comma-separated). Chain: name, package, description, scope, steps (array of {agent, task?, output?, outputMode?, reads?, model?, fastMode?, skill?, progress?}). Presence of 'steps' creates a chain instead of an agent. fastMode requests the provider priority service tier only for eligible resolved candidates and defaults to false. String values must be valid JSON."
 	})),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: [{agent, task, count?, output?, outputMode?, reads?, progress?}, ...]" })),
 	concurrency: Type.Optional(Type.Integer({ minimum: 1, description: "Top-level PARALLEL mode only: max concurrent tasks. Defaults to config.parallel.concurrency or 4." })),
 	worktree: Type.Optional(Type.Boolean({
-		description: "Create isolated git worktrees for each parallel task. " +
+		description: "Create isolated git worktrees for each parallel task. Set false only as a dedicated, guarded parent-authorized opt-out; child agents cannot self-decontain. " +
 			"Prevents filesystem conflicts. Requires clean git state. " +
 			"Every affected agent must permit the shared worktree override; per-worktree diffs are included in output."
 	})),

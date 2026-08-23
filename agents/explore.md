@@ -6,6 +6,7 @@ systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
 sandboxProvider: bubblewrap
+sandboxGitMode: read-only
 sandboxProfile: host-toolchain
 sandboxNetwork: host
 sandboxAuth: pi-json

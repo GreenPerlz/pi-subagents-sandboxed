@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
-import { resolveSandboxConfig } from "../../sandbox/config.ts";
+import { hasExplicitSandboxOptOut, resolveSandboxConfig, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -179,6 +179,8 @@ interface AsyncSingleParams {
 	sandbox?: ResolvedSandboxConfig;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
+	/** Direct parent authority may narrow an isolated child to read-only. */
+	worktree?: boolean;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	/** Minimal owner-scoped endpoint inherited by a detached nested run. */
 	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
@@ -497,7 +499,17 @@ export function executeAsyncChain(
 			const stepAgentConfigs = s.parallel
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
-			const stepSandboxes = stepAgentConfigs.map((agent) => resolveStepSandbox(agent));
+			const explicitWorktreeOptOut = Object.hasOwn(s, "worktree") && s.worktree === false;
+			const worktreeOptOutAllowed = explicitWorktreeOptOut
+				&& worktreeOptOutIsAuthorized(params.sandboxSettings)
+				&& stepAgentConfigs.every((agent) => agent.canOptOutOfWorktree === true);
+			if (explicitWorktreeOptOut && !worktreeOptOutAllowed) {
+				return formatAsyncStartError(resultMode, "Worktree opt-out denied: worktree:false requires trusted user-global sandbox.allowWorktreeOptOut=true and every target agent must set canOptOutOfWorktree=true.");
+			}
+			const stepSandboxes = stepAgentConfigs.map((agent) => {
+				const resolved = resolveStepSandbox(agent);
+				return worktreeOptOutAllowed && resolved?.gitMode === "isolated" ? { ...resolved, gitMode: "read-only" as const } : resolved;
+			});
 			const isolatedGitRequested = stepSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
 			if (isolatedGitRequested && s.worktree) {
 				return formatAsyncStartError(resultMode, `isolated Git cannot be combined with parent-managed worktree mode on chain step ${stepIndex + 1}`);
@@ -509,14 +521,25 @@ export function executeAsyncChain(
 				return formatAsyncStartError(resultMode, `isolated Git parallel step ${stepIndex + 1} cannot include a non-isolated write-capable task`);
 			}
 			const sandboxWriteInputs = stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] }));
-			if (!s.worktree && !isolatedGitRequested && hasSandboxWritableAgent({ agents: sandboxWriteInputs })) {
+			if (!s.worktree && !isolatedGitRequested && hasSandboxWritableAgent({ agents: sandboxWriteInputs })
+				&& !worktreeOptOutAllowed) {
 				return formatAsyncStartError(resultMode, sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`));
 			}
 		}
 		if (isDynamicParallelStep(s)) {
 			const agent = agents.find((candidate) => candidate.name === s.parallel.agent);
-			const dynamicSandbox = agent ? resolveStepSandbox(agent) : undefined;
-			if (agent && dynamicSandbox?.gitMode !== "isolated" && hasSandboxWritableAgent({ agents: [{ agentName: agent.name, tools: agent.tools, sandbox: dynamicSandbox }] })) {
+			const resolvedDynamicSandbox = agent ? resolveStepSandbox(agent) : undefined;
+			const explicitDynamicWorktreeOptOut = s.worktree === false;
+			const dynamicWorktreeOptOutAllowed = explicitDynamicWorktreeOptOut
+				&& worktreeOptOutIsAuthorized(params.sandboxSettings)
+				&& agent?.canOptOutOfWorktree === true;
+			if (explicitDynamicWorktreeOptOut && !dynamicWorktreeOptOutAllowed) {
+				return formatAsyncStartError(resultMode, "Worktree opt-out denied: worktree:false requires trusted user-global sandbox.allowWorktreeOptOut=true and every target agent must set canOptOutOfWorktree=true.");
+			}
+			const dynamicSandbox = dynamicWorktreeOptOutAllowed && resolvedDynamicSandbox?.gitMode === "isolated"
+				? { ...resolvedDynamicSandbox, gitMode: "read-only" as const }
+				: resolvedDynamicSandbox;
+			if (agent && dynamicSandbox?.gitMode !== "isolated" && hasSandboxWritableAgent({ agents: [{ agentName: agent.name, tools: agent.tools, sandbox: dynamicSandbox }] }) && !dynamicWorktreeOptOutAllowed) {
 				return formatAsyncStartError(resultMode, sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`));
 			}
 		}
@@ -560,9 +583,10 @@ export function executeAsyncChain(
 		progressPrecreated = false,
 		resolvedBehavior?: ResolvedStepBehavior,
 		outputIndex?: number,
+		sandboxOverride?: ResolvedSandboxConfig,
 	) => {
 		const a = agents.find((x) => x.name === s.agent)!;
-		const stepSandbox = resolveStepSandbox(a);
+		const stepSandbox = sandboxOverride ?? resolveStepSandbox(a);
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
 		const instructionCwd = behaviorCwd ?? stepCwd;
 		const behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
@@ -601,6 +625,7 @@ export function executeAsyncChain(
 		const model = modelCandidates[0];
 		return {
 			agent: s.agent,
+			source: a.source,
 			task,
 			phase: s.phase,
 			label: s.label,
@@ -626,6 +651,7 @@ export function executeAsyncChain(
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
 			sandbox: stepSandbox,
+			hostGitDiagnostic: !stepSandbox && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, agent: a, run: params.sandboxRun }),
 			effectiveAcceptance: resolveEffectiveAcceptance({
 				explicit: s.acceptance,
 				agentName: s.agent,
@@ -661,6 +687,14 @@ export function executeAsyncChain(
 					if (!s.worktree) writeInitialProgressFile(runnerCwd);
 					progressInstructionCreated = true;
 				}
+				const stepAgentConfigs = s.parallel.map((task) => agents.find((agent) => agent.name === task.agent)!);
+				const worktreeOptOutAllowed = s.worktree === false
+					&& worktreeOptOutIsAuthorized(params.sandboxSettings)
+					&& stepAgentConfigs.every((agent) => agent.canOptOutOfWorktree === true);
+				const stepSandboxes = stepAgentConfigs.map((agent) => {
+					const resolved = resolveStepSandbox(agent);
+					return worktreeOptOutAllowed && resolved?.gitMode === "isolated" ? { ...resolved, gitMode: "read-only" as const } : resolved;
+				});
 				return {
 					parallel: s.parallel.map((t, taskIndex) => {
 						let behaviorCwd: string | undefined;
@@ -671,11 +705,12 @@ export function executeAsyncChain(
 								behaviorCwd = undefined;
 							}
 						}
-						return buildSeqStep(t, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], stepIndex * 1000 + taskIndex);
+						return buildSeqStep(t, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], stepIndex * 1000 + taskIndex, stepSandboxes[taskIndex]);
 					}),
 					concurrency: s.concurrency,
 					failFast: s.failFast,
 					worktree: s.worktree,
+					...(worktreeOptOutAllowed ? { worktreeOptOutAuthorized: true } : {}),
 				};
 			}
 			if (isDynamicParallelStep(s)) {
@@ -686,11 +721,20 @@ export function executeAsyncChain(
 					writeInitialProgressFile(runnerCwd);
 					progressInstructionCreated = true;
 				}
+				const resolvedDynamicSandbox = resolveStepSandbox(agent);
+				const dynamicWorktreeOptOutAllowed = s.worktree === false
+					&& worktreeOptOutIsAuthorized(params.sandboxSettings)
+					&& agent.canOptOutOfWorktree === true;
+				const dynamicSandbox = dynamicWorktreeOptOutAllowed && resolvedDynamicSandbox?.gitMode === "isolated"
+					? { ...resolvedDynamicSandbox, gitMode: "read-only" as const }
+					: resolvedDynamicSandbox;
 				return {
 					expand: s.expand,
-					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior, stepIndex),
+					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior, stepIndex, dynamicSandbox),
 					collect: s.collect,
 					concurrency: s.concurrency,
+					worktree: s.worktree,
+					...(dynamicWorktreeOptOutAllowed ? { worktreeOptOutAuthorized: true } : {}),
 					failFast: s.failFast,
 					phase: s.phase,
 					label: s.label,
@@ -892,12 +936,17 @@ export function executeAsyncSingle(
 	const task = params.task ?? "";
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
-	const sandbox = hasSandboxResolutionInputs
+	let sandbox = hasSandboxResolutionInputs
 		? resolveSandboxConfig({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun })
 		: params.sandbox
 			? resolveSandboxConfig({ agent: agentConfig, run: params.sandbox })
 			: resolveSandboxConfig({ agent: agentConfig });
 	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = params.scopedGitEndpoint;
+	if (params.worktree === false && !scopedGitRunEndpoint && sandbox?.gitMode === "isolated"
+		&& worktreeOptOutIsAuthorized(params.sandboxSettings)
+		&& agentConfig.canOptOutOfWorktree === true) {
+		sandbox = { ...sandbox, gitMode: "read-only" };
+	}
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
 	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(skillNames, runnerCwd, ctx.cwd);
@@ -957,6 +1006,7 @@ export function executeAsyncSingle(
 				steps: [
 					{
 						agent,
+						source: agentConfig.source,
 						task: taskWithOutputInstruction,
 						cwd: runnerCwd,
 						model,
@@ -978,6 +1028,7 @@ export function executeAsyncSingle(
 						sessionFile,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
 						sandbox,
+						hostGitDiagnostic: !sandbox && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun }),
 						effectiveAcceptance: resolveEffectiveAcceptance({
 							explicit: params.acceptance,
 							agentName: agent,

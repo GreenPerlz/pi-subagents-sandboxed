@@ -106,6 +106,8 @@ export interface AgentConfig {
 	acceptanceMaxFinalizationTurns?: number;
 	/** Explicit run paths this agent definition permits a parent to override. */
 	canBeChangedByAgent?: string[];
+	/** Dedicated, narrowing permission for an explicit parent worktree:false opt-out. */
+	canOptOutOfWorktree?: boolean;
 	disabled?: boolean;
 	sandbox?: AgentSandboxConfig;
 	extraFields?: Record<string, string>;
@@ -461,6 +463,8 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	const input = value as Record<string, unknown>;
 	const sandbox: SandboxSettingsDefaults = {};
 	const defaultProvider = parseOptionalStringField(input.defaultProvider, { filePath, field: "sandbox.defaultProvider" });
+	const allowSandboxOptOut = parseOptionalBooleanField(input.allowSandboxOptOut, { filePath, field: "sandbox.allowSandboxOptOut" });
+	const allowWorktreeOptOut = parseOptionalBooleanField(input.allowWorktreeOptOut, { filePath, field: "sandbox.allowWorktreeOptOut" });
 	const gitMode = parseOptionalStringField(input.gitMode, { filePath, field: "sandbox.gitMode" });
 	const defaultProfile = parseOptionalStringField(input.defaultProfile, { filePath, field: "sandbox.defaultProfile" });
 	const network = parseOptionalStringField(input.network, { filePath, field: "sandbox.network" });
@@ -471,6 +475,8 @@ function parseSandboxSettingsEntry(value: unknown, filePath: string): SandboxSet
 	const extraWritableMounts = parseOptionalStringArrayField(input.extraWritableMounts, { filePath, field: "sandbox.extraWritableMounts" });
 	const packageDiscovery = parseOptionalStringField(input.packageDiscovery, { filePath, field: "sandbox.packageDiscovery" });
 	if (defaultProvider !== undefined) sandbox.defaultProvider = defaultProvider;
+	if (allowSandboxOptOut !== undefined) sandbox.allowSandboxOptOut = allowSandboxOptOut;
+	if (allowWorktreeOptOut !== undefined) sandbox.allowWorktreeOptOut = allowWorktreeOptOut;
 	if (gitMode !== undefined) sandbox.gitMode = gitMode;
 	if (defaultProfile !== undefined) sandbox.defaultProfile = defaultProfile;
 	if (network !== undefined) sandbox.network = network;
@@ -641,6 +647,27 @@ function mergeSandboxSettings(
 	return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+/**
+ * Merge trust-sensitive defaults with their source semantics. A project may
+ * narrow a user worktree ceiling, but it can never authorize unsandboxed
+ * execution or broaden a user permission.
+ */
+function mergeSandboxTrustSettings(
+	user: SandboxSettingsDefaults | undefined,
+	project: SandboxSettingsDefaults | undefined,
+): SandboxSettingsDefaults | undefined {
+	const ordinary = mergeSandboxSettings(user, project);
+	if (!ordinary && user?.allowSandboxOptOut === undefined && user?.allowWorktreeOptOut === undefined && project?.allowSandboxOptOut === undefined && project?.allowWorktreeOptOut === undefined) return undefined;
+	const allowSandboxOptOut = user?.allowSandboxOptOut === true;
+	const allowWorktreeOptOut = user?.allowWorktreeOptOut === true && project?.allowWorktreeOptOut !== false;
+	const trusted = {
+		...(ordinary ?? {}),
+		...(allowSandboxOptOut ? { allowSandboxOptOut: true } : { allowSandboxOptOut: false }),
+		...(allowWorktreeOptOut ? { allowWorktreeOptOut: true } : { allowWorktreeOptOut: false }),
+	};
+	return Object.keys(trusted).length > 0 ? trusted : undefined;
+}
+
 export function readSandboxSettings(cwd: string, scope: AgentScope = "both"): SandboxSettingsDefaults | undefined {
 	const userSettingsPath = getUserAgentSettingsPath();
 	const userSubagentSettingsPath = getUserSubagentSettingsPath();
@@ -648,7 +675,7 @@ export function readSandboxSettings(cwd: string, scope: AgentScope = "both"): Sa
 	const projectSubagentSettingsPath = getProjectSubagentSettingsPath(cwd);
 	const userSettings = scope === "project" ? EMPTY_SUBAGENT_SETTINGS : readSubagentSettings(userSettingsPath, userSubagentSettingsPath);
 	const projectSettings = scope === "user" ? EMPTY_SUBAGENT_SETTINGS : readSubagentSettings(projectSettingsPath, projectSubagentSettingsPath);
-	return mergeSandboxSettings(userSettings.sandbox, projectSettings.sandbox);
+	return mergeSandboxTrustSettings(userSettings.sandbox, projectSettings.sandbox);
 }
 
 function applyBuiltinOverride(
@@ -907,6 +934,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			? true
 			: DEFAULT_ACCEPTANCE_SELF_REVIEW;
 		const canBeChangedByAgent = frontmatterStringList(frontmatter.canBeChangedByAgent) ?? [];
+		const canOptOutOfWorktree = frontmatter.canOptOutOfWorktree === "true";
 		const sandbox = buildAgentSandboxConfig(frontmatter);
 
 		agents.push({
@@ -940,6 +968,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			acceptanceSelfReview,
 			acceptanceMaxFinalizationTurns,
 			canBeChangedByAgent,
+			canOptOutOfWorktree,
 			sandbox,
 			extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
 		});

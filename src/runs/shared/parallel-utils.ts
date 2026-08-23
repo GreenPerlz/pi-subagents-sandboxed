@@ -4,6 +4,8 @@ import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
 
 export interface RunnerSubagentStep {
 	agent: string;
+	/** Discovery source is security-sensitive; never infer packaged role by name. */
+	source?: import("../../agents/agents.ts").AgentSource;
 	task: string;
 	phase?: string;
 	label?: string;
@@ -37,6 +39,8 @@ export interface RunnerSubagentStep {
 	structuredOutputSchema?: JsonSchemaObject;
 	effectiveAcceptance?: ResolvedAcceptanceConfig;
 	sandbox?: ResolvedSandboxConfig;
+	/** Explicit authorized provider:none diagnostic; not an execution authority. */
+	hostGitDiagnostic?: boolean;
 }
 
 export interface ParallelStepGroup {
@@ -44,6 +48,8 @@ export interface ParallelStepGroup {
 	concurrency?: number;
 	failFast?: boolean;
 	worktree?: boolean;
+	/** Trusted parent preflight result; never accepted from model-generated input. */
+	worktreeOptOutAuthorized?: boolean;
 }
 
 export interface DynamicRunnerGroup {
@@ -51,6 +57,9 @@ export interface DynamicRunnerGroup {
 	parallel: RunnerSubagentStep;
 	collect: DynamicCollectSpec;
 	concurrency?: number;
+	worktree?: boolean;
+	/** Trusted parent preflight result; never accepted from model-generated input. */
+	worktreeOptOutAuthorized?: boolean;
 	failFast?: boolean;
 	phase?: string;
 	label?: string;

@@ -292,6 +292,20 @@ async function runSingleAttempt(
 		model: modelArg,
 		thinking: resolveCandidateLaunchThinking(modelArg, agent.thinking),
 		fastMode: shared.fastModeStatus,
+		// An authorized provider:none launch is intentionally visible in the
+		// result. Never let a host-Git checkout look like an isolated run.
+		...(options.hostGitDiagnostic === true && !options.sandbox ? {
+			sandbox: {
+				provider: "none",
+				gitMode: "read-only",
+				profile: "host",
+				network: "host",
+				auth: "none",
+				fallbackMode: "none",
+				fallbackOccurred: false,
+				diagnostics: [{ level: "warning" as const, message: "NO ISOLATION: this child is using the host checkout and host Git metadata. Changes are not protected by a managed isolated worktree." }],
+			},
+		} : {}),
 		artifactPaths: shared.artifactPaths,
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
@@ -396,7 +410,7 @@ async function runSingleAttempt(
 			effectiveSandboxMounts = buildSubagentSandboxMounts({
 				cwd: childCwd,
 				includeCwd: true,
-				cwdMode: "ro",
+				cwdMode: options.isolatedGitRights === "writer" ? "rw" : "ro",
 				tempDir,
 				sessionDir: options.sessionDir,
 				sessionFile: options.sessionFile,

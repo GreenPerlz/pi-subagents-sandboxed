@@ -92,6 +92,7 @@ function makeState(cwd: string) {
 describe("fork context execution wiring", { skip: !available ? "subagent executor not importable" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
+	let previousFixtureAgentDir: string | undefined;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -104,11 +105,18 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 	beforeEach(() => {
 		tempDir = createTempDir("pi-subagent-fork-test-");
+		previousFixtureAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const fixtureAgentDir = path.join(tempDir, "fixture-user-settings");
+		fs.mkdirSync(fixtureAgentDir, { recursive: true });
+		fs.writeFileSync(path.join(fixtureAgentDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = fixtureAgentDir;
 		mockPi.reset();
 		mockPi.onCall({ output: "ok" });
 	});
 
 	afterEach(() => {
+		if (previousFixtureAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousFixtureAgentDir;
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
 		if (originalUserProfile === undefined) delete process.env.USERPROFILE;

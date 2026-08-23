@@ -25,6 +25,7 @@ export const KNOWN_FIELDS = new Set([
 	"acceptanceSelfReview",
 	"acceptanceMaxFinalizationTurns",
 	"canBeChangedByAgent",
+	"canOptOutOfWorktree",
 	"sandboxProvider",
 	"sandboxGitMode",
 	"sandboxProfile",
@@ -96,6 +97,7 @@ export function serializeAgent(config: AgentConfig): string {
 	lines.push(`acceptanceMaxFinalizationTurns: ${acceptanceMaxFinalizationTurns}`);
 	const canBeChangedByAgent = joinComma(config.canBeChangedByAgent);
 	if (canBeChangedByAgent) lines.push(`canBeChangedByAgent: ${canBeChangedByAgent}`);
+	if (config.canOptOutOfWorktree) lines.push("canOptOutOfWorktree: true");
 	if (config.sandbox?.provider) lines.push(`sandboxProvider: ${config.sandbox.provider}`);
 	if (config.sandbox?.gitMode) lines.push(`sandboxGitMode: ${config.sandbox.gitMode}`);
 	if (config.sandbox?.profile) lines.push(`sandboxProfile: ${config.sandbox.profile}`);

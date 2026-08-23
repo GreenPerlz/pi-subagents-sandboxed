@@ -76,6 +76,9 @@ function createRecordingEventBus(options: { acknowledgeResults?: boolean } = {})
 describe("intercom result delivery cutover", { skip: !available ? "executor not importable" : undefined }, () => {
 	let tempDir: string;
 	let homeDir: string;
+	let previousFixtureAgentDir: string | undefined;
+	let previousIntercomSessionId: string | undefined;
+	let previousIntercomExtensionDir: string | undefined;
 	let mockPi: MockPi;
 	let originalHome: string | undefined;
 	let originalUserProfile: string | undefined;
@@ -104,10 +107,28 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 
 	beforeEach(() => {
 		tempDir = createTempDir("pi-subagent-intercom-result-");
+		previousFixtureAgentDir = process.env.PI_CODING_AGENT_DIR;
+		previousIntercomSessionId = process.env.PI_INTERCOM_SESSION_ID;
+		previousIntercomExtensionDir = process.env.PI_SUBAGENT_INTERCOM_EXTENSION_DIR;
+		const fixtureAgentDir = path.join(tempDir, "fixture-user-settings");
+		fs.mkdirSync(fixtureAgentDir, { recursive: true });
+		fs.writeFileSync(path.join(fixtureAgentDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
+		fs.mkdirSync(path.join(fixtureAgentDir, "intercom"), { recursive: true });
+		fs.writeFileSync(path.join(fixtureAgentDir, "intercom", "config.json"), JSON.stringify({ enabled: true }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = fixtureAgentDir;
+		process.env.PI_INTERCOM_SESSION_ID = "fixture-intercom-parent";
+		const fixtureIntercomDir = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-intercom");
+		if (fs.existsSync(fixtureIntercomDir)) process.env.PI_SUBAGENT_INTERCOM_EXTENSION_DIR = fixtureIntercomDir;
 		mockPi.reset();
 	});
 
 	afterEach(() => {
+		if (previousFixtureAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousFixtureAgentDir;
+		if (previousIntercomSessionId === undefined) delete process.env.PI_INTERCOM_SESSION_ID;
+		else process.env.PI_INTERCOM_SESSION_ID = previousIntercomSessionId;
+		if (previousIntercomExtensionDir === undefined) delete process.env.PI_SUBAGENT_INTERCOM_EXTENSION_DIR;
+		else process.env.PI_SUBAGENT_INTERCOM_EXTENSION_DIR = previousIntercomExtensionDir;
 		removeTempDir(tempDir);
 	});
 

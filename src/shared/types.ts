@@ -979,6 +979,8 @@ export interface RunSyncOptions {
 	};
 	/** Resolved sandbox config for this child process; omitted preserves the original spawn path. */
 	sandbox?: ResolvedSandboxConfig;
+	/** Authorized provider:none host-Git runs carry a prominent no-isolation diagnostic. */
+	hostGitDiagnostic?: boolean;
 	/** Progress files the child is instructed to update; parent dirs are mounted writable when sandboxed. */
 	progressPaths?: string[];
 	/** Intercom bridge state for sandboxed children. When set and sandbox is active, the intercom extension is loaded and state mounted. */

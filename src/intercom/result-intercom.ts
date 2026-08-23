@@ -292,6 +292,7 @@ function formatSubagentResultIntercomMessage(input: {
 			if (child.gitBundle.canonicalPayloadSize !== undefined) lines.push(`Git canonical payload size: ${child.gitBundle.canonicalPayloadSize} bytes`);
 			if (child.gitBundle.canonicalPayloadChecksum) lines.push(`Git canonical payload checksum: ${child.gitBundle.canonicalPayloadChecksum}`);
 			if (child.gitBundle.incomplete) lines.push("Git recovery is incomplete: a child-authored commit was required.");
+			lines.push("Git recovery guidance: the base repository is required. Use a temporary review checkout to fetch available bundle refs with git fetch <bundle> <head-ref> (also fetch <recovery-ref> and <staged-ref> when present), then inspect authored commits with git log <base>..<head> and final/recovery refs with git show <recovery> and git show <staged> (when present). In the base repository, cherry-pick authored commits with git cherry-pick <commit>..., or squash final state with git diff <base> <recovery> | git apply; run git add -A for staged changes or omit it to leave them uncommitted/unstaged. Retained for seven days (seven-day retention); no automatic integration.");
 		}
 		if (child.sessionPath) lines.push(`Session: ${child.sessionPath}`);
 		lines.push(...formatNestedResultLines(child.children));

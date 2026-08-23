@@ -27,9 +27,12 @@ import {
 	events,
 	tryImport,
 } from "../support/helpers.ts";
+import { discoverAgents } from "../../src/agents/agents.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, SUBAGENT_RESULT_INTERCOM_EVENT } from "../../src/shared/types.ts";
 import { createNestedRoute, NESTED_EVENTS_DIR, projectNestedEvents, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
-import { createScopedGitEndpoint } from "../../src/sandbox/scoped-git-endpoint.ts";import {
+import { createScopedGitEndpoint } from "../../src/sandbox/scoped-git-endpoint.ts";
+import { createIsolatedGitRuntime, teardownIsolatedGitRuntimeForTests } from "../../src/sandbox/isolated-git.ts";
+import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
 	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
@@ -180,6 +183,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 	let tempDir: string;
 	let mockPi: MockPi;
 	let nestedRoutesBefore: Set<string>;
+	let previousFixtureAgentDir: string | undefined;
+	let previousFixtureIntercomSessionId: string | undefined;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -192,11 +197,22 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 	beforeEach(() => {
 		tempDir = createTempDir();
+		previousFixtureAgentDir = process.env.PI_CODING_AGENT_DIR;
+		previousFixtureIntercomSessionId = process.env.PI_INTERCOM_SESSION_ID;
+		process.env.PI_INTERCOM_SESSION_ID = "fixture-intercom-parent";
+		const fixtureAgentDir = path.join(tempDir, "fixture-user-settings");
+		fs.mkdirSync(fixtureAgentDir, { recursive: true });
+		fs.writeFileSync(path.join(fixtureAgentDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = fixtureAgentDir;
 		nestedRoutesBefore = fs.existsSync(NESTED_EVENTS_DIR) ? new Set(fs.readdirSync(NESTED_EVENTS_DIR)) : new Set();
 		mockPi.reset();
 	});
 
 	afterEach(() => {
+		if (previousFixtureAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousFixtureAgentDir;
+		if (previousFixtureIntercomSessionId === undefined) delete process.env.PI_INTERCOM_SESSION_ID;
+		else process.env.PI_INTERCOM_SESSION_ID = previousFixtureIntercomSessionId;
 		removeTempDir(tempDir);
 		if (fs.existsSync(NESTED_EVENTS_DIR)) {
 			for (const entry of fs.readdirSync(NESTED_EVENTS_DIR)) if (!nestedRoutesBefore.has(entry)) fs.rmSync(path.join(NESTED_EVENTS_DIR, entry), { recursive: true, force: true });
@@ -2061,6 +2077,7 @@ process.exit(${exitCode});
 		fs.mkdirSync(intercomExtensionDir, { recursive: true });
 		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
 		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		mockPi.onCall({ output: "clarify background single ok" });
@@ -2102,6 +2119,7 @@ process.exit(${exitCode});
 		fs.mkdirSync(intercomExtensionDir, { recursive: true });
 		fs.writeFileSync(path.join(intercomExtensionDir, "package.json"), JSON.stringify({ name: "pi-intercom", pi: { extensions: ["./extension.ts"] } }), "utf-8");
 		fs.writeFileSync(path.join(intercomExtensionDir, "extension.ts"), "export default function register() {}\n", "utf-8");
+		fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		mockPi.onCall({ output: "clarify background chain ok" });
@@ -2834,6 +2852,125 @@ process.exit(${exitCode});
 		assert.equal(spawnSync("git", ["-C", repo, "config", "--local", "--get", "sandbox.mutation"], { encoding: "utf8" }).status, 1);
 	});
 
+	it("denies parent worktree opt-out without the trusted ceiling before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "must not run" });
+		const agent = makeAgent("writer", {
+			tools: ["read", "edit", "bash"],
+			canOptOutOfWorktree: true,
+			canBeChangedByAgent: ["sandbox.provider"],
+		});
+		const executor = makeExecutor([agent]);
+		const result = await executor.execute(
+			"parent-worktree-opt-out-denied",
+			{ agent: "writer", task: "Write a change", worktree: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Worktree opt-out denied: worktree:false requires trusted user-global/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("authorizes direct packaged worktree opt-out as writable checkout with read-only Git", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("builtin-direct-optout-repo");
+		fs.mkdirSync(path.join(repo, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(repo, ".pi", "settings.json"), JSON.stringify({ subagents: { sandbox: { extraWritableMounts: [mockPi.dir] } } }), "utf-8");
+		fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true, allowWorktreeOptOut: true } } }), "utf-8");
+		const work = discoverAgents(repo, "project").agents.find((agent) => agent.name === "work");
+		assert.ok(work?.canOptOutOfWorktree, "packaged work must authorize the dedicated parent opt-out");
+		const baseHead = spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+		const runtimeBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		const endpointBefore = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		mockPi.onCall({ output: "direct opt-out wrote checkout", commands: ["printf 'foreground opt-out\\n' > direct-optout.txt && if git config --local sandbox.optout blocked; then exit 42; else exit 0; fi"] });
+		const executor = makeExecutor([work]);
+		const result = await executor.execute("builtin-direct-worktree-optout", { agent: "work", task: "Write a checkout file without changing Git metadata.", worktree: false }, new AbortController().signal, undefined, makeMinimalCtx(repo));
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.equal(result.details.results.length, 1);
+		assert.equal(result.details.results[0]?.sandbox?.provider, "bubblewrap");
+		assert.equal(result.details.results[0]?.gitBundle, undefined, "read-only Git opt-out must not export an isolated bundle");
+		assert.equal(fs.readFileSync(path.join(repo, "direct-optout.txt"), "utf8"), "foreground opt-out\n", "the checkout remains writable");
+		assert.equal(spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(), baseHead);
+		assert.equal(spawnSync("git", ["-C", repo, "config", "--local", "--get", "sandbox.optout"], { encoding: "utf8" }).status, 1, "parent Git metadata remains unchanged");
+		assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimeBefore.has(entry)), []);
+		const endpointAfter = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		assert.deepEqual(endpointAfter.filter((entry) => !endpointBefore.includes(entry)), [], "direct opt-out must not leave scoped Git resources");
+	});
+
+	it("reuses the owner worktree for packaged builtin work through an inherited endpoint", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("builtin-inherited-endpoint-repo");
+		const work = discoverAgents(repo, "project").agents.find((agent) => agent.name === "work");
+		assert.ok(work?.sandbox?.gitMode === "isolated", "packaged work must request isolated Git in frontmatter");
+		const runId = `builtin-inherited-endpoint-${Date.now().toString(36)}`;
+		const endpointBaseline = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		const runtime = createIsolatedGitRuntime({ cwd: repo, runId, network: "host", fallback: "fail" });
+		const worktree = runtime.createWorktree({ index: 0, agent: "owner" });
+		const capability = runtime.issueInheritedContext({ worktree, rights: "writer" });
+		const endpoint = runtime.getScopedGitEndpointDescriptor(capability);
+		const inheritedWork = { ...work, sandbox: { ...work.sandbox, extraWritableMounts: [mockPi.dir] } };
+		const runtimePrefix = `pi-isolated-git-${runId}-`;
+		const runtimeRootsBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix)));
+		const endpointOwnerEntries = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		assert.ok(endpointOwnerEntries.length > endpointBaseline.length, "owner endpoint must be registered before child spawn");
+		try {
+			mockPi.onCall({ output: "inherited packaged work", commands: ["printf 'inherited\\n' > inherited.txt && git add inherited.txt && git commit -m inherited"] });
+			const executor = makeExecutor([inheritedWork]);
+			const result = await executor.execute("builtin-inherited-endpoint", { agent: "work", task: "Commit through the inherited scoped Git endpoint.", isolatedGitEndpoint: endpoint, isolatedGitRights: "writer" }, new AbortController().signal, undefined, makeMinimalCtx(worktree.worktreePath));
+			assert.equal(result.isError, undefined, result.content[0]?.text);
+			assert.equal(result.details.results.length, 1);
+			assert.equal(result.details.results[0]?.gitBundle, undefined, "an inherited child must not export the owner bundle");
+			assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix) && !runtimeRootsBefore.has(entry)), [], "nested execution must not create a second isolated runtime");
+			assert.equal(fs.existsSync(worktree.worktreePath), true, "the owner worktree remains live");
+			const endpointAfterChild = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+			assert.deepEqual(endpointAfterChild, endpointOwnerEntries, "the child must not close the owner endpoint");
+		} finally {
+			runtime.releaseInheritedContext(capability);
+			const cleanupDeadline = Date.now() + 5_000;
+			while (Date.now() < cleanupDeadline) {
+				await runtime.closeGitExecutionOwners();
+				const entries = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+				if (JSON.stringify(entries) === JSON.stringify(endpointBaseline)) break;
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			await teardownIsolatedGitRuntimeForTests(runtime);
+		}
+		const endpointAfter = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		assert.deepEqual(endpointAfter, endpointBaseline, "only owner cleanup closes the scoped endpoint");
+		assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith(runtimePrefix)), [], "owner cleanup removes the runtime");
+	});
+
+	it("directly launches packaged builtin work and orchestrator with one managed owner and export", { skip: process.platform !== "linux" || spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status !== 0 ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const repo = makeLifecycleRepo("builtin-direct-single-repo");
+		fs.mkdirSync(path.join(repo, ".pi"), { recursive: true });
+		fs.writeFileSync(path.join(repo, ".pi", "settings.json"), JSON.stringify({ subagents: { sandbox: { extraWritableMounts: [mockPi.dir] } } }), "utf-8");
+		const discovered = discoverAgents(repo, "project").agents;
+		const packaged = discovered.filter((agent) => agent.name === "work" || agent.name === "orchestrator");
+		assert.deepEqual(packaged.map((agent) => agent.name).sort(), ["orchestrator", "work"]);
+		const baseHead = spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+		const parentStatus = spawnSync("git", ["-C", repo, "status", "--porcelain=v1"], { encoding: "utf8" }).stdout;
+		const runtimeBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		const endpointBefore = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		for (const agent of packaged) {
+			mockPi.reset();
+			mockPi.onCall({ output: `${agent.name} direct`, commands: [agent.name === "work" ? `printf '${agent.name}\\n' > ${agent.name}-direct.txt && git add ${agent.name}-direct.txt && git commit -m '${agent.name} direct'` : "git status --porcelain=v1"] });
+			const executor = makeExecutor([agent]);
+			const result = await executor.execute(`builtin-direct-${agent.name}`, { agent: agent.name, task: "Inspect the isolated checkout." }, new AbortController().signal, undefined, makeMinimalCtx(repo));
+			assert.equal(result.isError, undefined, `${agent.name}: ${result.content[0]?.text ?? ""}`);
+			assert.equal(result.details.results.length, 1);
+			assert.ok(result.details.results[0]?.gitBundle?.path, `${agent.name}: expected one exported bundle`);
+			assert.equal(spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(), baseHead);
+			assert.equal(spawnSync("git", ["-C", repo, "status", "--porcelain=v1"], { encoding: "utf8" }).stdout, parentStatus);
+		}
+		assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimeBefore.has(entry)), []);
+		const endpointDeadline = Date.now() + 5_000;
+		let endpointAfter = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		while (endpointAfter.some((entry) => !endpointBefore.includes(entry)) && Date.now() < endpointDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			endpointAfter = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
+		}
+		assert.deepEqual(endpointAfter.filter((entry) => !endpointBefore.includes(entry)), []);
+	});
+
 	it("fails closed when isolated Git is configured without a runtime-managed worktree handle", async () => {
 		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Need isolated Git", {
 			sandbox: { provider: "bubblewrap", gitMode: "isolated" },
@@ -2897,6 +3034,24 @@ process.exit(${exitCode});
 		} finally {
 			if (previousPath === undefined) delete process.env.PATH;
 			else process.env.PATH = previousPath;
+		}
+	});
+
+	it("reports prominent host-Git diagnostics for an authorized frontmatter provider:none", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const trustedDir = path.join(tempDir, "trusted-user-settings");
+		fs.mkdirSync(trustedDir, { recursive: true });
+		fs.writeFileSync(path.join(trustedDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = trustedDir;
+		try {
+			mockPi.onCall({ output: "host git work completed" });
+			const executor = makeExecutor([makeAgent("echo", { sandbox: { provider: "none" } })]);
+			const result = await executor.execute("single-frontmatter-host-git", { agent: "echo", task: "Report host Git status" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(result.isError, undefined);
+			assert.match(result.details.results[0]?.sandbox?.diagnostics?.[0]?.message ?? "", /NO ISOLATION/i);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
 	});
 
@@ -3344,11 +3499,12 @@ process.exit(${exitCode});
 	it("detached nested route stays running until terminal callback and then publishes terminal truth", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const previousEnv = new Map<string, string | undefined>();
 		const envKeys = [SUBAGENT_PARENT_EVENT_SINK_ENV, SUBAGENT_PARENT_CONTROL_INBOX_ENV, SUBAGENT_PARENT_RUN_ID_ENV, SUBAGENT_PARENT_ROOT_RUN_ID_ENV, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV, SUBAGENT_PARENT_CHILD_INDEX_ENV, SUBAGENT_PARENT_DEPTH_ENV, SUBAGENT_PARENT_PATH_ENV];
+		const inheritedSafeSandbox = { provider: "bubblewrap", extraWritableMounts: [mockPi.dir] };
 		const modes: Array<{ label: string; params: Record<string, unknown> }> = [
-			{ label: "foreground single", params: { agent: "bridge", task: "Task" } },
-			{ label: "top-level parallel", params: { tasks: [{ agent: "bridge", task: "Task" }] } },
-			{ label: "sequential chain", params: { chain: [{ agent: "bridge", task: "Task" }], clarify: false } },
-			{ label: "parallel chain", params: { chain: [{ parallel: [{ agent: "bridge", task: "Task" }] }], clarify: false } },
+			{ label: "foreground single", params: { agent: "bridge", task: "Task", sandbox: inheritedSafeSandbox } },
+			{ label: "top-level parallel", params: { tasks: [{ agent: "bridge", task: "Task" }], sandbox: inheritedSafeSandbox } },
+			{ label: "sequential chain", params: { chain: [{ agent: "bridge", task: "Task" }], clarify: false, sandbox: inheritedSafeSandbox } },
+			{ label: "parallel chain", params: { chain: [{ parallel: [{ agent: "bridge", task: "Task" }] }], clarify: false, sandbox: inheritedSafeSandbox } },
 		];
 		try {
 			for (const key of envKeys) previousEnv.set(key, process.env[key]);

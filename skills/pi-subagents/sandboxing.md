@@ -96,9 +96,11 @@ sandboxPackageDiscovery: closed
 
 ### Git mode
 
-- Omitted and `read-only` are the safe default. In a Bubblewrap run, read-only mode protects the visible `.git` metadata from writes.
-- `isolated` is opt-in only. It requires Linux, `bubblewrap`, a runtime-created worktree handle, and both parent `user.name` and `user.email`. The runtime builds a sanitized exact-base object history, never mounts the parent common `.git`, disables remotes/credentials/hooks/signing/editors, and exports one owner-only compact recovery bundle for every terminal outcome. Dirty staged, modified, deleted, binary, executable, symlink, and non-ignored untracked state is represented by an internal recovery snapshot; ignored and runtime-synthetic paths are excluded. Ordinary checkouts, unsupported providers/platforms, inherited `GIT_*` redirection, and writable mounts overlapping parent `.git` fail closed.
-- Configure `sandboxGitMode: isolated` in agent frontmatter, `sandbox.gitMode` in settings/run configuration, or use the guarded `sandbox.gitMode` run override. An omitted/custom agent remains read-only unless it explicitly opts in.
+- Omitted and `read-only` are the safe default for custom/read-only agents. In a Bubblewrap run, read-only mode protects the visible `.git` metadata from writes. Packaged `work` and `orchestrator` select `isolated` by default when launched directly.
+- `isolated` requires Linux, `bubblewrap`, a runtime-created worktree handle, and both parent `user.name` and `user.email`. The runtime builds a sanitized exact-base object history, never mounts the parent common `.git`, disables remotes/credentials/hooks/signing/editors, and exports one owner-only compact recovery bundle for every terminal outcome. Dirty staged, modified, deleted, binary, executable, symlink, and non-ignored untracked state is represented by an internal recovery snapshot; ignored and runtime-synthetic paths are excluded. Ordinary checkouts, unsupported providers/platforms, inherited `GIT_*` redirection, and writable mounts overlapping parent `.git` fail closed.
+- Configure `sandboxGitMode: isolated` in agent frontmatter, `sandbox.gitMode` in settings/run configuration, or use the guarded `sandbox.gitMode` run override. Nested children inherit the authenticated scoped endpoint and cannot create a second runtime or opt out. An omitted/custom agent remains read-only unless it explicitly opts in.
+- `provider: none` is a trusted user-global opt-out only (`sandbox.allowSandboxOptOut: true`); project settings cannot enable it. Authorized `worktree: false` keeps the checkout writable while parent Git remains read-only and requires `canOptOutOfWorktree: true` plus `sandbox.allowWorktreeOptOut: true` (a project may narrow that ceiling).
+- An authorized unsandboxed host-Git run reports a prominent **NO ISOLATION** diagnostic; it is never represented as an isolated bundle.
 
 ### Recovery bundle consumption
 
@@ -109,7 +111,7 @@ Portable metadata omits personal or temporary absolute filesystem paths while pr
 ### Provider
 
 - `bubblewrap`: wraps the child with `bwrap`
-- `none`: explicit opt-out with no sandbox; an omitted provider defaults to `bubblewrap`
+- `none`: trusted user-global explicit opt-out with no sandbox; an omitted provider defaults to `bubblewrap`
 
 ### Profile
 
@@ -186,7 +188,7 @@ Write access is inferred, not granted broadly.
 - explicit `extraWritableMounts` should be only caches, outputs, temp/work dirs
 - explicit `extraReadOnlyMounts` should be toolchains, inputs, config, or other immutable dependencies
 
-Parallel sandboxed writers require `worktree: true`.
+Parallel sandboxed writers use isolated Git by default when packaged writer agents are selected. An explicit `worktree: false` is a guarded opt-out, not a request for parent Git write access.
 
 ## How to edit the existing profile
 

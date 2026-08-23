@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { discoverAgents, readSandboxSettings } from "../../src/agents/agents.ts";
-import { hasExplicitSandboxOptOut, resolveSandboxConfig } from "../../src/sandbox/config.ts";
+import { hasExplicitSandboxOptOut, resolveSandboxConfig, sandboxOptOutIsAuthorized, worktreeOptOutIsAuthorized } from "../../src/sandbox/config.ts";
 import { buildSubagentSandboxMounts } from "../../src/sandbox/mount-policy.ts";
 
 const tempDirs: string[] = [];
@@ -181,6 +181,32 @@ describe("sandbox configuration resolution", () => {
 			gitMode: "read-only",
 			auth: "pi-json",
 		});
+	});
+
+	it("retains trust-sensitive settings with user-global authority and project narrowing", () => {
+		const { project, home } = makeProject();
+		writeJson(path.join(home, ".pi", "agent", "subagents.json"), {
+			sandbox: { allowSandboxOptOut: true, allowWorktreeOptOut: true },
+		});
+		writeJson(path.join(project, ".pi", "subagents.json"), {
+			sandbox: { allowSandboxOptOut: true, allowWorktreeOptOut: false },
+		});
+		const settings = readSandboxSettings(project);
+		assert.deepEqual(settings, {
+			allowSandboxOptOut: true,
+			allowWorktreeOptOut: false,
+		});
+		assert.equal(sandboxOptOutIsAuthorized({ settings, run: { provider: "none" } }), true);
+		assert.equal(worktreeOptOutIsAuthorized(settings), false);
+	});
+
+	it("does not let a project enable trusted sandbox opt-out", () => {
+		const { project } = makeProject();
+		writeJson(path.join(project, ".pi", "subagents.json"), { sandbox: { allowSandboxOptOut: true, allowWorktreeOptOut: true } });
+		const settings = readSandboxSettings(project);
+		assert.equal(settings?.allowSandboxOptOut, false);
+		assert.equal(settings?.allowWorktreeOptOut, false);
+		assert.equal(sandboxOptOutIsAuthorized({ settings, run: { provider: "none" } }), false);
 	});
 
 	it("keeps an explicit provider none opt-out unsandboxed", () => {

@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Changed
+- Made packaged `work` and `orchestrator` direct launches use one isolated managed Git worktree by default; `explore`, `research`, and `review` remain read-only, nested descendants inherit a scoped endpoint, and custom agents remain read-only unless they explicitly opt into isolated Git.
+- Added trusted user-global ceilings for sandbox opt-out and parent `worktree:false`; project settings may narrow worktree opt-out but cannot authorize host Git or sandbox opt-out. Authorized host-Git runs emit a prominent NO ISOLATION diagnostic.
 - Made packaged issue orchestration parent-owned by default: one isolated worktree, inline explorer findings embedded in a same-cwd no-commit worker task, and a fresh reviewer that inspects the current `git diff`.
 - Made omitted output inline-only with no repo-local Markdown report; explicit output/file-only persistence and explicit legacy reads/progress behavior remain available.
 - Added guarded `worktree` overrides; shared worktree requests now require permission from every affected agent, and the packaged orchestrator explicitly permits them.
@@ -10,7 +12,7 @@
 - Acceptance self-review is now controlled per agent and defaults to enabled for all agents with a three-turn budget; set `acceptanceSelfReview: false` to opt an agent out.
 - Added exact and segment-aware wildcard override paths, management/frontmatter serialization, bundled agent policies, and a concise settings reference for the complete configuration surface.
 - Added the `max` thinking level to subagent settings and clarify selectors for models whose registry metadata explicitly supports it.
-- Packaged builtin agents now request a closed Bubblewrap `host-toolchain` sandbox by default, with fail-closed fallback and explicit per-run opt-out via `sandbox: { provider: "none" }`.
+- Packaged read-only agents now request a closed Bubblewrap `host-toolchain` sandbox with read-only Git; packaged `work` and `orchestrator` use isolated Git by default. Host-Git opt-out via `sandbox: { provider: "none" }` now requires trusted user-global authorization.
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 
 ### Fixed

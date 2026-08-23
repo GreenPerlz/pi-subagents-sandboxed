@@ -23,7 +23,9 @@ import { ASYNC_DIR, TEMP_ROOT_DIR, type AsyncStatus, type NestedRunSummary, type
 import { createMockPi } from "../support/mock-pi.ts";
 
 const routeRoots: string[] = [];
+const fixtureSettingsDirs: string[] = [];
 const savedEnv = {
+	PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
 	[SUBAGENT_CHILD_ENV]: process.env[SUBAGENT_CHILD_ENV],
 	[SUBAGENT_FANOUT_CHILD_ENV]: process.env[SUBAGENT_FANOUT_CHILD_ENV],
 	[SUBAGENT_PARENT_EVENT_SINK_ENV]: process.env[SUBAGENT_PARENT_EVENT_SINK_ENV],
@@ -34,10 +36,14 @@ const savedEnv = {
 	[SUBAGENT_PARENT_CHILD_INDEX_ENV]: process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV],
 	[SUBAGENT_CHILD_AGENT_ENV]: process.env[SUBAGENT_CHILD_AGENT_ENV],
 	[SUBAGENT_RUN_ID_ENV]: process.env[SUBAGENT_RUN_ID_ENV],
+	PI_SUBAGENT_DEPTH: undefined,
+	PI_SUBAGENT_MAX_DEPTH: undefined,
 };
+for (const key of ["PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"]) delete process.env[key];
 
 afterEach(() => {
 	for (const root of routeRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+	for (const dir of fixtureSettingsDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 	for (const [key, value] of Object.entries(savedEnv)) {
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = value;
@@ -73,6 +79,13 @@ function createState(): SubagentState {
 }
 
 function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }, asyncByDefault = false, isExpectedAsyncRunnerPid?: (pid: number | undefined, runId: string, identity?: string) => boolean) {
+	// These legacy control-flow fixtures intentionally exercise host-Git execution.
+	// Establish the trusted user-global permission explicitly rather than relying on
+	// the executor's old test-only provider:none injection.
+	const fixtureSettingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-trusted-settings-"));
+	fixtureSettingsDirs.push(fixtureSettingsDir);
+	fs.writeFileSync(path.join(fixtureSettingsDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
+	process.env.PI_CODING_AGENT_DIR = fixtureSettingsDir;
 	const baseExecutor = createSubagentExecutor({
 		pi: { events, getSessionName() { return "parent"; } } as any,
 		state,
@@ -81,14 +94,19 @@ function createExecutor(state = createState(), agents: Array<Record<string, unkn
 		tempArtifactsDir: os.tmpdir(),
 		getSubagentSessionRoot: (parentSessionFile) => parentSessionFile ? path.join(path.dirname(parentSessionFile), path.basename(parentSessionFile, ".jsonl")) : os.tmpdir(),
 		expandTilde: (value) => value,
-		discoverAgents: () => ({ agents: agents.map((agent) => ({ ...agent, canBeChangedByAgent: agent.canBeChangedByAgent ?? ["sandbox.provider"] })) as any }),
+		discoverAgents: () => ({ agents: agents.map((agent) => ({ ...agent, canBeChangedByAgent: agent.canBeChangedByAgent ?? ["sandbox.provider", "sandbox.extraWritableMounts"] })) as any }),
 		allowMutatingManagementActions,
 		isExpectedAsyncRunnerPid,
 	});
 	return {
 		...baseExecutor,
 		execute: (id: string, params: Record<string, unknown>, signal: AbortSignal, onUpdate: ((r: unknown) => void) | undefined, ctx: unknown) =>
-			baseExecutor.execute(id, { ...params, sandbox: params.sandbox ?? { provider: "none" } }, signal, onUpdate as never, ctx as never),
+			baseExecutor.execute(id, {
+			...params,
+			sandbox: params.sandbox ?? (process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV]
+				? { provider: "bubblewrap", extraWritableMounts: process.env.MOCK_PI_QUEUE_DIR ? [process.env.MOCK_PI_QUEUE_DIR] : undefined }
+				: { provider: "none" }),
+		}, signal, onUpdate as never, ctx as never),
 	};
 }
 
@@ -171,7 +189,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 	assert.equal(predicate(), true);
 }
 
-describe("nested control routing", () => {
+describe("nested control routing", { concurrency: false }, () => {
 	it("cascades foreground parent interrupt to live nested descendants before stopping the active child", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-foreground-cascade-"));
 		try {

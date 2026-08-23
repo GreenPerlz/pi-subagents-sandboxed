@@ -45,6 +45,25 @@ export function hasExplicitSandboxOptOut(input: SandboxResolutionInput = {}): bo
 	return normalizeString(provider) === "none";
 }
 
+/**
+ * Sandbox opt-out is a trust decision, not an agent default.  The low-level
+ * resolver remains backwards-compatible for callers that already authenticated
+ * a raw run request; execution entrypoints should use this predicate with the
+ * merged settings returned by readSandboxSettings.
+ */
+export function sandboxOptOutIsAuthorized(input: SandboxResolutionInput = {}): boolean {
+	if (!hasExplicitSandboxOptOut(input)) return true;
+	// A settings object means settings were discovered for this project.  Only
+	// its trusted user-global permission may authorize provider:none.  Callers
+	// without settings are legacy/internal resolution probes, not authority.
+	return input.settings?.allowSandboxOptOut === true;
+}
+
+/** Return the effective ceiling for a parent opting out of managed Git. */
+export function worktreeOptOutIsAuthorized(settings?: SandboxSettingsDefaults): boolean {
+	return settings?.allowWorktreeOptOut === true;
+}
+
 function appendPathOverrides(target: string[], value: string[] | undefined): void {
 	if (!value) return;
 	for (const item of value) {

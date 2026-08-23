@@ -346,6 +346,10 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			target.acceptanceMaxFinalizationTurns = cfg.acceptanceMaxFinalizationTurns;
 		}
 	}
+	if (hasKey(cfg, "canOptOutOfWorktree")) {
+		if (typeof cfg.canOptOutOfWorktree !== "boolean") return "config.canOptOutOfWorktree must be a boolean when provided.";
+		target.canOptOutOfWorktree = cfg.canOptOutOfWorktree;
+	}
 	if (hasKey(cfg, "canBeChangedByAgent")) {
 		let paths: string[];
 		if (cfg.canBeChangedByAgent === false || cfg.canBeChangedByAgent === "") paths = [];

@@ -158,7 +158,7 @@ Do work
 		const work = agents.find((candidate) => candidate.name === "work");
 		const orchestrator = agents.find((candidate) => candidate.name === "orchestrator");
 		assert.equal(work?.defaultContext, "fresh", "work should default to fresh context");
-		assert.ok(orchestrator?.canBeChangedByAgent?.includes("worktree"), "orchestrator should allow a parent-owned worktree");
+		assert.equal(orchestrator?.canBeChangedByAgent?.includes("worktree"), false, "orchestrator must not expose generic worktree override");
 		assert.equal(orchestrator?.defaultReads, undefined);
 		assert.equal(orchestrator?.defaultProgress, false);
 		for (const agent of agents) {
@@ -179,16 +179,17 @@ Do work
 		for (const agent of agents) {
 			assert.deepEqual(agent.sandbox, {
 				provider: "bubblewrap",
+				...(agent.name === "work" || agent.name === "orchestrator" ? { gitMode: "isolated" } : { gitMode: "read-only" }),
 				profile: "host-toolchain",
 				network: "host",
 				auth: "pi-json",
 				fallback: "fail",
 				packageDiscovery: "closed",
-			}, `${agent.name} should default to a closed bubblewrap sandbox`);
+			}, `${agent.name} should resolve the packaged Git policy`);
 		}
 	});
 
-	it("accepts the complete packaged parent-owned orchestrator launch without per-run overrides", () => {
+	it("rejects generic worktree override for packaged orchestrator launches", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-packaged-orchestrator-launch-"));
 		tempDirs.push(dir);
 		const agents = discoverAgentsAll(dir).builtin;
@@ -202,11 +203,14 @@ Do work
 		};
 
 		assert.deepEqual(Object.keys(topLevelLaunch).sort(), ["async", "tasks", "worktree"]);
-		assert.deepEqual(validateAgentOverridePolicy(topLevelLaunch, agents), []);
+		const violations = validateAgentOverridePolicy(topLevelLaunch, agents);
+		assert.equal(violations.length, 1);
+		assert.deepEqual(violations[0]?.paths, ["worktree"]);
 		assert.deepEqual([...collectAgentOverridePaths(topLevelLaunch).get("orchestrator")!], ["worktree"]);
 		const orchestrator = agents.find((agent) => agent.name === "orchestrator");
 		assert.ok(orchestrator);
-		assert.equal(orchestrator.canBeChangedByAgent?.some((path) => path.startsWith("sandbox")), false, "orchestrator should rely on its sandbox frontmatter default");
+		assert.equal(orchestrator.canBeChangedByAgent?.includes("sandbox.gitMode"), true, "orchestrator should permit only the parent Git-mode narrowing override");
+		assert.equal(orchestrator.canOptOutOfWorktree, true, "orchestrator should expose the dedicated parent worktree opt-out permission");
 
 		for (const nestedLaunch of [
 			{ agent: "explore", task: "Explore the issue and return findings inline.", async: false },

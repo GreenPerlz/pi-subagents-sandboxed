@@ -1,5 +1,7 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
 import { createMockPi, createTempDir, removeTempDir, events, tryImport } from "../support/helpers.ts";
 
@@ -108,6 +110,7 @@ function buildDockerNoiseChunk(step: number): string {
 describe("foreground result payload compaction", { skip: !available ? "subagent executor not importable" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
+	let previousFixtureAgentDir: string | undefined;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -120,10 +123,17 @@ describe("foreground result payload compaction", { skip: !available ? "subagent 
 
 	beforeEach(() => {
 		tempDir = createTempDir("pi-subagent-payload-test-");
+		previousFixtureAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const fixtureAgentDir = path.join(tempDir, "fixture-user-settings");
+		fs.mkdirSync(fixtureAgentDir, { recursive: true });
+		fs.writeFileSync(path.join(fixtureAgentDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = fixtureAgentDir;
 		mockPi.reset();
 	});
 
 	afterEach(() => {
+		if (previousFixtureAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousFixtureAgentDir;
 		removeTempDir(tempDir);
 	});
 

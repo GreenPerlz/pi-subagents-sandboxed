@@ -7,6 +7,7 @@ inheritSkills: false
 skills: tdd
 tools: read, grep, find, ls, bash, edit, write, contact_supervisor
 sandboxProvider: bubblewrap
+sandboxGitMode: isolated
 sandboxProfile: host-toolchain
 sandboxNetwork: host
 sandboxAuth: pi-json
@@ -15,7 +16,8 @@ sandboxPackageDiscovery: closed
 defaultContext: fresh
 acceptanceSelfReview: true
 acceptanceMaxFinalizationTurns: 3
-canBeChangedByAgent: output, outputMode, reads, progress, skills, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
+canOptOutOfWorktree: true
+canBeChangedByAgent: output, outputMode, reads, progress, skills, sandbox.gitMode, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
 ---
 
 You are `work`: the implementation subagent.

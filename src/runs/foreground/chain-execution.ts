@@ -7,9 +7,9 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
-import { resolveSandboxConfig, resolveGitMode } from "../../sandbox/config.ts";
+import { hasExplicitSandboxOptOut, resolveSandboxConfig, resolveGitMode, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitCapability, type ScopedGitEndpointDescriptor, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
-import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride } from "./chain-clarify.ts";
+import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride, type ChainClarifyPolicy } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import {
 	resolveChainTemplates,
@@ -166,6 +166,8 @@ interface ParallelChainRunInput {
 	nestedRoute?: NestedRouteInfo;
 	nestedFenceTimeoutMs?: number;
 	sandbox?: ResolvedSandboxConfig;
+	sandboxSettings?: SandboxSettingsDefaults;
+	sandboxRun?: SandboxRunConfig;
 	sandboxes?: (ResolvedSandboxConfig | undefined)[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	issueIsolatedGitCapability?: (worktree: IsolatedGitWorktree, rights: "writer" | "read-only", cwd: string) => Promise<IsolatedGitCapability>;
@@ -252,7 +254,7 @@ function resolveParallelCleanTask(input: Pick<ParallelChainRunInput, "parallelTe
 function commitRequiredForParallelTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined, parentRights?: "writer" | "read-only"): boolean {
 	const task = resolveParallelCleanTask(input, taskIndex);
 	return resolveCapabilityRights({
-		packagedRole: resolvePackagedAgentRole(agent?.name),
+		packagedRole: resolvePackagedAgentRole(agent?.name, agent?.source),
 		agentTools: agent?.tools,
 		sandbox,
 		taskMutationProhibited: taskDisallowsFileUpdates(task),
@@ -330,7 +332,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			// per-task output/session/interrupt/artifact path or runtime setup.
 			// Issue capability only after the resolved sandbox is known, but before
 			// output/session/structured paths or other path-sensitive side effects.
-			const packagedRole = resolvePackagedAgentRole(task.agent);
+			const packagedRole = resolvePackagedAgentRole(task.agent, taskAgentConfig?.source);
 			const taskSandbox = input.sandboxes?.[taskIndex] ?? input.sandbox;
 			const capabilityRights = resolveCapabilityRights({
 				packagedRole,
@@ -467,6 +469,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
 				sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox,
+				hostGitDiagnostic: !(input.sandboxes?.[taskIndex] ?? input.sandbox)
+					&& hasExplicitSandboxOptOut({ settings: input.sandboxSettings, run: input.sandboxRun }),
 				isolatedGit,
 				isolatedGitCapability: isolatedCapability,
 				isolatedGitEndpoint: input.scopedGitEndpoint,
@@ -1130,6 +1134,13 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					ctx.model?.provider,
 					availableSkills,
 					done,
+					"chain",
+					agentConfigs.map((agent) => ({
+						worktree: "inherited",
+						sandbox: resolveStepSandbox(agent),
+						canOptOutOfWorktree: agent.canOptOutOfWorktree === true && params.sandboxSettings?.allowWorktreeOptOut === true,
+						canOptOutOfSandbox: params.sandboxSettings?.allowSandboxOptOut === true,
+					} satisfies ChainClarifyPolicy)),
 				),
 			{
 				overlay: true,
@@ -1190,7 +1201,17 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const stepAgentConfigs = step.parallel
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
-			const stepSandboxes = stepAgentConfigs.map((agent) => resolveStepSandbox(agent));
+			const explicitWorktreeOptOut = Object.hasOwn(step, "worktree") && step.worktree === false;
+			const worktreeOptOutAllowed = explicitWorktreeOptOut
+				&& worktreeOptOutIsAuthorized(params.sandboxSettings)
+				&& stepAgentConfigs.every((agent) => agent.canOptOutOfWorktree === true);
+			if (explicitWorktreeOptOut && !worktreeOptOutAllowed) {
+				return buildChainExecutionErrorResult("Worktree opt-out denied: worktree:false requires trusted user-global sandbox.allowWorktreeOptOut=true and every target agent must set canOptOutOfWorktree=true.", makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+			}
+			const stepSandboxes = stepAgentConfigs.map((agent) => {
+				const resolved = resolveStepSandbox(agent);
+				return worktreeOptOutAllowed && resolved?.gitMode === "isolated" ? { ...resolved, gitMode: "read-only" as const } : resolved;
+			});
 			const isolatedGitRequested = !params.scopedGitEndpoint && stepSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
 			if (isolatedGitRequested && step.worktree) {
 				return buildChainExecutionErrorResult("isolated Git cannot be combined with parent-managed worktree mode", makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
@@ -1201,7 +1222,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			)) {
 				return buildChainExecutionErrorResult("isolated Git parallel steps cannot include a non-isolated write-capable task", makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
 			}
-			if (!isolatedGitRequested && !params.scopedGitEndpoint && !step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] })) })) {
+			if (!isolatedGitRequested && !params.scopedGitEndpoint && !step.worktree && hasSandboxWritableAgent({ agents: stepAgentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: stepSandboxes[index] })) })
+				&& !worktreeOptOutAllowed) {
 				return buildChainExecutionErrorResult(
 					sandboxParallelWorktreeRequiredMessage(`Parallel sandboxed chain step ${stepIndex + 1}`),
 					makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }),
@@ -1359,6 +1381,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					isolatedGitWorktrees,
 					maxSubagentDepth: params.maxSubagentDepth,
 					sandbox: sharedSandbox,
+					sandboxSettings: params.sandboxSettings,
+					sandboxRun: params.sandboxRun,
 					sandboxes: stepSandboxes,
 					sandboxIntercomBridge: params.sandboxIntercomBridge,
 					scopedGitEndpoint: params.scopedGitEndpoint,
@@ -1566,8 +1590,20 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			}
 		} else if (isDynamicParallelStep(step)) {
 			const dynamicAgentConfig = agents.find((agent) => agent.name === step.parallel.agent);
-			const dynamicSandbox = dynamicAgentConfig ? resolveStepSandbox(dynamicAgentConfig) : undefined;
-			if (dynamicAgentConfig && dynamicSandbox?.gitMode !== "isolated" && hasSandboxWritableAgent({ agents: [{ agentName: dynamicAgentConfig.name, tools: dynamicAgentConfig.tools, sandbox: dynamicSandbox }] })) {
+			const resolvedDynamicSandbox = dynamicAgentConfig ? resolveStepSandbox(dynamicAgentConfig) : undefined;
+			const explicitDynamicWorktreeOptOut = step.worktree === false;
+			const dynamicWorktreeOptOutAllowed = explicitDynamicWorktreeOptOut
+				&& worktreeOptOutIsAuthorized(params.sandboxSettings)
+				&& dynamicAgentConfig?.canOptOutOfWorktree === true;
+			if (explicitDynamicWorktreeOptOut && !dynamicWorktreeOptOutAllowed) {
+				const message = "Worktree opt-out denied: worktree:false requires trusted user-global sandbox.allowWorktreeOptOut=true and every target agent must set canOptOutOfWorktree=true.";
+				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
+				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+			}
+			const dynamicSandbox = dynamicWorktreeOptOutAllowed && resolvedDynamicSandbox?.gitMode === "isolated"
+				? { ...resolvedDynamicSandbox, gitMode: "read-only" as const }
+				: resolvedDynamicSandbox;
+			if (dynamicAgentConfig && dynamicSandbox?.gitMode !== "isolated" && hasSandboxWritableAgent({ agents: [{ agentName: dynamicAgentConfig.name, tools: dynamicAgentConfig.tools, sandbox: dynamicSandbox }] }) && !dynamicWorktreeOptOutAllowed) {
 				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
 				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
@@ -1646,6 +1682,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				parallel: materialized.parallel,
 				concurrency: step.concurrency,
 				failFast: step.failFast,
+				worktree: step.worktree,
 			};
 			const parallelTemplates = materialized.parallel.map((task) => task.task ?? "{previous}");
 			const parallelBehaviors = resolveParallelBehaviors(dynamicParallelStep.parallel, agents, stepIndex, chainSkills)
@@ -1749,6 +1786,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				nestedFenceTimeoutMs: params.nestedFenceTimeoutMs,
 				maxSubagentDepth: params.maxSubagentDepth,
 				sandbox: sharedSandbox,
+				sandboxSettings: params.sandboxSettings,
+				sandboxRun: params.sandboxRun,
 				sandboxes: dynamicParallelStep.parallel.map(() => dynamicSandbox),
 				isolatedGitWorktrees: dynamicIsolatedGitWorktrees,
 				sandboxIntercomBridge: params.sandboxIntercomBridge,
@@ -1977,7 +2016,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			let isolatedWorktree: IsolatedGitWorktree | undefined;
 			let isolatedWorktreeReadOnly = false;
 			let writer = resolveCapabilityRights({
-				packagedRole: resolvePackagedAgentRole(agentConfig.name),
+				packagedRole: resolvePackagedAgentRole(agentConfig.name, agentConfig.source),
 				agentTools: agentConfig.tools,
 				sandbox: stepSandbox,
 				taskMutationProhibited: taskDisallowsFileUpdates(stepTask),
@@ -1986,7 +2025,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			}) === "writer";
 			if (stepSandbox && resolveGitMode(stepSandbox) === "isolated" && !params.scopedGitEndpoint) {
 				try {
-					const packagedRole = resolvePackagedAgentRole(agentConfig.name);
+					const packagedRole = resolvePackagedAgentRole(agentConfig.name, agentConfig.source);
 					writer = resolveCapabilityRights({
 						packagedRole,
 						agentTools: agentConfig.tools,
@@ -2044,6 +2083,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				structuredOutput: structuredRuntime,
 				acceptance: seqStep.acceptance,
 				acceptanceContext: { mode: "chain" },
+				hostGitDiagnostic: !stepSandbox && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, run: params.sandbox }),
 				sandbox: stepSandbox,
 				isolatedGit: isolatedWorktree,
 				isolatedGitCapability: sequentialIsolatedGitCapability,

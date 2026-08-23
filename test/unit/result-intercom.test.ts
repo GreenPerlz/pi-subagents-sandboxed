@@ -246,6 +246,16 @@ describe("result intercom formatter", () => {
 		assert.match(receipt, /Delivered parallel subagent results via intercom\./);
 		assert.match(receipt, /Children: 1 completed, 1 failed/);
 		assert.match(receipt, /Git bundles:\n- a \[completed\]: \/tmp\/a\.bundle \(abc123, 42 bytes\) base\.\.head/);
+		assert.match(payload.message, /the base repository is required/);
+		assert.match(payload.message, /temporary review checkout/);
+		assert.match(payload.message, /git fetch <bundle> <head-ref>/);
+		assert.match(payload.message, /also fetch <recovery-ref> and <staged-ref> when present/);
+		assert.match(payload.message, /git log <base>\.\.<head>/);
+		assert.match(payload.message, /git show <recovery> and git show <staged>/);
+		assert.match(payload.message, /git cherry-pick <commit>\.\.\./);
+		assert.match(payload.message, /git diff <base> <recovery> \| git apply/);
+		assert.match(payload.message, /git add -A for staged changes or omit it to leave them uncommitted\/unstaged/);
+		assert.match(payload.message, /Retained for seven days \(seven-day retention\); no automatic integration/);
 		assert.match(receipt, /dirty summary: M file/);
 		assert.match(receipt, /payload checksum\/size: payload123 \/ 21 bytes/);
 		assert.match(receipt, /canonical payload checksum\/size: canonical123 \/ 17 bytes/);

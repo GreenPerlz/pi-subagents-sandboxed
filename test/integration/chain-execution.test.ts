@@ -1222,6 +1222,41 @@ process.exit(child.status ?? 0);
 		}
 	});
 
+	it("propagates authorized worktree opt-out through foreground dynamic fanout", async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }] } });
+		mockPi.onCall({ output: "wrote checkout" });
+		const fakeBwrap = installFakeBwrap();
+		const runtimeBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		try {
+			const agents = [
+				makeAgent("producer", { tools: ["read"] }),
+				makeAgent("writer", { tools: ["write"], canOptOutOfWorktree: true, sandbox: { provider: "bubblewrap", gitMode: "isolated" } }),
+			];
+			const result = await executeChain(makeChainParams([
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "file", key: "/path", maxItems: 1 },
+					parallel: { agent: "writer", task: "Edit {file.path}" }, collect: { as: "written" }, worktree: false,
+				},
+			], agents, { sandboxSettings: { allowWorktreeOptOut: true } }));
+			assert.equal(result.isError, undefined, result.content[0]?.text);
+			assert.ok(result.details.results.every((child) => child.gitBundle === undefined));
+			assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimeBefore.has(entry)), []);
+			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
+			assert.ok(bwrapArgs.some((arg, index) => arg === "--bind" && bwrapArgs[index + 1] === tempDir && bwrapArgs[index + 2] === tempDir));
+
+			mockPi.reset();
+			mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }] } });
+			const denied = await executeChain(makeChainParams([
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{ expand: { from: { output: "targets", path: "/items" }, maxItems: 1 }, parallel: { agent: "writer", task: "Edit target" }, collect: { as: "written" }, worktree: false },
+			], agents));
+			assert.equal(denied.isError, true);
+			assert.match(denied.content[0]?.text ?? "", /Worktree opt-out denied/);
+			assert.equal(mockPi.callCount(), 1, "unauthorized dynamic opt-out fails before spawning its writer");
+		} finally { fakeBwrap.restore(); }
+	});
+
 	it("uses custom chainDir when provided", async () => {
 		mockPi.onCall({ output: "Done" });
 		const agents = [makeAgent("worker")];

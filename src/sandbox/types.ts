@@ -20,6 +20,10 @@ export interface AgentSandboxConfig extends SandboxRunConfig {}
 
 export interface SandboxSettingsDefaults {
 	defaultProvider?: string;
+	/** Trusted user-global permission to explicitly disable Bubblewrap. Project settings cannot grant this. */
+	allowSandboxOptOut?: boolean;
+	/** User-global ceiling for parent-managed worktree opt-out; project settings may only narrow it. */
+	allowWorktreeOptOut?: boolean;
 	/** Default Git access policy. Unconfigured agents remain read-only. */
 	gitMode?: GitMode | string;
 	defaultProfile?: string;

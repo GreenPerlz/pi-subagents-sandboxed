@@ -355,6 +355,7 @@ function runPiStreaming(
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void,
 	onChildEvent?: (event: ChildEvent) => void,
 	sandbox?: RunPiStreamingSandboxInput,
+	hostGitDiagnostic = false,
 ): Promise<RunPiStreamingResult> {
 	return new Promise((resolve) => {
 		// Authentication below must precede caller-controlled output/package effects.
@@ -363,6 +364,25 @@ function runPiStreaming(
 		let piSpawnSpec: ReturnType<typeof getPiSpawnCommand> | undefined;
 		let spawnSpec: SpawnableInvocation;
 		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;
+		// An authorized provider:none launch intentionally runs against host Git;
+		// preserve the same prominent warning used by foreground execution.
+		if (hostGitDiagnostic || sandbox?.config.provider === "none") {
+			const diagnosticConfig = sandbox?.config ?? {
+				provider: "none",
+				gitMode: "read-only",
+				profile: "host",
+				network: "host",
+				auth: "none",
+				fallback: "none",
+			} as ResolvedSandboxConfig;
+			sandboxDetails = {
+				...(sandboxDetails ?? sandboxResultDetails(diagnosticConfig)),
+				diagnostics: [
+					...(sandboxDetails?.diagnostics ?? []),
+					{ level: "warning", message: "NO ISOLATION: this child is using the host checkout and host Git metadata. Changes are not protected by a managed isolated worktree." },
+				],
+			};
+		}
 		let effectiveSandboxMounts: ReturnType<typeof buildSubagentSandboxMounts> = [];
 		let scopedGitWriterBound = false;
 		const cancelScopedWriter = async () => {
@@ -1040,6 +1060,8 @@ interface SingleStepContext {
 	orchestratorIntercomTarget?: string;
 	nestedRoute?: NestedRouteInfo;
 	sandbox?: ResolvedSandboxConfig;
+	/** Explicit authorized provider:none diagnostic; not an execution authority. */
+	hostGitDiagnostic?: boolean;
 	isolatedGit?: IsolatedGitWorktree;
 	isolatedGitCapability?: import("../../sandbox/isolated-git.ts").IsolatedGitCapability;
 	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
@@ -1270,6 +1292,7 @@ async function runSingleStepInner(
 			ctx.registerInterrupt,
 			ctx.onChildEvent,
 			buildSandboxInput({ args, tempDir, sessionDir, sessionFile: step.sessionFile, outputFile: ctx.outputFile, structuredOutput: effectiveStructuredOutput }),
+			ctx.hostGitDiagnostic === true,
 			);
 		} finally {
 			// runPiStreaming resolves only after child/group teardown; its finally
@@ -1455,6 +1478,7 @@ async function runSingleStepInner(
 					ctx.registerInterrupt,
 					ctx.onChildEvent,
 					buildSandboxInput({ args, tempDir, sessionFile, outputFile: finalizationOutputFile }),
+					ctx.hostGitDiagnostic === true,
 					);
 				} finally {
 					cleanupTempDir(tempDir);
@@ -1551,7 +1575,7 @@ async function runSingleStepInner(
 				terminationState,
 				agent: step.agent,
 				commitRequired: resolveCapabilityRights({
-					packagedRole: resolvePackagedAgentRole(step.agent),
+					packagedRole: resolvePackagedAgentRole(step.agent, step.source),
 					agentTools: step.tools,
 					sandbox: step.sandbox ?? ctx.sandbox,
 					taskMutationProhibited: taskDisallowsFileUpdates(step.task),
@@ -1582,7 +1606,7 @@ async function runSingleStepInner(
 				portableMetadata: bundle.portableMetadata,
 			};
 			const requiresAuthoredCommit = resolveCapabilityRights({
-			packagedRole: resolvePackagedAgentRole(step.agent),
+			packagedRole: resolvePackagedAgentRole(step.agent, step.source),
 			agentTools: step.tools,
 			sandbox: step.sandbox ?? ctx.sandbox,
 			taskMutationProhibited: taskDisallowsFileUpdates(step.task),
@@ -2034,7 +2058,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		const sandbox = step.sandbox ?? config.sandbox;
 		if (sandbox?.gitMode !== "isolated" || scopedGitEndpoint) return undefined;
 		const sequential = sequentialFlatIndices.has(flatIndex);
-		const packagedRole = resolvePackagedAgentRole(step.agent);
+		const packagedRole = resolvePackagedAgentRole(step.agent, step.source);
 		const writer = resolveCapabilityRights({
 			packagedRole,
 			agentTools: step.tools,
@@ -2092,14 +2116,14 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		const existing = isolatedGitWorktrees.get(flatIndex) ?? isolatedGitRuntime?.worktrees.find((candidate) => candidate.index === flatIndex);
 		if (existing) {
 			isolatedGitWorktrees.set(flatIndex, existing);
-			materializedWorktreePolicies.set(flatIndex, { step, agent: step.agent, commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(step.agent), agentTools: step.tools, sandbox, taskMutationProhibited: taskDisallowsFileUpdates(step.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }), exclusiveLease: true }) === "writer" });
+			materializedWorktreePolicies.set(flatIndex, { step, agent: step.agent, commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(step.agent, step.source), agentTools: step.tools, sandbox, taskMutationProhibited: taskDisallowsFileUpdates(step.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }), exclusiveLease: true }) === "writer" });
 			return existing;
 		}
 		if (!isolatedGitRuntime) throw new Error("isolated Git runtime was not created");
 		const policy = {
 			step,
 			agent: step.agent,
-			commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(step.agent), agentTools: step.tools, sandbox, taskMutationProhibited: taskDisallowsFileUpdates(step.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }), exclusiveLease: true }) === "writer",
+			commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(step.agent, step.source), agentTools: step.tools, sandbox, taskMutationProhibited: taskDisallowsFileUpdates(step.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox }), exclusiveLease: true }) === "writer",
 		};
 		materializedWorktreePolicies.set(flatIndex, policy);
 		const worktree = isolatedGitRuntime.createRecoveryWorktree({ index: flatIndex, agent: step.agent });
@@ -2843,7 +2867,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		if (isDynamicRunnerGroup(step)) {
 			const groupStartFlatIndex = flatIndex;
 			const dynamicSandbox = step.parallel.sandbox ?? config.sandbox;
-			if (dynamicSandbox && dynamicSandbox.gitMode !== "isolated" && inferSandboxCwdWritable({ agentName: step.parallel.agent, tools: step.parallel.tools, sandbox: dynamicSandbox })) {
+			if (dynamicSandbox && dynamicSandbox.gitMode !== "isolated" && inferSandboxCwdWritable({ agentName: step.parallel.agent, tools: step.parallel.tools, sandbox: dynamicSandbox }) && !step.worktreeOptOutAuthorized) {
 				const now = Date.now();
 				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
 				statusPayload.state = "failed";
@@ -3053,7 +3077,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				writeStatusPayload();
 				appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.started", ts: taskStartTime, runId: id, stepIndex: fi, agent: task.agent }));
 				const dynamicWorktree = resolveIsolatedGitWorktree(task, fi);
-				const packagedRole = resolvePackagedAgentRole(task.agent);
+				const packagedRole = resolvePackagedAgentRole(task.agent, task.source);
 				const dynamicReadOnly = resolveCapabilityRights({
 					packagedRole,
 					agentTools: task.tools,
@@ -3079,6 +3103,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					orchestratorIntercomTarget: config.controlIntercomTarget,
 					nestedRoute: config.nestedRoute,
 					sandbox: config.sandbox,
+					hostGitDiagnostic: task.hostGitDiagnostic,
 					isolatedGit: dynamicWorktree,
 					isolatedGitCapability: dynamicCapability,
 					scopedGitEndpoint,
@@ -3226,6 +3251,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			let aborted = false;
 			let worktreeSetup: WorktreeSetup | undefined;
 			if (!group.worktree
+				&& !group.worktreeOptOutAuthorized
 				&& !group.parallel.some((task) => (task.sandbox ?? config.sandbox)?.gitMode === "isolated")
 				&& hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, agentName: task.agent, sandbox: task.sandbox ?? config.sandbox })) })) {
 				const failedAt = Date.now();
@@ -3374,7 +3400,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 							: undefined;
 						const { taskForRun, taskCwd: preparedTaskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
 						const isolatedGit = resolveIsolatedGitWorktree(taskForRun, fi);
-						const packagedRole = resolvePackagedAgentRole(taskForRun.agent);
+						const packagedRole = resolvePackagedAgentRole(taskForRun.agent, taskForRun.source);
 						const isolatedGitRights = resolveCapabilityRights({
 							packagedRole,
 							agentTools: taskForRun.tools,
@@ -3404,6 +3430,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 							orchestratorIntercomTarget: config.controlIntercomTarget,
 							nestedRoute: config.nestedRoute,
 							sandbox: config.sandbox,
+							hostGitDiagnostic: taskForRun.hostGitDiagnostic,
 							isolatedGit,
 							isolatedGitCapability,
 							scopedGitEndpoint,
@@ -3495,7 +3522,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 									syntheticPaths: isolatedGit.syntheticPaths,
 									terminationState: "execution-rejected",
 									agent: task.agent,
-									commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(task.agent), agentTools: task.tools, sandbox: task.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(task.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
+									commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(task.agent, task.source), agentTools: task.tools, sandbox: task.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(task.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
 								});
 								gitBundle = {
 									path: bundle.path,
@@ -3777,7 +3804,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			}));
 
 			const isolatedGit = resolveIsolatedGitWorktree(seqStep, flatIndex);
-			const packagedRole = resolvePackagedAgentRole(seqStep.agent);
+			const packagedRole = resolvePackagedAgentRole(seqStep.agent, seqStep.source);
 			const isolatedGitRights = resolveCapabilityRights({
 				packagedRole,
 				agentTools: seqStep.tools,
@@ -3805,6 +3832,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				orchestratorIntercomTarget: config.controlIntercomTarget,
 				nestedRoute: config.nestedRoute,
 				sandbox: config.sandbox,
+				hostGitDiagnostic: seqStep.hostGitDiagnostic,
 				isolatedGit,
 				isolatedGitCapability,
 				scopedGitEndpoint,
@@ -3838,7 +3866,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 								syntheticPaths: isolatedGit.syntheticPaths,
 								terminationState: interrupted ? "interrupted" : "execution-rejected",
 								agent: seqStep.agent,
-								commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(seqStep.agent), agentTools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(seqStep.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
+								commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(seqStep.agent, seqStep.source), agentTools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(seqStep.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
 							});
 							if (statusStep) statusStep.gitBundle = {
 								path: bundle.path,

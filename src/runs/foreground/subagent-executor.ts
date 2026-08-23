@@ -5,14 +5,14 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
-import { hasExplicitSandboxOptOut, resolveSandboxConfig } from "../../sandbox/config.ts";
+import { hasExplicitSandboxOptOut, resolveSandboxConfig, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { packagedAgentIsReadOnly, resolvePackagedAgentRole } from "../shared/agent-role.ts";
 import { resolveCapabilityRights } from "../shared/capability-rights.ts";
 import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
-import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
+import { ChainClarifyComponent, type ChainClarifyResult, type ChainClarifyPolicy } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import { resolveFastModeStatus } from "../../shared/fast-mode.ts";
 import { executeChain } from "./chain-execution.ts";
@@ -339,7 +339,7 @@ function resolveNestedStepState(result: SingleResult): "complete" | "failed" | "
 
 function isolatedGitCommitRequired(task: string | undefined, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined, parentRights?: "writer" | "read-only"): boolean {
 	return resolveCapabilityRights({
-		packagedRole: resolvePackagedAgentRole(agent?.name),
+		packagedRole: resolvePackagedAgentRole(agent?.name, agent?.source),
 		agentTools: agent?.tools,
 		sandbox,
 		taskMutationProhibited: taskDisallowsFileUpdates(task),
@@ -1741,11 +1741,17 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const skills = normalizedSkills === false ? [] : normalizedSkills;
 		const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, a.maxSubagentDepth);
 		const modelOverride = resolveModelCandidate((params.model as string | undefined) ?? a.model, availableModels, currentProvider);
-		const singleSandbox = resolveSandboxConfig({
-			settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+		const singleSandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
+		let singleSandbox = resolveSandboxConfig({
+			settings: singleSandboxSettings,
 			agent: a,
 			run: params.sandbox,
 		});
+		if (params.worktree === false && !asyncScopedEndpoint && singleSandbox?.gitMode === "isolated"
+			&& worktreeOptOutIsAuthorized(singleSandboxSettings)
+			&& a.canOptOutOfWorktree === true) {
+			singleSandbox = { ...singleSandbox, gitMode: "read-only" };
+		}
 		try {
 			asyncScopedEndpoint = await reserveAsyncScopedEndpoint(asyncScopedEndpoint, effectiveCwd, inferSandboxCwdWritable({ agentName: a.name, tools: a.tools, sandbox: singleSandbox }));
 		} catch (error) {
@@ -1778,6 +1784,9 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			nestedRoute,
 			acceptance: params.acceptance,
 			sandbox: singleSandbox,
+			sandboxSettings: singleSandboxSettings,
+			sandboxRun: params.sandbox,
+			worktree: params.worktree,
 			sandboxIntercomBridge: resolveSandboxIntercomBridge(intercomBridge),
 			scopedGitEndpoint: asyncScopedEndpoint,
 		});
@@ -2397,7 +2406,14 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		run: params.sandbox,
 	});
 	const sandboxIntercomBridge = resolveSandboxIntercomBridge(data.intercomBridge);
-	const taskSandboxes = agentConfigs.map((agent) => resolveChildSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox }));
+	const explicitWorktreeOptOut = Object.hasOwn(params, "worktree") && params.worktree === false;
+	const worktreeOptOutAllowed = explicitWorktreeOptOut
+		&& worktreeOptOutIsAuthorized(sandboxSettings)
+		&& agentConfigs.every((agent) => agent.canOptOutOfWorktree === true);
+	const taskSandboxes = agentConfigs.map((agent) => {
+		const resolved = resolveChildSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox });
+		return worktreeOptOutAllowed && resolved?.gitMode === "isolated" ? { ...resolved, gitMode: "read-only" as const } : resolved;
+	});
 	const isolatedGitRequested = !data.scopedGitEndpoint && taskSandboxes.some((sandboxConfig) => sandboxConfig?.gitMode === "isolated");
 	if (isolatedGitRequested && params.worktree) {
 		return buildParallelModeError("isolated Git cannot be combined with parent-managed worktree mode; use isolated Git alone");
@@ -2408,7 +2424,8 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	)) {
 		return buildParallelModeError("isolated Git parallel runs cannot include a non-isolated write-capable task");
 	}
-	if (!params.worktree && !isolatedGitRequested && !data.scopedGitEndpoint && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] })) })) {
+	if (!params.worktree && !isolatedGitRequested && !data.scopedGitEndpoint && hasSandboxWritableAgent({ agents: agentConfigs.map((agent, index) => ({ agentName: agent.name, tools: agent.tools, sandbox: taskSandboxes[index] })) })
+		&& !worktreeOptOutAllowed) {
 		return buildParallelModeError(sandboxParallelWorktreeRequiredMessage());
 	}
 
@@ -2456,6 +2473,12 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 					availableSkills,
 					done,
 					"parallel",
+					agentConfigs.map((agent) => ({
+						worktree: "isolated",
+						sandbox: resolveSandboxConfig({ settings: sandboxSettings, agent, run: params.sandbox }),
+						canOptOutOfWorktree: agent.canOptOutOfWorktree === true && sandboxSettings?.allowWorktreeOptOut === true,
+						canOptOutOfSandbox: sandboxSettings?.allowSandboxOptOut === true,
+					} satisfies ChainClarifyPolicy)),
 				),
 			{ overlay: true, overlayOptions: { anchor: "center", width: 84, maxHeight: "80%" } },
 		);
@@ -3539,6 +3562,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const effectiveOutputMode = params.outputMode ?? "inline";
 	const currentMaxSubagentDepth = resolveRunMaxSubagentDepth(params.maxSubagentDepth, deps.config.maxSubagentDepth);
 	const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, agentConfig.maxSubagentDepth);
+	const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
 
 	if (params.clarify === true && ctx.hasUI) {
 		const behavior = resolveStepBehavior(agentConfig, { output: effectiveOutput, skills: skillOverride, fastMode });
@@ -3558,6 +3582,12 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 					availableSkills,
 					done,
 					"single",
+					[{
+						worktree: "isolated",
+						sandbox: resolveSandboxConfig({ settings: sandboxSettings, agent: agentConfig, run: params.sandbox }),
+						canOptOutOfWorktree: agentConfig.canOptOutOfWorktree === true && sandboxSettings?.allowWorktreeOptOut === true,
+						canOptOutOfSandbox: sandboxSettings?.allowSandboxOptOut === true,
+					}],
 				),
 			{ overlay: true, overlayOptions: { anchor: "center", width: 84, maxHeight: "80%" } },
 		);
@@ -3596,11 +3626,17 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 					details: { mode: "single" as const, results: [] },
 				};
 			}
-			const sandbox = resolveSandboxConfig({
-				settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+			const asyncSandboxSettings = sandboxSettings;
+			let sandbox = resolveSandboxConfig({
+				settings: asyncSandboxSettings,
 				agent: asyncAgentConfig,
 				run: params.sandbox,
 			});
+			if (params.worktree === false && !data.scopedGitEndpoint && sandbox?.gitMode === "isolated"
+				&& worktreeOptOutIsAuthorized(asyncSandboxSettings)
+				&& asyncAgentConfig.canOptOutOfWorktree === true) {
+				sandbox = { ...sandbox, gitMode: "read-only" };
+			}
 
 			return executeAsyncSingle(id, {
 				agent: params.agent!,
@@ -3628,6 +3664,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				childIntercomTarget: data.intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(id, agent, index) : undefined,
 				nestedRoute: data.nestedRoute,
 				sandbox,
+				sandboxSettings: asyncSandboxSettings,
+				sandboxRun: params.sandbox,
+				worktree: params.worktree,
 				scopedGitEndpoint: data.scopedGitEndpoint,
 				sandboxIntercomBridge: resolveSandboxIntercomBridge(data.intercomBridge),
 			});
@@ -3639,7 +3678,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	let sandbox: ReturnType<typeof resolveSandboxConfig>;
 	try {
 		sandbox = resolveSandboxConfig({
-			settings: readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope)),
+			settings: sandboxSettings,
 			agent: agentConfig,
 			run: params.sandbox,
 		});
@@ -3648,8 +3687,16 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		const message = error instanceof Error ? error.message : String(error);
 		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "single", results: [] } };
 	}
+	if (params.worktree === false && !data.scopedGitEndpoint && sandbox?.gitMode === "isolated"
+		&& worktreeOptOutIsAuthorized(sandboxSettings)
+		&& agentConfig.canOptOutOfWorktree === true) {
+		sandbox = { ...sandbox, gitMode: "read-only" };
+	}
 	if (data.scopedGitEndpoint) {
+		// Force inherited Git/network/auth policy while retaining authorized
+		// runtime mounts needed by the child command (for example its mock queue).
 		sandbox = {
+			...sandbox,
 			provider: "bubblewrap",
 			gitMode: "isolated",
 			network: "none",
@@ -3734,7 +3781,10 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		: undefined;
 
 	if (data.scopedGitEndpoint) {
+		// Force inherited Git/network/auth policy while retaining authorized
+		// runtime mounts needed by the child command (for example its mock queue).
 		sandbox = {
+			...sandbox,
 			provider: "bubblewrap",
 			gitMode: "isolated",
 			network: "none",
@@ -4017,6 +4067,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		acceptance: params.acceptance,
 		acceptanceContext: { mode: "single" },
 		sandbox,
+		hostGitDiagnostic: !sandbox && hasExplicitSandboxOptOut({ settings: sandboxSettings, agent: agentConfig, run: params.sandbox }),
 		isolatedGit: isolatedWorktree,
 		isolatedGitCapability: isolatedCapability,
 		isolatedGitEndpoint: data.scopedGitEndpoint,
@@ -4440,6 +4491,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
 		deps.state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
 		const discoveredAgents = deps.discoverAgents(effectiveCwd, scope).agents;
+		const sandboxSettings = readSandboxSettings(effectiveCwd, scope);
+		// provider:none is intentionally not a normal agent default. It is only
+		// accepted when a trusted user-global setting explicitly enables the
+		// escape hatch; project settings and child requests cannot grant it.
 		effectiveParams = applyAgentDefaultContext(effectiveParams, discoveredAgents);
 		const orchestratorTarget = resolveIntercomSessionTarget(
 			deps.pi.getSessionName(),
@@ -4475,6 +4530,48 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const hasChain = (effectiveParams.chain?.length ?? 0) > 0;
 		const hasTasks = (effectiveParams.tasks?.length ?? 0) > 0;
 		const hasSingle = !hasChain && !hasTasks && Boolean(effectiveParams.agent);
+		const targetAgentsForSandboxPolicy = hasSingle
+			? [discoveredAgents.find((agent) => agent.name === effectiveParams.agent)].filter((agent): agent is AgentConfig => Boolean(agent))
+			: hasTasks
+				? (effectiveParams.tasks ?? []).map((task) => discoveredAgents.find((agent) => agent.name === task.agent)).filter((agent): agent is AgentConfig => Boolean(agent))
+				: (effectiveParams.chain ?? []).flatMap((step) => isParallelStep(step)
+					? step.parallel.map((task) => discoveredAgents.find((agent) => agent.name === task.agent))
+					: isDynamicParallelStep(step)
+						? [discoveredAgents.find((agent) => agent.name === step.parallel.agent)]
+						: step.agent ? [discoveredAgents.find((agent) => agent.name === step.agent)] : []).filter((agent): agent is AgentConfig => Boolean(agent));
+		const nestedSelfDecontainment = Boolean(inheritedNestedRoute);
+		const topLevelWorktreeOptOut = Object.hasOwn(effectiveParams, "worktree") && effectiveParams.worktree === false;
+		const chainWorktreeOptOutSteps = (effectiveParams.chain ?? []).filter((step) => Object.hasOwn(step, "worktree") && (step as { worktree?: boolean }).worktree === false);
+		const chainWorktreeOptOutAgents = chainWorktreeOptOutSteps.flatMap((step) => isParallelStep(step)
+			? step.parallel.map((task) => discoveredAgents.find((agent) => agent.name === task.agent))
+			: isDynamicParallelStep(step) ? [discoveredAgents.find((agent) => agent.name === step.parallel.agent)] : [])
+			.filter((agent): agent is AgentConfig => Boolean(agent));
+		const explicitWorktreeOptOut = topLevelWorktreeOptOut || chainWorktreeOptOutSteps.length > 0;
+		const worktreeOptOutTargetAgents = topLevelWorktreeOptOut ? targetAgentsForSandboxPolicy : chainWorktreeOptOutAgents;
+		const rawProvider = effectiveParams.sandbox?.provider;
+		const rawProviderNone = typeof rawProvider === "string" && rawProvider.trim() === "none";
+		const frontmatterProviderNone = targetAgentsForSandboxPolicy.some((agent) => agent.sandbox?.provider?.trim() === "none");
+		if (nestedSelfDecontainment && (explicitWorktreeOptOut || rawProviderNone || frontmatterProviderNone)) {
+			return validationErrorResult(
+				getRequestedModeLabel(effectiveParams),
+				"Child self-decontainment denied before spawn: nested children must retain inherited scoped isolation and cannot request worktree:false or sandbox.provider:none.",
+			);
+		}
+		const sandboxOptOutRequested = hasExplicitSandboxOptOut({ settings: sandboxSettings, run: effectiveParams.sandbox })
+			|| frontmatterProviderNone;
+		if (sandboxOptOutRequested && sandboxSettings?.allowSandboxOptOut !== true) {
+			return validationErrorResult(getRequestedModeLabel(effectiveParams), "Sandbox opt-out denied: provider:none requires trusted user-global sandbox.allowSandboxOptOut=true; project settings and child agents cannot enable it.");
+		}
+		const worktreeOptOutAllowed = explicitWorktreeOptOut
+			&& worktreeOptOutIsAuthorized(sandboxSettings)
+			&& worktreeOptOutTargetAgents.length > 0
+			&& worktreeOptOutTargetAgents.every((agent) => agent.canOptOutOfWorktree === true);
+		if (explicitWorktreeOptOut && !worktreeOptOutAllowed) {
+			return validationErrorResult(
+				getRequestedModeLabel(effectiveParams),
+				"Worktree opt-out denied: worktree:false requires trusted user-global sandbox.allowWorktreeOptOut=true and every target agent must set canOptOutOfWorktree=true.",
+			);
+		}
 		const allowClarifyTaskPrompt = hasChain
 			&& effectiveParams.clarify === true
 			&& ctx.hasUI

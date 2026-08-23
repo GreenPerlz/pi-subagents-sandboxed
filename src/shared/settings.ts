@@ -104,6 +104,7 @@ export interface DynamicParallelStep {
 	parallel: DynamicParallelTemplate;
 	collect: DynamicCollectSpec;
 	concurrency?: number;
+	worktree?: boolean;
 	failFast?: boolean;
 	phase?: string;
 	label?: string;

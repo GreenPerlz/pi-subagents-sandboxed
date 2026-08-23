@@ -572,7 +572,9 @@ describe("sandbox preflight: combined run", () => {
 
 describe("sandbox preflight: orchestrator integration", () => {
 	const routeRoots: string[] = [];
+	const fixtureSettingsDirs: string[] = [];
 	const envKeys = [
+		"PI_CODING_AGENT_DIR",
 		SUBAGENT_CHILD_ENV,
 		SUBAGENT_FANOUT_CHILD_ENV,
 		SUBAGENT_PARENT_EVENT_SINK_ENV,
@@ -598,6 +600,7 @@ describe("sandbox preflight: orchestrator integration", () => {
 
 	afterEach(() => {
 		for (const root of routeRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+		for (const dir of fixtureSettingsDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 		if (savedEnv) {
 			for (const key of envKeys) {
 				if (savedEnv[key] === undefined) delete process.env[key];
@@ -624,6 +627,13 @@ describe("sandbox preflight: orchestrator integration", () => {
 			watcherRestartTimer: null,
 			resultFileCoalescer: { schedule: () => false, clear: () => {} },
 		};
+	}
+
+	function enableTrustedSandboxOptOut(allowWorktreeOptOut = false): void {
+		const fixtureSettingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-trusted-settings-"));
+		fixtureSettingsDirs.push(fixtureSettingsDir);
+		fs.writeFileSync(path.join(fixtureSettingsDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true, ...(allowWorktreeOptOut ? { allowWorktreeOptOut: true } : {}) } } }), "utf-8");
+		process.env.PI_CODING_AGENT_DIR = fixtureSettingsDir;
 	}
 
 	function createTestExecutor(state = createState(), agents: Array<Record<string, unknown>> = [{ name: "worker", description: "Worker", prompt: "Do work" }]) {
@@ -696,6 +706,7 @@ describe("sandbox preflight: orchestrator integration", () => {
 
 	it("skips Ralph preflight when the run explicitly opts out with provider none", async () => {
 		saveAndClearEnv();
+		enableTrustedSandboxOptOut();
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-none-"));
 		tempDirs.push(root);
 		try {
@@ -722,15 +733,84 @@ describe("sandbox preflight: orchestrator integration", () => {
 			);
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /worker reached execution/);
+			assert.match(text(result), /Child self-decontainment denied before spawn/);
 			assert.doesNotMatch(text(result), /Ralph orchestrator sandbox preflight failed/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
+	it("rejects nested frontmatter provider none before spawning an unsandboxed child", async () => {
+		saveAndClearEnv();
+		enableTrustedSandboxOptOut();
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-frontmatter-none-"));
+		tempDirs.push(root);
+		try {
+			const route = createNestedRoute("root-preflight-frontmatter-none");
+			routeRoots.push(path.dirname(route.eventSink));
+			setRalphOrchestratorNestedEnv(route, "ralph-preflight-frontmatter-none-run");
+			const executor = createTestExecutor(undefined, [{
+				name: "worker",
+				description: "Worker",
+				prompt: "Do work",
+				sandbox: { provider: "none" },
+			}]);
+			const result = await executor.execute("run", { agent: "worker", task: "go" }, new AbortController().signal, undefined, testCtx(root));
+			assert.equal(result.isError, true);
+			assert.match(text(result), /Child self-decontainment denied before spawn/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects nested worktree opt-out before spawn even with trusted ceiling and target permission", async () => {
+		saveAndClearEnv();
+		enableTrustedSandboxOptOut(true);
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-nested-worktree-optout-"));
+		tempDirs.push(root);
+		git(root, ["init"]);
+		git(root, ["config", "user.email", "tests@example.com"]);
+		git(root, ["config", "user.name", "Preflight Tests"]);
+		fs.writeFileSync(path.join(root, "README.md"), "initial\\n", "utf-8");
+		git(root, ["add", "-A"]);
+		git(root, ["commit", "-m", "init"]);
+		const route = createNestedRoute("root-preflight-nested-worktree-optout");
+		routeRoots.push(path.dirname(route.eventSink));
+		setRalphOrchestratorNestedEnv(route, "ralph-preflight-nested-worktree-optout-run");
+		const routeEventBefore = fs.readdirSync(route.eventSink).sort();
+		const runtimeBefore = new Set(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-")));
+		const executor = createTestExecutor(createState(), [{
+			name: "worker", description: "Worker", prompt: "Do work", canOptOutOfWorktree: true,
+		}]);
+		const result = await executor.execute("run", { agent: "worker", task: "must not run", worktree: false }, new AbortController().signal, undefined, {
+			...testCtx(root), modelRegistry: { getAvailable() { throw new Error("child spawned"); } },
+		});
+		assert.equal(result.isError, true);
+		assert.match(text(result), /Child self-decontainment denied before spawn/);
+		assert.doesNotMatch(text(result), /child spawned/);
+		assert.deepEqual(fs.readdirSync(route.eventSink).sort(), routeEventBefore, "nested rejection must not write child events");
+		assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((entry) => entry.startsWith("pi-isolated-git-") && !runtimeBefore.has(entry)), [], "nested rejection must not create runtime state");
+		assert.equal(fs.existsSync(path.join(root, "must-not-run")), false);
+	});
+
+	it("rejects unauthorized per-chain worktree opt-out before spawn", async () => {
+		saveAndClearEnv();
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-chain-worktree-optout-"));
+		tempDirs.push(root);
+		const executor = createTestExecutor(createState(), [{ name: "worker", description: "Worker", prompt: "Do work" }]);
+		const result = await executor.execute("run", {
+			chain: [{ parallel: [{ agent: "worker", task: "must not run" }], worktree: false }], clarify: false,
+		}, new AbortController().signal, undefined, {
+			...testCtx(root), modelRegistry: { getAvailable() { throw new Error("child spawned"); } },
+		});
+		assert.equal(result.isError, true);
+		assert.match(text(result), /Worktree opt-out denied/);
+		assert.doesNotMatch(text(result), /child spawned/);
+	});
+
 	it("fails closed for provider none plus isolated Git while preserving inherited opt-out", async () => {
 		saveAndClearEnv();
+		enableTrustedSandboxOptOut();
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ralph-preflight-contradictory-sandbox-"));
 		tempDirs.push(root);
 		git(root, ["init"]);
@@ -762,7 +842,7 @@ describe("sandbox preflight: orchestrator integration", () => {
 				},
 			);
 			assert.equal(inheritedResult.isError, true);
-			assert.match(text(inheritedResult), /worker reached execution/);
+			assert.match(text(inheritedResult), /Child self-decontainment denied before spawn/);
 			assert.doesNotMatch(text(inheritedResult), /sandbox preflight failed/i);
 
 			const contradictoryRoute = createNestedRoute("root-preflight-contradictory-none");
@@ -774,16 +854,15 @@ describe("sandbox preflight: orchestrator integration", () => {
 				prompt: "Do work",
 				canBeChangedByAgent: ["sandbox.provider", "sandbox.gitMode"],
 			}]);
-			await assert.rejects(
-				() => contradictoryExecutor.execute(
-					"run",
-					{ agent: "worker", task: "go", sandbox: { provider: "none", gitMode: "isolated" } },
-					new AbortController().signal,
-					undefined,
-					testCtx(root),
-				),
-				/Explicit provider 'none'.*isolated Git/i,
+			const contradictoryResult = await contradictoryExecutor.execute(
+				"run",
+				{ agent: "worker", task: "go", sandbox: { provider: "none", gitMode: "isolated" } },
+				new AbortController().signal,
+				undefined,
+				testCtx(root),
 			);
+			assert.equal(contradictoryResult.isError, true);
+			assert.match(text(contradictoryResult), /Child self-decontainment denied before spawn/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

@@ -77,7 +77,7 @@ The parent owns the queue and integration. Children own only their assigned issu
 ## Hard rules
 
 - Assign each issue to exactly one orchestrator.
-- Each default issue launch uses one orchestrator task with `worktree: true`; every affected agent must permit the guarded shared worktree request.
+- Each default issue launch uses one orchestrator task with the parent-owned isolated worktree inherited by nested children; omit `worktree` for that reuse semantics. Request a separate worktree only for explicitly authorized parallel writers.
 - Never run two write-capable issue agents in the same checkout.
 - Keep nested explore/work/review children foreground with `async: false` in the orchestrator's inherited cwd; do not create nested worktrees. The runtime also suppresses an ambient `asyncByDefault` for omitted-`async` orchestrator loop calls.
 - A dirty repo is acceptable only when it is the explicitly assigned isolated worktree and its existing diff belongs to this issue; do not overwrite unrelated parent work.
@@ -241,7 +241,6 @@ subagent({
     label: "Issue <id>",
     task: "Orchestrate exactly this issue in this isolated worktree. Return explorer findings inline and embed relevant findings in same-cwd work. Work must edit without committing or staging. Pass only an abstract work handoff to a fresh reviewer, which must inspect actual current git diff.\n\nPrimary context:\n- Source: ...\n- Title: ...\n- Acceptance criteria: ...\n- Validation: ...\n- Non-goals: ...\n- Blockers: ...\n- Parent policy: preserve the reviewed worktree diff and report blockers inline."
   }],
-  worktree: true,
   async: true
 })
 ```

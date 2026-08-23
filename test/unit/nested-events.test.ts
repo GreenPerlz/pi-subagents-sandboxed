@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { afterEach, describe, it } from "node:test";
 import type { AsyncJobState, SubagentState } from "../../src/shared/types.ts";
 import {
@@ -756,20 +758,60 @@ describe("bounded journals and recovery seams", () => {
 		assert.equal(claimNestedControlRequest(route, "ambiguous-request"), "claimed");
 	});
 
-	it("reconciles every compaction fault phase without losing the sealed generation", () => {
+	it("reconciles every compaction fault phase for all journal generations", () => {
 		const phases = ["seal", "new", "snapshot", "state", "cleanup"] as const;
-		for (const phase of phases) {
-			const route = trackRoute(`crash-${phase}`);
-			writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child(`child-${phase}`, "running", 1) });
-			projectNestedEvents(route);
+		for (const kind of ["event", "control", "result"] as const) for (const phase of phases) {
+			const route = trackRoute(`crash-${kind}-${phase}`);
+			if (kind === "event") {
+				writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child(`child-${kind}-${phase}`, "running", 1) });
+				projectNestedEvents(route);
+			} else {
+				const id = `request-${kind}-${phase}`;
+				writeNestedControlRequest(route, { ts: 1, requestId: id, targetRunId: "nested-child", action: "interrupt" });
+				if (kind === "result") writeNestedControlResult(route, { ts: 2, requestId: id, targetRunId: "nested-child", ok: true, message: "done" });
+				if (kind === "control") readNestedControlRequests(route); else readNestedControlResults(route);
+			}
 			process.env.PI_NESTED_COMPACTION_BYTES = "1";
-			setNestedJournalFaultInjector((current, kind) => { if (kind === "event" && current === phase) throw new Error(`fault-${phase}`); });
-			assert.throws(() => projectNestedEvents(route), /fault-/);
+			setNestedJournalFaultInjector((current, currentKind) => { if (currentKind === kind && current === phase) throw new Error(`fault-${kind}-${phase}`); });
+			assert.throws(() => kind === "event" ? projectNestedEvents(route) : kind === "control" ? readNestedControlRequests(route) : readNestedControlResults(route), /fault-/);
 			setNestedJournalFaultInjector(undefined);
-			assert.equal(projectNestedEvents(route).children[0]?.id, `child-${phase}`);
+			if (kind === "event") assert.equal(projectNestedEvents(route).children[0]?.id, `child-${kind}-${phase}`);
+			else if (kind === "control") assert.equal(readNestedControlRequests(route).length, 1);
+			else assert.equal(readNestedControlResults(route).length, 1);
 			delete process.env.PI_NESTED_COMPACTION_BYTES;
 		}
-		delete process.env.PI_NESTED_COMPACTION_BYTES;
+		setNestedJournalFaultInjector(undefined);
+	});
+
+	it("imports over 1000 legacy records once and rejects late legacy files", () => {
+		const route = trackRoute("legacy-1001");
+		const records = Array.from({ length: 1001 }, (_, index) => ({ type: "subagent.nested.updated" as const, ts: index + 1, rootRunId: route.rootRunId, parentRunId: "root-run", parentStepIndex: 1, capabilityToken: route.capabilityToken, child: child("legacy-many", "running", index + 1) }));
+		fs.writeFileSync(path.join(route.eventSink, "legacy-many.jsonl"), records.map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
+		fs.writeFileSync(path.join(route.eventSink, "legacy-corrupt.json"), "not-json", "utf8");
+		fs.writeFileSync(path.join(route.eventSink, "legacy-wrong-token.json"), JSON.stringify({ ...records[0], capabilityToken: "wrong-token" }), "utf8");
+		projectNestedEvents(route);
+		const manifest = JSON.parse(fs.readFileSync(path.join(path.dirname(route.eventSink), ".legacy-import-manifest.json"), "utf8")) as { files: Record<string, { records: string[] }> };
+		assert.equal(manifest.files[path.join(route.eventSink, "legacy-many.jsonl")]?.records.length, 1001);
+		resetNestedJournalWorkCounters();
+		projectNestedEvents(route);
+		assert.equal(getNestedJournalWorkCounters().readdir, 0);
+		fs.writeFileSync(path.join(route.eventSink, "late-legacy.json"), JSON.stringify(records[0]), "utf8");
+		assert.throws(() => projectNestedEvents(route), /Legacy file arrived after migration/);
+	});
+
+	it("replays a partially imported mixed legacy file without duplicates", () => {
+		const route = trackRoute("legacy-restart");
+		const records = Array.from({ length: 5 }, (_, index) => ({ type: "subagent.nested.updated" as const, ts: index + 1, rootRunId: route.rootRunId, parentRunId: "root-run", parentStepIndex: 1, capabilityToken: route.capabilityToken, child: child(`legacy-${index}`, "running", index + 1) }));
+		fs.writeFileSync(path.join(route.eventSink, "legacy.jsonl"), records.map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
+		let states = 0;
+		setNestedJournalFaultInjector((phase, kind) => { if (phase === "state" && kind === "event" && ++states === 1) throw new Error("legacy crash"); });
+		assert.throws(() => projectNestedEvents(route), /legacy crash/);
+		setNestedJournalFaultInjector(undefined);
+		const registry = projectNestedEvents(route);
+		assert.equal(registry.children.filter((item) => item.id.startsWith("legacy-")).length, 5);
+		resetNestedJournalRuntime(route);
+		assert.equal(projectNestedEvents(route).children.filter((item) => item.id.startsWith("legacy-")).length, 5);
+		assert.equal(fs.existsSync(path.join(route.eventSink, "legacy.jsonl")), true);
 	});
 });
 
@@ -783,5 +825,16 @@ describe("nested route lock identity", () => {
 		fs.rmSync(lock, { recursive: true, force: true });
 		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 2, parentRunId: route.rootRunId, child: child("locked", "running", 2) });
 		assert.equal(projectNestedEvents(route).children[0]?.id, "locked");
+	});
+
+	it("retries live lock contention until the owner releases without dropping the append", async () => {
+		const route = trackRoute("lock-contention");
+		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
+		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,token:'live-owner-token'}),{mode:0o600}); fs.chmodSync(lock+'/owner',0o600); process.stdout.write('ready'); setTimeout(()=>fs.rmSync(lock,{recursive:true,force:true}),150);`;
+		const owner = spawn(process.execPath, ["-e", script, lock], { stdio: ["ignore", "pipe", "inherit"] });
+		await once(owner.stdout!, "data");
+		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("contended", "running", 1) });
+		await once(owner, "close");
+		assert.equal(projectNestedEvents(route).children[0]?.id, "contended");
 	});
 });

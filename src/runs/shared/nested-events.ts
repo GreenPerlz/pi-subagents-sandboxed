@@ -786,7 +786,7 @@ function legacyCandidates(route: NestedRoute): Array<{ kind: "event" | "control"
 		try { journalWork.readdir++; entries = fs.readdirSync(dir).filter((entry) => (entry.endsWith(".json") || entry.endsWith(".jsonl")) && !entry.startsWith("." )).sort(); } catch { continue; }
 		for (const entry of entries) {
 			const file = path.join(dir, entry); if (!containedPath(dir, file)) continue;
-			try { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.size > MAX_EVENT_BYTES) continue; const content = fs.readFileSync(file, "utf8");
+			try { const stat = fs.lstatSync(file); if (!stat.isFile() || stat.size > 64 * 1024 * 1024) continue; const content = fs.readFileSync(file, "utf8");
 				const records: Array<NestedEventRecord | NestedControlRequestRecord | NestedControlResultRecord> = [];
 				for (const line of (content.includes("\n") ? content.split("\n").filter((line) => line.trim()) : [content])) { const parsed = kind === "event" ? parseRecord(line, route) : kind === "control" ? parseControlRequest(line, route) : parseControlResult(line, route); if (parsed) records.push(parsed); }
 				output.push({ kind, file, hash: createHash("sha256").update(content).digest("hex"), records });

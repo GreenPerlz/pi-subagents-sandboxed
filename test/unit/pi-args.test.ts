@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import {
+	SUBAGENT_CHILD_ENV,
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_INTERCOM_EXTENSION_DIR_ENV,
 	SUBAGENT_INTERCOM_STATE_DIR_ENV,
@@ -26,6 +27,7 @@ const originalEnv = {
 	HOME: process.env.HOME,
 	USERPROFILE: process.env.USERPROFILE,
 	PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+	PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD,
 	PI_SUBAGENT_FANOUT_CHILD: process.env.PI_SUBAGENT_FANOUT_CHILD,
 	PI_SUBAGENT_PARENT_EVENT_SINK: process.env.PI_SUBAGENT_PARENT_EVENT_SINK,
 	PI_SUBAGENT_PARENT_CONTROL_INBOX: process.env.PI_SUBAGENT_PARENT_CONTROL_INBOX,
@@ -660,6 +662,31 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.equal(env[SUBAGENT_PARENT_EVENT_SINK_ENV], "/tmp/explicit/events");
 		assert.equal(env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV], "explicit-root");
 		assert.deepEqual(JSON.parse(env[SUBAGENT_PARENT_PATH_ENV] ?? "[]"), [{ runId: "explicit-child", stepIndex: 2 }]);
+	});
+
+	it("preserves authenticated ancestry when a nested child receives the route explicitly", () => {
+		process.env[SUBAGENT_CHILD_ENV] = "1";
+		process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] = "/tmp/inherited/events";
+		process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = "/tmp/inherited/control";
+		process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = "inherited-root";
+		process.env[SUBAGENT_PARENT_RUN_ID_ENV] = "orchestrator-run";
+		process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "1";
+		process.env[SUBAGENT_PARENT_DEPTH_ENV] = "2";
+		process.env[SUBAGENT_PARENT_PATH_ENV] = JSON.stringify([{ runId: "root-run", stepIndex: 0 }, { runId: "orchestrator-run", stepIndex: 1 }]);
+		process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = "inherited-token";
+
+		const { env } = buildPiArgs({
+			baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false,
+			tools: ["read"], runId: "leaf-run", childIndex: 2,
+			parentEventSink: "/tmp/inherited/events", parentControlInbox: "/tmp/inherited/control",
+			parentRootRunId: "inherited-root", parentCapabilityToken: "inherited-token",
+		});
+		assert.equal(env[SUBAGENT_PARENT_DEPTH_ENV], "3");
+		assert.deepEqual(JSON.parse(env[SUBAGENT_PARENT_PATH_ENV] ?? "[]"), [
+			{ runId: "root-run", stepIndex: 0 },
+			{ runId: "orchestrator-run", stepIndex: 1 },
+			{ runId: "leaf-run", stepIndex: 2 },
+		]);
 	});
 
 	it("prefers the current subagent run id over inherited ancestor ids for nested fanout routing", () => {

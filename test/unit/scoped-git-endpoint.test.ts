@@ -90,7 +90,7 @@ describe("scoped Git endpoint", () => {
 			for (const system of ["/usr", "/bin", "/lib", "/etc", nodeRoot]) {
 				if (fs.existsSync(system) && !args.includes(system)) args.push("--ro-bind", system, system);
 			}
-			args.push("--bind", worktree, worktree, "--ro-bind", mount.source, mount.target!, "--chdir", worktree, "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--", "/run/pi-scoped-git/git", "status");
+			args.push("--bind", worktree, worktree, "--ro-bind", mount.source, mount.target!, "--chdir", worktree, "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--", "/bin/sh", "/run/pi-scoped-git/git", "status");
 			const result = await new Promise<{ status: number | null; stderr: string }>((resolve, reject) => { const child = spawn("bwrap", args, { stdio: ["pipe", "ignore", "pipe"] }); let stderr = ""; child.stderr.on("data", (chunk) => stderr += chunk); child.on("error", reject); child.on("close", (status) => resolve({ status, stderr })); child.stdin.end(); });
 			assert.equal(result.status, 0, result.stderr);
 		} finally { await owner.close(); }
@@ -107,7 +107,7 @@ describe("scoped Git endpoint", () => {
 				if (fs.existsSync(system) && !command.includes(system)) command.push("--ro-bind", system, system);
 			}
 			for (const mount of scope.invocationMounts()) command.push("--ro-bind", mount.source, mount.target!);
-			command.push("--", "/run/pi-scoped-git/git", ...args);
+			command.push("--", "/bin/sh", "/run/pi-scoped-git/git", ...args);
 			return await new Promise<{ status: number | null; stderr: string }>((resolve, reject) => { const child = spawn("bwrap", command, { stdio: ["ignore", "ignore", "pipe"] }); let stderr = ""; child.stderr.on("data", (chunk) => stderr += chunk); child.on("error", reject); child.on("close", (status) => resolve({ status, stderr })); });
 		};
 		try {

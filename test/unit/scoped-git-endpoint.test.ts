@@ -85,7 +85,7 @@ describe("scoped Git endpoint", () => {
 		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
 		try {
 			const mount = owner.invocationMounts()[0]!;
-			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev"];
+			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
 			const nodeRoot = path.dirname(path.dirname(process.execPath));
 			for (const system of ["/usr", "/bin", "/lib", "/etc", nodeRoot]) {
 				if (fs.existsSync(system) && !args.includes(system)) args.push("--ro-bind", system, system);
@@ -101,7 +101,7 @@ describe("scoped Git endpoint", () => {
 		const worktree = repo(); const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-runtime-")); roots.add(runtimeRoot);
 		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
 		const run = async (scope: ReturnType<typeof createScopedGitEndpoint>, args: string[]) => {
-			const command = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev"];
+			const command = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
 			const nodeRoot = path.dirname(path.dirname(process.execPath));
 			for (const system of ["/usr", "/bin", "/lib", "/etc", nodeRoot]) {
 				if (fs.existsSync(system) && !command.includes(system)) command.push("--ro-bind", system, system);

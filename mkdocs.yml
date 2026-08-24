@@ -1,0 +1,54 @@
+site_name: pi-subagents-sandboxed
+site_description: Safe, sandboxed delegation for Pi
+site_url: https://greenperlz.github.io/pi-subagents-sandboxed/
+repo_url: https://github.com/GreenPerlz/pi-subagents-sandboxed
+repo_name: GreenPerlz/pi-subagents-sandboxed
+edit_uri: edit/main/docs/
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-sunny
+        name: Use dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-night
+        name: Use light mode
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+plugins:
+  - search
+nav:
+  - Home: index.md
+  - Concepts:
+      - Mental model & execution modes: concepts.md
+      - Agents: agents.md
+      - Workflows: workflows.md
+  - Safety:
+      - Sandbox & security: sandbox-security.md
+      - Git, worktrees & recovery: git-worktrees.md
+      - Async, nested runs & control: async-lifecycle.md
+  - Reference:
+      - Configuration: configuration.md
+      - Settings reference: settings-reference.md
+      - Troubleshooting & doctor: troubleshooting.md
+  - Agent contract: agent-contract.md
+  - Maintainer handoff: handoff-subprocess-cleanup.md

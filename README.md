@@ -32,6 +32,10 @@ This is a local safety/containment feature, not a claim of hostile-code-grade is
 
 https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
 
+## Documentation
+
+The maintainable user and agent guide lives in [`docs/`](docs/index.md) and is published with MkDocs Material. Build it locally with `python -m venv .venv && . .venv/bin/activate && pip install -r requirements-docs.txt && mkdocs serve`; CI runs `mkdocs build --strict` on `main`.
+
 ## Installation
 
 ```bash

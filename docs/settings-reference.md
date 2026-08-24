@@ -1,13 +1,13 @@
 # Subagent settings reference
 
-This page is the compact reference for persistent extension settings, agent Markdown frontmatter, acceptance contracts, and common run options. Each setting is described in no more than two sentences; see the main [README](../README.md) for complete examples and workflow guides.
+This page is the compact reference for persistent extension settings, agent Markdown frontmatter, acceptance contracts, and common run options. Each setting is described in no more than two sentences; see the [overview](index.md) and [workflows](workflows.md) for complete examples and workflow guides.
 
 ## Configuration locations and precedence
 
 - **User settings:** `~/.pi/agent/subagents.json` applies across projects.
 - **Project settings:** `.pi/subagents.json` overrides user settings for that project.
 - **Legacy settings:** `settings.json -> subagents` is still read, but a same-scope `subagents.json` wins.
-- **Agent definitions:** User agents live in `~/.pi/agent/agents/*.md`, project agents in `.pi/agents/*.md`, and packaged agents in this repository's [`agents/`](../agents) directory. Project agents override same-named user agents, and user/project agents override packaged agents.
+- **Agent definitions:** User agents live in `~/.pi/agent/agents/*.md`, project agents in `.pi/agents/*.md`, and packaged agents in this repository's [`agents/`](https://github.com/GreenPerlz/pi-subagents-sandboxed/tree/main/agents) directory. Project agents override same-named user agents, and user/project agents override packaged agents.
 
 ## Extension settings (`subagents.json`)
 

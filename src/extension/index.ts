@@ -279,7 +279,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
 
-	const { ensurePoller, handleStarted, handleComplete, resetJobs } = createAsyncJobTracker(pi, state, ASYNC_DIR);
+	const { ensurePoller, handleStarted, handleComplete, adoptPersistedActiveRuns, resetJobs } = createAsyncJobTracker(pi, state, ASYNC_DIR);
 	const executor = createSubagentExecutor({
 		pi,
 		state,
@@ -540,6 +540,7 @@ DIAGNOSTICS:
 		cleanupSessionArtifacts(ctx);
 		clearPendingForegroundControlNotices(state);
 		resetJobs(ctx);
+		adoptPersistedActiveRuns(ctx);
 		restoreSlashFinalSnapshots(ctx.sessionManager.getEntries());
 		primeExistingResults();
 	};
@@ -548,8 +549,12 @@ DIAGNOSTICS:
 		resetSessionState(ctx);
 	});
 
-	pi.on("session_shutdown", () => {
-		shutdownOwnedAsyncJobs(state);
+	pi.on("session_shutdown", (event) => {
+		const reason = (event as { reason?: unknown } | undefined)?.reason;
+		// Pi reload replaces this runtime in-process. Dispose this instance's
+		// resources, but leave verified async runners owned by the session alive;
+		// the replacement tracker adopts them from durable status on session_start.
+		if (reason !== "reload") shutdownOwnedAsyncJobs(state);
 		for (const unsubscribe of eventUnsubscribes) {
 			try {
 				unsubscribe();

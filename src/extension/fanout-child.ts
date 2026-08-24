@@ -13,6 +13,7 @@ import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
 import { loadConfig } from "./config.ts";
 import { shutdownOwnedAsyncJobs, type ShutdownCascadeDeps } from "../runs/background/session-shutdown-cascade.ts";
+import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import {
 	ASYNC_DIR,
 	SUBAGENT_ASYNC_STARTED_EVENT,
@@ -189,7 +190,7 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, i
 		},
 	};
 
-	const { handleStarted, handleComplete } = createAsyncJobTracker(pi, state, ASYNC_DIR);
+	const { handleStarted, handleComplete, adoptPersistedActiveRuns } = createAsyncJobTracker(pi, state, ASYNC_DIR);
 	const eventUnsubscribes = [
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted),
 		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete),
@@ -198,12 +199,21 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, i
 	const nestedControlTimer = startNestedControlInboxListener(pi, state);
 
 	if (typeof pi.on === "function") {
-		pi.on("session_shutdown", () => {
-			shutdownOwnedAsyncJobs(state, internalDeps);
+		pi.on("session_start", (_event, ctx) => {
+			try { state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager); } catch { state.currentSessionId = null; }
+			adoptPersistedActiveRuns(ctx);
+		});
+		pi.on("session_shutdown", (event) => {
+			const reason = (event as { reason?: unknown } | undefined)?.reason;
+			if (reason !== "reload") shutdownOwnedAsyncJobs(state, internalDeps);
 			for (const unsubscribe of eventUnsubscribes) {
 				try { unsubscribe(); } catch { /* best effort */ }
 			}
 			if (nestedControlTimer) clearInterval(nestedControlTimer);
+			if (state.poller) clearInterval(state.poller);
+			state.poller = null;
+			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
+			state.cleanupTimers.clear();
 			state.asyncJobs.clear();
 		});
 	}

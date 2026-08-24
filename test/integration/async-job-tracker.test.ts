@@ -15,11 +15,13 @@ interface AsyncJobTrackerModule {
 			resultsDir?: string;
 			kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 			now?: () => number;
+			isExpectedAsyncRunnerPid?: (pid: number | undefined, runId: string, identity?: string) => boolean;
 		},
 	): {
 		resetJobs(ctx?: unknown): void;
 		handleStarted(data: unknown): void;
 		handleComplete(data: unknown): void;
+		adoptPersistedActiveRuns(ctx?: unknown): number;
 	};
 }
 
@@ -93,6 +95,71 @@ function createUiContext() {
 }
 
 describe("async job tracker", { skip: !available ? "pi packages not available" : undefined }, () => {
+	it("adopts each identity-verified active persisted run once and restores compact viewer state", async () => {
+		const asyncRoot = createTempDir("pi-async-job-adoption-");
+		try {
+			const state = createState();
+			state.currentSessionId = "session-reload";
+			const ui = createUiContext();
+			const recorder = createEventRecorder();
+			for (const [id, agent, sessionId, runState, identity] of [
+				["run-b", "reviewer", "session-reload", "running", "fixture-run-b"],
+				["run-a", "worker", "session-reload", "running", "fixture-run-a"],
+				["run-foreign", "intruder", "other-session", "running", "fixture-foreign"],
+				["run-terminal", "done", "session-reload", "complete", "fixture-terminal"],
+				["run-unverified", "unknown", "session-reload", "running", "fixture-unverified"],
+			]) {
+				const runDir = path.join(asyncRoot, id);
+				fs.mkdirSync(runDir, { recursive: true });
+				fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
+					runId: id,
+					sessionId,
+					mode: "single",
+					state: runState,
+					startedAt: 1000,
+					lastUpdate: id === "run-a" ? 3000 : 2000,
+					pid: 1234,
+					runnerIdentity: identity,
+					steps: [{ agent, status: "running", startedAt: 1000 }],
+				}), "utf8");
+			}
+			const tracker = trackerMod!.createAsyncJobTracker(recorder.pi, state as never, asyncRoot, {
+				completionRetentionMs: 5,
+				pollIntervalMs: 1000,
+				isExpectedAsyncRunnerPid: (_pid, _runId, identity) => identity !== "fixture-unverified",
+			});
+			assert.equal(tracker.adoptPersistedActiveRuns(ui.ctx as never), 2);
+			assert.deepEqual([...state.asyncJobs.keys()].sort(), ["run-a", "run-b"]);
+			assert.ok(ui.widgets.some((widget) => widget !== undefined), "adoption should rebuild the compact viewer");
+			assert.equal(state.asyncJobs.get("run-a")?.status, "running");
+			assert.deepEqual(state.asyncJobs.get("run-b")?.agents, ["reviewer"]);
+			if (state.poller) clearInterval(state.poller);
+			state.poller = null;
+
+			// A replacement extension instance starts with a fresh tracker/state.
+			const freshState = createState();
+			freshState.currentSessionId = "session-reload";
+			const freshTracker = trackerMod!.createAsyncJobTracker(recorder.pi, freshState as never, asyncRoot, {
+				completionRetentionMs: 5,
+				pollIntervalMs: 1000,
+				isExpectedAsyncRunnerPid: (_pid, _runId, identity) => identity !== "fixture-unverified",
+			});
+			assert.equal(freshTracker.adoptPersistedActiveRuns(ui.ctx as never), 2);
+			assert.deepEqual([...freshState.asyncJobs.keys()].sort(), ["run-a", "run-b"]);
+			assert.equal(freshTracker.adoptPersistedActiveRuns(ui.ctx as never), 0, "repeated reload adoption must not duplicate runs");
+			const completedStatus = JSON.parse(fs.readFileSync(path.join(asyncRoot, "run-a", "status.json"), "utf8"));
+			completedStatus.state = "complete";
+			completedStatus.endedAt = 4000;
+			fs.writeFileSync(path.join(asyncRoot, "run-a", "status.json"), JSON.stringify(completedStatus), "utf8");
+			freshTracker.handleComplete({ id: "run-a", success: true });
+			assert.equal(freshState.asyncJobs.get("run-a")?.status, "complete");
+			if (freshState.poller) clearInterval(freshState.poller);
+			freshState.poller = null;
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
 	it("removes completed jobs after retention and requests a rerender", async () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-");
 		try {

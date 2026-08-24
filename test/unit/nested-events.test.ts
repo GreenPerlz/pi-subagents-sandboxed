@@ -981,6 +981,17 @@ describe("nested route lock identity", () => {
 		assert.equal(projectNestedEvents(route).children[0]?.id, "locked");
 	});
 
+	it("retries an atomically publishing owner without accepting partial identity", async () => {
+		const route = trackRoute("lock-publication");
+		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
+		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); process.stdout.write('ready'); setTimeout(()=>{ const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,token:'publishing-owner'}),{flag:'wx',mode:0o600}); setTimeout(()=>fs.rmSync(lock,{recursive:true,force:true}),60); },20);`;
+		const owner = spawn(process.execPath, ["-e", script, lock], { stdio: ["ignore", "pipe", "inherit"] });
+		await once(owner.stdout!, "data");
+		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("published", "running", 1) });
+		await once(owner, "close");
+		assert.equal(projectNestedEvents(route).children[0]?.id, "published");
+	});
+
 	it("retries live lock contention until the owner releases without dropping the append", async () => {
 		const route = trackRoute("lock-contention");
 		const lock = path.join(path.dirname(route.eventSink), ".route.lock");

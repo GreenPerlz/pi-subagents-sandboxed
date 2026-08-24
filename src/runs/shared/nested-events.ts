@@ -871,15 +871,40 @@ function linuxStartToken(pid: number): string | undefined {
 		return fields.length > 19 && /^\d+$/.test(fields[19]!) ? fields[19] : undefined;
 	} catch { return undefined; }
 }
+function publishRouteLock(root: string, lock: string, identity: { pid: number; uid: number; startToken: string; token: string }): void {
+	// The directory is the no-replace lock primitive. Publish its owner through
+	// an atomically linked, fully written file so contenders can observe either
+	// no owner yet (brief contention) or the complete identity, never partial JSON.
+	fs.mkdirSync(lock, { mode: 0o700 });
+	const owner = path.join(lock, "owner");
+	const pending = path.join(lock, `.owner.${identity.token}.pending`);
+	let pendingExists = false;
+	try {
+		const fd = fs.openSync(pending, "wx", 0o600);
+		pendingExists = true;
+		try { fs.writeFileSync(fd, `${JSON.stringify(identity)}\n`, "utf8"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+		// link(2) is atomic and fails if an unexpected owner already exists.
+		fs.linkSync(pending, owner);
+		fs.unlinkSync(pending);
+		pendingExists = false;
+		fsyncDirectory(lock);
+		fsyncDirectory(root);
+	} catch (error) {
+		if (pendingExists) { try { fs.unlinkSync(pending); } catch { /* retain uncertain evidence */ } }
+		// Retain the lock directory on publication failure. Deleting an identity
+		// that was not proven would weaken fail-closed ownership semantics.
+		throw error;
+	}
+}
 function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
-	const lock = path.join(routeRoot(route), ROUTE_LOCK);
+	const root = routeRoot(route);
+	const lock = path.join(root, ROUTE_LOCK);
 	const startToken = linuxStartToken(process.pid);
 	if (typeof process.getuid !== "function" || !startToken) throw new Error("Nested route locking requires Linux exact process identity proof.");
 	const identity = { pid: process.pid, uid: process.getuid(), startToken, token: randomUUID() };
 	for (let attempt = 0; attempt < 80; attempt++) {
 		try {
-			fs.mkdirSync(lock, { mode: 0o700 });
-			try { fs.writeFileSync(path.join(lock, "owner"), `${JSON.stringify(identity)}\n`, { flag: "wx", mode: 0o600 }); } catch { fs.rmSync(lock, { recursive: true, force: true }); throw new Error("Unable to publish nested route lock identity."); }
+			publishRouteLock(root, lock, identity);
 			try { return fn(); } finally {
 				// Never remove a replacement lock. The owner token is the release
 				// capability, not merely the pathname.
@@ -900,7 +925,10 @@ function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
 			} catch (lockError) {
 				// The owner may have released between EEXIST and inspection.
 				// Treat that narrow race as contention, never as a dropped record.
-				if ((lockError as NodeJS.ErrnoException).code === "ENOENT") { continue; }
+				if ((lockError as NodeJS.ErrnoException).code === "ENOENT") {
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, 1 + attempt));
+					continue;
+				}
 				throw lockError instanceof Error ? lockError : new Error(String(lockError));
 			}
 			if (stale) { try { fs.rmSync(lock, { recursive: true, force: false }); } catch { /* another contender won */ } continue; }

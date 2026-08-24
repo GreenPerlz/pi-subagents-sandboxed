@@ -14,6 +14,8 @@ import {
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
 } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
+import { listAsyncRuns } from "./async-status.ts";
+import { isExpectedAsyncRunnerPid } from "./pid-identity.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { hasLiveNestedDescendants, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
@@ -25,12 +27,16 @@ interface AsyncJobTrackerOptions {
 	resultsDir?: string;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
+	/** Override exact runner identity checks only for trusted test fixtures. */
+	isExpectedAsyncRunnerPid?: typeof isExpectedAsyncRunnerPid;
 }
 
 export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): {
 	ensurePoller: () => void;
 	handleStarted: (data: unknown) => void;
 	handleComplete: (data: unknown) => void;
+	/** Rehydrate only live, identity-verified runs owned by this session. */
+	adoptPersistedActiveRuns: (ctx?: ExtensionContext) => number;
 	resetJobs: (ctx?: ExtensionContext) => void;
 } {
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
@@ -65,7 +71,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			// descendant is still actionable.
 			try {
 				if (job.nestedRoute) {
-					reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now });
+					reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now, isExpectedAsyncRunnerPid: options.isExpectedAsyncRunnerPid });
 					updateAsyncJobNestedProjection(job);
 				}
 				const current = readStatus(job.asyncDir);
@@ -181,7 +187,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				};
 				const reconcileNestedDescendants = () => {
 					try {
-						if (job.nestedRoute) reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now });
+						if (job.nestedRoute) reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now, isExpectedAsyncRunnerPid: options.isExpectedAsyncRunnerPid });
 					} catch (error) {
 						nestedRefreshFailed = true;
 						console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
@@ -195,6 +201,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						resultsDir,
 						kill: options.kill,
 						now: options.now,
+						isExpectedAsyncRunnerPid: options.isExpectedAsyncRunnerPid,
 						startedRun: {
 							runId: job.asyncId,
 							pid: job.pid,
@@ -286,6 +293,82 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		state.poller.unref?.();
 	};
 
+	const adoptPersistedActiveRuns = (ctx?: ExtensionContext): number => {
+		let adopted = 0;
+		let runs;
+		try {
+			// listAsyncRuns is the trusted status/list seam. Reconciliation is
+			// deliberately disabled here: adoption must not mutate stale or terminal
+			// records while the new extension instance is coming up.
+			runs = listAsyncRuns(asyncDirRoot, {
+				states: ["queued", "running"],
+				sessionId: state.currentSessionId ?? undefined,
+				reconcile: false,
+				isExpectedAsyncRunnerPid: options.isExpectedAsyncRunnerPid,
+			});
+		} catch (error) {
+			console.error(`Failed to inspect persisted async runs in '${asyncDirRoot}':`, error);
+			return 0;
+		}
+		for (const summary of runs) {
+			// listAsyncRuns is rooted, but retain explicit exact-root and directory
+			// checks so malformed status or symlinked entries cannot escape adoption.
+			if (path.resolve(path.dirname(summary.asyncDir)) !== path.resolve(asyncDirRoot) || path.basename(summary.asyncDir) !== summary.id) continue;
+			try { if (!fs.lstatSync(summary.asyncDir).isDirectory()) continue; } catch { continue; }
+			if (state.asyncJobs.has(summary.id)) continue;
+			let status;
+			try { status = readStatus(summary.asyncDir); } catch { continue; }
+			if (!status || status.runId !== summary.id || (status.state !== "queued" && status.state !== "running")) continue;
+			if (state.currentSessionId ? status.sessionId !== state.currentSessionId : status.sessionId !== undefined) continue;
+			if (!Number.isInteger(status.pid) || (status.pid ?? 0) <= 0) continue;
+			const verifyRunnerPid = options.isExpectedAsyncRunnerPid ?? isExpectedAsyncRunnerPid;
+			if (!verifyRunnerPid(status.pid, summary.id, status.runnerIdentity)) continue;
+			const now = options.now?.() ?? Date.now();
+			const steps = summary.steps as AsyncJobState["steps"];
+			const groups = normalizeParallelGroups(status.parallelGroups, steps.length, status.chainStepCount ?? steps.length);
+			state.asyncJobs.set(summary.id, {
+				asyncId: summary.id,
+				asyncDir: summary.asyncDir,
+				status: aggregateStatus(status),
+				pid: status.pid,
+				...(status.sessionId ? { sessionId: status.sessionId } : {}),
+				mode: status.mode,
+				agents: steps.map((step) => step.agent),
+				steps,
+				stepsTotal: steps.length + (status.groupDiagnostics?.length ?? 0),
+				runningSteps: steps.filter((step) => step.status === "running").length,
+				completedSteps: steps.filter((step) => step.status === "complete" || step.status === "completed").length,
+				currentStep: status.currentStep,
+				chainStepCount: status.chainStepCount,
+				parallelGroups: groups,
+				groupDiagnostics: status.groupDiagnostics,
+				hasParallelGroups: groups.length > 0,
+				activeParallelGroup: status.currentStep !== undefined && groups.some((group) => status.currentStep! >= group.start && status.currentStep! < group.start + group.count),
+				startedAt: status.startedAt,
+				updatedAt: status.lastUpdate ?? now,
+				activityState: status.activityState,
+				lastActivityAt: status.lastActivityAt,
+				currentTool: status.currentTool,
+				currentToolStartedAt: status.currentToolStartedAt,
+				currentPath: status.currentPath,
+				turnCount: status.turnCount,
+				toolCount: status.toolCount,
+				sessionDir: status.sessionDir,
+				outputFile: status.outputFile,
+				totalTokens: status.totalTokens,
+				sessionFile: status.sessionFile,
+				nestedRoute: status.nestedRoute,
+				nestedChildren: status.nestedChildren,
+			});
+			adopted += 1;
+		}
+		if (adopted > 0) {
+			ensurePoller();
+			if (ctx) rerenderWidget(ctx);
+		}
+		return adopted;
+	};
+
 	const handleStarted = (data: unknown) => {
 		const info = data as AsyncStartedEvent;
 		if (!info.id) return;
@@ -365,5 +448,5 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}
 	};
 
-	return { ensurePoller, handleStarted, handleComplete, resetJobs };
+	return { ensurePoller, handleStarted, handleComplete, adoptPersistedActiveRuns, resetJobs };
 }

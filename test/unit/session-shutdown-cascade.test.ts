@@ -484,7 +484,7 @@ describe("fanout-child session_shutdown cascade (issue #37 blocker 2)", () => {
 		}) as typeof process.kill;
 
 		const eventCallbacks: Record<string, Array<(...args: unknown[]) => void>> = {};
-		const shutdownCallbacks: Array<() => void> = [];
+		const shutdownCallbacks: Array<(...args: unknown[]) => void> = [];
 		const pi = {
 			events: {
 				on(name: string, cb: (...args: unknown[]) => void) {
@@ -518,12 +518,21 @@ describe("fanout-child session_shutdown cascade (issue #37 blocker 2)", () => {
 
 			await new Promise((resolve) => setTimeout(resolve, 50));
 
-			// Trigger session_shutdown.
+			// Reload disposes this runtime but must not interrupt the still-owned child.
 			assert.ok(shutdownCallbacks.length > 0, "fanout-child should register a session_shutdown handler");
-			for (const cb of shutdownCallbacks) cb();
+			for (const cb of shutdownCallbacks) cb({ reason: "reload" });
+			assert.equal(killCalls.length, 0, "reload must preserve the owned async job");
 
-			// shutdownOwnedAsyncJobs should have sent interrupt signal to the job PID.
-			assert.ok(killCalls.some((c) => c.pid === 77777), "should interrupt fanout-child async job pid on session_shutdown");
+			// Re-register the job as a fresh runtime would before testing quit.
+			pi.events.emit(SUBAGENT_ASYNC_STARTED_EVENT, {
+				id: "fanout-job-1",
+				asyncDir: "/tmp/fanout-async-1",
+				pid: 77777,
+				mode: "single",
+			});
+			// A normal quit retains the established graceful interrupt behavior.
+			for (const cb of shutdownCallbacks) cb({ reason: "quit" });
+			assert.ok(killCalls.some((c) => c.pid === 77777), "quit should interrupt fanout-child async job pid");
 		} finally {
 			process.kill = originalKill;
 			delete process.env[SUBAGENT_CHILD_ENV];

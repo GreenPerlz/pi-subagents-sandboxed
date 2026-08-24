@@ -272,7 +272,8 @@ function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 		if (byState !== 0) return byState;
 		const aTime = a.lastUpdate ?? a.endedAt ?? a.startedAt;
 		const bTime = b.lastUpdate ?? b.endedAt ?? b.startedAt;
-		return bTime - aTime;
+		const byTime = bTime - aTime;
+		return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
 	});
 }
 

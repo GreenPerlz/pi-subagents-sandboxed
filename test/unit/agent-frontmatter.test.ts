@@ -37,8 +37,8 @@ describe("agent frontmatter acceptance and override policy", () => {
 			["skills/improve-codebase-architecture/SKILL.md", "scout"],
 			["skills/pi-subagents/sandboxing.md", "sandbox-work"],
 			["skills/pi-subagents/SKILL.md", "sandbox-work"],
-			["README.md", "sandbox-work"],
-			["README.md", "auditor"],
+			["docs/agents.md", "focused-review"],
+			["docs/git-worktrees.md", "isolated-writer"],
 		] as const;
 		for (const [relativePath, name] of examples) {
 			const frontmatter = readDocumentedAgentFrontmatter(relativePath, name);

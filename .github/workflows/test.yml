@@ -27,9 +27,19 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-      - name: Install Bubblewrap
+      - name: Enable Bubblewrap
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          # Ubuntu 24.04 runner AppArmor blocks unprivileged user namespaces by
+          # default. This is an ephemeral test VM; enable them so the suite can
+          # exercise real Bubblewrap rather than skipping containment coverage.
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / -- true
       - name: Install locked dependencies
         run: npm ci
       - name: Unit tests

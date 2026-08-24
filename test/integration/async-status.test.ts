@@ -40,7 +40,7 @@ describe("async status helpers", () => {
 				steps: [{ agent: "reviewer", status: "complete" }],
 			});
 
-			const runs = listAsyncRuns(root, { states: ["queued", "running"] });
+			const runs = listAsyncRuns(root, { states: ["queued", "running"], reconcile: false });
 			assert.equal(runs.length, 1);
 			assert.equal(runs[0]?.id, "run-a");
 			assert.equal(runs[0]?.cwd, "/repo-a");

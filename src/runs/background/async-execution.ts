@@ -10,8 +10,8 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
-import { hasExplicitSandboxOptOut, resolveSandboxConfig, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
-import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
+import { hasExplicitSandboxOptOut, normalizeSandboxTransport, resolveSandboxTransport, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
+import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults, SandboxTransport } from "../../sandbox/types.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
@@ -145,7 +145,7 @@ interface AsyncChainParams {
 	/** Explicit authenticated ancestry restored by a routed launch. */
 	nestedSelf?: NonNullable<AsyncStatus["nestedSelf"]>;
 	acceptance?: AcceptanceInput;
-	sandbox?: ResolvedSandboxConfig;
+	sandbox?: SandboxTransport;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
@@ -181,7 +181,7 @@ interface AsyncSingleParams {
 	/** Explicit authenticated ancestry restored by async revival. */
 	nestedSelf?: NonNullable<AsyncStatus["nestedSelf"]>;
 	acceptance?: AcceptanceInput;
-	sandbox?: ResolvedSandboxConfig;
+	sandbox?: SandboxTransport;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	/** Direct parent authority may narrow an isolated child to read-only. */
@@ -460,14 +460,15 @@ export function executeAsyncChain(
 	const availableModels = params.availableModels;
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
-	const sharedSandbox = hasSandboxResolutionInputs
-		? resolveSandboxConfig({ settings: params.sandboxSettings, run: params.sandboxRun })
-		: params.sandbox;
-	const resolveStepSandbox = (agent: AgentConfig): ResolvedSandboxConfig | undefined => hasSandboxResolutionInputs
-		? resolveSandboxConfig({ settings: params.sandboxSettings, agent, run: params.sandboxRun })
-		: params.sandbox
-			? resolveSandboxConfig({ agent, run: params.sandbox })
-			: resolveSandboxConfig({ agent });
+	const sharedSandbox: SandboxTransport | undefined = hasSandboxResolutionInputs
+		? resolveSandboxTransport({ settings: params.sandboxSettings, run: params.sandboxRun })
+		: Object.hasOwn(params, "sandbox") ? normalizeSandboxTransport(params.sandbox) : undefined;
+	const resolveStepSandbox = (agent: AgentConfig): SandboxTransport | undefined => {
+		if (hasSandboxResolutionInputs) return resolveSandboxTransport({ settings: params.sandboxSettings, agent, run: params.sandboxRun });
+		if (!Object.hasOwn(params, "sandbox")) return resolveSandboxTransport({ agent });
+		const supplied = normalizeSandboxTransport(params.sandbox);
+		return supplied === null ? null : resolveSandboxTransport({ agent, run: supplied });
+	};
 	const firstStep = chain[0];
 	const originalTask = params.task ?? (firstStep
 		? (isParallelStep(firstStep)
@@ -601,7 +602,7 @@ export function executeAsyncChain(
 		sandboxOverride?: ResolvedSandboxConfig,
 	) => {
 		const a = agents.find((x) => x.name === s.agent)!;
-		const stepSandbox = sandboxOverride ?? resolveStepSandbox(a);
+		const stepSandbox = sandboxOverride !== undefined ? sandboxOverride : resolveStepSandbox(a);
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
 		const instructionCwd = behaviorCwd ?? stepCwd;
 		const behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
@@ -666,7 +667,7 @@ export function executeAsyncChain(
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
 			sandbox: stepSandbox,
-			hostGitDiagnostic: !stepSandbox && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, agent: a, run: params.sandboxRun }),
+			hostGitDiagnostic: (stepSandbox === null || stepSandbox === undefined) && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, agent: a, run: params.sandboxRun }),
 			effectiveAcceptance: resolveEffectiveAcceptance({
 				explicit: s.acceptance,
 				agentName: s.agent,
@@ -960,11 +961,13 @@ export function executeAsyncSingle(
 	const authorityRoute = explicitNestedRoute && !effectiveNestedSelf ? undefined : inheritedNestedRoute;
 	const scopedGitRunEndpoint: ScopedGitEndpointDescriptor | undefined = explicitNestedRoute && !effectiveNestedSelf && inheritedNestedRoute ? undefined : params.scopedGitEndpoint;
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
-	let sandbox = hasSandboxResolutionInputs
-		? resolveSandboxConfig({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun })
-		: params.sandbox
-			? resolveSandboxConfig({ agent: agentConfig, run: params.sandbox })
-			: resolveSandboxConfig({ agent: agentConfig });
+	let sandbox: SandboxTransport | undefined;
+	if (hasSandboxResolutionInputs) sandbox = resolveSandboxTransport({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun });
+	else if (!Object.hasOwn(params, "sandbox")) sandbox = resolveSandboxTransport({ agent: agentConfig });
+	else {
+		const supplied = normalizeSandboxTransport(params.sandbox);
+		sandbox = supplied === null ? null : resolveSandboxTransport({ agent: agentConfig, run: supplied });
+	}
 	if (params.worktree === false && !scopedGitRunEndpoint && sandbox?.gitMode === "isolated"
 		&& worktreeOptOutIsAuthorized(params.sandboxSettings)
 		&& agentConfig.canOptOutOfWorktree === true) {
@@ -1049,7 +1052,7 @@ export function executeAsyncSingle(
 						sessionFile,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
 						sandbox,
-						hostGitDiagnostic: !sandbox && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun }),
+						hostGitDiagnostic: (sandbox === null || sandbox === undefined) && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, agent: agentConfig, run: params.sandboxRun }),
 						effectiveAcceptance: resolveEffectiveAcceptance({
 							explicit: params.acceptance,
 							agentName: agent,

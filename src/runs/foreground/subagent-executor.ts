@@ -5,12 +5,12 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
-import { hasExplicitSandboxOptOut, resolveSandboxConfig, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
+import { hasExplicitSandboxOptOut, resolveSandboxConfig, resolveSandboxTransport, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { packagedAgentIsReadOnly, resolvePackagedAgentRole } from "../shared/agent-role.ts";
 import { resolveCapabilityRights } from "../shared/capability-rights.ts";
-import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults, SandboxTransport } from "../../sandbox/types.ts";
 import { getArtifactsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type ChainClarifyPolicy } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -190,8 +190,8 @@ function resolveChildSandboxConfig(input: {
 	settings?: SandboxSettingsDefaults;
 	agent?: AgentConfig;
 	run?: SandboxRunConfig;
-}): ResolvedSandboxConfig | undefined {
-	return resolveSandboxConfig(input);
+}): SandboxTransport | undefined {
+	return resolveSandboxTransport(input);
 }
 
 interface TeardownHooks {
@@ -340,7 +340,7 @@ function resolveNestedStepState(result: SingleResult): "complete" | "failed" | "
 	return status === "detached" ? "running" : status === "cancelled" ? "cancelled" : status === "paused" ? "paused" : status === "failed" ? "failed" : "complete";
 }
 
-function isolatedGitCommitRequired(task: string | undefined, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined, parentRights?: "writer" | "read-only"): boolean {
+function isolatedGitCommitRequired(task: string | undefined, agent: AgentConfig | undefined, sandbox: SandboxTransport | undefined, parentRights?: "writer" | "read-only"): boolean {
 	return resolveCapabilityRights({
 		packagedRole: resolvePackagedAgentRole(agent?.name, agent?.source),
 		agentTools: agent?.tools,
@@ -1075,8 +1075,19 @@ async function resumeAsyncRun(input: {
 	const runId = randomUUID().slice(0, 8);
 	const artifactConfig: ArtifactConfig = { ...DEFAULT_ARTIFACT_CONFIG, enabled: input.params.artifacts !== false };
 	const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
-	const sandbox = resolveSandboxConfig({ agent: agentConfig, run: input.params.sandbox });
+	const sandboxSettings = readSandboxSettings(effectiveCwd, scope);
+	let sandbox: SandboxTransport | undefined;
+	try {
+		sandbox = target.sandbox === null
+			? resolveSandboxTransport({ settings: sandboxSettings, agent: agentConfig, run: { provider: "none" } })
+			: resolveSandboxTransport({ settings: sandboxSettings, agent: agentConfig, run: input.params.sandbox });
+	} catch (error) {
+		return { content: [{ type: "text", text: `Sandbox policy revalidation rejected resume: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "management", results: [] } };
+	}
 	let scopedGitEndpoint: ScopedGitEndpointDescriptor | undefined;
+	if (target.nestedSelf && input.scopedGitEndpoint && sandbox === null) {
+		return { content: [{ type: "text", text: "Scoped Git endpoint requires Bubblewrap isolated mode; explicit sandbox opt-out is not permitted on resume." }], isError: true, details: { mode: "management", results: [] } };
+	}
 	try {
 		scopedGitEndpoint = target.nestedSelf
 			? await reserveAsyncScopedEndpoint(input.scopedGitEndpoint, effectiveCwd, isolatedGitCommitRequired(followUp, agentConfig, sandbox))
@@ -2072,8 +2083,8 @@ interface ForegroundParallelRunInput {
 	worktreeSetup?: WorktreeSetup;
 	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[];
 	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
-	sandbox?: ResolvedSandboxConfig;
-	sandboxes?: (ResolvedSandboxConfig | undefined)[];
+	sandbox?: SandboxTransport;
+	sandboxes?: (SandboxTransport | undefined)[];
 	parentRights?: "writer" | "read-only";
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	issueIsolatedGitCapability?: (worktree: IsolatedGitWorktree, rights: "writer" | "read-only", cwd: string) => Promise<import("../../sandbox/isolated-git.ts").IsolatedGitCapability>;
@@ -2081,6 +2092,10 @@ interface ForegroundParallelRunInput {
 	progressPaths?: string[];
 	onDetachedStarted?: (index: number, result: SingleResult) => void;
 	onDetachedTerminal?: (index: number, result: SingleResult) => void | Promise<void>;
+}
+
+function sandboxAt(values: Array<SandboxTransport | undefined> | undefined, index: number, fallback: SandboxTransport | undefined): SandboxTransport | undefined {
+	return values && index in values ? values[index] : fallback;
 }
 
 function buildParallelModeError(message: string): AgentToolResult<Details> {
@@ -2212,14 +2227,15 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 		const effectiveSkills = behavior?.skills;
 		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees);
 		const agentConfig = input.agents.find((agent) => agent.name === task.agent);
+		const taskSandbox = sandboxAt(input.sandboxes, index, input.sandbox);
 		// Issue capability after the resolved per-task sandbox is available and
 		// before output/session/artifact path work begins.
 		const isolatedCapability = input.isolatedGitWorktrees?.[index]
 			? await (input.issueIsolatedGitCapability
-				? input.issueIsolatedGitCapability(input.isolatedGitWorktrees[index]!, isolatedGitCommitRequired(task.task, agentConfig, input.sandboxes?.[index] ?? input.sandbox, input.parentRights) ? "writer" : "read-only", taskCwd)
+				? input.issueIsolatedGitCapability(input.isolatedGitWorktrees[index]!, isolatedGitCommitRequired(task.task, agentConfig, taskSandbox, input.parentRights) ? "writer" : "read-only", taskCwd)
 				: input.isolatedGitWorktrees[index]!.runtime.issueInheritedContext({
 					worktree: input.isolatedGitWorktrees[index]!,
-					rights: isolatedGitCommitRequired(task.task, agentConfig, input.sandboxes?.[index] ?? input.sandbox, input.parentRights) ? "writer" : "read-only",
+					rights: isolatedGitCommitRequired(task.task, agentConfig, taskSandbox, input.parentRights) ? "writer" : "read-only",
 					cwd: taskCwd,
 				}))
 			: undefined;
@@ -2332,13 +2348,13 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			skills: effectiveSkills === false ? [] : effectiveSkills,
 			acceptance: task.acceptance,
 			acceptanceContext: { mode: "parallel" },
-			sandbox: input.sandboxes?.[index] ?? input.sandbox,
+			sandbox: taskSandbox,
 			isolatedGit: input.isolatedGitWorktrees?.[index],
 			isolatedGitCapability: isolatedCapability,
 			isolatedGitBundleDir: input.artifactsDir,
 			isolatedGitEndpoint: input.scopedGitEndpoint,
-			isolatedGitRights: input.scopedGitEndpoint ? (isolatedGitCommitRequired(taskText, agentConfig, input.sandboxes?.[index] ?? input.sandbox) ? "writer" : "read-only") : undefined,
-			isolatedGitCommitRequired: Boolean(input.isolatedGitWorktrees?.[index]) && isolatedGitCommitRequired(taskText, agentConfig, input.sandboxes?.[index] ?? input.sandbox),
+			isolatedGitRights: input.scopedGitEndpoint ? (isolatedGitCommitRequired(taskText, agentConfig, taskSandbox) ? "writer" : "read-only") : undefined,
+			isolatedGitCommitRequired: Boolean(input.isolatedGitWorktrees?.[index]) && isolatedGitCommitRequired(taskText, agentConfig, taskSandbox),
 			sandboxIntercomBridge: input.sandboxIntercomBridge,
 			progressPaths: behavior?.progress ? input.progressPaths : undefined,
 			onDetachedStarted: input.onDetachedStarted ? (result) => input.onDetachedStarted!(index, result) : undefined,
@@ -3727,9 +3743,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 
 	// Resolve sandbox policy before reserving any inherited endpoint subtree.
 	// The owner retains lifecycle authority; this process borrows a narrowed lease.
-	let sandbox: ReturnType<typeof resolveSandboxConfig>;
+	let sandbox: SandboxTransport | undefined;
 	try {
-		sandbox = resolveSandboxConfig({
+		sandbox = resolveChildSandboxConfig({
 			settings: sandboxSettings,
 			agent: agentConfig,
 			run: params.sandbox,
@@ -3745,6 +3761,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		sandbox = { ...sandbox, gitMode: "read-only" };
 	}
 	if (data.scopedGitEndpoint) {
+		if (sandbox === null) {
+			return { content: [{ type: "text", text: "Scoped Git endpoint requires Bubblewrap isolated mode; explicit sandbox opt-out is not permitted." }], isError: true, details: { mode: "single", results: [] } };
+		}
 		// The endpoint narrows Git authority only. Keep the trusted child agent's
 		// model network/auth policy: a nested Bubblewrap can inherit, but cannot
 		// broaden, its outer network namespace or exact credential-file mounts.
@@ -3754,7 +3773,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			gitMode: "isolated",
 			profile: "host-toolchain",
 			fallback: "fail",
-		} as ReturnType<typeof resolveSandboxConfig>;
+		};
 	}
 	// Foreground nested authority is represented only by scopedGitEndpoint.
 	if (params.context === "fork") {
@@ -3831,14 +3850,14 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		}
 		: undefined;
 
-	if (data.scopedGitEndpoint) {
+	if (data.scopedGitEndpoint && sandbox) {
 		sandbox = {
 			...sandbox,
 			provider: "bubblewrap",
 			gitMode: "isolated",
 			profile: "host-toolchain",
 			fallback: "fail",
-		} as ReturnType<typeof resolveSandboxConfig>;
+		};
 	}
 	let isolatedRuntime: IsolatedGitRuntime | undefined;
 	let isolatedWorktree: IsolatedGitWorktree | undefined;

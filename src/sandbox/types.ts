@@ -36,6 +36,9 @@ export interface SandboxSettingsDefaults {
 	packageDiscovery?: SandboxPackageDiscoveryMode | string;
 }
 
+/** Internal transport: null is an authenticated explicit provider:none decision. */
+export type SandboxTransport = ResolvedSandboxConfig | null;
+
 export interface ResolvedSandboxConfig {
 	provider: string;
 	gitMode?: GitMode | string;

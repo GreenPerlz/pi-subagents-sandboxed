@@ -1,9 +1,9 @@
-import type { ResolvedSandboxConfig } from "./types.ts";
+import type { ResolvedSandboxConfig, SandboxTransport } from "./types.ts";
 
 export interface SandboxWriteInferenceInput {
 	agentName?: string;
 	tools?: string[];
-	sandbox?: Pick<ResolvedSandboxConfig, "bashWrite">;
+	sandbox?: Pick<ResolvedSandboxConfig, "bashWrite"> | null;
 }
 
 function isBuiltinTool(tool: string, name: string): boolean {
@@ -30,11 +30,11 @@ export function inferSandboxCwdWritable(input: SandboxWriteInferenceInput): bool
 	return false;
 }
 
-export function hasSandboxWritableAgent(input: { agents: Array<SandboxWriteInferenceInput>; sandbox?: ResolvedSandboxConfig }): boolean {
+export function hasSandboxWritableAgent(input: { agents: Array<SandboxWriteInferenceInput>; sandbox?: SandboxTransport }): boolean {
 	const hasSandbox = Boolean(input.sandbox) || input.agents.some((agent) => Boolean(agent.sandbox));
 	if (!hasSandbox) return false;
 	return input.agents.some((agent) => {
-		const sandbox = agent.sandbox ?? input.sandbox;
+		const sandbox = agent.sandbox !== undefined ? agent.sandbox : input.sandbox;
 		return Boolean(sandbox) && inferSandboxCwdWritable({ agentName: agent.agentName, tools: agent.tools, sandbox });
 	});
 }

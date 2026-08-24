@@ -44,6 +44,23 @@ describe("async resume lookup", () => {
 		}
 	});
 
+	it("preserves an explicit provider:none policy marker for trusted revival revalidation", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-none-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(asyncRoot, "run-none", "status.json"), {
+				runId: "run-none", mode: "single", state: "complete", cwd: root, sessionFile,
+				steps: [{ agent: "worker", status: "complete", sessionFile, sandbox: { provider: "none" }, sandboxDisabled: true }],
+			});
+			const target = resolveAsyncResumeTarget({ id: "run-none" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
+			assert.equal(target.sandbox, null);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("restores authenticated nested route and ancestry and rejects missing nested metadata", () => {
 		const rootRunId = `resume-root-${Date.now().toString(36)}`;
 		const route = createNestedRoute(rootRunId);

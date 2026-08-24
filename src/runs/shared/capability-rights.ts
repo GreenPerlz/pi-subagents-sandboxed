@@ -11,7 +11,7 @@ export type CapabilityRights = "writer" | "read-only";
 export interface CapabilityRightsInput {
 	packagedRole?: PackagedAgentRole;
 	agentTools?: readonly string[];
-	sandbox?: Pick<ResolvedSandboxConfig, "gitMode" | "bashWrite" | "extraWritableMounts">;
+	sandbox?: Pick<ResolvedSandboxConfig, "gitMode" | "bashWrite" | "extraWritableMounts"> | null;
 	taskMutationProhibited?: boolean;
 	parentRights?: CapabilityRights;
 	/** Whether the caller has an exclusive writer lease available. */

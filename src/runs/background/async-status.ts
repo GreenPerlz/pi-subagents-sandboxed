@@ -200,7 +200,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.cancelled ? { cancelled: true } : {}),
 			...(step.teardownUnproven ? { teardownUnproven: true } : {}),
 			...(step.acceptance ? { acceptance: step.acceptance } : {}),
-			...(step.sandbox ? { sandbox: step.sandbox } : {}),
+			...(step.sandbox !== undefined ? { sandbox: step.sandbox } : {}),
 			...(step.gitBundle ? { gitBundle: step.gitBundle } : {}),
 			...(step.children?.length ? { children: step.children } : {}),
 		};

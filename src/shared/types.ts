@@ -484,7 +484,9 @@ export interface SingleResult {
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
-	sandbox?: SandboxResultDetails;
+	sandbox?: SandboxResultDetails | null;
+	/** Persisted policy marker; never authorizes opt-out without trusted settings revalidation. */
+	sandboxDisabled?: true;
 	gitBundle?: GitBundleResult;
 	/** Process-group teardown was not proven; do not publish a terminal nested event. */
 	teardownUnproven?: boolean;
@@ -749,7 +751,9 @@ export interface AsyncStatus {
 		structuredOutputPath?: string;
 		structuredOutputSchemaPath?: string;
 		acceptance?: AcceptanceLedger;
-		sandbox?: SandboxResultDetails;
+		sandbox?: SandboxResultDetails | null;
+		/** Persisted policy marker; never authorizes opt-out without trusted settings revalidation. */
+		sandboxDisabled?: true;
 		gitBundle?: GitBundleResult;
 		teardownUnproven?: boolean;
 	}>;
@@ -995,8 +999,8 @@ export interface RunSyncOptions {
 		dynamic?: boolean;
 		dynamicGroup?: boolean;
 	};
-	/** Resolved sandbox config for this child process; omitted preserves the original spawn path. */
-	sandbox?: ResolvedSandboxConfig;
+	/** Resolved sandbox transport; null is an authorized explicit provider:none decision. */
+	sandbox?: ResolvedSandboxConfig | null;
 	/** Authorized provider:none host-Git runs carry a prominent no-isolation diagnostic. */
 	hostGitDiagnostic?: boolean;
 	/** Progress files the child is instructed to update; parent dirs are mounted writable when sandboxed. */

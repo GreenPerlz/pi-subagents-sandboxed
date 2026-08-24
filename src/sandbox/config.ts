@@ -1,4 +1,4 @@
-import type { AgentSandboxConfig, ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "./types.ts";
+import type { AgentSandboxConfig, ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults, SandboxTransport } from "./types.ts";
 
 interface SandboxResolutionInput {
 	settings?: SandboxSettingsDefaults;
@@ -70,6 +70,28 @@ function appendPathOverrides(target: string[], value: string[] | undefined): voi
 		const normalized = normalizeString(item);
 		if (normalized && !target.includes(normalized)) target.push(normalized);
 	}
+}
+
+/** Normalize legacy already-authorized internal provider:none values at transport boundaries. */
+export function normalizeSandboxTransport(value: SandboxTransport | undefined): SandboxTransport | undefined {
+	return value?.provider === "none" ? null : value;
+}
+
+/**
+ * Resolve the internal serialized transport. Unlike the public resolver,
+ * explicit authorized provider:none is represented as null so revival and
+ * per-step inheritance cannot mistake it for an omitted value.
+ */
+export function resolveSandboxTransport(input: SandboxResolutionInput = {}): SandboxTransport | undefined {
+	const resolved = resolveSandboxConfig(input);
+	if (resolved !== undefined) return resolved;
+	if (hasExplicitSandboxOptOut(input)) {
+		if (!sandboxOptOutIsAuthorized(input)) {
+			throw new Error("Sandbox opt-out denied: provider:none requires trusted user-global sandbox.allowSandboxOptOut=true; project settings and child agents cannot enable it.");
+		}
+		return null;
+	}
+	return undefined;
 }
 
 export function resolveSandboxConfig(input: SandboxResolutionInput = {}): ResolvedSandboxConfig | undefined {

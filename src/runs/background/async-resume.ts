@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ASYNC_DIR, RESULTS_DIR, TEMP_ROOT_DIR, type AsyncStatus, type NestedRouteInfo } from "../../shared/types.ts";
+import type { SandboxTransport } from "../../sandbox/types.ts";
 import { validateNestedRouteForRevival } from "../shared/nested-events.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
@@ -29,6 +30,8 @@ export type AsyncResumeTarget = {
 	intercomTarget: string;
 	cwd?: string;
 	sessionFile?: string;
+	/** Persisted null marker for an authorized provider:none revival. */
+	sandbox?: SandboxTransport;
 	nestedRoute?: NestedRouteInfo;
 	nestedSelf?: AsyncStatus["nestedSelf"];
 };
@@ -42,6 +45,8 @@ interface AsyncResultChild {
 	groupId?: string;
 	unindexed?: boolean;
 	teardownUnproven?: boolean;
+	sandbox?: null;
+	sandboxDisabled?: true;
 }
 
 interface AsyncResultFile {
@@ -112,6 +117,8 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 				...(typeof child.groupId === "string" ? { groupId: child.groupId } : {}),
 				...(child.unindexed === true ? { unindexed: true } : {}),
 				...(child.teardownUnproven === true ? { teardownUnproven: true } : {}),
+				...(child.sandbox === null ? { sandbox: null } : {}),
+				...(child.sandboxDisabled === true ? { sandboxDisabled: true } : {}),
 			};
 		});
 	}
@@ -433,6 +440,12 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		?? (stepCount === 1 ? status?.sessionFile ?? result?.sessionFile : undefined);
 	if (!sessionFile) throw new Error(`Async run '${runId}' child ${index} does not have a persisted session file to resume from.`);
 	const resolvedSessionFile = validateResumeSessionFile(runId, sessionFile);
+	const persistedSandbox = statusStep?.sandboxDisabled === true
+		|| resultStep?.sandboxDisabled === true
+		|| statusStep?.sandbox === null
+		|| resultStep?.sandbox === null
+		? null
+		: undefined;
 
 	return {
 		kind: "revive",
@@ -444,6 +457,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		intercomTarget: resolveSubagentIntercomTarget(runId, agent, index),
 		cwd: status?.cwd ?? result?.cwd,
 		sessionFile: resolvedSessionFile,
+		...(persistedSandbox === null ? { sandbox: null } : {}),
 		...(persistedRoute ? { nestedRoute: persistedRoute } : {}),
 		...(persistedNestedSelf ? { nestedSelf: persistedNestedSelf } : {}),
 	};

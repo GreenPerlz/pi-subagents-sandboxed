@@ -15,7 +15,7 @@ import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitB
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
-import type { ResolvedSandboxConfig, SandboxResultDetails, SpawnableInvocation } from "../../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxResultDetails, SandboxTransport, SpawnableInvocation } from "../../sandbox/types.ts";
 import { writeSavedOutput } from "../../shared/output-paths.ts";
 import { appendSavedOutputSystemPrompt, captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
@@ -145,7 +145,7 @@ interface SubagentRunConfig {
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
-	sandbox?: ResolvedSandboxConfig;
+	sandbox?: SandboxTransport;
 	progressPaths?: string[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	ownerPid?: number;
@@ -216,6 +216,18 @@ const TEST_REJECT_AFTER_CHILD_ENV = "PI_SUBAGENTS_TEST_REJECT_AFTER_CHILD";
 // inherited endpoint has been validated but before the first child subtree is
 // reserved. It is inert unless a test supplies an explicit gate path.
 const TEST_PAUSE_AFTER_INHERITED_AUTH_ENV = "PI_SUBAGENTS_TEST_PAUSE_AFTER_INHERITED_AUTH";
+
+/** Preserve null (explicit provider:none) while inheriting omitted sandbox values. */
+function inheritedSandbox(step: { sandbox?: SandboxTransport }, parent: SandboxTransport | undefined): SandboxTransport | undefined {
+	return Object.hasOwn(step, "sandbox") ? step.sandbox : parent;
+}
+
+function sandboxStatus(sandbox: SandboxTransport | undefined): { sandbox?: SandboxResultDetails | null; sandboxDisabled?: true } {
+	if (sandbox === undefined) return {};
+	return sandbox === null
+		? { sandbox: null, sandboxDisabled: true }
+		: { sandbox: sandboxResultDetails(sandbox) };
+}
 
 async function waitForTestInheritedAuthGate(): Promise<void> {
 	const gate = process.env[TEST_PAUSE_AFTER_INHERITED_AUTH_ENV];
@@ -437,7 +449,7 @@ function runPiStreaming(
 					? { invocation: sandbox.isolatedGit.runtime.wrapInvocation(sandbox.isolatedGitCapability!, { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd, env: spawnEnv }, effectiveSandboxMounts, sandbox.config), diagnostics: [] }
 					: createSandboxProvider(sandbox.config).wrapInvocation({
 						config: sandbox.config,
-						invocation: { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd, env: spawnEnv, pinReadonlyMounts: Boolean(sandbox.scopedGitEndpoint) },
+						invocation: { command: piSpawnSpec!.command, args: piSpawnSpec!.args, cwd, env: spawnEnv, pinReadonlyMounts: true },
 						mounts: effectiveSandboxMounts,
 					});
 				pinnedSandboxFds = wrapped.invocation.inheritedFds;
@@ -1186,7 +1198,7 @@ async function runSingleStepInner(
 	const modelAttempts: ModelAttempt[] = [];
 	const attemptNotes: string[] = [];
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
-	const effectiveSandbox = step.sandbox ?? ctx.sandbox;
+	const effectiveSandbox = inheritedSandbox(step, ctx.sandbox);
 	const stepCwd = step.cwd ?? ctx.cwd;
 	const executionCwd = ctx.isolatedGit ? mapIsolatedGitCwd(ctx.isolatedGit, stepCwd) : stepCwd;
 	// Every nested child receives a fresh endpoint subtree. The writer subtree
@@ -1587,10 +1599,10 @@ async function runSingleStepInner(
 				commitRequired: resolveCapabilityRights({
 					packagedRole: resolvePackagedAgentRole(step.agent, step.source),
 					agentTools: step.tools,
-					sandbox: step.sandbox ?? ctx.sandbox,
+					sandbox: inheritedSandbox(step, ctx.sandbox),
 					taskMutationProhibited: taskDisallowsFileUpdates(step.task),
 					parentRights: ctx.isolatedGitCapability?.rights,
-					writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }),
+					writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: inheritedSandbox(step, ctx.sandbox) }),
 					exclusiveLease: true,
 				}) === "writer",
 			});
@@ -1618,10 +1630,10 @@ async function runSingleStepInner(
 			const requiresAuthoredCommit = resolveCapabilityRights({
 			packagedRole: resolvePackagedAgentRole(step.agent, step.source),
 			agentTools: step.tools,
-			sandbox: step.sandbox ?? ctx.sandbox,
+			sandbox: inheritedSandbox(step, ctx.sandbox),
 			taskMutationProhibited: taskDisallowsFileUpdates(step.task),
 			parentRights: ctx.isolatedGitCapability?.rights,
-			writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: step.sandbox ?? ctx.sandbox }),
+			writableCwd: inferSandboxCwdWritable({ agentName: step.agent, tools: step.tools, sandbox: inheritedSandbox(step, ctx.sandbox) }),
 			exclusiveLease: true,
 		}) === "writer";
 			if (bundle.incomplete && requiresAuthoredCommit && !finalResult?.error) {
@@ -1962,7 +1974,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					thinking: task.thinking,
 					fastMode: initialFastModeStatus(task),
 					attemptedModels: task.modelCandidates && task.modelCandidates.length > 0 ? task.modelCandidates : task.model ? [task.model] : undefined,
-					...((task.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((task.sandbox ?? config.sandbox)!) } : {}),
+					...sandboxStatus(inheritedSandbox(task, config.sandbox)),
 					recentTools: [],
 					recentOutput: [],
 				});
@@ -1977,7 +1989,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				outputName: step.collect.as,
 				structured: Boolean(step.collect.outputSchema),
 				status: "pending",
-				...((step.parallel.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((step.parallel.sandbox ?? config.sandbox)!) } : {}),
+				...sandboxStatus(inheritedSandbox(step.parallel, config.sandbox)),
 				recentTools: [],
 				recentOutput: [],
 			});
@@ -1996,7 +2008,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				thinking: step.thinking,
 				fastMode: initialFastModeStatus(step),
 				attemptedModels: step.modelCandidates && step.modelCandidates.length > 0 ? step.modelCandidates : step.model ? [step.model] : undefined,
-				...((step.sandbox ?? config.sandbox) ? { sandbox: sandboxResultDetails((step.sandbox ?? config.sandbox)!) } : {}),
+				...sandboxStatus(inheritedSandbox(step, config.sandbox)),
 				recentTools: [],
 				recentOutput: [],
 			});
@@ -2025,7 +2037,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		...flatSteps.map((step) => step.sandbox).filter((sandbox): sandbox is ResolvedSandboxConfig => sandbox?.gitMode === "isolated"),
 		...steps
 			.filter(isDynamicRunnerGroup)
-			.map((step) => step.parallel.sandbox ?? config.sandbox)
+			.map((step) => inheritedSandbox(step.parallel, config.sandbox))
 			.filter((sandbox): sandbox is ResolvedSandboxConfig => sandbox?.gitMode === "isolated"),
 	];
 	const hasIsolatedGit = isolatedSandboxConfigs.length > 0;
@@ -2065,7 +2077,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 	const resolveIsolatedGitWorktree = (step: SubagentStep, flatIndex: number): IsolatedGitWorktree | undefined => {
-		const sandbox = step.sandbox ?? config.sandbox;
+		const sandbox = inheritedSandbox(step, config.sandbox);
 		if (sandbox?.gitMode !== "isolated" || scopedGitEndpoint) return undefined;
 		const sequential = sequentialFlatIndices.has(flatIndex);
 		const packagedRole = resolvePackagedAgentRole(step.agent, step.source);
@@ -2121,7 +2133,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 	 * failed after making edits.
 	 */
 	const createRecoverySlot = (step: SubagentStep, flatIndex: number): IsolatedGitWorktree | undefined => {
-		const sandbox = step.sandbox ?? config.sandbox;
+		const sandbox = inheritedSandbox(step, config.sandbox);
 		if (sandbox?.gitMode !== "isolated" || scopedGitEndpoint) return undefined;
 		const existing = isolatedGitWorktrees.get(flatIndex) ?? isolatedGitRuntime?.worktrees.find((candidate) => candidate.index === flatIndex);
 		if (existing) {
@@ -2316,7 +2328,9 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		step.structuredOutputPath = result.structuredOutputPath;
 		step.structuredOutputSchemaPath = result.structuredOutputSchemaPath;
 		step.acceptance = result.acceptance;
-		step.sandbox = result.sandbox;
+		const sandboxDisabled = step.sandboxDisabled === true || step.sandbox === null;
+		step.sandbox = result.sandbox ?? (sandboxDisabled ? null : undefined);
+		if (sandboxDisabled) step.sandboxDisabled = true;
 		step.gitBundle = result.gitBundle ?? step.gitBundle;
 		step.teardownUnproven = result.teardownUnproven === true || step.teardownUnproven === true ? true : undefined;
 		if (result.teardownUnproven) statusPayload.teardownUnproven = true;
@@ -2876,7 +2890,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 
 		if (isDynamicRunnerGroup(step)) {
 			const groupStartFlatIndex = flatIndex;
-			const dynamicSandbox = step.parallel.sandbox ?? config.sandbox;
+			const dynamicSandbox = inheritedSandbox(step.parallel, config.sandbox);
 			if (dynamicSandbox && dynamicSandbox.gitMode !== "isolated" && inferSandboxCwdWritable({ agentName: step.parallel.agent, tools: step.parallel.tools, sandbox: dynamicSandbox }) && !step.worktreeOptOutAuthorized) {
 				const now = Date.now();
 				const message = sandboxDynamicFanoutUnsupportedMessage(`Dynamic sandboxed chain step ${stepIndex + 1}`);
@@ -3091,10 +3105,10 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				const dynamicReadOnly = resolveCapabilityRights({
 					packagedRole,
 					agentTools: task.tools,
-					sandbox: task.sandbox ?? config.sandbox,
+					sandbox: inheritedSandbox(task, config.sandbox),
 					taskMutationProhibited: taskDisallowsFileUpdates(task.task),
 					parentRights: undefined,
-					writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }),
+					writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: inheritedSandbox(task, config.sandbox) }),
 					exclusiveLease: true,
 				}) !== "writer";
 				const dynamicCapability = dynamicWorktree
@@ -3262,8 +3276,8 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			let worktreeSetup: WorktreeSetup | undefined;
 			if (!group.worktree
 				&& !group.worktreeOptOutAuthorized
-				&& !group.parallel.some((task) => (task.sandbox ?? config.sandbox)?.gitMode === "isolated")
-				&& hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, agentName: task.agent, sandbox: task.sandbox ?? config.sandbox })) })) {
+				&& !group.parallel.some((task) => (inheritedSandbox(task, config.sandbox))?.gitMode === "isolated")
+				&& hasSandboxWritableAgent({ agents: group.parallel.map((task) => ({ ...task, agentName: task.agent, sandbox: inheritedSandbox(task, config.sandbox) })) })) {
 				const failedAt = Date.now();
 				markParallelGroupSetupFailure({
 					statusPayload,
@@ -3414,10 +3428,10 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 						const isolatedGitRights = resolveCapabilityRights({
 							packagedRole,
 							agentTools: taskForRun.tools,
-							sandbox: taskForRun.sandbox ?? config.sandbox,
+							sandbox: inheritedSandbox(taskForRun, config.sandbox),
 							taskMutationProhibited: taskDisallowsFileUpdates(taskForRun.task),
 							parentRights: undefined,
-							writableCwd: inferSandboxCwdWritable({ agentName: taskForRun.agent, tools: taskForRun.tools, sandbox: taskForRun.sandbox ?? config.sandbox }),
+							writableCwd: inferSandboxCwdWritable({ agentName: taskForRun.agent, tools: taskForRun.tools, sandbox: inheritedSandbox(taskForRun, config.sandbox) }),
 							exclusiveLease: true,
 						});
 						const isolatedGitCapability = isolatedGit
@@ -3532,7 +3546,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 									syntheticPaths: isolatedGit.syntheticPaths,
 									terminationState: "execution-rejected",
 									agent: task.agent,
-									commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(task.agent, task.source), agentTools: task.tools, sandbox: task.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(task.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: task.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
+									commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(task.agent, task.source), agentTools: task.tools, sandbox: inheritedSandbox(task, config.sandbox), taskMutationProhibited: taskDisallowsFileUpdates(task.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: task.agent, tools: task.tools, sandbox: inheritedSandbox(task, config.sandbox) }), exclusiveLease: true }) === "writer",
 								});
 								gitBundle = {
 									path: bundle.path,
@@ -3818,10 +3832,10 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			const isolatedGitRights = resolveCapabilityRights({
 				packagedRole,
 				agentTools: seqStep.tools,
-				sandbox: seqStep.sandbox ?? config.sandbox,
+				sandbox: inheritedSandbox(seqStep, config.sandbox),
 				taskMutationProhibited: taskDisallowsFileUpdates(seqStep.task),
 				parentRights: undefined,
-				writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }),
+				writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: inheritedSandbox(seqStep, config.sandbox) }),
 				exclusiveLease: true,
 			});
 			const isolatedGitCapability = isolatedGit
@@ -3876,7 +3890,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 								syntheticPaths: isolatedGit.syntheticPaths,
 								terminationState: interrupted ? "interrupted" : "execution-rejected",
 								agent: seqStep.agent,
-								commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(seqStep.agent, seqStep.source), agentTools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox, taskMutationProhibited: taskDisallowsFileUpdates(seqStep.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: seqStep.sandbox ?? config.sandbox }), exclusiveLease: true }) === "writer",
+								commitRequired: resolveCapabilityRights({ packagedRole: resolvePackagedAgentRole(seqStep.agent, seqStep.source), agentTools: seqStep.tools, sandbox: inheritedSandbox(seqStep, config.sandbox), taskMutationProhibited: taskDisallowsFileUpdates(seqStep.task), parentRights: undefined, writableCwd: inferSandboxCwdWritable({ agentName: seqStep.agent, tools: seqStep.tools, sandbox: inheritedSandbox(seqStep, config.sandbox) }), exclusiveLease: true }) === "writer",
 							});
 							if (statusStep) statusStep.gitBundle = {
 								path: bundle.path,
@@ -4275,6 +4289,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				structuredOutputSchemaPath: r.structuredOutputSchemaPath,
 				acceptance: r.acceptance,
 				sandbox: r.sandbox,
+				...(statusPayload.steps[r.flatIndex]?.sandboxDisabled === true ? { sandboxDisabled: true } : {}),
 				gitBundle: r.gitBundle,
 				teardownUnproven: r.teardownUnproven,
 			})),

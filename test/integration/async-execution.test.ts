@@ -582,12 +582,14 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		} finally { removeTempDir(repo); }
 	});
 
-	it("background frontmatter provider:none carries prominent host-Git diagnostics", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+	it("background explicit provider:none overrides Bubblewrap frontmatter and persists revival policy", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		const trustedDir = path.join(tempDir, "trusted-user-settings");
 		fs.mkdirSync(trustedDir, { recursive: true });
 		fs.writeFileSync(path.join(trustedDir, "settings.json"), JSON.stringify({ subagents: { sandbox: { allowSandboxOptOut: true } } }), "utf-8");
 		process.env.PI_CODING_AGENT_DIR = trustedDir;
+		const fakeBwrapRoot = fs.mkdtempSync(path.join(tempDir, "provider-none-bwrap-"));
+		const fakeBwrap = installFakeBwrap(fakeBwrapRoot);
 		try {
 			mockPi.onCall({ output: "background host git work completed" });
 			const ctx = makeMinimalCtx(tempDir);
@@ -599,17 +601,54 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				tempArtifactsDir: tempDir,
 				getSubagentSessionRoot: () => tempDir,
 				expandTilde: (p: string) => p,
-				discoverAgents: () => ({ agents: [makeAgent("worker", { sandbox: { provider: "none" } })] }),
+				discoverAgents: () => ({ agents: [makeAgent("worker", { sandbox: { provider: "bubblewrap" } })] }),
 			});
-			const response = await executor.execute("background-frontmatter-host-git", { agent: "worker", task: "Report host Git status", async: true }, new AbortController().signal, undefined, ctx);
+			const response = await executor.execute("background-explicit-host-git", { agent: "worker", task: "Report host Git status", async: true, sandbox: { provider: "none" } }, new AbortController().signal, undefined, ctx);
 			const asyncId = response.details?.asyncId;
 			assert.ok(asyncId);
 			const resultPath = await waitForAsyncResultFile(asyncId, 10_000);
-			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload & { results: Array<AsyncResultPayload["results"][number] & { sandboxDisabled?: true }> };
+			const persistedStatus = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, asyncId, "status.json"), "utf-8")) as { steps?: Array<{ sandboxDisabled?: true }> };
 			assert.match(payload.results[0]?.sandbox?.diagnostics?.[0]?.message ?? "", /NO ISOLATION/i);
+			assert.equal(payload.results[0]?.sandboxDisabled, true, "terminal result retains the disabled-policy marker");
+			assert.equal(persistedStatus.steps?.[0]?.sandboxDisabled, true, "terminal status retains the disabled-policy marker");
+			assert.deepEqual(fs.readdirSync(fakeBwrap.recordDir), [], "explicit provider:none must not be recomputed from agent Bubblewrap frontmatter");
 		} finally {
+			fakeBwrap.restore();
+			fs.rmSync(fakeBwrapRoot, { recursive: true, force: true });
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
+	it("keeps an explicitly disabled async chain step from inheriting shared Bubblewrap", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const fakeBwrapRoot = fs.mkdtempSync(path.join(tempDir, "mixed-chain-bwrap-"));
+		const fakeBwrap = installFakeBwrap(fakeBwrapRoot);
+		try {
+			mockPi.onCall({ output: "host step" });
+			mockPi.onCall({ output: "boxed step" });
+			const id = `async-mixed-sandbox-${Date.now().toString(36)}`;
+			const launch = executeAsyncChain(id, {
+				chain: [{ agent: "host", task: "Run on host" }, { agent: "boxed", task: "Run boxed" }],
+				agents: [
+					makeAgent("host", { sandbox: { provider: "none" } }),
+					makeAgent("boxed", { sandbox: { provider: "bubblewrap" } }),
+				],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-mixed-sandbox" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				sandboxSettings: { defaultProvider: "bubblewrap", allowSandboxOptOut: true },
+			});
+			assert.equal(launch.isError, undefined, launch.content[0]?.text);
+			const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as { success?: boolean; results?: Array<{ sandboxDisabled?: true }> };
+			assert.equal(payload.success, true, JSON.stringify(payload));
+			assert.equal(payload.results?.[0]?.sandboxDisabled, true);
+			assert.equal(payload.results?.[1]?.sandboxDisabled, undefined);
+			assert.equal(readAllFakeBwrapArgs(fakeBwrap.recordDir).length, 1, "only the Bubblewrap step should be wrapped");
+		} finally {
+			fakeBwrap.restore();
+			fs.rmSync(fakeBwrapRoot, { recursive: true, force: true });
 		}
 	});
 
@@ -1015,7 +1054,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			}
 			assert.ok(allBwrapArgs.length >= 1, "expected producer and/or dynamic read-only children to run under bwrap");
 			for (const args of allBwrapArgs) {
-				assert.deepEqual(args.slice(args.indexOf(tempDir) - 1, args.indexOf(tempDir) + 2), ["--ro-bind", tempDir, tempDir]);
+				const bindIndex = args.findIndex((arg, index) => arg === "--ro-bind" && args[index + 2] === tempDir);
+				assert.ok(bindIndex >= 0, "expected read-only cwd bind");
+				assert.match(args[bindIndex + 1] ?? "", /^\/proc\/self\/fd\/\d+$/, "read-only source should be inode-pinned");
 			}
 			const resultPath = path.join(RESULTS_DIR, `${id}.json`);
 			const terminalDeadline = Date.now() + 10_000;

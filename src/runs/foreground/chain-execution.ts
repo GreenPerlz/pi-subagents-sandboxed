@@ -7,7 +7,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
-import { hasExplicitSandboxOptOut, resolveSandboxConfig, resolveGitMode, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
+import { hasExplicitSandboxOptOut, normalizeSandboxTransport, resolveGitMode, resolveSandboxTransport, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitCapability, type ScopedGitEndpointDescriptor, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride, type ChainClarifyPolicy } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -69,7 +69,7 @@ import {
 	TEMP_ARTIFACTS_DIR,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
-import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults } from "../../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxRunConfig, SandboxSettingsDefaults, SandboxTransport } from "../../sandbox/types.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { resolveCapabilityRights } from "../shared/capability-rights.ts";
 import { resolvePackagedAgentRole } from "../shared/agent-role.ts"
@@ -165,10 +165,10 @@ interface ParallelChainRunInput {
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
 	nestedFenceTimeoutMs?: number;
-	sandbox?: ResolvedSandboxConfig;
+	sandbox?: SandboxTransport;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
-	sandboxes?: (ResolvedSandboxConfig | undefined)[];
+	sandboxes?: (SandboxTransport | undefined)[];
 	sandboxIntercomBridge?: SandboxIntercomBridge;
 	issueIsolatedGitCapability?: (worktree: IsolatedGitWorktree, rights: "writer" | "read-only", cwd: string) => Promise<IsolatedGitCapability>;
 	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
@@ -251,7 +251,11 @@ function resolveParallelCleanTask(input: Pick<ParallelChainRunInput, "parallelTe
 	return cleanTask;
 }
 
-function commitRequiredForParallelTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number, agent: AgentConfig | undefined, sandbox: ResolvedSandboxConfig | undefined, parentRights?: "writer" | "read-only"): boolean {
+function selectSandboxAt(values: Array<SandboxTransport | undefined> | undefined, index: number, fallback: SandboxTransport | undefined): SandboxTransport | undefined {
+	return values && index in values ? values[index] : fallback;
+}
+
+function commitRequiredForParallelTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number, agent: AgentConfig | undefined, sandbox: SandboxTransport | undefined, parentRights?: "writer" | "read-only"): boolean {
 	const task = resolveParallelCleanTask(input, taskIndex);
 	return resolveCapabilityRights({
 		packagedRole: resolvePackagedAgentRole(agent?.name, agent?.source),
@@ -333,7 +337,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			// Issue capability only after the resolved sandbox is known, but before
 			// output/session/structured paths or other path-sensitive side effects.
 			const packagedRole = resolvePackagedAgentRole(task.agent, taskAgentConfig?.source);
-			const taskSandbox = input.sandboxes?.[taskIndex] ?? input.sandbox;
+			const taskSandbox = selectSandboxAt(input.sandboxes, taskIndex, input.sandbox);
 			const capabilityRights = resolveCapabilityRights({
 				packagedRole,
 				agentTools: taskAgentConfig?.tools,
@@ -468,15 +472,15 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				structuredOutput: structuredRuntime,
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
-				sandbox: input.sandboxes?.[taskIndex] ?? input.sandbox,
-				hostGitDiagnostic: !(input.sandboxes?.[taskIndex] ?? input.sandbox)
+				sandbox: selectSandboxAt(input.sandboxes, taskIndex, input.sandbox),
+				hostGitDiagnostic: !(selectSandboxAt(input.sandboxes, taskIndex, input.sandbox))
 					&& hasExplicitSandboxOptOut({ settings: input.sandboxSettings, run: input.sandboxRun }),
 				isolatedGit,
 				isolatedGitCapability: isolatedCapability,
 				isolatedGitEndpoint: input.scopedGitEndpoint,
 				isolatedGitRights: input.scopedGitEndpoint ? capabilityRights : undefined,
 				isolatedGitBundleDir: input.artifactsDir,
-				isolatedGitCommitRequired: Boolean(isolatedGit) && commitRequiredForParallelTask(input, taskIndex, taskAgentConfig, input.sandboxes?.[taskIndex] ?? input.sandbox),
+				isolatedGitCommitRequired: Boolean(isolatedGit) && commitRequiredForParallelTask(input, taskIndex, taskAgentConfig, selectSandboxAt(input.sandboxes, taskIndex, input.sandbox)),
 				sandboxIntercomBridge: input.sandboxIntercomBridge,
 				progressPaths: behavior.progress ? input.progressPaths : undefined,
 				onDetachedStarted: () => input.onDetachedStarted?.(input.globalTaskIndex + taskIndex, {
@@ -583,7 +587,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 					syntheticPaths: worktree.syntheticPaths,
 					terminationState: input.signal?.aborted ? "cancelled" : "execution-rejected",
 					agent: task.agent,
-					commitRequired: commitRequiredForParallelTask(input, taskIndex, input.agents.find((agent) => agent.name === task.agent), input.sandboxes?.[taskIndex] ?? input.sandbox),
+					commitRequired: commitRequiredForParallelTask(input, taskIndex, input.agents.find((agent) => agent.name === task.agent), selectSandboxAt(input.sandboxes, taskIndex, input.sandbox)),
 				});
 				gitBundle = { path: bundle.path, checksum: bundle.checksum, base: bundle.base, head: bundle.head, commits: bundle.commits, commitSummary: bundle.commitSummary, ...(bundle.recovery ? { recovery: bundle.recovery } : {}), ...(bundle.stagedSnapshot ? { stagedSnapshot: bundle.stagedSnapshot } : {}), ...(bundle.stagedTree ? { stagedTree: bundle.stagedTree } : {}), ...(bundle.recoveryTree ? { recoveryTree: bundle.recoveryTree } : {}), terminationState: bundle.terminationState, incomplete: bundle.incomplete, dirtySummary: bundle.dirtySummary, bundleSize: bundle.bundleSize, payloadChecksum: bundle.payloadChecksum, payloadSize: bundle.payloadSize, canonicalPayloadChecksum: bundle.canonicalPayloadChecksum, canonicalPayloadSize: bundle.canonicalPayloadSize, portableMetadata: bundle.portableMetadata };
 			} catch (exportError) {
@@ -650,7 +654,7 @@ interface ChainExecutionParams {
 	nestedFenceTimeoutMs?: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
-	sandbox?: ResolvedSandboxConfig;
+	sandbox?: SandboxTransport;
 	sandboxSettings?: SandboxSettingsDefaults;
 	sandboxRun?: SandboxRunConfig;
 	sandboxIntercomBridge?: SandboxIntercomBridge;
@@ -705,13 +709,14 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		chainDir: chainDirBase,
 	} = params;
 	const chainSkills = chainSkillsParam ?? [];
-	const sharedSandbox = params.sandbox?.provider === "none" ? undefined : params.sandbox;
+	const sharedSandbox: SandboxTransport | undefined = normalizeSandboxTransport(params.sandbox);
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
-	const resolveStepSandbox = (agent: AgentConfig): ResolvedSandboxConfig | undefined => hasSandboxResolutionInputs
-		? resolveSandboxConfig({ settings: params.sandboxSettings, agent, run: params.sandboxRun })
-		: params.sandbox
-			? resolveSandboxConfig({ agent, run: params.sandbox })
-			: resolveSandboxConfig({ agent });
+	const resolveStepSandbox = (agent: AgentConfig): SandboxTransport | undefined => {
+		if (hasSandboxResolutionInputs) return resolveSandboxTransport({ settings: params.sandboxSettings, agent, run: params.sandboxRun });
+		if (!Object.hasOwn(params, "sandbox")) return resolveSandboxTransport({ agent });
+		const supplied = normalizeSandboxTransport(params.sandbox);
+		return supplied === null ? null : resolveSandboxTransport({ agent, run: supplied });
+	};
 
 	const results: SingleResult[] = [];
 	const outputs: ChainOutputMap = {};

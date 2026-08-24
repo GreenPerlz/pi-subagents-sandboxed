@@ -1,6 +1,6 @@
 import type { DynamicCollectSpec, DynamicExpandSpec } from "../../shared/settings.ts";
 import type { JsonSchemaObject, ResolvedAcceptanceConfig } from "../../shared/types.ts";
-import type { ResolvedSandboxConfig } from "../../sandbox/types.ts";
+import type { ResolvedSandboxConfig, SandboxTransport } from "../../sandbox/types.ts";
 
 export interface RunnerSubagentStep {
 	agent: string;
@@ -38,7 +38,7 @@ export interface RunnerSubagentStep {
 	};
 	structuredOutputSchema?: JsonSchemaObject;
 	effectiveAcceptance?: ResolvedAcceptanceConfig;
-	sandbox?: ResolvedSandboxConfig;
+	sandbox?: SandboxTransport;
 	/** Explicit authorized provider:none diagnostic; not an execution authority. */
 	hostGitDiagnostic?: boolean;
 }

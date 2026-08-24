@@ -53,8 +53,9 @@ export interface BubblewrapProviderDeps {
 	env?: Record<string, string | undefined>;
 	/** Isolate the child PID namespace so host processes and their roots are not inspectable. */
 	unsharePid?: boolean;
-	/** Test seam for validating resolver source metadata. */
+	/** Test seams for resolver metadata and merged-/usr symlink handling. */
 	lstat?: (filePath: string) => fs.Stats;
+	readLink?: (filePath: string) => string;
 }
 
 function isExecutable(filePath: string): boolean {
@@ -171,6 +172,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 	private readonly pathExists: (candidate: string) => boolean;
 	private readonly realPath: (filePath: string) => string;
 	private readonly lstat: (filePath: string) => fs.Stats;
+	private readonly readLink: (filePath: string) => string;
 	private readonly unsharePid: boolean;
 
 	constructor(deps: BubblewrapProviderDeps = {}) {
@@ -179,6 +181,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		this.pathExists = deps.pathExists ?? fs.existsSync;
 		this.realPath = deps.realPath ?? ((p) => fs.realpathSync(p));
 		this.lstat = deps.lstat ?? ((p) => fs.lstatSync(p));
+		this.readLink = deps.readLink ?? ((p) => fs.readlinkSync(p));
 		this.unsharePid = deps.unsharePid ?? false;
 	}
 
@@ -233,12 +236,14 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		const diagnosticMounts: SandboxMount[] = [];
 		for (const target of HOST_TOOLCHAIN_READONLY_PATHS) {
 			if (!this.pathExists(target)) continue;
-			// Bind the canonical directory into the conventional host path. Some
-			// Bubblewrap versions do not preserve merged-/usr symlink sources such
-			// as /bin -> /usr/bin, leaving the sandbox without /bin/sh.
-			const source = this.realPath(target);
-			if (source !== target) args.push("--dir", target);
-			addMount(args, { source, target, mode: "ro" }, seenMounts, diagnosticMounts);
+			// Recreate merged-/usr links instead of bind-mounting a symlink source.
+			// Bubblewrap 0.9 on Ubuntu 24.04 otherwise leaves paths such as /bin
+			// absent even when /usr/bin was supplied as the canonical bind source.
+			if (this.lstat(target).isSymbolicLink()) {
+				args.push("--symlink", this.readLink(target), target);
+				continue;
+			}
+			addMount(args, { source: this.realPath(target), target, mode: "ro" }, seenMounts, diagnosticMounts);
 		}
 		// Ensure the wrapped command dies if the runner or Bubblewrap wrapper
 		// disappears. Without this, a killed runner can leave its Pi/tool tree

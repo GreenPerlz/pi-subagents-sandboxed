@@ -39,7 +39,15 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          bwrap --ro-bind /usr /usr --dir /bin --ro-bind "$(readlink -f /bin)" /bin -- /bin/sh -c true
+          bwrap_args=(--ro-bind /usr /usr)
+          for target in /bin /sbin /lib /lib64; do
+            if [[ -L "$target" ]]; then
+              bwrap_args+=(--symlink "$(readlink "$target")" "$target")
+            elif [[ -e "$target" ]]; then
+              bwrap_args+=(--ro-bind "$target" "$target")
+            fi
+          done
+          bwrap "${bwrap_args[@]}" -- /bin/sh -c true
       - name: Install locked dependencies
         run: npm ci
       - name: Unit tests

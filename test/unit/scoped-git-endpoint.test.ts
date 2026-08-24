@@ -87,11 +87,10 @@ describe("scoped Git endpoint", () => {
 			const mount = owner.invocationMounts()[0]!;
 			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
 			const nodeRoot = path.dirname(path.dirname(process.execPath));
-			for (const system of ["/usr", "/bin", "/lib", "/etc", nodeRoot]) {
+			for (const system of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", nodeRoot]) {
 				if (!fs.existsSync(system) || args.includes(system)) continue;
-				const source = fs.realpathSync(system);
-				if (source !== system) args.push("--dir", system);
-				args.push("--ro-bind", source, system);
+				if (fs.lstatSync(system).isSymbolicLink()) args.push("--symlink", fs.readlinkSync(system), system);
+				else args.push("--ro-bind", fs.realpathSync(system), system);
 			}
 			args.push("--bind", worktree, worktree, "--ro-bind", mount.source, mount.target!, "--chdir", worktree, "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--", "/bin/sh", "/run/pi-scoped-git/git", "status");
 			const result = await new Promise<{ status: number | null; stderr: string }>((resolve, reject) => { const child = spawn("bwrap", args, { stdio: ["pipe", "ignore", "pipe"] }); let stderr = ""; child.stderr.on("data", (chunk) => stderr += chunk); child.on("error", reject); child.on("close", (status) => resolve({ status, stderr })); child.stdin.end(); });
@@ -106,11 +105,10 @@ describe("scoped Git endpoint", () => {
 		const run = async (scope: ReturnType<typeof createScopedGitEndpoint>, args: string[]) => {
 			const command = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
 			const nodeRoot = path.dirname(path.dirname(process.execPath));
-			for (const system of ["/usr", "/bin", "/lib", "/etc", nodeRoot]) {
+			for (const system of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", nodeRoot]) {
 				if (!fs.existsSync(system) || command.includes(system)) continue;
-				const source = fs.realpathSync(system);
-				if (source !== system) command.push("--dir", system);
-				command.push("--ro-bind", source, system);
+				if (fs.lstatSync(system).isSymbolicLink()) command.push("--symlink", fs.readlinkSync(system), system);
+				else command.push("--ro-bind", fs.realpathSync(system), system);
 			}
 			for (const mount of scope.invocationMounts()) command.push("--ro-bind", mount.source, mount.target!);
 			command.push("--", "/bin/sh", "/run/pi-scoped-git/git", ...args);

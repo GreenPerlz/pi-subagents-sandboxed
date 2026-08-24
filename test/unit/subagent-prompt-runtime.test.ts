@@ -42,6 +42,26 @@ const PROMPT_WITH_EXPLICIT_SKILL = [
 	"\nCurrent date: 2026-04-16",
 ].join("");
 
+type RuntimeHandler = (...args: any[]) => unknown;
+
+function runtimeHarness() {
+	const handlers = new Map<string, RuntimeHandler>();
+	let structuredExecute: ((_id: string, params: { value: unknown }) => Promise<any>) | undefined;
+	registerSubagentPromptRuntime({
+		on(event: string, handler: RuntimeHandler) {
+			handlers.set(event, handler);
+		},
+		registerTool(tool: { name: string; execute: (_id: string, params: { value: unknown }) => Promise<any> }) {
+			if (tool.name === "structured_output") structuredExecute = tool.execute;
+		},
+	} as any);
+	return { handlers, getStructuredExecute: () => structuredExecute };
+}
+
+const assistant = (stopReason: string) => ({ role: "assistant", stopReason });
+const compactEvent = (reason: string, willRetry = false) => ({ reason, willRetry });
+const compactContext = (pending = false) => ({ hasPendingMessages: () => pending });
+
 afterEach(() => {
 	if (envSnapshot.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT === undefined) delete process.env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT;
 	else process.env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = envSnapshot.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT;
@@ -58,6 +78,87 @@ afterEach(() => {
 });
 
 describe("subagent prompt runtime", () => {
+	it("cancels threshold compaction after a successful final natural stop", () => {
+		const runtime = runtimeHarness();
+		runtime.handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
+		runtime.handlers.get("agent_start")?.({});
+		runtime.handlers.get("agent_end")?.({ messages: [assistant("stop")] });
+
+		assert.deepEqual(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), { cancel: true });
+	});
+
+	it("allows threshold compaction when continuation is pending and resets on new input", () => {
+		const runtime = runtimeHarness();
+		runtime.handlers.get("agent_end")?.({ messages: [assistant("stop")] });
+		assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext(true)), undefined);
+
+		runtime.handlers.get("input")?.({ text: "new prompt", source: "interactive" });
+		runtime.handlers.get("message_start")?.({ message: { role: "user" } });
+		assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined);
+	});
+
+	it("allows overflow, manual, and retry compactions", () => {
+		for (const event of [compactEvent("overflow"), compactEvent("overflow", true), compactEvent("manual"), compactEvent("threshold", true)]) {
+			const runtime = runtimeHarness();
+			runtime.handlers.get("agent_end")?.({ messages: [assistant("stop")] });
+			assert.equal(runtime.handlers.get("session_before_compact")?.(event, compactContext()), undefined, event.reason);
+		}
+	});
+
+	it("does not cancel compaction for unsuccessful or intermediate agent ends", () => {
+		for (const stopReason of ["error", "length", "aborted", "toolUse"]) {
+			const runtime = runtimeHarness();
+			runtime.handlers.get("agent_end")?.({ messages: [assistant(stopReason)] });
+			assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined, stopReason);
+		}
+	});
+
+	it("recognizes successful terminating structured output without leaking run state", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-structured-guard-"));
+		try {
+			const schemaPath = path.join(dir, "schema.json");
+			const outputPath = path.join(dir, "output.json");
+			fs.writeFileSync(schemaPath, JSON.stringify({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }), "utf-8");
+			process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = schemaPath;
+			process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = outputPath;
+			const runtime = runtimeHarness();
+			const execute = runtime.getStructuredExecute();
+			assert.ok(execute);
+			runtime.handlers.get("agent_start")?.({});
+			await execute("tool-1", { value: { ok: true } });
+			runtime.handlers.get("tool_execution_end")?.({ toolName: "structured_output", result: { terminate: true }, isError: false });
+			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
+			assert.deepEqual(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), { cancel: true });
+
+			const newRun = runtime.handlers.get("agent_start");
+			newRun?.({});
+			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
+			assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("allows failed structured output and keeps intermediate tool turns eligible for compaction", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-structured-failed-"));
+		try {
+			const schemaPath = path.join(dir, "schema.json");
+			const outputPath = path.join(dir, "output.json");
+			fs.writeFileSync(schemaPath, JSON.stringify({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }), "utf-8");
+			process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = schemaPath;
+			process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = outputPath;
+			const runtime = runtimeHarness();
+			const execute = runtime.getStructuredExecute();
+			assert.ok(execute);
+			await assert.rejects(execute("tool-1", { value: { ok: "not-a-boolean" } }));
+			runtime.handlers.get("tool_execution_end")?.({ toolName: "structured_output", result: { terminate: true }, isError: true });
+			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
+			assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("registered structured_output tool accepts valid schema output and writes the capture file", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-structured-runtime-"));
 		try {

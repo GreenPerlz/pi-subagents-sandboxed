@@ -154,6 +154,8 @@ export function stripParentOnlySubagentMessages(messages: unknown[]): unknown[] 
 }
 
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
+	let terminalCandidate = false;
+	let structuredOutputSucceeded = false;
 	const structuredOutputPath = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV];
 	const structuredSchemaPath = process.env[STRUCTURED_OUTPUT_SCHEMA_ENV];
 	if (structuredOutputPath && structuredSchemaPath) {
@@ -183,6 +185,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 				}
 				fs.mkdirSync(path.dirname(structuredOutputPath), { recursive: true });
 				fs.writeFileSync(structuredOutputPath, JSON.stringify(params.value), { mode: 0o600 });
+				structuredOutputSucceeded = true;
 				return {
 					content: [{ type: "text", text: "Structured output captured." }],
 					details: { path: structuredOutputPath },
@@ -192,7 +195,41 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		});
 	}
 
-	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown) => unknown) => void;
+	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown, ctx?: { hasPendingMessages?: () => boolean }) => unknown) => void;
+	onRuntimeEvent("input", () => {
+		terminalCandidate = false;
+		structuredOutputSucceeded = false;
+	});
+	onRuntimeEvent("message_start", (rawEvent: unknown) => {
+		const event = rawEvent as { message?: { role?: string } };
+		if (event.message?.role === "user") {
+			terminalCandidate = false;
+			structuredOutputSucceeded = false;
+		}
+	});
+	onRuntimeEvent("agent_start", () => {
+		terminalCandidate = false;
+		structuredOutputSucceeded = false;
+	});
+	onRuntimeEvent("tool_execution_end", (rawEvent: unknown) => {
+		const event = rawEvent as { toolName?: string; result?: { terminate?: boolean }; isError?: boolean };
+		if (event.toolName === "structured_output" && event.isError !== true && event.result?.terminate === true) {
+			structuredOutputSucceeded = true;
+		}
+	});
+	onRuntimeEvent("agent_end", (rawEvent: unknown) => {
+		const event = rawEvent as { messages?: unknown[] };
+		const messages = Array.isArray(event.messages) ? event.messages : [];
+		const finalAssistant = [...messages].reverse().find((message) => (message as { role?: string })?.role === "assistant") as { stopReason?: string } | undefined;
+		terminalCandidate = finalAssistant?.stopReason === "stop"
+			|| (structuredOutputSucceeded && finalAssistant?.stopReason === "toolUse");
+	});
+	onRuntimeEvent("session_before_compact", (rawEvent: unknown, ctx) => {
+		const event = rawEvent as { reason?: string; willRetry?: boolean };
+		if (event.reason !== "threshold" || event.willRetry !== false || !terminalCandidate) return undefined;
+		if (!ctx || typeof ctx.hasPendingMessages !== "function" || ctx.hasPendingMessages()) return undefined;
+		return { cancel: true };
+	});
 	// This extension is explicitly loaded for every child, including closed
 	// sandboxes. The parent sets this env only for a registry-resolved model
 	// whose provider request semantics are known.
@@ -214,6 +251,8 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	});
 
 	onRuntimeEvent("before_agent_start", async (event: { systemPrompt: string }) => {
+		terminalCandidate = false;
+		structuredOutputSucceeded = false;
 		const intercomSessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
 		if (intercomSessionName && typeof pi.setSessionName === "function") {
 			pi.setSessionName(intercomSessionName);

@@ -91,6 +91,7 @@ import {
 	buildFinalizationProcessFailureLedger,
 	createFinalizationProcessFailureTurn,
 	createFinalizationTurn,
+	collectRuntimeReviewEvidence,
 	evaluateAcceptance,
 	formatAcceptanceFinalizationPrompt,
 	formatAcceptancePrompt,
@@ -1347,6 +1348,8 @@ async function runAcceptanceFinalizationLoop(input: {
 	acceptance: ResolvedAcceptanceConfig;
 	options: RunSyncOptions;
 	systemPrompt: string;
+	runtimeReviewEvidence: string[];
+	runtimeReviewRoots: string[];
 	resolvedSkillNames?: string[];
 	skillsWarning?: string;
 }): Promise<AcceptanceLedger> {
@@ -1436,6 +1439,7 @@ async function runAcceptanceFinalizationLoop(input: {
 			input.result.controlEvents = [...(input.result.controlEvents ?? []), ...finalizationResult.controlEvents];
 		}
 		const rawOutput = acceptanceOutputByResult.get(finalizationResult) ?? getFinalOutput(finalizationResult.messages) ?? finalizationResult.finalOutput ?? "";
+		input.runtimeReviewEvidence = collectRuntimeReviewEvidence(finalizationResult.messages ?? [], input.runtimeReviewRoots, input.runtimeReviewEvidence);
 		if (finalizationResult.interrupted) {
 			input.result.interrupted = true;
 			input.result.exitCode = finalizationResult.exitCode;
@@ -1454,6 +1458,7 @@ async function runAcceptanceFinalizationLoop(input: {
 			acceptance: selfReviewAcceptance,
 			output: rawOutput,
 			cwd: input.options.cwd ?? input.runtimeCwd,
+			runtimeReviewEvidence: input.runtimeReviewEvidence,
 		});
 		authoritativeLedger = selfReviewLedger;
 		turns.push(createFinalizationTurn({ turn, prompt, rawOutput, ledger: selfReviewLedger }));
@@ -1465,6 +1470,7 @@ async function runAcceptanceFinalizationLoop(input: {
 					acceptance: input.acceptance,
 					output: rawOutput,
 					cwd: input.options.cwd ?? input.runtimeCwd,
+					runtimeReviewEvidence: input.runtimeReviewEvidence,
 				});
 			return attachFinalizationToLedger({ initialLedger: input.initialLedger, authoritativeLedger, turns, status: "completed", maxTurns });
 		}
@@ -1731,6 +1737,12 @@ export async function runSync(
 		if (sessionFile) result.sessionFile = sessionFile;
 	}
 
+	const runtimeReviewRoots = [
+		options.artifactsDir,
+		options.sessionDir,
+		options.sessionFile ? path.dirname(options.sessionFile) : undefined,
+	].filter((root): root is string => Boolean(root));
+	const runtimeReviewEvidence = collectRuntimeReviewEvidence(result.messages ?? [], runtimeReviewRoots);
 	const initialAcceptanceOutput = acceptanceOutputByResult.get(result) ?? result.finalOutput ?? "";
 	const acceptanceForInitialReport = shouldRunAcceptanceFinalization(effectiveAcceptance)
 		? acceptanceSelfReviewConfig(effectiveAcceptance)
@@ -1739,6 +1751,7 @@ export async function runSync(
 		acceptance: acceptanceForInitialReport,
 		output: initialAcceptanceOutput,
 		cwd: options.cwd ?? runtimeCwd,
+		runtimeReviewEvidence,
 	});
 	result.acceptance = initialAcceptance;
 	if (shouldRunAcceptanceFinalization(effectiveAcceptance) && result.exitCode === 0 && !result.detached && !result.interrupted) {
@@ -1751,6 +1764,8 @@ export async function runSync(
 			acceptance: effectiveAcceptance,
 			options,
 			systemPrompt,
+			runtimeReviewEvidence,
+			runtimeReviewRoots,
 			resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
 			...(missingSkills.length > 0 ? { skillsWarning: `Skills not found: ${missingSkills.join(", ")}` } : {}),
 		});

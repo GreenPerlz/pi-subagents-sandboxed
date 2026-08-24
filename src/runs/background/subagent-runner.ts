@@ -105,6 +105,7 @@ import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts
 import {
 	acceptanceFailureMessage,
 	acceptanceSelfReviewConfig,
+	collectRuntimeReviewEvidence,
 	attachFinalizationToLedger,
 	buildFinalizationProcessFailureLedger,
 	createFinalizationProcessFailureTurn,
@@ -1426,6 +1427,12 @@ async function runSingleStepInner(
 		announceSavedPath: announceSavedOutput,
 	});
 	outputForSummary = finalizedOutput.displayOutput;
+	const runtimeReviewRoots = [
+		ctx.artifactsDir,
+		ctx.sessionDir,
+		finalResult?.sessionFile ? path.dirname(finalResult.sessionFile) : undefined,
+	].filter((root): root is string => Boolean(root));
+	let runtimeReviewEvidence = collectRuntimeReviewEvidence(finalResult?.messages ?? [], runtimeReviewRoots);
 	const acceptanceForInitialReport = step.effectiveAcceptance && shouldRunAcceptanceFinalization(step.effectiveAcceptance)
 		? acceptanceSelfReviewConfig(step.effectiveAcceptance)
 		: step.effectiveAcceptance;
@@ -1434,6 +1441,7 @@ async function runSingleStepInner(
 			acceptance: acceptanceForInitialReport,
 			output: outputForAcceptance,
 			cwd: executionCwd,
+			runtimeReviewEvidence,
 		})
 		: undefined;
 	if (acceptance && step.effectiveAcceptance && shouldRunAcceptanceFinalization(step.effectiveAcceptance) && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted) {
@@ -1531,10 +1539,12 @@ async function runSingleStepInner(
 					acceptance = buildFinalizationProcessFailureLedger({ initialLedger: acceptance, turns, maxTurns, message });
 					break;
 				}
+				runtimeReviewEvidence = collectRuntimeReviewEvidence(finalizationRun.messages, runtimeReviewRoots, runtimeReviewEvidence);
 				const selfReviewLedger = await evaluateAcceptance({
 					acceptance: selfReviewAcceptance,
 					output: finalizationOutput,
 					cwd: executionCwd,
+					runtimeReviewEvidence,
 				});
 				authoritativeLedger = selfReviewLedger;
 				turns.push(createFinalizationTurn({ turn, prompt, rawOutput: finalizationOutput, ledger: selfReviewLedger }));
@@ -1546,6 +1556,7 @@ async function runSingleStepInner(
 							acceptance: step.effectiveAcceptance,
 							output: finalizationOutput,
 							cwd: executionCwd,
+							runtimeReviewEvidence,
 						});
 					acceptance = attachFinalizationToLedger({ initialLedger: acceptance, authoritativeLedger, turns, status: "completed", maxTurns });
 					break;

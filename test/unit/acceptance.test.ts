@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import {
 	acceptanceFailureMessage,
 	attachFinalizationToLedger,
+	collectRuntimeReviewEvidence,
 	createFinalizationTurn,
 	evaluateAcceptance,
 	formatAcceptanceFinalizationPrompt,
@@ -335,6 +336,54 @@ describe("acceptance gates", () => {
 		assert.notEqual(ledger.status, "reviewed");
 	}));
 
+
+	it("collects only successful review results from trusted regular artifacts", async () => withTempRepo(async (cwd) => {
+		const trusted = path.join(cwd, "artifacts");
+		const outside = path.join(cwd, "outside.md");
+		fs.mkdirSync(trusted);
+		fs.writeFileSync(path.join(trusted, "review.md"), "file-only finding", "utf-8");
+		fs.writeFileSync(path.join(trusted, "large.md"), "x".repeat(20_000), "utf-8");
+		fs.writeFileSync(outside, "outside finding", "utf-8");
+		fs.symlinkSync(outside, path.join(trusted, "link.md"));
+		const message = (results: unknown[]) => [{ role: "toolResult", toolName: "subagent", details: { results } }];
+		assert.deepEqual(collectRuntimeReviewEvidence(message([
+			{ agent: "review", exitCode: 0, finalOutput: "inline finding" },
+			{ agent: "review", exitCode: 0, artifactPaths: { outputPath: path.join(trusted, "review.md") } },
+		]), [trusted]), ["inline finding", "file-only finding"]);
+		const bounded = collectRuntimeReviewEvidence(message([{ agent: "review", exitCode: 0, artifactPaths: { outputPath: path.join(trusted, "large.md") } }]), [trusted]);
+		assert.match(bounded[0] ?? "", /\.\.\.\[truncated\]$/);
+		assert.ok((bounded[0]?.length ?? Infinity) < 12_100);
+		assert.deepEqual(collectRuntimeReviewEvidence(message([
+			{ agent: "review", exitCode: 0, artifactPaths: { outputPath: outside } },
+			{ agent: "review", exitCode: 0, outputMode: "file-only", finalOutput: `Output saved to: ${outside}`, artifactPaths: { outputPath: outside } },
+			{ agent: "review", exitCode: 0, artifactPaths: { outputPath: path.join(trusted, "link.md") } },
+			{ agent: "review", exitCode: 1, finalOutput: "failed" },
+			{ agent: "review", error: "failed", exitCode: 0, finalOutput: "errored" },
+			{ agent: "review", exitCode: 0, detached: true, finalOutput: "detached" },
+			{ agent: "review", exitCode: 0, teardownUnproven: true, finalOutput: "unproven" },
+			{ agent: "worker", exitCode: 0, finalOutput: "not review" },
+			{ agent: "fake-review", exitCode: 0, finalOutput: "not packaged review" },
+		]), [trusted]), []);
+		assert.deepEqual(collectRuntimeReviewEvidence([{ role: "toolResult", toolName: "bash", details: { results: [{ agent: "review", exitCode: 0, finalOutput: "wrong tool" }] } }], [trusted]), []);
+		assert.deepEqual(collectRuntimeReviewEvidence([{ role: "toolResult", toolName: "subagent", isError: true, details: { results: [{ agent: "review", exitCode: 0, finalOutput: "failed tool call" }] } }], [trusted]), []);
+		assert.deepEqual(collectRuntimeReviewEvidence(message([
+			...Array.from({ length: 128 }, () => ({ agent: "worker", exitCode: 0, finalOutput: "invalid" })),
+			{ agent: "review", exitCode: 0, finalOutput: "beyond scan bound" },
+		]), [trusted]), []);
+		assert.deepEqual(collectRuntimeReviewEvidence(message([{ agent: "review", exitCode: 0, finalOutput: "x" }]), [path.join(cwd, "missing")]), ["x"]);
+		assert.deepEqual(collectRuntimeReviewEvidence(message([{ agent: "review", exitCode: 0, finalOutput: "x" }]), [], ["x"]), ["x"], "evidence is deduplicated across finalization turns");
+	}));
+
+	it("merges runtime review evidence only when reviewFindings is omitted", async () => withTempRepo(async (cwd) => {
+		const acceptance = resolveEffectiveAcceptance({ agentName: "worker", task: "Patch", explicit: { criteria: ["Patch"], evidence: ["review-findings"] } });
+		const runtimeReviewEvidence = ["nested review finding"];
+		const rejectedWithoutRuntimeEvidence = await evaluateAcceptance({ acceptance, output: report(), cwd });
+		assert.equal(rejectedWithoutRuntimeEvidence.status, "rejected");
+		const merged = await evaluateAcceptance({ acceptance, output: report(), cwd, runtimeReviewEvidence });
+		assert.deepEqual(merged.childReport?.reviewFindings, runtimeReviewEvidence);
+		const explicit = await evaluateAcceptance({ acceptance, output: report({ reviewFindings: [] }), cwd, runtimeReviewEvidence });
+		assert.deepEqual(explicit.childReport?.reviewFindings, []);
+	}));
 
 	it("validates removed level API, empty contracts, verify shapes, and loop bounds", () => {
 		assert.deepEqual(validateAcceptanceInput({ level: "none" }), [

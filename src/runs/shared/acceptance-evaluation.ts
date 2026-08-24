@@ -91,6 +91,102 @@ function trimOutput(value: string): string | undefined {
 	return trimmed.length > 12_000 ? `${trimmed.slice(0, 12_000)}\n...[truncated]` : trimmed;
 }
 
+const RUNTIME_REVIEW_MAX_OUTPUT = 12_000;
+const RUNTIME_REVIEW_MAX_RESULTS = 128;
+
+function isContainedPath(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function readTrustedReviewArtifact(candidate: unknown, trustedRoots: string[]): string | undefined {
+	if (typeof candidate !== "string" || candidate.trim() === "" || trustedRoots.length === 0) return undefined;
+	try {
+		const resolvedCandidate = path.resolve(candidate);
+		const candidateRealpath = fs.realpathSync(resolvedCandidate);
+		if (trustedRoots.every((root) => {
+			try { return !isContainedPath(fs.realpathSync(path.resolve(root)), candidateRealpath); } catch { return true; }
+		})) return undefined;
+		const requestedStat = fs.lstatSync(resolvedCandidate);
+		if (!requestedStat.isFile() || requestedStat.isSymbolicLink()) return undefined;
+		const canonicalStat = fs.lstatSync(candidateRealpath);
+		if (!canonicalStat.isFile() || canonicalStat.isSymbolicLink()) return undefined;
+		const noFollow = (fs.constants as typeof fs.constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+		const fd = fs.openSync(candidateRealpath, fs.constants.O_RDONLY | noFollow);
+		try {
+			const opened = fs.fstatSync(fd);
+			if (!opened.isFile() || opened.dev !== canonicalStat.dev || opened.ino !== canonicalStat.ino) return undefined;
+			const buffer = Buffer.allocUnsafe(RUNTIME_REVIEW_MAX_OUTPUT + 1);
+			const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+			const content = buffer.subarray(0, Math.min(bytesRead, RUNTIME_REVIEW_MAX_OUTPUT)).toString("utf8").trim();
+			return bytesRead > RUNTIME_REVIEW_MAX_OUTPUT || opened.size > RUNTIME_REVIEW_MAX_OUTPUT
+				? `${content}\n...[truncated]`
+				: content || undefined;
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+function reviewResultOutput(result: Record<string, unknown>, trustedRoots: string[]): string | undefined {
+	const fileOnly = result.outputMode === "file-only";
+	const readArtifact = (): string | undefined => {
+		const reference = result.outputReference;
+		if (reference && typeof reference === "object" && !Array.isArray(reference)) {
+			const content = readTrustedReviewArtifact((reference as Record<string, unknown>).path, trustedRoots);
+			if (content) return content;
+		}
+		const artifacts = result.artifactPaths;
+		if (artifacts && typeof artifacts === "object" && !Array.isArray(artifacts)) {
+			const content = readTrustedReviewArtifact((artifacts as Record<string, unknown>).outputPath, trustedRoots);
+			if (content) return content;
+		}
+		return readTrustedReviewArtifact(result.savedOutputPath, trustedRoots);
+	};
+	if (fileOnly) return readArtifact();
+	if (typeof result.finalOutput === "string") {
+		const inline = trimOutput(result.finalOutput);
+		if (inline) return inline;
+	}
+	return readArtifact();
+}
+
+/** Collect only authenticated-shaped nested review tool results for acceptance evidence. */
+export function collectRuntimeReviewEvidence(messages: unknown[], trustedRoots: string[] = [], existing: string[] = []): string[] {
+	const evidence = existing.slice(0, RUNTIME_REVIEW_MAX_RESULTS);
+	if (evidence.length >= RUNTIME_REVIEW_MAX_RESULTS) return evidence;
+	const seen = new Set(evidence);
+	let scannedMessages = 0;
+	let scannedResults = 0;
+	for (const message of messages) {
+		if (++scannedMessages > RUNTIME_REVIEW_MAX_RESULTS) break;
+		if (!message || typeof message !== "object") continue;
+		const toolMessage = message as Record<string, unknown>;
+		if (toolMessage.role !== "toolResult" || toolMessage.toolName !== "subagent" || toolMessage.isError === true) continue;
+		const details = toolMessage.details;
+		if (!details || typeof details !== "object" || Array.isArray(details)) continue;
+		const results = (details as Record<string, unknown>).results;
+		if (!Array.isArray(results)) continue;
+		for (const value of results) {
+			if (++scannedResults > RUNTIME_REVIEW_MAX_RESULTS) return evidence;
+			if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+			const result = value as Record<string, unknown>;
+			const agent = typeof result.agent === "string" ? result.agent : "";
+			if (!/^(review|reviewer)$/i.test(agent)) continue;
+			if (result.exitCode !== 0 || result.error !== undefined || result.interrupted === true || result.cancelled === true || result.detached === true || result.teardownUnproven === true) continue;
+			const output = reviewResultOutput(result, trustedRoots);
+			if (output && !seen.has(output)) {
+				evidence.push(output);
+				seen.add(output);
+			}
+			if (evidence.length >= RUNTIME_REVIEW_MAX_RESULTS) return evidence;
+		}
+	}
+	return evidence;
+}
+
 function processStartToken(pid: number): string | undefined {
 	if (process.platform !== "linux" || !Number.isInteger(pid) || pid <= 0) return undefined;
 	try {
@@ -245,6 +341,7 @@ export async function evaluateAcceptance(input: {
 	cwd: string;
 	report?: AcceptanceReport;
 	reviewResult?: AcceptanceReviewResult;
+	runtimeReviewEvidence?: string[];
 }): Promise<AcceptanceLedger> {
 	const acceptance = input.acceptance;
 	const ledger: AcceptanceLedger = {
@@ -260,6 +357,11 @@ export async function evaluateAcceptance(input: {
 
 	const parsed = input.report ? { report: input.report } : parseAcceptanceReport(input.output);
 	if (parsed.report) {
+		// Runtime review evidence supplements (but never overrides) an explicitly
+		// attested reviewFindings field. It is supplied only by the narrow collector.
+		if (parsed.report.reviewFindings === undefined && input.runtimeReviewEvidence?.length) {
+			parsed.report = { ...parsed.report, reviewFindings: input.runtimeReviewEvidence };
+		}
 		ledger.childReport = parsed.report;
 		ledger.status = "attested";
 	} else {

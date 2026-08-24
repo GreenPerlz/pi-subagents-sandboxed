@@ -11,6 +11,7 @@ export {
 } from "./acceptance-reports.ts";
 export {
 	acceptanceFailureMessage,
+	collectRuntimeReviewEvidence,
 	evaluateAcceptance,
 } from "./acceptance-evaluation.ts";
 export {

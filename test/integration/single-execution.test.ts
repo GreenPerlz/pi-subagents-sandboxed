@@ -403,7 +403,9 @@ process.exit(${exitCode});
 	function assertMountMode(args: string[], source: string, mode: "ro" | "rw"): void {
 		const expectedFlag = mode === "rw" ? "--bind" : "--ro-bind";
 		assert.ok(
-			args.some((arg, index) => arg === expectedFlag && args[index + 1] === source && args[index + 2] === source),
+			args.some((arg, index) => arg === expectedFlag
+				&& (mode === "rw" ? args[index + 1] === source : /^\/proc\/self\/fd\/\d+$/.test(args[index + 1] ?? ""))
+				&& args[index + 2] === source),
 			`expected ${source} to be mounted ${mode}`,
 		);
 	}
@@ -1864,8 +1866,8 @@ process.exit(${exitCode});
 			for (const extPath of customExtensionArgs.filter((arg) => path.isAbsolute(arg))) {
 				const isMounted = bwrapArgs.some((arg, index) => {
 					if (arg !== "--ro-bind") return false;
-					const source = bwrapArgs[index + 1];
-					return source === extPath || source === path.dirname(extPath);
+					const target = bwrapArgs[index + 2];
+					return target === extPath || target === path.dirname(extPath);
 				});
 				assert.ok(isMounted, `bubblewrap should read-only mount extension ${extPath} or its parent`);
 			}

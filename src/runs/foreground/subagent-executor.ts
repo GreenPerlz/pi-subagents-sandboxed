@@ -1680,7 +1680,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 	const controlIntercomTarget = intercomBridge.active ? intercomBridge.orchestratorTarget : undefined;
 	const childIntercomTarget = intercomBridge.active ? (agent: string, index: number) => resolveSubagentIntercomTarget(id, agent, index) : undefined;
 	const sandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
-	const sandbox = resolveSandboxConfig({
+	const sandbox = resolveSandboxTransport({
 		settings: sandboxSettings,
 		run: params.sandbox,
 	});
@@ -1692,6 +1692,10 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			resolveModelCandidate(task.model ?? agentConfigs[index]?.model, availableModels, currentProvider),
 		);
 		const skillOverrides = params.tasks.map((task) => normalizeSkillInput(task.skill));
+		const taskSandboxes = agentConfigs.map((agent) => resolveSandboxTransport({ settings: sandboxSettings, agent, run: params.sandbox }));
+		if (asyncScopedEndpoint && taskSandboxes.some((value) => !value || value.provider !== "bubblewrap" || resolveGitMode(value) !== "isolated")) {
+			return validationErrorResult("parallel", "Scoped Git endpoint requires Bubblewrap isolated mode; refusing sandbox opt-out before reservation.");
+		}
 		const parallelTasks = params.tasks.map((task, index) => ({
 			agent: task.agent,
 			task: params.context === "fork" ? wrapForkTask(task.task) : task.task,
@@ -1706,7 +1710,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			...(task.acceptance !== undefined ? { acceptance: task.acceptance } : {}),
 		}));
 		try {
-			const wantsWriter = params.tasks.some((task, index) => inferSandboxCwdWritable({ agentName: task.agent, tools: agentConfigs[index]?.tools, sandbox }));
+			const wantsWriter = params.tasks.some((task, index) => inferSandboxCwdWritable({ agentName: task.agent, tools: agentConfigs[index]?.tools, sandbox: taskSandboxes[index] }));
 			asyncScopedEndpoint = await reserveAsyncScopedEndpoint(asyncScopedEndpoint, effectiveCwd, wantsWriter);
 		} catch (error) {
 			return validationErrorResult("parallel", `Scoped Git endpoint reservation failed closed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1750,11 +1754,14 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const normalized = normalizeSkillInput(params.skill);
 		const chainSkills = normalized === false ? [] : (normalized ?? []);
 		const chain = wrapChainTasksForFork(params.chain as ChainStep[], params.context);
+		const chainTasks = chain.flatMap((step) => isParallelStep(step) ? step.parallel : isDynamicParallelStep(step) ? [step.parallel] : [step]);
+		const chainAgentConfigs = chainTasks.map((task) => agents.find((candidate) => candidate.name === task.agent));
+		const chainSandboxes = chainAgentConfigs.map((agent) => resolveSandboxTransport({ settings: sandboxSettings, agent, run: params.sandbox }));
+		if (asyncScopedEndpoint && chainSandboxes.some((value) => !value || value.provider !== "bubblewrap" || resolveGitMode(value) !== "isolated")) {
+			return validationErrorResult("chain", "Scoped Git endpoint requires Bubblewrap isolated mode; refusing sandbox opt-out before reservation.");
+		}
 		try {
-			const wantsWriter = chain.some((step) => {
-				const tasks = isParallelStep(step) ? step.parallel : isDynamicParallelStep(step) ? [step.parallel] : [step];
-				return tasks.some((task: any) => inferSandboxCwdWritable({ agentName: task.agent, tools: agents.find((candidate) => candidate.name === task.agent)?.tools, sandbox }));
-			});
+			const wantsWriter = chainTasks.some((task, index) => inferSandboxCwdWritable({ agentName: task.agent, tools: chainAgentConfigs[index]?.tools, sandbox: chainSandboxes[index] }));
 			asyncScopedEndpoint = await reserveAsyncScopedEndpoint(asyncScopedEndpoint, effectiveCwd, wantsWriter);
 		} catch (error) {
 			return validationErrorResult("chain", `Scoped Git endpoint reservation failed closed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1808,7 +1815,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, a.maxSubagentDepth);
 		const modelOverride = resolveModelCandidate((params.model as string | undefined) ?? a.model, availableModels, currentProvider);
 		const singleSandboxSettings = readSandboxSettings(effectiveCwd, resolveExecutionAgentScope(params.agentScope));
-		let singleSandbox = resolveSandboxConfig({
+		let singleSandbox = resolveSandboxTransport({
 			settings: singleSandboxSettings,
 			agent: a,
 			run: params.sandbox,
@@ -1817,6 +1824,9 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			&& worktreeOptOutIsAuthorized(singleSandboxSettings)
 			&& a.canOptOutOfWorktree === true) {
 			singleSandbox = { ...singleSandbox, gitMode: "read-only" };
+		}
+		if (asyncScopedEndpoint && (!singleSandbox || singleSandbox.provider !== "bubblewrap" || resolveGitMode(singleSandbox) !== "isolated")) {
+			return validationErrorResult("single", "Scoped Git endpoint requires Bubblewrap isolated mode; refusing sandbox opt-out before reservation.");
 		}
 		try {
 			asyncScopedEndpoint = await reserveAsyncScopedEndpoint(asyncScopedEndpoint, effectiveCwd, inferSandboxCwdWritable({ agentName: a.name, tools: a.tools, sandbox: singleSandbox }));
@@ -2098,7 +2108,7 @@ interface ForegroundParallelRunInput {
 }
 
 function sandboxAt(values: Array<SandboxTransport | undefined> | undefined, index: number, fallback: SandboxTransport | undefined): SandboxTransport | undefined {
-	return values && index in values ? values[index] : fallback;
+	return values?.[index] !== undefined ? values[index] : fallback;
 }
 
 function buildParallelModeError(message: string): AgentToolResult<Details> {

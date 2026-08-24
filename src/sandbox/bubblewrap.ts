@@ -214,10 +214,14 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 			?? systemdResolvedMount(this.pathExists, this.realPath)
 			: undefined;
 		const requestedMounts = input.mounts ?? [];
+		const aliasesWslResolver = (candidate: string): boolean => {
+			if (path.resolve(candidate) === WSL_RESOLVER_PATH) return true;
+			try { return this.realPath(candidate) === WSL_RESOLVER_PATH; } catch { return false; }
+		};
 		const mountsToPin = dnsMount === WSL_RESOLVER_PATH
 			? [
 				{ source: WSL_RESOLVER_PATH, target: WSL_RESOLVER_PATH, mode: "ro" as const },
-				...requestedMounts.filter((mount) => mount.source !== WSL_RESOLVER_PATH && (mount.target ?? mount.source) !== WSL_RESOLVER_PATH),
+				...requestedMounts.filter((mount) => !aliasesWslResolver(mount.source) && !aliasesWslResolver(mount.target ?? mount.source)),
 			]
 			: requestedMounts;
 		const pinned = input.invocation.pinReadonlyMounts

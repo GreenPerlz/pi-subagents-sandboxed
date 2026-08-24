@@ -582,6 +582,30 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		} finally { removeTempDir(repo); }
 	});
 
+	it("rejects scoped Git sandbox opt-out before creating async artifacts", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+		const endpoint = {} as never;
+		const common = {
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "scoped-optout-preflight" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sandboxSettings: { allowSandboxOptOut: true },
+			sandboxRun: { provider: "none" as const },
+			scopedGitEndpoint: endpoint,
+		};
+		const singleId = `async-scoped-optout-single-${Date.now().toString(36)}`;
+		const single = executeAsyncSingle(singleId, { agent: "worker", task: "Must not run", agentConfig: makeAgent("worker"), ...common });
+		assert.equal(single.isError, true);
+		assert.match(single.content[0]?.text ?? "", /requires Bubblewrap isolated mode/);
+		assert.equal(fs.existsSync(path.join(ASYNC_DIR, singleId)), false);
+
+		const chainId = `async-scoped-optout-chain-${Date.now().toString(36)}`;
+		const chainResult = executeAsyncChain(chainId, { chain: [{ agent: "worker", task: "Must not run" }], agents: [makeAgent("worker")], ...common });
+		assert.equal(chainResult.isError, true);
+		assert.match(chainResult.content[0]?.text ?? "", /requires Bubblewrap isolated mode/);
+		assert.equal(fs.existsSync(path.join(ASYNC_DIR, chainId)), false);
+	});
+
 	it("background explicit provider:none overrides Bubblewrap frontmatter and persists revival policy", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		const trustedDir = path.join(tempDir, "trusted-user-settings");

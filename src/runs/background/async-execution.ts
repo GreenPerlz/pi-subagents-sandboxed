@@ -563,6 +563,17 @@ export function executeAsyncChain(
 	} : undefined);
 	const authorityRoute = explicitNestedRoute && !effectiveNestedSelf ? undefined : inheritedNestedRoute;
 	const effectiveScopedGitEndpoint = explicitNestedRoute && !effectiveNestedSelf && inheritedNestedRoute ? undefined : params.scopedGitEndpoint;
+	if (effectiveScopedGitEndpoint) {
+		const scopedAgents = chain.flatMap((step) => isParallelStep(step)
+			? step.parallel.map((task) => task.agent)
+			: isDynamicParallelStep(step) ? [step.parallel.agent] : [(step as SequentialStep).agent]);
+		const invalidScopedSandbox = scopedAgents.some((agentName) => {
+			const agent = agents.find((candidate) => candidate.name === agentName);
+			const resolved = agent ? resolveStepSandbox(agent) : undefined;
+			return !resolved || resolved.provider !== "bubblewrap" || resolved.gitMode !== "isolated";
+		});
+		if (invalidScopedSandbox) return formatAsyncStartError(resultMode, "Scoped Git endpoint requires Bubblewrap isolated mode; refusing sandbox opt-out before async artifacts or spawn.");
+	}
 	const endpointValidationError = validateInheritedScopedEndpoint(effectiveScopedGitEndpoint, authorityRoute);
 	if (endpointValidationError) return formatAsyncStartError(resultMode, endpointValidationError);
 	const asyncDir = effectiveNestedRoute && effectiveNestedSelf
@@ -972,6 +983,9 @@ export function executeAsyncSingle(
 		&& worktreeOptOutIsAuthorized(params.sandboxSettings)
 		&& agentConfig.canOptOutOfWorktree === true) {
 		sandbox = { ...sandbox, gitMode: "read-only" };
+	}
+	if (scopedGitRunEndpoint && (!sandbox || sandbox.provider !== "bubblewrap" || sandbox.gitMode !== "isolated")) {
+		return formatAsyncStartError("single", "Scoped Git endpoint requires Bubblewrap isolated mode; refusing sandbox opt-out before async artifacts or spawn.");
 	}
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;

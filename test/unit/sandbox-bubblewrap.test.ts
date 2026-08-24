@@ -195,7 +195,7 @@ describe("Bubblewrap sandbox provider", () => {
 		const provider = new BubblewrapSandboxProvider({
 			isBubblewrapAvailable: () => true,
 			pathExists: (candidate) => ["/etc", "/etc/resolv.conf", "/mnt/wsl/resolv.conf"].includes(candidate),
-			realPath: (filePath) => filePath === "/etc/resolv.conf" ? "/mnt/wsl/resolv.conf" : filePath,
+			realPath: (filePath) => filePath === "/etc/resolv.conf" || filePath === "/tmp/resolver-link" ? "/mnt/wsl/resolv.conf" : filePath,
 			lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0o100644, uid: typeof process.getuid === "function" ? process.getuid() : 0 } as fs.Stats),
 		});
 		const result = provider.wrapInvocation({
@@ -203,10 +203,14 @@ describe("Bubblewrap sandbox provider", () => {
 			invocation: { command: "node", args: [] },
 			mounts: [
 				{ source: "/mnt/wsl/resolv.conf", target: "/tmp/resolver-alias", mode: "ro" },
-				{ source: "/tmp/forged-resolver", target: "/mnt/wsl/resolv.conf", mode: "ro" },
+				{ source: "/mnt/wsl/./resolv.conf", target: "/tmp/normalized-alias", mode: "ro" },
+				{ source: "/tmp/resolver-link", target: "/tmp/symlink-alias", mode: "ro" },
+				{ source: "/tmp/forged-resolver", target: "/mnt/wsl/../wsl/resolv.conf", mode: "ro" },
 			],
 		});
 		assert.equal(result.invocation.args.includes("/tmp/resolver-alias"), false);
+		assert.equal(result.invocation.args.includes("/tmp/normalized-alias"), false);
+		assert.equal(result.invocation.args.includes("/tmp/symlink-alias"), false);
 		assert.equal(result.invocation.args.includes("/tmp/forged-resolver"), false);
 		assert.equal(result.invocation.args.filter((arg) => arg === "/mnt/wsl/resolv.conf").length, 2);
 	});

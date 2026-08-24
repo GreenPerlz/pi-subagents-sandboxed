@@ -254,7 +254,9 @@ process.exit(child.status ?? 0);
 	function assertMountMode(args: string[], source: string, mode: "ro" | "rw"): void {
 		const expectedFlag = mode === "rw" ? "--bind" : "--ro-bind";
 		assert.ok(
-			args.some((arg, index) => arg === expectedFlag && args[index + 1] === source && args[index + 2] === source),
+			args.some((arg, index) => arg === expectedFlag
+				&& (mode === "rw" ? args[index + 1] === source : /^\/proc\/self\/fd\/\d+$/.test(args[index + 1] ?? ""))
+				&& args[index + 2] === source),
 			`expected ${source} to be mounted ${mode}`,
 		);
 	}

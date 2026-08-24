@@ -294,6 +294,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 
 	const adoptPersistedActiveRuns = (ctx?: ExtensionContext): number => {
+		// Reload adoption is an ownership transfer, so a verified process identity
+		// is necessary but not sufficient: require exact current-session authority.
+		if (!state.currentSessionId) return 0;
 		let adopted = 0;
 		let runs;
 		try {
@@ -319,7 +322,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			let status;
 			try { status = readStatus(summary.asyncDir); } catch { continue; }
 			if (!status || status.runId !== summary.id || (status.state !== "queued" && status.state !== "running")) continue;
-			if (state.currentSessionId ? status.sessionId !== state.currentSessionId : status.sessionId !== undefined) continue;
+			if (status.sessionId !== state.currentSessionId) continue;
 			if (!Number.isInteger(status.pid) || (status.pid ?? 0) <= 0) continue;
 			const verifyRunnerPid = options.isExpectedAsyncRunnerPid ?? isExpectedAsyncRunnerPid;
 			if (!verifyRunnerPid(status.pid, summary.id, status.runnerIdentity)) continue;

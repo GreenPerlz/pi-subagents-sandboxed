@@ -108,6 +108,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				["run-foreign", "intruder", "other-session", "running", "fixture-foreign"],
 				["run-terminal", "done", "session-reload", "complete", "fixture-terminal"],
 				["run-unverified", "unknown", "session-reload", "running", "fixture-unverified"],
+				["run-sessionless", "legacy", undefined, "running", "fixture-sessionless"],
 			]) {
 				const runDir = path.join(asyncRoot, id);
 				fs.mkdirSync(runDir, { recursive: true });
@@ -147,6 +148,12 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(freshTracker.adoptPersistedActiveRuns(ui.ctx as never), 2);
 			assert.deepEqual([...freshState.asyncJobs.keys()].sort(), ["run-a", "run-b"]);
 			assert.equal(freshTracker.adoptPersistedActiveRuns(ui.ctx as never), 0, "repeated reload adoption must not duplicate runs");
+			const unscopedState = createState();
+			const unscopedTracker = trackerMod!.createAsyncJobTracker(recorder.pi, unscopedState as never, asyncRoot, {
+				isExpectedAsyncRunnerPid: () => true,
+			});
+			assert.equal(unscopedTracker.adoptPersistedActiveRuns(ui.ctx as never), 0, "missing current session identity must fail closed");
+			assert.equal(unscopedState.asyncJobs.size, 0);
 			const completedStatus = JSON.parse(fs.readFileSync(path.join(asyncRoot, "run-a", "status.json"), "utf8"));
 			completedStatus.state = "complete";
 			completedStatus.endedAt = 4000;

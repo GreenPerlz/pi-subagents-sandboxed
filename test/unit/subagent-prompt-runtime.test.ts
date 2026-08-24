@@ -125,12 +125,14 @@ describe("subagent prompt runtime", () => {
 			const execute = runtime.getStructuredExecute();
 			assert.ok(execute);
 			runtime.handlers.get("agent_start")?.({});
+			runtime.handlers.get("turn_start")?.({ turnIndex: 0 });
+			runtime.handlers.get("tool_execution_start")?.({ toolCallId: "tool-1", toolName: "structured_output" });
 			await execute("tool-1", { value: { ok: true } });
-			runtime.handlers.get("tool_execution_end")?.({ toolName: "structured_output", result: { terminate: true }, isError: false });
+			runtime.handlers.get("tool_execution_end")?.({ toolCallId: "tool-1", toolName: "structured_output", result: { terminate: true }, isError: false });
 			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
 			assert.deepEqual(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), { cancel: true });
 
-			runtime.handlers.get("tool_execution_end")?.({ toolName: "structured_output", result: { terminate: true }, isError: true });
+			runtime.handlers.get("tool_execution_end")?.({ toolCallId: "tool-1", toolName: "structured_output", result: { terminate: true }, isError: true });
 			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
 			assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined);
 
@@ -141,6 +143,18 @@ describe("subagent prompt runtime", () => {
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	it("does not treat a mixed terminating and non-terminating tool batch as terminal", () => {
+		const runtime = runtimeHarness();
+		runtime.handlers.get("agent_start")?.({});
+		runtime.handlers.get("turn_start")?.({ turnIndex: 0 });
+		runtime.handlers.get("tool_execution_start")?.({ toolCallId: "structured", toolName: "structured_output" });
+		runtime.handlers.get("tool_execution_start")?.({ toolCallId: "other", toolName: "read" });
+		runtime.handlers.get("tool_execution_end")?.({ toolCallId: "structured", toolName: "structured_output", result: { terminate: true }, isError: false });
+		runtime.handlers.get("tool_execution_end")?.({ toolCallId: "other", toolName: "read", result: {}, isError: false });
+		runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
+		assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined);
 	});
 
 	it("allows failed structured output and keeps intermediate tool turns eligible for compaction", async () => {
@@ -154,8 +168,11 @@ describe("subagent prompt runtime", () => {
 			const runtime = runtimeHarness();
 			const execute = runtime.getStructuredExecute();
 			assert.ok(execute);
+			runtime.handlers.get("agent_start")?.({});
+			runtime.handlers.get("turn_start")?.({ turnIndex: 0 });
+			runtime.handlers.get("tool_execution_start")?.({ toolCallId: "tool-1", toolName: "structured_output" });
 			await assert.rejects(execute("tool-1", { value: { ok: "not-a-boolean" } }));
-			runtime.handlers.get("tool_execution_end")?.({ toolName: "structured_output", result: { terminate: true }, isError: true });
+			runtime.handlers.get("tool_execution_end")?.({ toolCallId: "tool-1", toolName: "structured_output", result: { terminate: true }, isError: true });
 			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
 			assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined);
 		} finally {

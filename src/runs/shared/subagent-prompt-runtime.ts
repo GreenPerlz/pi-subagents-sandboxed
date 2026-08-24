@@ -156,6 +156,12 @@ export function stripParentOnlySubagentMessages(messages: unknown[]): unknown[] 
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	let terminalCandidate = false;
 	let structuredOutputSucceeded = false;
+	const toolBatchResults = new Map<string, boolean>();
+	const resetRunState = () => {
+		terminalCandidate = false;
+		structuredOutputSucceeded = false;
+		toolBatchResults.clear();
+	};
 	const structuredOutputPath = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV];
 	const structuredSchemaPath = process.env[STRUCTURED_OUTPUT_SCHEMA_ENV];
 	if (structuredOutputPath && structuredSchemaPath) {
@@ -185,7 +191,6 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 				}
 				fs.mkdirSync(path.dirname(structuredOutputPath), { recursive: true });
 				fs.writeFileSync(structuredOutputPath, JSON.stringify(params.value), { mode: 0o600 });
-				structuredOutputSucceeded = true;
 				return {
 					content: [{ type: "text", text: "Structured output captured." }],
 					details: { path: structuredOutputPath },
@@ -196,32 +201,36 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	}
 
 	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown, ctx?: { hasPendingMessages?: () => boolean }) => unknown) => void;
-	onRuntimeEvent("input", () => {
-		terminalCandidate = false;
-		structuredOutputSucceeded = false;
-	});
+	onRuntimeEvent("input", resetRunState);
 	onRuntimeEvent("message_start", (rawEvent: unknown) => {
 		const event = rawEvent as { message?: { role?: string } };
-		if (event.message?.role === "user") {
-			terminalCandidate = false;
-			structuredOutputSucceeded = false;
-		}
+		if (event.message?.role === "user") resetRunState();
 	});
-	onRuntimeEvent("agent_start", () => {
-		terminalCandidate = false;
+	onRuntimeEvent("agent_start", resetRunState);
+	onRuntimeEvent("turn_start", () => {
 		structuredOutputSucceeded = false;
+		toolBatchResults.clear();
+	});
+	onRuntimeEvent("tool_execution_start", (rawEvent: unknown) => {
+		const event = rawEvent as { toolCallId?: string };
+		if (typeof event.toolCallId === "string") toolBatchResults.set(event.toolCallId, false);
 	});
 	onRuntimeEvent("tool_execution_end", (rawEvent: unknown) => {
-		const event = rawEvent as { toolName?: string; result?: { terminate?: boolean }; isError?: boolean };
-		if (event.toolName !== "structured_output") return;
-		structuredOutputSucceeded = event.isError !== true && event.result?.terminate === true;
+		const event = rawEvent as { toolCallId?: string; toolName?: string; result?: { terminate?: boolean }; isError?: boolean };
+		if (typeof event.toolCallId !== "string") return;
+		const terminated = event.isError !== true && event.result?.terminate === true;
+		toolBatchResults.set(event.toolCallId, terminated);
+		if (event.toolName === "structured_output") structuredOutputSucceeded = terminated;
 	});
 	onRuntimeEvent("agent_end", (rawEvent: unknown) => {
 		const event = rawEvent as { messages?: unknown[] };
 		const messages = Array.isArray(event.messages) ? event.messages : [];
 		const finalAssistant = [...messages].reverse().find((message) => (message as { role?: string })?.role === "assistant") as { stopReason?: string } | undefined;
+		const terminatingToolBatch = structuredOutputSucceeded
+			&& toolBatchResults.size > 0
+			&& [...toolBatchResults.values()].every(Boolean);
 		terminalCandidate = finalAssistant?.stopReason === "stop"
-			|| (structuredOutputSucceeded && finalAssistant?.stopReason === "toolUse");
+			|| (terminatingToolBatch && finalAssistant?.stopReason === "toolUse");
 	});
 	onRuntimeEvent("session_before_compact", (rawEvent: unknown, ctx) => {
 		const event = rawEvent as { reason?: string; willRetry?: boolean };
@@ -250,8 +259,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	});
 
 	onRuntimeEvent("before_agent_start", async (event: { systemPrompt: string }) => {
-		terminalCandidate = false;
-		structuredOutputSucceeded = false;
+		resetRunState();
 		const intercomSessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
 		if (intercomSessionName && typeof pi.setSessionName === "function") {
 			pi.setSessionName(intercomSessionName);

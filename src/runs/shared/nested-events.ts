@@ -677,7 +677,10 @@ export function resolveNestedRoute(rootRunId: string, persisted?: NestedRouteInf
 		return { route: persisted, validity: "trusted" };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		if (message.includes("ENOENT") || message.includes("route root does not exist") || message.includes("route directories do not exist")) return { validity: "unavailable", error: message };
+		// Only disappearance of the whole trusted route root is cleanup. Missing
+		// metadata or child directories inside an existing root are malformed and
+		// must fail closed as invalid rather than masquerading as unavailable.
+		if (message.includes("route root does not exist")) return { validity: "unavailable", error: message };
 		return { validity: "invalid", error: message };
 	}
 }

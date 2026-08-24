@@ -137,6 +137,14 @@ describe("nested snapshot fidelity and route authority", () => {
 		assert.equal(resolveNestedRoute("authority-root", forged).validity, "invalid");
 	});
 
+	it("classifies a partial route with missing metadata as invalid", () => {
+		const route = trackRoute("partial-root");
+		fs.rmSync(path.join(path.dirname(route.eventSink), "route.json"));
+		const resolution = resolveNestedRoute("partial-root", route);
+		assert.equal(resolution.validity, "invalid");
+		assert.equal(resolution.route, undefined);
+	});
+
 	it("treats required missing metadata as unavailable without ambient fallback", () => {
 		const ambient = trackRoute("required-root");
 		const resolution = resolveNestedRoute("required-root", undefined, { routeRequired: true });

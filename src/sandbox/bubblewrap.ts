@@ -237,6 +237,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 			// Bubblewrap versions do not preserve merged-/usr symlink sources such
 			// as /bin -> /usr/bin, leaving the sandbox without /bin/sh.
 			const source = this.realPath(target);
+			if (source !== target) args.push("--dir", target);
 			addMount(args, { source, target, mode: "ro" }, seenMounts, diagnosticMounts);
 		}
 		// Ensure the wrapped command dies if the runner or Bubblewrap wrapper

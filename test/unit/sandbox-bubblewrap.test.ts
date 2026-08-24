@@ -46,7 +46,7 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.deepEqual(result.diagnostics, []);
 
 		const args = result.invocation.args;
-		assert.deepEqual(args.slice(0, 6), ["--ro-bind", "/usr", "/usr", "--ro-bind", "/usr/bin", "/bin"]);
+		assert.deepEqual(args.slice(0, 8), ["--ro-bind", "/usr", "/usr", "--dir", "/bin", "--ro-bind", "/usr/bin", "/bin"]);
 		assert.deepEqual(args.slice(args.indexOf("/home/alice/project") - 1, args.indexOf("/home/alice/project") + 2), ["--bind", "/home/alice/project", "/home/alice/project"]);
 		assert.ok(args.includes("--ro-bind"));
 		assert.ok(args.includes("/var/cache/tool"));

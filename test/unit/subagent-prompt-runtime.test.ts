@@ -130,6 +130,10 @@ describe("subagent prompt runtime", () => {
 			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
 			assert.deepEqual(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), { cancel: true });
 
+			runtime.handlers.get("tool_execution_end")?.({ toolName: "structured_output", result: { terminate: true }, isError: true });
+			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });
+			assert.equal(runtime.handlers.get("session_before_compact")?.(compactEvent("threshold"), compactContext()), undefined);
+
 			const newRun = runtime.handlers.get("agent_start");
 			newRun?.({});
 			runtime.handlers.get("agent_end")?.({ messages: [assistant("toolUse")] });

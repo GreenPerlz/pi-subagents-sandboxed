@@ -213,9 +213,8 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	});
 	onRuntimeEvent("tool_execution_end", (rawEvent: unknown) => {
 		const event = rawEvent as { toolName?: string; result?: { terminate?: boolean }; isError?: boolean };
-		if (event.toolName === "structured_output" && event.isError !== true && event.result?.terminate === true) {
-			structuredOutputSucceeded = true;
-		}
+		if (event.toolName !== "structured_output") return;
+		structuredOutputSucceeded = event.isError !== true && event.result?.terminate === true;
 	});
 	onRuntimeEvent("agent_end", (rawEvent: unknown) => {
 		const event = rawEvent as { messages?: unknown[] };

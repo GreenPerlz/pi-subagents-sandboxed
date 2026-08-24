@@ -119,11 +119,11 @@ describe("nested snapshot fidelity and route authority", () => {
 		assert.equal(merged.children?.[0]?.id, "fresh-child");
 	});
 
-	it("rejects a valid route from another root and never substitutes it", () => {
-		const foreign = trackRoute("foreign-root");
-		const resolution = resolveNestedRoute("requested-root", foreign);
-		assert.equal(resolution.validity, "invalid");
-		assert.equal(resolution.route, undefined);
+	it("accepts an exact authenticated inherited route when the detached run id differs", () => {
+		const inherited = trackRoute("launching-parent");
+		const resolution = resolveNestedRoute("detached-child-run", inherited);
+		assert.equal(resolution.validity, "trusted");
+		assert.deepEqual(resolution.route, inherited);
 	});
 
 	it("classifies cleaned trusted routes as unavailable and forged routes as invalid", () => {

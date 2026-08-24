@@ -667,7 +667,10 @@ export function resolveNestedRoute(rootRunId: string, persisted?: NestedRouteInf
 		return { route, validity: route ? "trusted" : "legacy" };
 	}
 	try {
-		if (persisted.rootRunId !== rootRunId) throw new Error("Persisted nested route root does not match the requested run root.");
+		// The persisted authenticated route is the authority. Its root can differ
+		// from a detached status/run id: nested and foreground children inherit the
+		// launching parent's route root. The requested id is used only for legacy
+		// ambient lookup when no persisted route exists.
 		// First validate coordinates and route identity even when the route was
 		// cleaned up. A correctly shaped but absent route is unavailable, not forged.
 		validateRouteShape(persisted);

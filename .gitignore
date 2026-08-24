@@ -3,6 +3,8 @@
 AGENTS.md
 node_modules/
 .fallow/
+.venv/
+site/
 
 tmp/
 

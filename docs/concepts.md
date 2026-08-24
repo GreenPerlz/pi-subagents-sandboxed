@@ -46,10 +46,10 @@ Foreground runs stream results to the current session. Background runs are detac
 
 ## A safe orchestration shape
 
-For implementation work, keep one parent-owned checkout and use inline handoffs:
+For packaged implementation work, keep one runtime-owned isolated scope and use inline handoffs:
 
 ```text
-parent-owned worktree → explore (read-only) → work (single writer) → fresh review → optional fix
+isolated runtime scope → explore (read-only) → work (single commit-producing writer) → fresh scoped review → optional fix → trusted parent integration
 ```
 
-Avoid creating repo-local reports just to pass context unless an explicit `output`, `reads`, or `progress` option requires one. The [workflows](workflows.md) page has concrete prompts and tool calls.
+Nested steps inherit the scoped Git endpoint instead of creating more worktrees. The outer parent verifies and integrates exported authored commits after the scoped review. Avoid creating repo-local reports just to pass context unless an explicit `output`, `reads`, or `progress` option requires one. The [workflows](workflows.md) page has concrete prompts and tool calls.

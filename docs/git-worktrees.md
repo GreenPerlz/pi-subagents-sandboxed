@@ -4,12 +4,12 @@ Git isolation is a policy boundary as well as a filesystem choice. The parent ow
 
 ## Two safe access modes
 
-| Mode | Checkout | Git metadata | Use |
+| Git mode | Project files | Git metadata | Use |
 | --- | --- | --- | --- |
-| `read-only` | Read-only | Protected | `explore`, `research`, `review`, and custom observers |
-| `isolated` | Private runtime-managed worktree | Private Git metadata/object layer | `work`, `orchestrator`, and explicitly configured commit-producing writers |
+| `read-only` | Read-only for observers; may be writable when `edit`/`write` tools or trusted `bashWrite` enable content writes | Parent metadata remains protected | `explore`, `research`, `review`, and custom agents that must not change Git state |
+| `isolated` | Writable private runtime-managed worktree | Private Git metadata/object layer | `work`, `orchestrator`, and explicitly configured commit-producing writers |
 
-A custom agent with no sandbox frontmatter remains read-only. Packaged writers default to isolated Git. Host-Git operation (`provider: none`) and `worktree: false` are trusted, guarded opt-outs—not defaults.
+A custom agent with no sandbox frontmatter defaults to **read-only Git**, not necessarily read-only project files: write inference can still mount its cwd writable when it has `edit` or `write` tools. Packaged writers default to isolated Git. Host-Git operation (`provider: none`) and `worktree: false` are trusted, guarded opt-outs—not defaults.
 
 ## Isolated versus parent-managed worktrees
 
@@ -32,20 +32,25 @@ The runtime does not auto-integrate isolated work. Inspect first:
 
 ```bash
 git bundle verify /path/to/bundle
-# fetch refs into a temporary namespace or checkout
-git fetch /path/to/bundle 'refs/*:refs/recovery/*'
-git log --oneline <base>..<head>
-git show <commit>
+git bundle list-heads /path/to/bundle
+# Replace this example with the exact named head ref reported by the result.
+head_ref=refs/heads/isolated-0
+git fetch /path/to/bundle "$head_ref":refs/review/subagent-head
+git log --oneline <base>..refs/review/subagent-head
+git show <authored-commit>
 ```
+
+Use only refs reported by the result metadata and `git bundle list-heads`. A recovery or staged-snapshot ref is optional; do not assume either exists. If metadata reports one that you need, fetch that exact ref into a temporary review namespace before inspecting it.
 
 Then choose one deliberate integration path in the canonical parent checkout:
 
 ```bash
-# authored commits only, after review
+# Authored commits only, after review.
 git cherry-pick <authored-commit>...
 
-# or apply a reviewed final-state patch without adopting runtime packaging commits
-git diff <base>..<recovery> > /tmp/recovery.patch
+# Or, only when metadata reported and you fetched a recovery ref, apply its
+# reviewed final state without adopting runtime packaging commits.
+git diff <base> refs/review/subagent-recovery > /tmp/recovery.patch
 git apply /tmp/recovery.patch
 git add -A
 ```

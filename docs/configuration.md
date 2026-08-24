@@ -1,14 +1,13 @@
 # Configuration and reference routing
 
-Most users need no configuration beyond Bubblewrap. Persistent settings are JSON and follow this precedence:
+Most users need no configuration beyond Bubblewrap. Effective values resolve from broadest to narrowest authority:
 
-1. user `~/.pi/agent/subagents.json`,
-2. project `.pi/subagents.json`,
-3. legacy `settings.json -> subagents` at the same scope (the dedicated file wins),
-4. agent frontmatter,
-5. permitted run overrides.
+1. user settings,
+2. project settings (override user settings),
+3. agent frontmatter (overrides settings defaults),
+4. permitted run options (override frontmatter).
 
-Agent discovery follows project over user over packaged definitions. The complete list of settings, frontmatter fields, acceptance fields, run options, and recovery metadata is preserved in the [settings reference](settings-reference.md); use this page to route concepts rather than duplicate that reference.
+At each user or project scope, dedicated `subagents.json` wins over the legacy `settings.json -> subagents` block. Agent discovery separately follows project over user over packaged definitions. A run option is effective only when the target agent's `canBeChangedByAgent` permits that exact override; precedence is not authority. The complete list of settings, frontmatter fields, acceptance fields, run options, and recovery metadata is preserved in the [settings reference](settings-reference.md); use this page to route concepts rather than duplicate that reference.
 
 ## Minimal safe defaults
 

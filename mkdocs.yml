@@ -36,6 +36,10 @@ markdown_extensions:
       custom_checkbox: true
 plugins:
   - search
+# Historical maintainer handoff contains machine-specific recovery notes. Keep
+# the source in Git, but do not publish it as user documentation.
+exclude_docs: |
+  handoff-subprocess-cleanup.md
 nav:
   - Home: index.md
   - Concepts:
@@ -51,4 +55,3 @@ nav:
       - Settings reference: settings-reference.md
       - Troubleshooting & doctor: troubleshooting.md
   - Agent contract: agent-contract.md
-  - Maintainer handoff: handoff-subprocess-cleanup.md

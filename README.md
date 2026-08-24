@@ -25,7 +25,7 @@ Main changes from the upstream v0.27.0 baseline:
 - Added a closed child Pi runtime path for sandboxed children, reducing ambient extension/tool discovery.
 - Mounted systemd-resolved DNS state for host networking where needed.
 - Mounted `/dev` in Bubblewrap so Node child processes and the built-in bash tool can open `/dev/null`.
-- Adjusted bundled orchestration defaults: one parent-owned worktree with inline explore/work/review handoffs, no worker commits, and no implicit repo-local Markdown reports.
+- Adjusted bundled orchestration defaults: one runtime-managed isolated worktree with inline explore/work/review handoffs, writer-authored commits exported as evidence, and no implicit repo-local Markdown reports.
 - Adjusted bundled work/review defaults and prompt guidance for this sandbox-focused fork.
 
 This is a local safety/containment feature, not a claim of hostile-code-grade isolation. The current goal is: **make packaged subagent delegation safer by default, while preserving explicit opt-outs and configurable access when a run needs broader host access.**
@@ -48,7 +48,7 @@ That installs the extension and the packaged agents. Because those packaged agen
 
 ## Sandboxed subagents
 
-The packaged read-only agents (`explore`, `research`, and `review`) request Bubblewrap with read-only Git. Packaged `work` and `orchestrator` use Bubblewrap isolated Git and receive exactly one runtime-managed worktree when launched directly; nested launches inherit the parent's scoped endpoint instead of creating another worktree. Custom agents with no sandbox frontmatter remain read-only. A parent may explicitly request `worktree: false` only when the agent's dedicated `canOptOutOfWorktree` permission and trusted user-global ceiling allow it; the checkout stays writable while parent Git metadata remains read-only. Sandbox opt-out (`provider: "none"`) is denied unless trusted user-global settings explicitly enable it, and project settings cannot enable it.
+The packaged read-only agents (`explore`, `research`, and `review`) request Bubblewrap with read-only Git. Packaged `work` and `orchestrator` use Bubblewrap isolated Git and receive exactly one runtime-managed worktree when launched directly; nested launches inherit the parent's scoped endpoint instead of creating another worktree. Custom agents with no sandbox frontmatter default to read-only **Git metadata**, but `edit`/`write` tools or trusted `bashWrite` can still make project files writable through write inference. A parent may explicitly request `worktree: false` only when the agent's dedicated `canOptOutOfWorktree` permission and trusted user-global ceiling allow it; the checkout stays writable while parent Git metadata remains read-only. Sandbox opt-out (`provider: "none"`) is denied unless trusted user-global settings explicitly enable it, and project settings cannot enable it.
 
 ### Bubblewrap requirements
 
@@ -230,7 +230,7 @@ Those are ordinary Pi requests. Pi decides whether to call `subagent`, which age
 | See running work | “Show active async runs.” |
 | Check setup | “Check whether subagents are configured correctly.” |
 
-The extension ships with builtin agents you can use immediately. In this fork, packaged read-only agents use read-only Git while `work` and `orchestrator` use isolated managed Git by default. Keep packaged launches on those defaults; custom agents remain read-only unless they explicitly opt into isolated Git. Host-Git opt-out requires trusted user-global authorization.
+The extension ships with builtin agents you can use immediately. In this fork, packaged read-only agents use read-only Git while `work` and `orchestrator` use isolated managed Git by default. Keep packaged launches on those defaults; custom agents remain read-only in Git unless they explicitly opt into isolated Git (their project-file mounts can still be writable through write inference). Host-Git opt-out requires trusted user-global authorization.
 
 ## Builtin agents in plain English
 
@@ -294,13 +294,13 @@ Check whether subagents and intercom are set up correctly.
 
 ## Recommended orchestration pattern (scaffolding)
 
-Use orchestration as parent-agent guidance, not as a runtime workflow mode. The default implementation loop owns one isolated worktree in the parent and keeps handoffs inline:
+Use orchestration as parent-agent guidance, not as a runtime workflow mode. The default implementation loop owns one runtime-managed isolated worktree and keeps handoffs inline:
 
 ```text
-parent-owned worktree → explore (inline findings) → work (same cwd, no commit) → fresh review (inspect current git diff) → optional work fix
+isolated runtime scope → explore (read-only) → work (author commits) → fresh review (same scoped tree/history, read-only) → optional work fix → parent verifies/integrates bundle
 ```
 
-The parent runs nested `explore`, `work`, and `review` foreground with `async: false`, embeds relevant explorer findings in the worker task, then passes only an abstract worker handoff to the fresh reviewer. Omitted-`async` orchestrator loop calls are also kept foreground when `asyncByDefault` is enabled. Do not create `tmp/`, context, plan, or progress Markdown for this loop unless an explicit `output`, `progress`, or `reads` option is intentional. Use the optional prompt shortcuts below when you want the pattern to be repeatable.
+The orchestrator runs nested `explore`, `work`, and `review` foreground with `async: false`, embeds relevant explorer findings in the worker task, then passes only an abstract worker handoff to the fresh reviewer. Nested children inherit the orchestrator's scoped Git endpoint instead of creating more worktrees: the writer authors commits inside that isolated scope, reviewers inspect the same tree/history read-only, and the outer trusted parent remains responsible for verifying and integrating the exported bundle. Omitted-`async` orchestrator loop calls are also kept foreground when `asyncByDefault` is enabled. Do not create `tmp/`, context, plan, or progress Markdown for this loop unless an explicit `output`, `progress`, or `reads` option is intentional. Use the optional prompt shortcuts below when you want the pattern to be repeatable.
 
 Packaged agents use their declared context defaults (`work` is fresh); omit `context` for the safe packaged shape. An explicit `context: "fork"` is runnable only for an agent whose frontmatter permits the `context` override.
 
@@ -948,27 +948,47 @@ subagent({ action: "doctor" })
 
 Parallel agents can clobber each other if they edit the same checkout. Packaged `work` and `orchestrator` now default to one runtime-managed Bubblewrap Git worktree when launched directly; nested writer/reviewer calls inherit the parent's scoped endpoint and do not allocate another worktree. Parent-managed `worktree: true` remains available for explicitly permitted agents, while an explicit `worktree: false` opt-out requires the target's dedicated `canOptOutOfWorktree: true` permission plus the trusted user-global ceiling. In that opt-out, the checkout is writable but parent Git metadata stays read-only.
 
-### Parent-managed worktrees
+### Isolated bundle recovery and integration
 
 ```ts
-{ agent: "orchestrator", task: "Own this one issue; relay explorer findings inline, have work edit, then have a fresh reviewer inspect the current diff." }
+{ agent: "orchestrator", task: "Own this one issue; relay explorer findings inline, have work author the isolated change, then have a fresh scoped reviewer inspect its tree and history." }
 ```
 
-The ordinary recovery workflow uses standard Git commands and requires the base repository. Isolated bundles are retained for seven days and are not integrated automatically:
+The ordinary recovery workflow uses standard Git commands and requires the base repository. Isolated bundles are retained for seven days and are not integrated automatically. Use the exact path, checksum, base, and named refs reported by the result metadata:
 
 ```bash
-# temporary review checkout
-mkdir -p /tmp/review && git clone /path/to/base-repo /tmp/review
-# inspect commits and final recovery refs, then cherry-pick authored commits
-cd /tmp/review && git log --oneline <base>..<head>
-git cherry-pick <commit>...
-# or squash the final state into staged/uncommitted changes
- git diff <base>..<recovery> > recovery.patch
- git apply recovery.patch
- git add -A   # leave staged, or omit this for an uncommitted working tree
+BUNDLE=/absolute/path/from-result.bundle
+BASE_COMMIT=replace-with-reported-base
+HEAD_REF=refs/heads/isolated-0  # replace with the exact listed/reported head ref
+
+sha256sum "$BUNDLE"           # compare with the reported checksum
+git bundle verify "$BUNDLE"
+git bundle list-heads "$BUNDLE"
+
+rm -rf /tmp/subagent-review
+git clone /path/to/base-repo /tmp/subagent-review
+cd /tmp/subagent-review
+git fetch "$BUNDLE" "$HEAD_REF":refs/review/subagent-head
+git log --oneline "$BASE_COMMIT"..refs/review/subagent-head
+git show replace-with-authored-commit
+
+# After review, integrate only the intended child-authored commits.
+git cherry-pick replace-with-authored-commit
+```
+
+Recovery and staged-snapshot refs are optional. As an alternative to cherry-picking, and only when result metadata reports a recovery ref, fetch that exact named ref and inspect/apply its reviewed final state without adopting the runtime packaging commit:
+
+```bash
+RECOVERY_REF=refs/isolated/recovery-0  # replace with the exact reported ref
+git fetch "$BUNDLE" "$RECOVERY_REF":refs/review/subagent-recovery
+git diff "$BASE_COMMIT" refs/review/subagent-recovery > /tmp/recovery.patch
+git apply /tmp/recovery.patch
+git add -A   # leave staged, or omit this for an unstaged working tree
 ```
 
 Review the bundle and choose the desired commits/state yourself; there are no inspect, integrate, finalize, discard, or rollback actions and no automatic integration.
+
+### Parent-managed worktrees
 
 Generic independent parallel work remains available through either the guarded parent-managed `worktree` override or explicit `sandboxGitMode: isolated`. Packaged `work` intentionally does not grant parent-managed `worktree:true`; its dedicated permission covers only the narrowing `worktree:false` opt-out. Define a project agent when independent parent-managed writer worktrees are desired:
 

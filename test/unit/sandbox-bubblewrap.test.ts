@@ -172,6 +172,69 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.deepEqual(result.invocation.args.slice(-2), ["echo", "ok"]);
 	});
 
+	it("mounts the exact WSL resolver target with narrow destination parents", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/usr", "/bin", "/etc", "/etc/resolv.conf", "/mnt/wsl/resolv.conf"].includes(candidate),
+			realPath: (filePath) => filePath === "/etc/resolv.conf" ? "/mnt/wsl/resolv.conf" : filePath,
+			lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0o100644, uid: typeof process.getuid === "function" ? process.getuid() : 0 } as fs.Stats),
+		});
+		const result = provider.wrapInvocation({ config: hostToolchainConfig, invocation: { command: "node", args: [] } });
+		const args = result.invocation.args;
+		const mount = args.lastIndexOf("/mnt/wsl/resolv.conf");
+		assert.ok(mount > -1);
+		assert.equal(args[mount - 2], "--ro-bind");
+		assert.equal(args[mount - 1], "/mnt/wsl/resolv.conf");
+		assert.equal(args[mount - 4], "--dir");
+		assert.equal(args[mount - 3], "/mnt/wsl");
+		assert.equal(args[mount - 6], "--dir");
+		assert.equal(args[mount - 5], "/mnt");
+	});
+
+	it("rejects an external resolver target and a missing WSL target", () => {
+		for (const target of ["/tmp/secret-resolv.conf", "/mnt/wsl/missing-resolv.conf"]) {
+			const provider = new BubblewrapSandboxProvider({
+				isBubblewrapAvailable: () => true,
+				pathExists: (candidate) => candidate === "/etc" || candidate === "/etc/resolv.conf" || (target !== "/mnt/wsl/missing-resolv.conf" && candidate === "/mnt/wsl/resolv.conf"),
+				realPath: (filePath) => filePath === "/etc/resolv.conf" ? target : filePath,
+				lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0o100644, uid: typeof process.getuid === "function" ? process.getuid() : 0 } as fs.Stats),
+			});
+			const result = provider.wrapInvocation({ config: hostToolchainConfig, invocation: { command: "node", args: [] } });
+			assert.equal(result.invocation.args.includes("/mnt/wsl/resolv.conf"), false);
+			assert.equal(result.invocation.args.includes("/tmp/secret-resolv.conf"), false);
+		}
+	});
+
+	it("rejects an untrusted WSL resolver source", () => {
+		for (const stat of [
+			{ isFile: () => false, isSymbolicLink: () => false, mode: 0o040755, uid: 0 },
+			{ isFile: () => true, isSymbolicLink: () => true, mode: 0o120777, uid: 0 },
+			{ isFile: () => true, isSymbolicLink: () => false, mode: 0o100666, uid: 0 },
+			{ isFile: () => true, isSymbolicLink: () => false, mode: 0o100644, uid: (typeof process.getuid === "function" ? process.getuid() : 0) + 1 },
+		]) {
+			const provider = new BubblewrapSandboxProvider({
+				isBubblewrapAvailable: () => true,
+				pathExists: (candidate) => ["/etc", "/etc/resolv.conf", "/mnt/wsl/resolv.conf"].includes(candidate),
+				realPath: (filePath) => filePath === "/etc/resolv.conf" ? "/mnt/wsl/resolv.conf" : filePath,
+				lstat: () => stat as fs.Stats,
+			});
+			const result = provider.wrapInvocation({ config: hostToolchainConfig, invocation: { command: "node", args: [] } });
+			assert.equal(result.invocation.args.includes("/mnt/wsl/resolv.conf"), false);
+		}
+	});
+
+	it("does not mount the WSL resolver without host networking", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/etc", "/etc/resolv.conf", "/mnt/wsl/resolv.conf"].includes(candidate),
+			realPath: (filePath) => filePath === "/etc/resolv.conf" ? "/mnt/wsl/resolv.conf" : filePath,
+			lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0o100644, uid: typeof process.getuid === "function" ? process.getuid() : 0 } as fs.Stats),
+		});
+		const result = provider.wrapInvocation({ config: { ...hostToolchainConfig, network: "none" }, invocation: { command: "node", args: [] } });
+		assert.equal(result.invocation.args.includes("/mnt/wsl/resolv.conf"), false);
+		assert.ok(result.invocation.args.includes("--unshare-net"));
+	});
+
 	it("mounts /run/systemd/resolve read-only when /etc/resolv.conf resolves into it on host networking", () => {
 		const provider = new BubblewrapSandboxProvider({
 			isBubblewrapAvailable: () => true,

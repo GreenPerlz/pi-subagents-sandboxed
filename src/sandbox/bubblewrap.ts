@@ -6,6 +6,7 @@ import { SandboxUnavailableError } from "./types.ts";
 const DEFAULT_BWRAP_COMMAND = "bwrap";
 const SANDBOX_DOCS_REFERENCE = "See the README Sandboxed subagents section (README.md#sandboxed-subagents) and docs/prd/sandboxed-subagents.md for Bubblewrap setup, network/auth modes, and fallback configuration.";
 const HOST_TOOLCHAIN_READONLY_PATHS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"];
+const WSL_RESOLVER_PATH = "/mnt/wsl/resolv.conf";
 
 export interface PinnedSandboxMounts {
 	mounts: SandboxMount[];
@@ -44,6 +45,8 @@ export interface BubblewrapProviderDeps {
 	env?: Record<string, string | undefined>;
 	/** Isolate the child PID namespace so host processes and their roots are not inspectable. */
 	unsharePid?: boolean;
+	/** Test seam for validating resolver source metadata. */
+	lstat?: (filePath: string) => fs.Stats;
 }
 
 function isExecutable(filePath: string): boolean {
@@ -105,6 +108,39 @@ function addEnvironment(args: string[], env: SpawnableInvocation["env"]): void {
 	}
 }
 
+function resolverSourceIsTrusted(source: string, lstat: (filePath: string) => fs.Stats): boolean {
+	try {
+		const stat = lstat(source);
+		// Resolver data is host input. Never follow a replacement symlink and do
+		// not expose a writable secret through a read-only bind.
+		if (!stat.isFile() || stat.isSymbolicLink()) return false;
+		if ((stat.mode & 0o022) !== 0) return false;
+		if (typeof process.getuid === "function" && stat.uid !== 0 && stat.uid !== process.getuid()) return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function wslResolverMount(
+	pathExists: (candidate: string) => boolean,
+	realPath: (filePath: string) => string,
+	lstat: (filePath: string) => fs.Stats,
+): string | undefined {
+	if (!pathExists("/etc/resolv.conf")) return undefined;
+	let resolved: string;
+	try {
+		resolved = realPath("/etc/resolv.conf");
+	} catch {
+		return undefined;
+	}
+	if (resolved !== WSL_RESOLVER_PATH || !pathExists(WSL_RESOLVER_PATH)) return undefined;
+	let canonicalSource: string;
+	try { canonicalSource = realPath(WSL_RESOLVER_PATH); } catch { return undefined; }
+	if (canonicalSource !== WSL_RESOLVER_PATH || !resolverSourceIsTrusted(WSL_RESOLVER_PATH, lstat)) return undefined;
+	return WSL_RESOLVER_PATH;
+}
+
 function systemdResolvedMount(pathExists: (candidate: string) => boolean, realPath: (filePath: string) => string): string | undefined {
 	if (!pathExists("/etc/resolv.conf")) return undefined;
 	let resolved: string;
@@ -123,6 +159,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 	private readonly isBubblewrapAvailable: () => boolean;
 	private readonly pathExists: (candidate: string) => boolean;
 	private readonly realPath: (filePath: string) => string;
+	private readonly lstat: (filePath: string) => fs.Stats;
 	private readonly unsharePid: boolean;
 
 	constructor(deps: BubblewrapProviderDeps = {}) {
@@ -130,6 +167,7 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		this.isBubblewrapAvailable = deps.isBubblewrapAvailable ?? (() => commandExists(this.bwrapCommand, deps.env));
 		this.pathExists = deps.pathExists ?? fs.existsSync;
 		this.realPath = deps.realPath ?? ((p) => fs.realpathSync(p));
+		this.lstat = deps.lstat ?? ((p) => fs.lstatSync(p));
 		this.unsharePid = deps.unsharePid ?? false;
 	}
 
@@ -160,8 +198,19 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		}
 
 		const args: string[] = [];
+		const dnsMount = network === "host"
+			? wslResolverMount(this.pathExists, this.realPath, this.lstat)
+			?? systemdResolvedMount(this.pathExists, this.realPath)
+			: undefined;
+		const requestedMounts = input.mounts ?? [];
+		const mountsToPin = dnsMount === WSL_RESOLVER_PATH
+			? [
+				{ source: WSL_RESOLVER_PATH, target: WSL_RESOLVER_PATH, mode: "ro" as const },
+				...requestedMounts.filter((mount) => (mount.target ?? mount.source) !== WSL_RESOLVER_PATH),
+			]
+			: requestedMounts;
 		const pinned = input.invocation.pinReadonlyMounts
-			? pinReadonlySandboxMounts(input.mounts ?? [], 3 + (input.invocation.inheritedFds?.length ?? 0))
+			? pinReadonlySandboxMounts(mountsToPin, 3 + (input.invocation.inheritedFds?.length ?? 0))
 			: { mounts: input.mounts ?? [], fds: [] };
 		const inheritedFds = [...(input.invocation.inheritedFds ?? []), ...pinned.fds];
 		try {
@@ -178,8 +227,14 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		args.push("--proc", "/proc");
 		args.push("--dev", "/dev");
 		if (network === "host") {
-			const dnsMount = systemdResolvedMount(this.pathExists, this.realPath);
-			if (dnsMount) addMount(args, { source: dnsMount, mode: "ro" }, seenMounts, diagnosticMounts);
+			if (dnsMount === WSL_RESOLVER_PATH) {
+				// bwrap cannot create a missing destination for a file bind. Keep
+				// these narrowly scoped to the exact allowlisted WSL target.
+				args.push("--dir", "/mnt", "--dir", "/mnt/wsl");
+				if (!input.invocation.pinReadonlyMounts) addMount(args, { source: WSL_RESOLVER_PATH, target: WSL_RESOLVER_PATH, mode: "ro" }, seenMounts, diagnosticMounts);
+			} else if (dnsMount) {
+				addMount(args, { source: dnsMount, mode: "ro" }, seenMounts, diagnosticMounts);
+			}
 		}
 		const nodeRoot = nodeInstallRoot(input.invocation.command);
 		if (nodeRoot && this.pathExists(nodeRoot)) addMount(args, { source: nodeRoot, mode: "ro" }, seenMounts, diagnosticMounts);

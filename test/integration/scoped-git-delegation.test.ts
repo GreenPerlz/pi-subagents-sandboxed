@@ -141,6 +141,32 @@ describe("foreground nested writer delegation endpoint", () => {
 		} finally { await owner.close(); }
 	});
 
+	it("blocks direct parent .git rewiring in scoped isolated mode", { skip: !hasBubblewrap ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const worktree = repository();
+		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-git-metadata-runtime-"));
+		roots.add(runtimeRoot);
+		const entrypoint = path.join(runtimeRoot, "pi-entry.mjs");
+		fs.writeFileSync(entrypoint, [
+			"import fs from 'node:fs';",
+			"import path from 'node:path';",
+			"try { fs.writeFileSync(path.join(process.cwd(), '.git', 'pi-direct-corruption'), 'corrupt\\n'); process.stderr.write('direct .git write unexpectedly succeeded'); process.exit(73); }",
+			"catch (error) { if (!['EACCES', 'EPERM', 'EROFS'].includes(error?.code)) { process.stderr.write(String(error)); process.exit(74); } }",
+			"process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'git metadata stayed protected' }], stopReason: 'stop' } }) + '\\n');",
+		].join("\n"), "utf8");
+		setPiSpawnEntrypointOverrideForTests(entrypoint);
+		const owner = createScopedGitEndpoint({ runtimeRoot: path.join(runtimeRoot, "owner"), worktree, rights: "writer" });
+		try {
+			const result = await runSync(worktree, [{ name: "foreground", tools: ["read", "bash"], systemPromptMode: "replace" }], "foreground", "Do not alter Git metadata", {
+				cwd: worktree,
+				sandbox: { provider: "bubblewrap", gitMode: "isolated", fallback: "fail", network: "none", auth: "none" },
+				isolatedGitEndpoint: owner.descriptor,
+				isolatedGitRights: "writer",
+			});
+			assert.equal(result.exitCode, 0, result.error);
+			assert.equal(fs.existsSync(path.join(worktree, ".git", "pi-direct-corruption")), false);
+		} finally { await owner.close(); }
+	});
+
 	it("binds the exact foreground runSync child through Bubblewrap before allowing parent writes", { skip: !hasBubblewrap ? "Linux Bubblewrap is required" : undefined }, async () => {
 		const worktree = repository();
 		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-delegation-runtime-"));

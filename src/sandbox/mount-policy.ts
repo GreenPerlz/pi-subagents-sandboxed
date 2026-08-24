@@ -366,14 +366,12 @@ function addGitWorktreePointerMount(
 	}
 	const resolvedCwd = path.resolve(cwd);
 	const gitEntry = path.join(resolvedCwd, ".git");
-	const effectiveGitMode = resolveGitMode({ gitMode });
+	resolveGitMode({ gitMode });
 	if (existsSync(gitEntry)) protectedGitPaths.push(gitEntry);
-	// Always overlay the checkout's .git entry read-only. This covers both
-	// ordinary directory repositories (which have no pointerGitdir) and the
-	// pointer file itself for linked worktrees.
-	if (effectiveGitMode === "read-only") {
-		addSandboxMount(mounts, seen, gitEntry, "ro");
-	}
+	// Always overlay the checkout's .git entry read-only. In scoped isolated
+	// mode, Git mutations must pass through the authenticated endpoint rather
+	// than direct filesystem writes into the parent checkout's metadata.
+	addSandboxMount(mounts, seen, gitEntry, "ro");
 	if (!detection.pointerGitdir) return;
 	protectedGitPaths.push(detection.pointerGitdir);
 	// Mount even in-tree metadata explicitly: cwd may be writable, and the

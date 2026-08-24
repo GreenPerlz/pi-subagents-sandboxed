@@ -127,6 +127,17 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, gitDir), "ro");
 	});
 
+	it("overlays ordinary repo Git metadata read-only for scoped isolated mode", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const gitDir = mkdirp(path.join(cwd, ".git"));
+
+		const mounts = buildSubagentSandboxMounts({ cwd, cwdMode: "rw", gitMode: "isolated" });
+
+		assert.equal(mountMode(mounts, cwd), "rw");
+		assert.equal(mountMode(mounts, gitDir), "ro");
+	});
+
 	it("auto-mounts a linked worktree .git pointer gitdir read-only without changing cwd writability", () => {
 		const root = tempRoot();
 		const cwd = mkdirp(path.join(root, "worktree"));

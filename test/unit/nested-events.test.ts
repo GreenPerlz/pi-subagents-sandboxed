@@ -981,6 +981,18 @@ describe("nested route lock identity", () => {
 		assert.equal(projectNestedEvents(route).children[0]?.id, "locked");
 	});
 
+	it("reclaims a lock whose exactly recorded owner has exited", async () => {
+		const route = trackRoute("lock-dead-owner");
+		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
+		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,token:'dead-owner-token'}),{mode:0o600});`;
+		const owner = spawn(process.execPath, ["-e", script, lock], { stdio: "ignore" });
+		await once(owner, "close");
+
+		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("reclaimed", "running", 1) });
+
+		assert.equal(projectNestedEvents(route).children[0]?.id, "reclaimed");
+	});
+
 	it("retries an atomically publishing owner without accepting partial identity", async () => {
 		const route = trackRoute("lock-publication");
 		const lock = path.join(path.dirname(route.eventSink), ".route.lock");

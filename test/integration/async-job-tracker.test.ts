@@ -514,11 +514,12 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("keeps root jobs running when nested refresh fails during polling", async () => {
+	it("keeps root jobs running and logs a repeated nested refresh failure once", async () => {
 		const asyncRoot = createTempDir("pi-async-job-nested-refresh-um");
 		let tracker: ReturnType<AsyncJobTrackerModule["createAsyncJobTracker"]> | undefined;
 		const originalError = console.error;
-		console.error = () => {};
+		const errors: string[] = [];
+		console.error = (...args: unknown[]) => errors.push(args.map(String).join(" "));
 		try {
 			const runDir = path.join(asyncRoot, "run-nested-refresh");
 			fs.mkdirSync(runDir, { recursive: true });
@@ -553,6 +554,36 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 
 			assert.equal(state.asyncJobs.get("run-nested-refresh")?.status, "running");
 			assert.equal(state.cleanupTimers.has("run-nested-refresh"), false);
+			assert.equal(errors.filter((message) => message.includes("Failed to refresh nested async descendants")).length, 1);
+		} finally {
+			console.error = originalError;
+			tracker?.resetJobs();
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("retains a terminal job when cleanup cannot prove nested projection", async () => {
+		const asyncRoot = createTempDir("pi-async-job-cleanup-unproven-");
+		let tracker: ReturnType<AsyncJobTrackerModule["createAsyncJobTracker"]> | undefined;
+		const originalError = console.error;
+		console.error = () => {};
+		try {
+			const runDir = path.join(asyncRoot, "run-cleanup-unproven");
+			fs.mkdirSync(runDir, { recursive: true });
+			fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({ runId: "run-cleanup-unproven", mode: "single", state: "complete", steps: [{ agent: "worker", status: "complete" }] }), "utf8");
+			const state = createState();
+			const recorder = createEventRecorder();
+			tracker = trackerMod!.createAsyncJobTracker(recorder.pi, state as never, asyncRoot, { completionRetentionMs: 10, pollIntervalMs: 1_000 });
+			tracker.handleStarted({ id: "run-cleanup-unproven", asyncDir: runDir, agent: "worker" });
+			tracker.handleComplete({ id: "run-cleanup-unproven", success: true, state: "complete" });
+			const job = state.asyncJobs.get("run-cleanup-unproven");
+			assert.ok(job);
+			job.nestedRoute = { rootRunId: "run-cleanup-unproven", eventSink: path.join(asyncRoot, "outside-events"), controlInbox: path.join(asyncRoot, "outside-controls"), capabilityToken: "bad-token" };
+
+			await new Promise((resolve) => setTimeout(resolve, 45));
+
+			assert.equal(state.asyncJobs.has("run-cleanup-unproven"), true);
+			assert.equal(state.cleanupTimers.has("run-cleanup-unproven"), true);
 		} finally {
 			console.error = originalError;
 			tracker?.resetJobs();

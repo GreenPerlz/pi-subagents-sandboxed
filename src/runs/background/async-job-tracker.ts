@@ -42,6 +42,23 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
 	const pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
 	const resultsDir = options.resultsDir ?? RESULTS_DIR;
+	const nestedRefreshErrorSignatures = new Map<string, Set<string>>();
+	const logNestedRefreshError = (job: Pick<AsyncJobState, "asyncId" | "asyncDir">, error: unknown): void => {
+		const detail = error instanceof Error ? `${error.name}:${error.message}` : String(error);
+		let seen = nestedRefreshErrorSignatures.get(job.asyncId);
+		if (!seen) { seen = new Set(); nestedRefreshErrorSignatures.set(job.asyncId, seen); }
+		if (seen.has(detail)) {
+			// Refresh recency so a repeatedly observed signature remains suppressed
+			// while genuinely changed failures displace only the least-recent one.
+			seen.delete(detail);
+			seen.add(detail);
+			return;
+		}
+		// Bound memory without permanently silencing a genuinely changed failure.
+		if (seen.size >= 8) seen.delete(seen.values().next().value!);
+		seen.add(detail);
+		console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
+	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		renderWidget(ctx, jobs);
 		ctx.ui.requestRender?.();
@@ -69,10 +86,16 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			// handleComplete scheduled this timer). Re-read both durable status and
 			// the nested event projection at fire time; never evict a job while a
 			// descendant is still actionable.
+			let nestedProjectionFailed = false;
 			try {
 				if (job.nestedRoute) {
-					reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now, isExpectedAsyncRunnerPid: options.isExpectedAsyncRunnerPid });
-					updateAsyncJobNestedProjection(job);
+					try {
+						reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now, isExpectedAsyncRunnerPid: options.isExpectedAsyncRunnerPid });
+						updateAsyncJobNestedProjection(job);
+					} catch (error) {
+						nestedProjectionFailed = true;
+						throw error;
+					}
 				}
 				const current = readStatus(job.asyncDir);
 				if (current) {
@@ -82,15 +105,23 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					job.updatedAt = current.lastUpdate ?? job.updatedAt;
 				}
 			} catch (error) {
-				console.error(`Failed to recheck async cleanup fence for '${asyncId}':`, error);
-				if (hasLiveNestedDescendants(job.nestedChildren)) {
+				if (nestedProjectionFailed) {
+					logNestedRefreshError(job, error);
+					// Projection failure means descendant absence is unproven. Retain the
+					// job and retry even when cached projection has no live child.
 					scheduleCleanup(asyncId);
 				} else {
-					state.asyncJobs.delete(asyncId);
-					if (state.lastUiContext) rerenderWidget(state.lastUiContext);
+					console.error(`Failed to recheck async cleanup fence for '${asyncId}':`, error);
+					if (hasLiveNestedDescendants(job.nestedChildren)) scheduleCleanup(asyncId);
+					else {
+						state.asyncJobs.delete(asyncId);
+						nestedRefreshErrorSignatures.delete(asyncId);
+						if (state.lastUiContext) rerenderWidget(state.lastUiContext);
+					}
 				}
 				return;
 			}
+			nestedRefreshErrorSignatures.delete(asyncId);
 			if (job.teardownUnproven === true || (job.status !== "complete" && job.status !== "failed" && job.status !== "paused" && job.status !== "cancelled") || hasLiveNestedDescendants(job.nestedChildren)) {
 				// Keep the tracker entry and let the poller observe the eventual
 				// terminal descendant event before trying cleanup again.
@@ -182,7 +213,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						updateAsyncJobNestedProjection(job);
 					} catch (error) {
 						nestedRefreshFailed = true;
-						console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
+						logNestedRefreshError(job, error);
 					}
 				};
 				const reconcileNestedDescendants = () => {
@@ -190,7 +221,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						if (job.nestedRoute) reconcileNestedAsyncDescendants(job.nestedRoute, { resultsDir, kill: options.kill, now: options.now, isExpectedAsyncRunnerPid: options.isExpectedAsyncRunnerPid });
 					} catch (error) {
 						nestedRefreshFailed = true;
-						console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
+						logNestedRefreshError(job, error);
 					}
 					refreshNestedProjection();
 				};
@@ -269,6 +300,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 							scheduleCleanup(job.asyncId);
 						}
 						if (widgetRenderKey(job) !== widgetStateBefore) widgetChanged = true;
+						if (!nestedRefreshFailed) nestedRefreshErrorSignatures.delete(job.asyncId);
 						continue;
 					}
 					if (job.status === "queued") {
@@ -285,6 +317,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						scheduleCleanup(job.asyncId);
 					}
 				}
+				if (!nestedRefreshFailed) nestedRefreshErrorSignatures.delete(job.asyncId);
 				if (widgetRenderKey(job) !== widgetStateBefore) widgetChanged = true;
 			}
 
@@ -384,6 +417,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		const agents = firstGroupCount && firstGroupCount > 0
 			? rawAgents?.slice(0, firstGroupCount)
 			: rawAgents;
+		nestedRefreshErrorSignatures.delete(info.id);
 		state.asyncJobs.set(info.id, {
 			asyncId: info.id,
 			asyncDir,
@@ -427,8 +461,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				updateAsyncJobNestedProjection(job);
 			} catch (error) {
 				nestedRefreshFailed = true;
-				console.error(`Failed to refresh nested async descendants for '${job.asyncDir}':`, error);
+				logNestedRefreshError(job, error);
 			}
+			if (!nestedRefreshFailed) nestedRefreshErrorSignatures.delete(job.asyncId);
 		}
 		if (state.lastUiContext) {
 			rerenderWidget(state.lastUiContext);
@@ -441,6 +476,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			clearTimeout(timer);
 		}
 		state.cleanupTimers.clear();
+		nestedRefreshErrorSignatures.clear();
 		state.asyncJobs.clear();
 		state.foregroundControls?.clear();
 		state.lastForegroundControlId = null;

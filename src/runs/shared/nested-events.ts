@@ -865,14 +865,27 @@ function runtimeFor(route: NestedRoute): JournalRuntime {
 	journalRuntimes.set(key, runtime); return runtime;
 }
 
-function linuxStartToken(pid: number): string | undefined {
-	if (!Number.isInteger(pid) || pid <= 0 || process.platform !== "linux") return undefined;
+type LinuxStartTokenProbe = { state: "present"; token: string } | { state: "absent" } | { state: "unprovable" };
+function probeLinuxStartToken(pid: number): LinuxStartTokenProbe {
+	if (!Number.isInteger(pid) || pid <= 0 || process.platform !== "linux") return { state: "unprovable" };
 	try {
 		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const prefix = `${pid} (`;
 		const close = stat.lastIndexOf(")");
+		if (!stat.startsWith(prefix) || close < prefix.length || stat[close + 1] !== " ") return { state: "unprovable" };
 		const fields = stat.slice(close + 2).trim().split(/\s+/);
-		return fields.length > 19 && /^\d+$/.test(fields[19]!) ? fields[19] : undefined;
-	} catch { return undefined; }
+		// Fields after comm start at kernel field 3 (state); starttime is field
+		// 22, therefore index 19 here. Validate the surrounding shape so malformed
+		// proc text cannot be mistaken for an exact identity.
+		if (fields.length <= 19 || !/^[A-Za-z]$/.test(fields[0]!) || !/^\d+$/.test(fields[19]!)) return { state: "unprovable" };
+		return { state: "present", token: fields[19]! };
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? { state: "absent" } : { state: "unprovable" };
+	}
+}
+function linuxStartToken(pid: number): string | undefined {
+	const probe = probeLinuxStartToken(pid);
+	return probe.state === "present" ? probe.token : undefined;
 }
 function publishRouteLock(root: string, lock: string, identity: { pid: number; uid: number; startToken: string; token: string }): void {
 	// The directory is the no-replace lock primitive. Publish its owner through
@@ -923,8 +936,11 @@ function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
 				const raw = JSON.parse(fs.readFileSync(ownerFile, "utf8")) as { pid?: unknown; uid?: unknown; startToken?: unknown; token?: unknown };
 				if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0 || !Number.isInteger(raw.uid) || (raw.uid as number) < 0 || typeof raw.startToken !== "string" || !/^\d+$/.test(raw.startToken) || typeof raw.token !== "string" || !isSafeNestedId(raw.token)) throw new Error("Nested route lock identity is ambiguous.");
 				if (raw.uid !== identity.uid) throw new Error("Nested route lock belongs to another user.");
-				const observed = linuxStartToken(raw.pid as number); if (!observed) throw new Error("Nested route lock identity cannot be proven exactly.");
-				stale = observed !== raw.startToken;
+				const observed = probeLinuxStartToken(raw.pid as number);
+				if (observed.state === "unprovable") throw new Error("Nested route lock identity cannot be proven exactly.");
+				// ENOENT is exact absence proof. A present PID with a different start
+				// token is PID reuse; neither process can own the recorded lock.
+				stale = observed.state === "absent" || observed.token !== raw.startToken;
 			} catch (lockError) {
 				// The owner may have released between EEXIST and inspection.
 				// Treat that narrow race as contention, never as a dropped record.

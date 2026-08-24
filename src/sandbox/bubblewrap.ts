@@ -231,8 +231,13 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		try {
 		const seenMounts = new Set<string>();
 		const diagnosticMounts: SandboxMount[] = [];
-		for (const source of HOST_TOOLCHAIN_READONLY_PATHS) {
-			if (this.pathExists(source)) addMount(args, { source, mode: "ro" }, seenMounts, diagnosticMounts);
+		for (const target of HOST_TOOLCHAIN_READONLY_PATHS) {
+			if (!this.pathExists(target)) continue;
+			// Bind the canonical directory into the conventional host path. Some
+			// Bubblewrap versions do not preserve merged-/usr symlink sources such
+			// as /bin -> /usr/bin, leaving the sandbox without /bin/sh.
+			const source = this.realPath(target);
+			addMount(args, { source, target, mode: "ro" }, seenMounts, diagnosticMounts);
 		}
 		// Ensure the wrapped command dies if the runner or Bubblewrap wrapper
 		// disappears. Without this, a killed runner can leave its Pi/tool tree

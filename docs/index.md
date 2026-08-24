@@ -10,7 +10,26 @@
    pi install npm:pi-subagents-sandboxed
    ```
 
-2. Install Bubblewrap (`bwrap`) with your OS package manager. For example: `sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, or `sudo pacman -S bubblewrap`.
+2. Install Bubblewrap (`bwrap`) with your OS package manager:
+
+   === "Debian/Ubuntu"
+
+       ```bash
+       sudo apt install bubblewrap
+       ```
+
+   === "Fedora"
+
+       ```bash
+       sudo dnf install bubblewrap
+       ```
+
+   === "Arch"
+
+       ```bash
+       sudo pacman -S bubblewrap
+       ```
+
 3. Keep this fork **or** upstream `pi-subagents` enabled, not both.
 4. Ask Pi in natural language:
 

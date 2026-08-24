@@ -21,9 +21,17 @@ export function pinReadonlySandboxMounts(mounts: readonly SandboxMount[], firstC
 			if (mount.mode !== "ro") return mount;
 			const target = mount.target ?? mount.source;
 			const canonicalSource = fs.realpathSync.native(mount.source);
+			const expected = fs.statSync(canonicalSource);
 			const fd = fs.openSync(canonicalSource, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
 			const childFd = firstChildFd + fds.length;
 			fds.push(fd);
+			const opened = fs.fstatSync(fd);
+			if (opened.dev !== expected.dev || opened.ino !== expected.ino) {
+				throw new Error(`Read-only sandbox mount changed while it was being pinned: ${mount.source}`);
+			}
+			if (canonicalSource === WSL_RESOLVER_PATH && !resolverStatIsTrusted(opened)) {
+				throw new Error(`WSL resolver mount source became unsafe while it was being pinned: ${WSL_RESOLVER_PATH}`);
+			}
 			return { source: `/proc/self/fd/${childFd}`, target, mode: "ro" as const };
 		});
 		return { mounts: pinned, fds };
@@ -108,15 +116,18 @@ function addEnvironment(args: string[], env: SpawnableInvocation["env"]): void {
 	}
 }
 
+function resolverStatIsTrusted(stat: fs.Stats): boolean {
+	if (!stat.isFile() || stat.isSymbolicLink()) return false;
+	if ((stat.mode & 0o022) !== 0) return false;
+	if (typeof process.getuid === "function" && stat.uid !== 0 && stat.uid !== process.getuid()) return false;
+	return true;
+}
+
 function resolverSourceIsTrusted(source: string, lstat: (filePath: string) => fs.Stats): boolean {
 	try {
-		const stat = lstat(source);
 		// Resolver data is host input. Never follow a replacement symlink and do
 		// not expose a writable secret through a read-only bind.
-		if (!stat.isFile() || stat.isSymbolicLink()) return false;
-		if ((stat.mode & 0o022) !== 0) return false;
-		if (typeof process.getuid === "function" && stat.uid !== 0 && stat.uid !== process.getuid()) return false;
-		return true;
+		return resolverStatIsTrusted(lstat(source));
 	} catch {
 		return false;
 	}
@@ -206,12 +217,12 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		const mountsToPin = dnsMount === WSL_RESOLVER_PATH
 			? [
 				{ source: WSL_RESOLVER_PATH, target: WSL_RESOLVER_PATH, mode: "ro" as const },
-				...requestedMounts.filter((mount) => (mount.target ?? mount.source) !== WSL_RESOLVER_PATH),
+				...requestedMounts.filter((mount) => mount.source !== WSL_RESOLVER_PATH && (mount.target ?? mount.source) !== WSL_RESOLVER_PATH),
 			]
 			: requestedMounts;
 		const pinned = input.invocation.pinReadonlyMounts
 			? pinReadonlySandboxMounts(mountsToPin, 3 + (input.invocation.inheritedFds?.length ?? 0))
-			: { mounts: input.mounts ?? [], fds: [] };
+			: { mounts: mountsToPin, fds: [] };
 		const inheritedFds = [...(input.invocation.inheritedFds ?? []), ...pinned.fds];
 		try {
 		const seenMounts = new Set<string>();

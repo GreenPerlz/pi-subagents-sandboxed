@@ -739,7 +739,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 					collect: { as: "results" },
 				},
 			],
-			agents: [makeAgent("producer"), makeAgent("writer")],
+			agents: [makeAgent("producer", { sandbox: { provider: "none" } }), makeAgent("writer", { sandbox: { provider: "none" } })],
+			sandboxSettings: { allowSandboxOptOut: true },
 			availableModels,
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-fast-dynamic" },
 			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
@@ -752,6 +753,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const finalStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
 		const writerStep = finalStatus.steps?.find((step) => step.model === "openai/gpt-5.5");
 		assert.deepEqual(writerStep?.fastMode, { requested: true, eligible: true, active: "unknown", model: "openai/gpt-5.5" });
+		assert.equal(writerStep?.sandboxDisabled, true, "materialized dynamic steps retain explicit sandbox disable policy");
 	});
 
 	it("async single evaluates fast mode for its selected candidate", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

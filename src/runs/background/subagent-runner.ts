@@ -219,7 +219,7 @@ const TEST_PAUSE_AFTER_INHERITED_AUTH_ENV = "PI_SUBAGENTS_TEST_PAUSE_AFTER_INHER
 
 /** Preserve null (explicit provider:none) while inheriting omitted sandbox values. */
 function inheritedSandbox(step: { sandbox?: SandboxTransport }, parent: SandboxTransport | undefined): SandboxTransport | undefined {
-	return Object.hasOwn(step, "sandbox") ? step.sandbox : parent;
+	return step.sandbox !== undefined ? step.sandbox : parent;
 }
 
 function sandboxStatus(sandbox: SandboxTransport | undefined): { sandbox?: SandboxResultDetails | null; sandboxDisabled?: true } {
@@ -549,8 +549,14 @@ function runPiStreaming(
 			resolve({ stderr: String(spawnError), exitCode: 1, messages: [], usage: emptyUsage(), error: spawnError instanceof Error ? spawnError.message : String(spawnError), finalOutput: "" });
 			return;
 		}
-		closePinnedSandboxFds(pinnedSandboxFds);
-		pinnedSandboxFds = undefined;
+		const releasePinnedSandboxFds = () => {
+			closePinnedSandboxFds(pinnedSandboxFds);
+			pinnedSandboxFds = undefined;
+		};
+		// Keep source descriptors open until libuv confirms the child inherited
+		// its stdio table. Closing immediately after spawn() races asynchronous exec.
+		child.once("spawn", releasePinnedSandboxFds);
+		child.once("error", releasePinnedSandboxFds);
 		let scopedGitBindError: string | undefined;
 		let scopedGitBindingReady = !Boolean(sandbox?.scopedGitWriter && sandbox.scopedGitEndpoint);
 		let pendingScopedClose: { kind: "close"; exitCode: number | null; signal?: NodeJS.Signals } | { kind: "error"; error: Error } | undefined;
@@ -1167,6 +1173,12 @@ async function runSingleStepInner(
 	}
 	const sessionEnabled = Boolean(step.sessionFile) || ctx.sessionEnabled;
 	const sessionDir = step.sessionFile ? undefined : ctx.sessionDir;
+	const effectiveSandbox = inheritedSandbox(step, ctx.sandbox);
+	if (ctx.scopedGitEndpoint && (!effectiveSandbox || effectiveSandbox.provider !== "bubblewrap" || resolveGitMode(effectiveSandbox) !== "isolated")) {
+		throw new Error(effectiveSandbox === null
+			? "Scoped Git endpoint requires Bubblewrap isolated mode; explicit sandbox opt-out is not permitted."
+			: "Scoped Git endpoint requires Bubblewrap isolated mode; refusing unsandboxed execution.");
+	}
 
 	// Reserve inherited endpoint scope before any artifact, output, session, or
 	// sandbox setup side effects. A stale/forged descriptor therefore fails at
@@ -1198,7 +1210,6 @@ async function runSingleStepInner(
 	const modelAttempts: ModelAttempt[] = [];
 	const attemptNotes: string[] = [];
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
-	const effectiveSandbox = inheritedSandbox(step, ctx.sandbox);
 	const stepCwd = step.cwd ?? ctx.cwd;
 	const executionCwd = ctx.isolatedGit ? mapIsolatedGitCwd(ctx.isolatedGit, stepCwd) : stepCwd;
 	// Every nested child receives a fresh endpoint subtree. The writer subtree
@@ -3005,6 +3016,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					thinking: task.thinking,
 					fastMode: initialFastModeStatus(task),
 					attemptedModels: task.modelCandidates && task.modelCandidates.length > 0 ? task.modelCandidates : task.model ? [task.model] : undefined,
+					...sandboxStatus(inheritedSandbox(task, config.sandbox)),
 					recentTools: [],
 					recentOutput: [],
 				}));

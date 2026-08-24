@@ -1187,7 +1187,7 @@ process.exit(child.status ?? 0);
 			);
 			assert.equal(allowed.isError, undefined);
 			const bwrapArgs = readLastFakeBwrapArgs(fakeBwrap.recordDir);
-			assert.ok(bwrapArgs.some((arg, index) => arg === "--ro-bind" && bwrapArgs[index + 1] === tempDir && bwrapArgs[index + 2] === tempDir));
+			assert.ok(bwrapArgs.some((arg, index) => arg === "--ro-bind" && /^\/proc\/self\/fd\/\d+$/.test(bwrapArgs[index + 1] ?? "") && bwrapArgs[index + 2] === tempDir));
 		} finally {
 			fakeBwrap.restore();
 		}

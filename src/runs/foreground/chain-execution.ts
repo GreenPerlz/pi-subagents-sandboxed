@@ -7,7 +7,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
-import { hasExplicitSandboxOptOut, normalizeSandboxTransport, resolveGitMode, resolveSandboxTransport, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
+import { normalizeSandboxTransport, resolveGitMode, resolveSandboxTransport, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitCapability, type ScopedGitEndpointDescriptor, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride, type ChainClarifyPolicy } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -252,7 +252,7 @@ function resolveParallelCleanTask(input: Pick<ParallelChainRunInput, "parallelTe
 }
 
 function selectSandboxAt(values: Array<SandboxTransport | undefined> | undefined, index: number, fallback: SandboxTransport | undefined): SandboxTransport | undefined {
-	return values && index in values ? values[index] : fallback;
+	return values?.[index] !== undefined ? values[index] : fallback;
 }
 
 function commitRequiredForParallelTask(input: Pick<ParallelChainRunInput, "parallelTemplates" | "outputs" | "originalTask" | "prev" | "chainDir">, taskIndex: number, agent: AgentConfig | undefined, sandbox: SandboxTransport | undefined, parentRights?: "writer" | "read-only"): boolean {
@@ -473,8 +473,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
 				sandbox: selectSandboxAt(input.sandboxes, taskIndex, input.sandbox),
-				hostGitDiagnostic: !(selectSandboxAt(input.sandboxes, taskIndex, input.sandbox))
-					&& hasExplicitSandboxOptOut({ settings: input.sandboxSettings, run: input.sandboxRun }),
+				hostGitDiagnostic: selectSandboxAt(input.sandboxes, taskIndex, input.sandbox) === null,
 				isolatedGit,
 				isolatedGitCapability: isolatedCapability,
 				isolatedGitEndpoint: input.scopedGitEndpoint,
@@ -2088,7 +2087,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				structuredOutput: structuredRuntime,
 				acceptance: seqStep.acceptance,
 				acceptanceContext: { mode: "chain" },
-				hostGitDiagnostic: !stepSandbox && hasExplicitSandboxOptOut({ settings: params.sandboxSettings, run: params.sandbox }),
+				hostGitDiagnostic: stepSandbox === null,
 				sandbox: stepSandbox,
 				isolatedGit: isolatedWorktree,
 				isolatedGitCapability: sequentialIsolatedGitCapability,

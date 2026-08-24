@@ -27,7 +27,7 @@ describe("async status helpers", () => {
 				currentStep: 1,
 				outputFile,
 				steps: [
-					{ agent: "scout", status: "complete", durationMs: 10 },
+					{ agent: "scout", status: "complete", durationMs: 10, sandbox: null, sandboxDisabled: true },
 					{ agent: "worker", status: "running", durationMs: 20 },
 				],
 			});
@@ -47,6 +47,7 @@ describe("async status helpers", () => {
 			assert.equal(runs[0]?.steps.length, 2);
 			assert.equal(runs[0]?.steps[1]?.agent, "worker");
 			assert.equal(runs[0]?.steps[1]?.status, "running");
+			assert.equal(runs[0]?.steps[0]?.sandboxDisabled, true);
 			assert.match(formatAsyncRunList(runs), /output: .*output-1\.log/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

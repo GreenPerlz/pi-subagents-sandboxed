@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readSandboxSettings, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
-import { hasExplicitSandboxOptOut, resolveSandboxConfig, resolveSandboxTransport, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
+import { hasExplicitSandboxOptOut, resolveGitMode, resolveSandboxConfig, resolveSandboxTransport, worktreeOptOutIsAuthorized } from "../../sandbox/config.ts";
 import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitBundle, cleanupIsolatedGitRuntime, stripIsolatedGitExportDiagnostics, type IsolatedGitRuntime, type IsolatedGitWorktree } from "../../sandbox/isolated-git.ts";
 import { hasSandboxWritableAgent, inferSandboxCwdWritable, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
 import { packagedAgentIsReadOnly, resolvePackagedAgentRole } from "../shared/agent-role.ts";
@@ -1085,8 +1085,11 @@ async function resumeAsyncRun(input: {
 		return { content: [{ type: "text", text: `Sandbox policy revalidation rejected resume: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "management", results: [] } };
 	}
 	let scopedGitEndpoint: ScopedGitEndpointDescriptor | undefined;
-	if (target.nestedSelf && input.scopedGitEndpoint && sandbox === null) {
-		return { content: [{ type: "text", text: "Scoped Git endpoint requires Bubblewrap isolated mode; explicit sandbox opt-out is not permitted on resume." }], isError: true, details: { mode: "management", results: [] } };
+	if (target.nestedSelf && input.scopedGitEndpoint && (!sandbox || sandbox.provider !== "bubblewrap" || resolveGitMode(sandbox) !== "isolated")) {
+		const message = sandbox === null
+			? "Scoped Git endpoint requires Bubblewrap isolated mode; explicit sandbox opt-out is not permitted on resume."
+			: "Scoped Git endpoint requires Bubblewrap isolated mode; refusing unsandboxed resume.";
+		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
 	}
 	try {
 		scopedGitEndpoint = target.nestedSelf

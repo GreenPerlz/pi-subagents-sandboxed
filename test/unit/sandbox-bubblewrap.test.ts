@@ -191,6 +191,26 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.equal(args[mount - 5], "/mnt");
 	});
 
+	it("keeps caller mounts from aliasing the WSL resolver source or target", () => {
+		const provider = new BubblewrapSandboxProvider({
+			isBubblewrapAvailable: () => true,
+			pathExists: (candidate) => ["/etc", "/etc/resolv.conf", "/mnt/wsl/resolv.conf"].includes(candidate),
+			realPath: (filePath) => filePath === "/etc/resolv.conf" ? "/mnt/wsl/resolv.conf" : filePath,
+			lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0o100644, uid: typeof process.getuid === "function" ? process.getuid() : 0 } as fs.Stats),
+		});
+		const result = provider.wrapInvocation({
+			config: hostToolchainConfig,
+			invocation: { command: "node", args: [] },
+			mounts: [
+				{ source: "/mnt/wsl/resolv.conf", target: "/tmp/resolver-alias", mode: "ro" },
+				{ source: "/tmp/forged-resolver", target: "/mnt/wsl/resolv.conf", mode: "ro" },
+			],
+		});
+		assert.equal(result.invocation.args.includes("/tmp/resolver-alias"), false);
+		assert.equal(result.invocation.args.includes("/tmp/forged-resolver"), false);
+		assert.equal(result.invocation.args.filter((arg) => arg === "/mnt/wsl/resolv.conf").length, 2);
+	});
+
 	it("rejects an external resolver target and a missing WSL target", () => {
 		for (const target of ["/tmp/secret-resolv.conf", "/mnt/wsl/missing-resolv.conf"]) {
 			const provider = new BubblewrapSandboxProvider({

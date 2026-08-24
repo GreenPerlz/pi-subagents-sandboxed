@@ -449,6 +449,7 @@ async function runSingleAttempt(
 				command: piSpawnSpec.command,
 				args: piSpawnSpec.args,
 				cwd: childCwd,
+				pinReadonlyMounts: true,
 			};
 			effectiveSandboxMounts = buildSubagentSandboxMounts({
 				cwd: childCwd,
@@ -477,6 +478,7 @@ async function runSingleAttempt(
 				invocation: sandboxInvocation,
 				mounts: effectiveSandboxMounts,
 			});
+			pinnedSandboxFds = wrapped.invocation.inheritedFds;
 			if (wrapped.mounts?.length) {
 				const seenDiagnosticMounts = new Set(effectiveSandboxMounts.map((mount) => `${mount.mode}:${mount.source}`));
 				for (const mount of wrapped.mounts) {
@@ -496,6 +498,7 @@ async function runSingleAttempt(
 				args: wrapped.invocation.args,
 				cwd: wrapped.invocation.cwd ?? childCwd,
 				env: wrapped.invocation.env ?? spawnEnv,
+				inheritedFds: wrapped.invocation.inheritedFds,
 			};
 		} else {
 			spawnSpec = piInvocation;
@@ -541,8 +544,14 @@ async function runSingleAttempt(
 			resolve(1);
 			return;
 		}
-		closePinnedSandboxFds(pinnedSandboxFds);
-		pinnedSandboxFds = undefined;
+		const releasePinnedSandboxFds = () => {
+			closePinnedSandboxFds(pinnedSandboxFds);
+			pinnedSandboxFds = undefined;
+		};
+		// Keep source descriptors open until libuv confirms the child inherited
+		// its stdio table. Closing immediately after spawn() races asynchronous exec.
+		proc.once("spawn", releasePinnedSandboxFds);
+		proc.once("error", releasePinnedSandboxFds);
 		// A nested writer is bound only after the child process identity is
 		// independently proven. The foreground result is held until both binding
 		// and exact reservation release are observable; a fast child cannot win

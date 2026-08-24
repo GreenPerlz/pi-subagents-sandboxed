@@ -39,8 +39,8 @@
   "scripts": {
     "check:pi-version": "node scripts/check-pi-version.mjs",
     "test": "npm run test:unit",
-    "test:unit": "node --experimental-strip-types --test test/unit/*.test.ts",
-    "test:integration": "node --experimental-strip-types --import ./test/support/register-loader.mjs --test test/integration/*.test.ts",
+    "test:unit": "node --experimental-strip-types --test --test-concurrency=1 test/unit/*.test.ts",
+    "test:integration": "node --experimental-strip-types --import ./test/support/register-loader.mjs --test --test-concurrency=1 test/integration/*.test.ts",
     "test:all": "npm run test:unit && npm run test:integration"
   },
   "pi": {

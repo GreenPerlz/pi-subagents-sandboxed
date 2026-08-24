@@ -18,8 +18,8 @@ function availableProvider(): BubblewrapSandboxProvider {
 		isBubblewrapAvailable: () => true,
 		pathExists: (candidate) => ["/usr", "/bin", "/etc", "/opt/node"].includes(candidate),
 		realPath: (candidate) => candidate,
-		lstat: (candidate) => ({ isSymbolicLink: () => candidate === "/bin" }) as fs.Stats,
-		readLink: () => "usr/bin",
+		hostPathLstat: (candidate) => ({ isSymbolicLink: () => candidate === "/bin" }) as fs.Stats,
+		hostPathReadLink: () => "usr/bin",
 	});
 }
 

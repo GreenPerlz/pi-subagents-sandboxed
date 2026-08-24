@@ -53,9 +53,11 @@ export interface BubblewrapProviderDeps {
 	env?: Record<string, string | undefined>;
 	/** Isolate the child PID namespace so host processes and their roots are not inspectable. */
 	unsharePid?: boolean;
-	/** Test seams for resolver metadata and merged-/usr symlink handling. */
+	/** Test seam for validating resolver source metadata. */
 	lstat?: (filePath: string) => fs.Stats;
-	readLink?: (filePath: string) => string;
+	/** Separate seams for fixed host-toolchain paths; resolver test doubles must not affect them. */
+	hostPathLstat?: (filePath: string) => fs.Stats;
+	hostPathReadLink?: (filePath: string) => string;
 }
 
 function isExecutable(filePath: string): boolean {
@@ -172,7 +174,8 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 	private readonly pathExists: (candidate: string) => boolean;
 	private readonly realPath: (filePath: string) => string;
 	private readonly lstat: (filePath: string) => fs.Stats;
-	private readonly readLink: (filePath: string) => string;
+	private readonly hostPathLstat: (filePath: string) => fs.Stats;
+	private readonly hostPathReadLink: (filePath: string) => string;
 	private readonly unsharePid: boolean;
 
 	constructor(deps: BubblewrapProviderDeps = {}) {
@@ -181,7 +184,8 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 		this.pathExists = deps.pathExists ?? fs.existsSync;
 		this.realPath = deps.realPath ?? ((p) => fs.realpathSync(p));
 		this.lstat = deps.lstat ?? ((p) => fs.lstatSync(p));
-		this.readLink = deps.readLink ?? ((p) => fs.readlinkSync(p));
+		this.hostPathLstat = deps.hostPathLstat ?? ((p) => fs.lstatSync(p));
+		this.hostPathReadLink = deps.hostPathReadLink ?? ((p) => fs.readlinkSync(p));
 		this.unsharePid = deps.unsharePid ?? false;
 	}
 
@@ -239,8 +243,8 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 			// Recreate merged-/usr links instead of bind-mounting a symlink source.
 			// Bubblewrap 0.9 on Ubuntu 24.04 otherwise leaves paths such as /bin
 			// absent even when /usr/bin was supplied as the canonical bind source.
-			if (this.lstat(target).isSymbolicLink()) {
-				args.push("--symlink", this.readLink(target), target);
+			if (this.hostPathLstat(target).isSymbolicLink()) {
+				args.push("--symlink", this.hostPathReadLink(target), target);
 				continue;
 			}
 			addMount(args, { source: this.realPath(target), target, mode: "ro" }, seenMounts, diagnosticMounts);

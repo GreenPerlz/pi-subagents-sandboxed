@@ -62,7 +62,7 @@ const savedEnv = {
 
 afterEach(() => {
 	for (const route of routes.splice(0)) {
-		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 	}
 	for (const [key, value] of Object.entries(savedEnv)) {
 		if (value === undefined) delete process.env[key];

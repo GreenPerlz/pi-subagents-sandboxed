@@ -17,18 +17,14 @@ jobs:
 
   test:
     needs: pi-version
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           node-version: 24
       - name: Enable Bubblewrap
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update

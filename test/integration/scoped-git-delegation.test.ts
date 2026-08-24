@@ -71,12 +71,18 @@ async function gitOutput(endpoint: string, args: string[]): Promise<{ status: nu
 	return { status: Number(result.status), stdout: Buffer.from(String(result.stdout ?? ""), "base64").toString() };
 }
 
+function appendHostToolchainMounts(args: string[]): void {
+	const nodeRoot = path.dirname(path.dirname(process.execPath));
+	for (const target of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", nodeRoot]) {
+		if (!fs.existsSync(target) || args.includes(target)) continue;
+		if (fs.lstatSync(target).isSymbolicLink()) args.push("--symlink", fs.readlinkSync(target), target);
+		else args.push("--ro-bind", fs.realpathSync(target), target);
+	}
+}
+
 function spawnBubblewrapHandshake(worktree: string, endpointRoot: string): ReturnType<typeof spawn> {
 	const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev"];
-	const nodeRoot = path.dirname(path.dirname(process.execPath));
-	for (const system of ["/usr", "/bin", "/lib", "/etc", nodeRoot]) {
-		if (fs.existsSync(system) && !args.includes(system)) args.push("--ro-bind", system, system);
-	}
+	appendHostToolchainMounts(args);
 	args.push(
 		"--bind", worktree, worktree,
 		"--ro-bind", endpointRoot, "/run/pi-scoped-git",
@@ -345,10 +351,7 @@ describe("foreground nested writer delegation endpoint", () => {
 		try {
 			const child = owner.reserveChild({ cwd: worktree, rights: "read-only" });
 			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev"];
-			const nodeRoot = path.dirname(path.dirname(process.execPath));
-			for (const system of ["/usr", "/bin", "/lib", "/etc", nodeRoot]) {
-				if (fs.existsSync(system) && !args.includes(system)) args.push("--ro-bind", system, system);
-			}
+			appendHostToolchainMounts(args);
 			args.push("--bind", worktree, worktree, "--ro-bind", child.scope.endpointRoot, "/run/pi-scoped-git", "--chdir", worktree, "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--", "/run/pi-scoped-git/git", "status");
 			const result = await new Promise<{ status: number | null; stderr: string }>((resolve, reject) => {
 				const process = spawn("bwrap", args, { stdio: ["ignore", "ignore", "pipe"] }); let stderr = "";

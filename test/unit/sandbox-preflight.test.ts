@@ -142,7 +142,7 @@ describe("sandbox preflight: git probe", () => {
 
 		const result = checkGitProbe(repoDir);
 		assert.equal(result.ok, true);
-		assert.ok(result.gitdir);
+		assert.equal(result.stdout.trim(), "true");
 		assert.equal(result.error, undefined);
 	});
 
@@ -155,10 +155,41 @@ describe("sandbox preflight: git probe", () => {
 		try {
 			const result = checkGitProbe(worktreeDir);
 			assert.equal(result.ok, true);
-			assert.ok(result.gitdir);
+			assert.equal(result.stdout.trim(), "true");
 		} finally {
 			cleanup();
 		}
+	});
+
+	it("uses the process cwd and the scoped-endpoint-compatible worktree query", { skip: process.platform === "win32" ? "POSIX Git wrapper fixture" : undefined }, () => {
+		const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-probe-argv-repo-"));
+		const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preflight-probe-argv-bin-"));
+		tempDirs.push(repoDir, binDir);
+		fs.mkdirSync(path.join(repoDir, ".git"));
+		const capturePath = path.join(binDir, "argv");
+		fs.writeFileSync(path.join(binDir, "git"), `#!/bin/sh\nprintf '%s\\n' "$PWD" "$@" > ${JSON.stringify(capturePath)}\nprintf 'true\\n'\n`, { mode: 0o755 });
+		const previousPath = process.env.PATH;
+		process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+		try {
+			const result = checkGitProbe(repoDir, undefined, { requireGitWorktree: true });
+			assert.equal(result.ok, true, result.error);
+			assert.deepEqual(fs.readFileSync(capturePath, "utf-8").trim().split("\n"), [
+				repoDir,
+				"rev-parse",
+				"--is-inside-work-tree",
+			]);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	});
+
+	it("fails closed when Git does not confirm the cwd is inside a worktree", () => {
+		const result = checkGitProbe("/some/path", {
+			execSync: () => ({ status: 0, stdout: "false\n", stderr: "" }),
+		}, { requireGitWorktree: true });
+		assert.equal(result.ok, false);
+		assert.match(result.error ?? "", /did not confirm.*worktree/i);
 	});
 
 	it("fails with actionable error when git is not found", () => {
@@ -540,6 +571,7 @@ describe("sandbox preflight: combined run", () => {
 
 		assert.equal(result.passed, true);
 		assert.match(result.summary, /git probe: ok/);
+		assert.doesNotMatch(result.summary, /git probe:.*gitdir:/);
 	});
 
 	it("allows generic preflight to opt out of git worktree requirement", () => {

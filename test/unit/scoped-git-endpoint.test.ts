@@ -56,6 +56,18 @@ describe("scoped Git endpoint", () => {
 		} finally { await owner.close(); }
 	});
 
+	it("accepts the preflight worktree query while rejecting cwd and Git metadata overrides", async () => {
+		const worktree = repo(); const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-runtime-")); roots.add(runtimeRoot);
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "read-only" });
+		try {
+			const probe = await request(owner.scope.endpoint, ["rev-parse", "--is-inside-work-tree"]);
+			assert.equal(probe.status, 0, probe.stderr);
+			assert.equal(probe.stdout.trim(), "true");
+			assert.notEqual((await request(owner.scope.endpoint, ["-C", worktree, "rev-parse", "--is-inside-work-tree"])).status, 0);
+			assert.notEqual((await request(owner.scope.endpoint, ["rev-parse", "--git-dir"])).status, 0);
+		} finally { await owner.close(); }
+	});
+
 	it("narrows endpoint subtrees and keeps scope records independent of request paths", async () => {
 		const worktree = repo(); const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-runtime-")); roots.add(runtimeRoot);
 		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });

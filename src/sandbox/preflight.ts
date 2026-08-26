@@ -11,7 +11,6 @@ export interface GhAuthResult {
 export interface GitProbeResult {
 	ok: boolean;
 	skipped?: boolean;
-	gitdir?: string;
 	error?: string;
 	stdout?: string;
 	stderr?: string;
@@ -102,10 +101,10 @@ export function checkGhAuthAvailability(deps: { execSync: () => ExecResult } = d
 }
 
 /**
- * Probe that git actually works in the given cwd by running
- * `git -C <cwd> rev-parse --git-dir`. This catches broken/inaccessible
- * gitdirs, missing git binary, and pointer-file worktrees that satisfy path
- * containment but still fail under git.
+ * Probe that git actually works in the process cwd by running
+ * `git rev-parse --is-inside-work-tree`. Using the process cwd keeps the probe
+ * compatible with scoped Git endpoints, which authenticate cwd and reject
+ * command-line cwd or Git metadata overrides.
  *
  * When default deps are used and there is no .git, the probe passes silently.
  * When deps are injected, the caller controls the behavior completely.
@@ -144,10 +143,18 @@ export function checkGitProbe(cwd: string, deps?: { execSync: () => ExecResult }
 		};
 	}
 
-	const gitdir = result.stdout?.trim() ?? "";
+	const stdout = result.stdout?.trim() ?? "";
+	if (stdout !== "true" && (options?.requireGitWorktree || stdout.length > 0)) {
+		return {
+			ok: false,
+			error: `git probe did not confirm cwd is inside a worktree at ${cwd}: expected 'true', got '${stdout || "(empty)"}'`,
+			stdout,
+			stderr: result.stderr,
+		};
+	}
+
 	return {
 		ok: true,
-		gitdir: gitdir || undefined,
 		stdout: result.stdout,
 		stderr: result.stderr,
 	};
@@ -358,7 +365,8 @@ function defaultGitProbeDeps(cwd: string, options?: { requireGitWorktree?: boole
 				}
 			}
 			try {
-				const result = child_process.spawnSync("git", ["-C", cwd, "rev-parse", "--git-dir"], {
+				const result = child_process.spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+					cwd,
 					encoding: "utf-8",
 					timeout: 10_000,
 					maxBuffer: 8 * 1024 * 1024,
@@ -414,7 +422,7 @@ export function runSandboxPreflight(input: PreflightInput): PreflightCheckResult
 	} else {
 		gitProbe = checkGitProbe(input.cwd, input.gitProbe, { requireGitWorktree: input.requireGitWorktree });
 		if (gitProbe.ok) {
-			lines.push(`  git probe: ok${gitProbe.gitdir ? ` (gitdir: ${gitProbe.gitdir})` : ""}`);
+			lines.push("  git probe: ok");
 		} else {
 			lines.push(`  git probe: ${gitProbe.error}`);
 			if (gitProbe.error) errors.push(gitProbe.error);

@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createScopedGitEndpoint, readScopedGitProcessIdentity } from "../../src/sandbox/scoped-git-endpoint.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { executeChain } from "../../src/runs/foreground/chain-execution.ts";
@@ -125,6 +126,66 @@ afterEach(() => {
 });
 
 describe("foreground nested writer delegation endpoint", () => {
+	it("starts a nested worker after preflight through the real scoped Git endpoint", { skip: !hasBubblewrap ? "Linux Bubblewrap is required" : undefined }, async () => {
+		const worktree = repository();
+		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-preflight-runtime-"));
+		roots.add(runtimeRoot);
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "read-only" });
+		try {
+			const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+			const executorUrl = new URL("../../src/runs/foreground/subagent-executor.ts", import.meta.url).href;
+			const nestedEventsUrl = new URL("../../src/runs/shared/nested-events.ts", import.meta.url).href;
+			const piArgsUrl = new URL("../../src/runs/shared/pi-args.ts", import.meta.url).href;
+			const piSpawnUrl = new URL("../../src/runs/shared/pi-spawn.ts", import.meta.url).href;
+			const childEvent = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "worker child started" }], model: "mock/test-model", stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } };
+			const childSource = `process.stdout.write(${JSON.stringify(`${JSON.stringify(childEvent)}\n`)});\n`;
+			const script = [
+				"import fs from 'node:fs';",
+				"import os from 'node:os';",
+				"import path from 'node:path';",
+				`import { createSubagentExecutor } from ${JSON.stringify(executorUrl)};`,
+				`import { createNestedRoute } from ${JSON.stringify(nestedEventsUrl)};`,
+				`import * as piArgs from ${JSON.stringify(piArgsUrl)};`,
+				`import { setPiSpawnEntrypointOverrideForTests } from ${JSON.stringify(piSpawnUrl)};`,
+				"const route = createNestedRoute('scoped-preflight-nested');",
+				"const routeRoot = path.dirname(route.eventSink);",
+				"const mockEntrypoint = path.join(process.cwd(), 'mock-worker.mjs');",
+				`fs.writeFileSync(mockEntrypoint, ${JSON.stringify(childSource)}, { mode: 0o755 });`,
+				"setPiSpawnEntrypointOverrideForTests(mockEntrypoint);",
+				"process.env[piArgs.SUBAGENT_PARENT_EVENT_SINK_ENV] = route.eventSink;",
+				"process.env[piArgs.SUBAGENT_PARENT_CONTROL_INBOX_ENV] = route.controlInbox;",
+				"process.env[piArgs.SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = route.rootRunId;",
+				"process.env[piArgs.SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = route.capabilityToken;",
+				"process.env[piArgs.SUBAGENT_PARENT_RUN_ID_ENV] = 'parent-run';",
+				"process.env[piArgs.SUBAGENT_PARENT_CHILD_INDEX_ENV] = '0';",
+				"process.env[piArgs.SUBAGENT_CHILD_AGENT_ENV] = 'orchestrator';",
+				"process.env[piArgs.SUBAGENT_RUN_ID_ENV] = 'scoped-preflight-run';",
+				"const state = { baseCwd: '', currentSessionId: null, asyncJobs: new Map(), foregroundRuns: new Map(), foregroundControls: new Map(), lastForegroundControlId: null, pendingForegroundControlNotices: new Map(), cleanupTimers: new Map(), lastUiContext: null, poller: null, completionSeen: new Map(), watcher: null, watcherRestartTimer: null, resultFileCoalescer: { schedule: () => false, clear() {} } };",
+				"const worker = { name: 'worker', description: 'Worker fixture', prompt: 'Read only fixture', tools: ['read'], systemPromptMode: 'replace' };",
+				"const executor = createSubagentExecutor({ pi: { events: { emit() {}, on() { return () => {}; } }, getSessionName() { return 'parent'; } }, state, config: { maxSubagentDepth: 2, control: {}, intercomBridge: {} }, asyncByDefault: false, tempArtifactsDir: os.tmpdir(), getSubagentSessionRoot: () => os.tmpdir(), expandTilde: (value) => value, discoverAgents: () => ({ agents: [worker] }) });",
+				"const ctx = { cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId() { return 'session'; }, getSessionFile() { return null; } }, modelRegistry: { getAvailable() { return []; } } };",
+				"try { const result = await executor.execute('run', { agent: 'worker', task: 'Start the worker fixture.' }, new AbortController().signal, undefined, ctx); const text = result.content[0]?.type === 'text' ? result.content[0].text : ''; if (result.isError || !text.includes('worker child started')) throw new Error(text || 'nested worker did not start'); console.log(text); } finally { setPiSpawnEntrypointOverrideForTests(undefined); fs.rmSync(routeRoot, { recursive: true, force: true }); fs.rmSync(mockEntrypoint, { force: true }); }",
+			].join("\n");
+			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
+			appendHostToolchainMounts(args);
+			args.push("--ro-bind", sourceRoot, sourceRoot, "--bind", worktree, worktree);
+			for (const mount of owner.invocationMounts()) args.push("--ro-bind", mount.source, mount.target!);
+			args.push("--chdir", worktree, "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--", process.execPath, "--experimental-strip-types", "--input-type=module", "-e", script);
+			const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+				const child = spawn("bwrap", args, { stdio: ["ignore", "pipe", "pipe"] });
+				let stdout = ""; let stderr = "";
+				child.stdout.on("data", (chunk) => stdout += chunk);
+				child.stderr.on("data", (chunk) => stderr += chunk);
+				child.on("error", reject);
+				child.on("close", (status) => resolve({ status, stdout, stderr }));
+			});
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+			assert.match(result.stdout, /Preflight: (?:all checks passed|passed with \d+ warning)/);
+			assert.match(result.stdout, /git probe: ok/);
+			assert.match(result.stdout, /worker child started/);
+		} finally { await owner.close(); }
+	});
+
 	it("reserves before spawn, binds the exact Bubblewrap child, and restores only after group disappearance", { skip: !hasBubblewrap ? "Linux Bubblewrap is required" : undefined }, async () => {
 		const worktree = repository();
 		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-delegation-runtime-"));

@@ -775,6 +775,82 @@ Review
 });
 
 describe("project agent directory discovery", () => {
+	it("excludes skill documents from user and project agent discovery", () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-skill-agent-home-"));
+		const project = path.join(home, "projects", "app");
+		tempDirs.push(home);
+		const oldHome = process.env.HOME;
+		const oldUserProfile = process.env.USERPROFILE;
+		const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		process.env.PI_CODING_AGENT_DIR = path.join(home, ".pi", "agent");
+		try {
+			fs.mkdirSync(path.join(home, ".agents", "skills", "user-skill"), { recursive: true });
+			fs.mkdirSync(path.join(project, ".agents", "skills", "project-skill"), { recursive: true });
+			fs.mkdirSync(path.join(project, ".pi", "agents", "skills", "canonical-skill"), { recursive: true });
+			fs.writeFileSync(path.join(home, ".agents", "user.md"), "---\nname: user-agent\ndescription: User agent\n---\nUser", "utf-8");
+			fs.writeFileSync(path.join(home, ".agents", "skills", "user-skill", "SKILL.md"), "---\nname: user-skill\ndescription: User skill\n---\nSkill", "utf-8");
+			fs.writeFileSync(path.join(home, ".agents", "skills", "user-skill", "agent-like.md"), "---\nname: user-nested-skill\ndescription: User nested skill\n---\nSkill", "utf-8");
+			fs.writeFileSync(path.join(project, ".agents", "project.md"), "---\nname: project-agent\ndescription: Project agent\n---\nProject", "utf-8");
+			fs.writeFileSync(path.join(project, ".agents", "skills", "project-skill", "agent-like.md"), "---\nname: project-skill\ndescription: Project skill\n---\nSkill", "utf-8");
+			fs.writeFileSync(path.join(project, ".pi", "agents", "SKILL.md"), "---\nname: direct-skill-file\ndescription: Direct skill file\n---\nSkill", "utf-8");
+			fs.writeFileSync(path.join(project, ".pi", "agents", "skills", "canonical-skill", "agent-like.md"), "---\nname: canonical-project-skill\ndescription: Canonical project skill\n---\nSkill", "utf-8");
+
+			const result = discoverAgentsAll(project);
+			assert.ok(result.user.some((agent) => agent.name === "user-agent"));
+			assert.ok(result.project.some((agent) => agent.name === "project-agent"));
+			assert.equal(result.user.some((agent) => agent.name === "user-skill" || agent.name === "user-nested-skill"), false);
+			assert.equal(result.project.some((agent) => agent.name === "project-skill" || agent.name === "direct-skill-file" || agent.name === "canonical-project-skill"), false);
+		} finally {
+			if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+			if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile;
+			if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+		}
+	});
+
+	it("does not treat the home directory as a project root", () => {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-home-root-"));
+		const projectlessCwd = path.join(home, "work", "projectless");
+		const realProject = path.join(home, "work", "real-project");
+		const nestedProjectCwd = path.join(realProject, "packages", "app");
+		const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-home-alias-"));
+		const homeAlias = path.join(aliasRoot, "home");
+		tempDirs.push(home, aliasRoot);
+		const oldHome = process.env.HOME;
+		const oldUserProfile = process.env.USERPROFILE;
+		const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		process.env.PI_CODING_AGENT_DIR = path.join(home, ".pi", "agent");
+		try {
+			fs.mkdirSync(path.join(home, ".agents"), { recursive: true });
+			fs.mkdirSync(projectlessCwd, { recursive: true });
+			fs.symlinkSync(home, homeAlias, process.platform === "win32" ? "junction" : "dir");
+			fs.mkdirSync(path.join(realProject, ".agents"), { recursive: true });
+			fs.mkdirSync(nestedProjectCwd, { recursive: true });
+			fs.writeFileSync(path.join(home, ".agents", "user.md"), "---\nname: home-user\ndescription: Home user\n---\nUser", "utf-8");
+			fs.writeFileSync(path.join(realProject, ".agents", "project.md"), "---\nname: real-project-agent\ndescription: Project\n---\nProject", "utf-8");
+
+			const projectless = discoverAgentsAll(projectlessCwd);
+			assert.ok(projectless.user.some((agent) => agent.name === "home-user"));
+			assert.equal(projectless.project.some((agent) => agent.name === "home-user"), false);
+			assert.equal(projectless.projectDir, null);
+
+			const aliased = discoverAgentsAll(path.join(homeAlias, "work", "projectless"));
+			assert.equal(aliased.project.some((agent) => agent.name === "home-user"), false);
+			assert.equal(aliased.projectDir, null);
+
+			const nested = discoverAgentsAll(nestedProjectCwd);
+			assert.ok(nested.project.some((agent) => agent.name === "real-project-agent"));
+			assert.equal(nested.projectDir, path.join(realProject, ".pi", "agents"));
+		} finally {
+			if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+			if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile;
+			if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+		}
+	});
+
 	it("discovers project agents from both .agents and .pi/agents", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-project-agent-dirs-"));
 		tempDirs.push(dir);

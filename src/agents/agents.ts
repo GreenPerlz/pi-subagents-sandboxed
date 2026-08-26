@@ -305,9 +305,22 @@ function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentO
 	};
 }
 
+function canonicalDirectoryPath(dir: string): string {
+	try {
+		return fs.realpathSync.native(dir);
+	} catch {
+		return path.resolve(dir);
+	}
+}
+
 function findNearestProjectRoot(cwd: string): string | null {
-	let currentDir = cwd;
+	let currentDir = path.resolve(cwd);
+	const homeDir = canonicalDirectoryPath(os.homedir());
 	while (true) {
+		// ~/.pi and ~/.agents are user configuration, never project markers.
+		// Compare canonical paths so a symlink or junction to HOME cannot turn
+		// those user directories back into project configuration.
+		if (canonicalDirectoryPath(currentDir) === homeDir) return null;
 		if (isDirectory(path.join(currentDir, ".pi")) || isDirectory(path.join(currentDir, ".agents"))) {
 			return currentDir;
 		}
@@ -811,7 +824,11 @@ export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "us
 	return dedicatedPath;
 }
 
-function listFilesRecursive(dir: string, predicate: (fileName: string) => boolean): string[] {
+function listFilesRecursive(
+	dir: string,
+	predicate: (fileName: string) => boolean,
+	shouldDescend: (directoryName: string) => boolean = () => true,
+): string[] {
 	const files: string[] = [];
 	if (!fs.existsSync(dir)) return files;
 
@@ -825,7 +842,7 @@ function listFilesRecursive(dir: string, predicate: (fileName: string) => boolea
 	for (const entry of entries) {
 		const filePath = path.join(dir, entry.name);
 		if (entry.isDirectory()) {
-			files.push(...listFilesRecursive(filePath, predicate));
+			if (shouldDescend(entry.name)) files.push(...listFilesRecursive(filePath, predicate, shouldDescend));
 			continue;
 		}
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
@@ -838,7 +855,11 @@ function listFilesRecursive(dir: string, predicate: (fileName: string) => boolea
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
-	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
+	for (const filePath of listFilesRecursive(
+		dir,
+		(fileName) => fileName.endsWith(".md") && fileName !== "SKILL.md" && !fileName.endsWith(".chain.md"),
+		(directoryName) => directoryName !== "skills",
+	)) {
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");

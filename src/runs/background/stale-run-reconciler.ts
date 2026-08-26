@@ -146,12 +146,25 @@ function childState(overallState: ResultRepairData["state"], child: ResultChildO
 	return overallState;
 }
 
+function repairTeardownResultProjection(resultPath: string): boolean {
+	const raw = JSON.parse(fs.readFileSync(resultPath, "utf8")) as Record<string, unknown> & { results?: Array<Record<string, unknown>> };
+	const cleanupUnproven = raw.teardownUnproven === true || raw.results?.some((child) => child.teardownUnproven === true) === true;
+	if (!cleanupUnproven) return false;
+	const results = raw.results?.map((child) => {
+		const state = typeof child.state === "string" ? child.state : typeof child.status === "string" ? child.status : undefined;
+		if (child.teardownUnproven !== true && state !== "running" && state !== "pending" && state !== "paused") return child;
+		return { ...child, state: "failed", ...(child.status !== undefined ? { status: "failed" } : {}), success: false, incomplete: true };
+	});
+	const repaired = { ...raw, state: "failed", success: false, incomplete: true, ...(results ? { results } : {}) };
+	if (JSON.stringify(repaired) === JSON.stringify(raw)) return false;
+	writeAtomicJson(resultPath, repaired);
+	return true;
+}
+
 function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: number): AsyncStatus | undefined {
 	const repair = readResultRepairData(resultPath, status.state);
 	if (!repair) return undefined;
-	if (status.teardownUnproven === true || repair.teardownUnproven === true || repair.results?.some((child) => child.teardownUnproven === true)) {
-		return { ...status, state: "running", incomplete: true, teardownUnproven: true, activityState: undefined, lastUpdate: now };
-	}
+	const cleanupUnproven = status.teardownUnproven === true || repair.teardownUnproven === true || repair.results?.some((child) => child.teardownUnproven === true);
 	// Result diagnostics for parallel groups are intentionally unindexed. Build
 	// the repair lookup from canonical flat indexes rather than raw result-array
 	// positions, otherwise one diagnostic shifts every later child outcome.
@@ -187,6 +200,20 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			gitBundle: child?.gitBundle ?? step.gitBundle,
 		};
 	});
+	if (cleanupUnproven) {
+		return {
+			...status,
+			state: "failed",
+			incomplete: true,
+			teardownUnproven: true,
+			activityState: undefined,
+			endedAt: status.endedAt ?? now,
+			lastUpdate: now,
+			steps: steps.map((step) => step.status === "running" || step.status === "pending" || step.status === "paused"
+				? { ...step, status: "failed" as const, success: false, exitCode: step.exitCode ?? 1, endedAt: step.endedAt ?? now, error: step.error ?? "Scoped cleanup proof was not established; recovery evidence is retained." }
+				: step),
+		};
+	}
 	const resultDiagnostics = (repair.results ?? [])
 		.filter((child) => Boolean(child.groupId || child.unindexed))
 		.map((child) => ({
@@ -327,15 +354,11 @@ function isIsolatedStatus(status: AsyncStatus): boolean {
 }
 
 function writeIncompleteRepair(asyncDir: string, status: AsyncStatus, resultPath: string, now: number): ReconcileAsyncRunResult {
-	const message = `Async isolated run ${status.runId || path.basename(asyncDir)} ended without a verified recovery bundle or retained runtime; preserving nonterminal incomplete status for fail-closed recovery.`;
-	const incompleteStatus: AsyncStatus = {
-		...status,
-		state: "running",
-		incomplete: true,
-		activityState: undefined,
-		lastUpdate: now,
-		error: status.error ? `${status.error}\n${message}` : message,
-	};
+	const message = `Async isolated run ${status.runId || path.basename(asyncDir)} ended without a verified recovery bundle or retained runtime; marked failed with incomplete recovery evidence.`;
+	const repair = buildFailedRepair(status, asyncDir, now, message);
+	const incompleteStatus: AsyncStatus = { ...repair.status, incomplete: true };
+	const incompleteResult = { ...repair.result, incomplete: true };
+	writeAtomicJson(resultPath, incompleteResult);
 	writeAtomicJson(path.join(asyncDir, "status.json"), incompleteStatus);
 	appendJsonl(path.join(asyncDir, "events.jsonl"), {
 		type: "subagent.run.repaired_incomplete",
@@ -459,14 +482,23 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const runId = effectiveStatus.runId || path.basename(asyncDir);
 	const resultPath = path.join(options.resultsDir ?? RESULTS_DIR, `${runId}.json`);
 	if (fs.existsSync(resultPath)) {
-		const terminalStatus = effectiveStatus.state === "running" || effectiveStatus.state === "queued"
-			? terminalStatusFromResult(effectiveStatus, resultPath, now)
-			: undefined;
-		if (terminalStatus) {
-			writeAtomicJson(path.join(asyncDir, "status.json"), terminalStatus);
-			return { status: terminalStatus, repaired: true, resultPath, message: "Existing async result file was used to repair stale running status." };
+		const resultRepaired = repairTeardownResultProjection(resultPath);
+		const staleProjection = effectiveStatus.state === "running" || effectiveStatus.state === "queued"
+			|| effectiveStatus.teardownUnproven === true
+			|| effectiveStatus.steps?.some((step) => step.status === "running" || step.status === "pending" || step.status === "paused") === true;
+		const projectedStatus = staleProjection ? terminalStatusFromResult(effectiveStatus, resultPath, now) : undefined;
+		if (projectedStatus) {
+			// Ignore the reconciliation timestamp when deciding whether durable state
+			// already matches. This keeps polling idempotent and prevents perpetual
+			// status rewrites/UI rerenders for retained cleanup evidence.
+			const comparable = { ...projectedStatus, lastUpdate: effectiveStatus.lastUpdate };
+			const statusRepaired = JSON.stringify(comparable) !== JSON.stringify(effectiveStatus);
+			const terminalStatus = statusRepaired ? projectedStatus : effectiveStatus;
+			if (statusRepaired) writeAtomicJson(path.join(asyncDir, "status.json"), terminalStatus);
+			const repaired = statusRepaired || resultRepaired;
+			return { status: terminalStatus, repaired, resultPath, ...(repaired ? { message: "Existing async result file was used to reconcile terminal status/result projections." } : {}) };
 		}
-		return { status: effectiveStatus, repaired: false, resultPath };
+		return { status: effectiveStatus, repaired: resultRepaired, resultPath };
 	}
 
 	if (effectiveStatus.state !== "running" || typeof effectiveStatus.pid !== "number" || !Number.isFinite(effectiveStatus.pid) || !Number.isInteger(effectiveStatus.pid) || effectiveStatus.pid <= 0) {

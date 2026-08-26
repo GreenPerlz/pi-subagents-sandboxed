@@ -59,12 +59,15 @@ export interface ScopedGitEndpointOptions {
 }
 
 export interface ScopedGitProcessIdentity {
+	/** PID as visible in the caller's PID namespace. */
 	readonly pid: number;
 	readonly startToken: string;
 	readonly uid: number;
 	readonly ppid: number;
 	readonly pgid: number;
 	readonly argv: readonly string[];
+	/** Linux PID namespace inode used by the owner to resolve the host PID. */
+	readonly pidNamespace?: string;
 }
 
 export interface ScopedGitEndpointServer {
@@ -93,6 +96,8 @@ interface WriterReservation {
 	readonly id: string;
 	readonly parentScopeId: string;
 	readonly childScopeId: string;
+	/** Host-namespace identity of the process that reserved this child. */
+	readonly requester: ScopedGitProcessIdentity;
 	state: ReservationState;
 	identity?: ScopedGitProcessIdentity;
 	expires?: ReturnType<typeof setTimeout>;
@@ -104,7 +109,16 @@ interface LeaseState {
 function exactIdentityMatches(expected: ScopedGitProcessIdentity, actual: ScopedGitProcessIdentity | undefined): boolean {
 	return Boolean(actual && actual.startToken === expected.startToken && actual.uid === expected.uid
 		&& actual.ppid === expected.ppid && actual.pgid === expected.pgid
+		&& (!expected.pidNamespace || actual.pidNamespace === expected.pidNamespace)
 		&& actual.argv.length === expected.argv.length && actual.argv.every((arg, index) => arg === expected.argv[index]));
+}
+
+function portableIdentityMatches(expected: ScopedGitProcessIdentity, actual: ScopedGitProcessIdentity): boolean {
+	// PID namespace, UID, and Linux start token are stable for the lifetime of a
+	// process. argv is intentionally excluded because an authenticated process
+	// may exec without becoming a different process or relinquishing its group.
+	return expected.startToken === actual.startToken && expected.uid === actual.uid
+		&& Boolean(expected.pidNamespace) && expected.pidNamespace === actual.pidNamespace;
 }
 
 /**
@@ -117,7 +131,13 @@ function processGroupGone(identity: ScopedGitProcessIdentity): boolean {
 	if (process.platform === "win32") return !processIdentity(identity.pid);
 	if (process.platform !== "linux") return false;
 	const currentLeader = processIdentity(identity.pid);
-	if (currentLeader && !exactIdentityMatches(identity, currentLeader)) return false;
+	if (currentLeader) {
+		// The exact leader still anchors the original private group. If the PID now
+		// names a different process, the original leader is gone and the numeric
+		// PID/PGID has been reused; that replacement cannot retain authority from
+		// the authenticated reservation.
+		return !portableIdentityMatches(identity, currentLeader);
+	}
 	// Direct API callers may provide a non-detached process. The foreground
 	// execution path always supplies a private pgid == pid.
 	if (identity.pgid !== identity.pid) return !currentLeader;
@@ -157,8 +177,45 @@ function processIdentity(pid: number): ScopedGitProcessIdentity | undefined {
 		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); const close = stat.lastIndexOf(")"); const fields = stat.slice(close + 2).split(/\s+/u);
 		const argv = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
 		const uid = fs.statSync(`/proc/${pid}`).uid;
-		return { pid, startToken: fields[19]!, ppid: Number(fields[1]), pgid: Number(fields[2]), uid, argv };
+		const pidNamespace = fs.readlinkSync(`/proc/${pid}/ns/pid`);
+		return { pid, startToken: fields[19]!, ppid: Number(fields[1]), pgid: Number(fields[2]), uid, argv, pidNamespace };
 	} catch { return undefined; }
+}
+
+function namespacePids(pid: number): number[] {
+	try {
+		const line = fs.readFileSync(`/proc/${pid}/status`, "utf8").split("\n").find((entry) => entry.startsWith("NSpid:"));
+		if (!line) return [];
+		return line.slice("NSpid:".length).trim().split(/\s+/u).map(Number).filter((value) => Number.isInteger(value) && value > 0);
+	} catch { return []; }
+}
+
+/** Resolve a namespace-local identity to the endpoint owner's host /proc view. */
+function resolveHostProcessIdentity(identity: ScopedGitProcessIdentity): ScopedGitProcessIdentity | undefined {
+	const direct = processIdentity(identity.pid);
+	if (direct && exactIdentityMatches(identity, direct)) return direct;
+	if (process.platform !== "linux" || !identity.pidNamespace) return undefined;
+	try {
+		for (const entry of fs.readdirSync("/proc")) {
+			if (!/^\d+$/u.test(entry)) continue;
+			const hostPid = Number(entry);
+			const candidate = processIdentity(hostPid);
+			if (!candidate || !portableIdentityMatches(identity, candidate)) continue;
+			const visiblePids = namespacePids(hostPid);
+			if (visiblePids.at(-1) === identity.pid) return candidate;
+		}
+	} catch { return undefined; }
+	return undefined;
+}
+
+function identityIsDescendantOf(identity: ScopedGitProcessIdentity, ancestor: ScopedGitProcessIdentity): boolean {
+	let current: ScopedGitProcessIdentity | undefined = identity;
+	for (let depth = 0; current && depth < 256; depth += 1) {
+		if (current.pid === ancestor.pid) return exactIdentityMatches(ancestor, current);
+		if (current.ppid <= 0 || current.ppid === current.pid) return false;
+		current = processIdentity(current.ppid);
+	}
+	return false;
 }
 
 export function readScopedGitProcessIdentity(pid: number): ScopedGitProcessIdentity | undefined { return processIdentity(pid); }
@@ -517,6 +574,7 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 	}
 	const scopes = new Map<string, ScopedGitScope>([[scope.scopeId, scope]]);
 	const servers: net.Server[] = [];
+	const publishedServers = new Map<string, ScopedGitEndpointServer>();
 	const connections = new Set<net.Socket>();
 	const activeProcesses = new Set<TrackedGitProcess>();
 	const configSnapshot = snapshotLocalConfig(scope.worktree);
@@ -525,10 +583,18 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 	const leaseState: LeaseState = { reservations: new Map() };
 	const revokedScopes = new Set<string>();
 	const reservationTimeoutMs = Number.isFinite(options.reservationTimeoutMs) && options.reservationTimeoutMs !== undefined && options.reservationTimeoutMs >= 0 ? options.reservationTimeoutMs : DEADLINE;
+	const ownerIdentity = processIdentity(process.pid);
+	if (!ownerIdentity) throw new Error("scoped Git endpoint requires an exact owner process identity");
 	const reservationsFor = (parentScopeId: string) => [...leaseState.reservations.values()].filter((reservation) => reservation.parentScopeId === parentScopeId && (reservation.state === "pending" || reservation.state === "bound"));
 	const reservationForChild = (childScopeId: string) => [...leaseState.reservations.values()].find((reservation) => reservation.childScopeId === childScopeId && (reservation.state === "pending" || reservation.state === "bound"));
-	const addReservation = (parentScopeId: string, childScopeId: string): WriterReservation => {
-		const reservation: WriterReservation = { id: randomUUID(), parentScopeId, childScopeId, state: "pending" };
+	const authenticateRequester = (identity: ScopedGitProcessIdentity | undefined): ScopedGitProcessIdentity => {
+		if (!identity) throw new Error("scoped Git writer reservation requires requester identity");
+		const requester = resolveHostProcessIdentity(identity);
+		if (!requester || requester.uid !== ownerIdentity.uid || !identityIsDescendantOf(requester, ownerIdentity)) throw new Error("scoped Git writer reservation requester identity could not be proven");
+		return requester;
+	};
+	const addReservation = (parentScopeId: string, childScopeId: string, requester = ownerIdentity): WriterReservation => {
+		const reservation: WriterReservation = { id: randomUUID(), parentScopeId, childScopeId, requester, state: "pending" };
 		reservation.expires = setTimeout(() => { if (reservation.state === "pending") releaseReservation(reservation, "cancelled"); }, reservationTimeoutMs);
 		reservation.expires.unref?.();
 		leaseState.reservations.set(reservation.id, reservation);
@@ -543,11 +609,11 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 	const bindReservation = (selected: ScopedGitScope, identity: ScopedGitProcessIdentity): WriterReservation => {
 		const reservation = reservationForChild(selected.scopeId);
 		if (!reservation || reservation.state !== "pending") throw new Error("scoped Git writer reservation is missing or already bound");
-		const ownerIdentity = processIdentity(process.pid);
-		if (identity.ppid !== process.pid || !ownerIdentity || identity.uid !== ownerIdentity.uid || identity.pgid !== identity.pid || identity.pgid === ownerIdentity.pgid) throw new Error("scoped Git delegated process identity does not name a private child group");
-		const captured = processIdentity(identity.pid);
-		if (!exactIdentityMatches(identity, captured)) throw new Error("scoped Git delegated process identity could not be proven");
-		reservation.identity = identity;
+		const captured = resolveHostProcessIdentity(identity);
+		const requester = processIdentity(reservation.requester.pid);
+		if (!captured || !requester || !portableIdentityMatches(reservation.requester, requester)) throw new Error("scoped Git delegated process identity could not be proven");
+		if (captured.ppid !== requester.pid || captured.uid !== ownerIdentity.uid || captured.pgid !== captured.pid || captured.pgid === ownerIdentity.pgid) throw new Error("scoped Git delegated process identity does not name the reserving process's private child group");
+		reservation.identity = captured;
 		reservation.state = "bound";
 		return reservation;
 	};
@@ -559,6 +625,28 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 		};
 		poll();
 	});
+	const waitForReservationBinding = (reservation: WriterReservation): Promise<void> => new Promise((resolve, reject) => {
+		const deadline = Date.now() + DEADLINE;
+		const poll = () => {
+			if (reservation.state === "bound") { resolve(); return; }
+			if (reservation.state === "cancelled" || reservation.state === "released") { reject(new Error("scoped Git writer reservation was cancelled before binding")); return; }
+			if (Date.now() >= deadline) { reject(new Error("scoped Git writer reservation binding timed out")); return; }
+			setTimeout(poll, 5);
+		};
+		poll();
+	});
+	type InternalEndpointServer = ScopedGitEndpointServer & { __ready: Promise<void>; __rawServer: net.Server };
+	const rollbackChildPublication = (child: ScopedGitScope, reservation?: WriterReservation, childServer?: InternalEndpointServer): void => {
+		if (reservation) releaseReservation(reservation, "cancelled");
+		scopes.delete(child.scopeId);
+		publishedServers.delete(child.scopeId);
+		if (childServer) {
+			const index = servers.indexOf(childServer.__rawServer);
+			if (index >= 0) servers.splice(index, 1);
+			try { childServer.__rawServer.close(); } catch { /* not listening after bind failure */ }
+		}
+		fs.rmSync(child.endpointRoot, { recursive: true, force: true });
+	};
 	const create = (selected: ScopedGitScope): ScopedGitEndpointServer => {
 		const server = net.createServer({ allowHalfOpen: true }, (connection) => {
 			connections.add(connection);
@@ -624,23 +712,43 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 						connection.end(JSON.stringify({ ok: true }) + "\n"); return;
 					}
 					if (request.op === "reserve-child") {
+						const body = request as typeof request & { requesterIdentity?: ScopedGitProcessIdentity };
 						const rights = request.rights === "writer" ? "writer" : "read-only";
 						if (rights === "writer" && selected.rights !== "writer") throw new Error("scoped Git child cannot widen rights");
 						if (rights === "writer" && reservationsFor(selected.scopeId).length > 0) throw new Error("scoped Git writer lease is already delegated from this scope");
 						const requestedCwd = typeof request.cwd === "string" && request.cwd ? (path.isAbsolute(request.cwd) ? request.cwd : path.join(selected.cwd, request.cwd)) : selected.cwd;
 						const childCwd = canonical(requestedCwd);
 						if (!within(selected.cwd, childCwd)) throw new Error("scoped Git child cwd widens its parent scope");
-						const childRoot = path.join(selected.endpointRoot, randomPart()); fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
-						const child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath);
-						prepareEndpointFiles(childRoot, selected.execPath); scopes.set(child.scopeId, child); create(child);
-						if (rights === "writer") addReservation(selected.scopeId, child.scopeId);
+						// Authenticate writer authority before publishing any discoverable
+						// endpoint subtree. A rejected request must leave no unfenced scope.
+						const requester = rights === "writer" ? authenticateRequester(body.requesterIdentity) : undefined;
+						const childRoot = path.join(selected.endpointRoot, randomPart());
+						let child: ScopedGitScope | undefined;
+						let reservation: WriterReservation | undefined;
+						let childServer: InternalEndpointServer | undefined;
+						try {
+							fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
+							child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath);
+							prepareEndpointFiles(childRoot, selected.execPath);
+							scopes.set(child.scopeId, child);
+							if (requester) reservation = addReservation(selected.scopeId, child.scopeId, requester);
+							childServer = create(child) as InternalEndpointServer;
+							await childServer.__ready;
+						} catch (error) {
+							if (child) rollbackChildPublication(child, reservation, childServer);
+							else fs.rmSync(childRoot, { recursive: true, force: true });
+							throw error;
+						}
 						// Rebound descriptors are relative to the newly-mounted subtree.
 						const childRelative = path.relative(selected.endpointRoot, childRoot) || ".";
 						connection.end(JSON.stringify({ descriptor: { relativeSubtree: childRelative }, ownerRelativeSubtree: childRelative }) + "\n"); return;
 					}
 					if (!Array.isArray(request.args) || request.args.some((arg) => typeof arg !== "string") || typeof request.input !== "string") throw new Error("invalid scoped Git request");
 					const args = request.args as string[];
-					if (selected.rights === "writer" && reservationsFor(selected.scopeId).length > 0 && !["status", "diff", "log"].includes(commandName(args))) throw new Error("scoped Git writer is suspended during delegated execution");
+					const command = commandName(args);
+					const ownReservation = reservationForChild(selected.scopeId);
+					if (ownReservation?.state === "pending" && !READ_ONLY_COMMANDS.has(command)) await waitForReservationBinding(ownReservation);
+					if (selected.rights === "writer" && reservationsFor(selected.scopeId).length > 0 && !["status", "diff", "log"].includes(command)) throw new Error("scoped Git writer is suspended during delegated execution");
 					verifyLocalConfig(configSnapshot);
 					validateScopedGitCommand(args, selected.rights);
 					validateScopedGitPaths(args, selected.cwd);
@@ -654,13 +762,29 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 				} catch (error) { const message = redactEndpointText(error instanceof Error ? error.message : String(error), selected, runtimeRoot); connection.end(JSON.stringify({ status: 126, error: message, stdout: "", stderr: Buffer.from(message).toString("base64") }) + "\n"); }
 			});
 		});
-		servers.push(server); server.listen(selected.endpoint);
+		let readyResolve!: () => void;
+		let readyReject!: (error: Error) => void;
+		const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+		// Keep the rejection observed even for the synchronous owner API. Remote
+		// reservation publication additionally awaits this exact promise.
+		void ready.catch(() => {});
+		server.once("listening", readyResolve);
+		server.once("error", readyReject);
+		servers.push(server);
+		try { server.listen(selected.endpoint); }
+		catch (error) {
+			const index = servers.indexOf(server);
+			if (index >= 0) servers.splice(index, 1);
+			readyReject(error instanceof Error ? error : new Error(String(error)));
+			try { server.close(); } catch { /* listen failed synchronously */ }
+			throw error;
+		}
 		// Recovery endpoints may intentionally outlive a failed foreground run;
 		// do not keep the owner process alive solely because the socket is open.
 		server.unref();
 		const relativeSubtree = path.relative(endpointRoot, selected.endpointRoot) || ".";
 		const descriptor = Object.freeze(attachDescriptorMetadata({ relativeSubtree }, { hostEndpointRoot: selected.endpointRoot }));
-		return {
+		const endpointServer: ScopedGitEndpointServer = {
 			scope: selected,
 			descriptor,
 			reserveChild: ({ cwd, rights = selected.rights, allowWriter = false }) => {
@@ -669,12 +793,24 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 				if (rights === "writer" && !allowWriter) throw new Error("scoped Git writer reservation requires explicit delegation");
 				const childCwd = canonical(cwd ?? selected.cwd);
 				if (!within(selected.cwd, childCwd)) throw new Error("scoped Git child cwd widens its parent scope");
-				const childRoot = path.join(selected.endpointRoot, randomPart()); fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
-				const child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath);
-				prepareEndpointFiles(childRoot, selected.execPath);
-				scopes.set(child.scopeId, child);
-				if (rights === "writer") addReservation(selected.scopeId, child.scopeId);
-				return create(child);
+				const childRoot = path.join(selected.endpointRoot, randomPart());
+				let child: ScopedGitScope | undefined;
+				let reservation: WriterReservation | undefined;
+				let childServer: InternalEndpointServer | undefined;
+				try {
+					fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
+					child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath);
+					prepareEndpointFiles(childRoot, selected.execPath);
+					scopes.set(child.scopeId, child);
+					if (rights === "writer") reservation = addReservation(selected.scopeId, child.scopeId);
+					childServer = create(child) as InternalEndpointServer;
+					void childServer.__ready.catch(() => rollbackChildPublication(child!, reservation, childServer));
+					return childServer;
+				} catch (error) {
+					if (child) rollbackChildPublication(child, reservation, childServer);
+					else fs.rmSync(childRoot, { recursive: true, force: true });
+					throw error;
+				}
 			},
 			delegateWriter: (identity, childOptions = {}) => {
 				if (selected.rights !== "writer") throw new Error("scoped Git writer delegation requires a writer scope");
@@ -687,6 +823,7 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 					child = [...scopes.values()].find((candidate) => candidate.endpointRoot === requestedRoot);
 					if (!child || child.rights !== "writer" || !within(selected.cwd, child.cwd)) throw new Error("scoped Git delegated descriptor is not a narrowed writer scope");
 				}
+			let newlyPublished = false;
 			if (!child) {
 				const childRoot = path.join(selected.endpointRoot, randomPart());
 				fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
@@ -694,12 +831,20 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 				prepareEndpointFiles(childRoot, selected.execPath);
 				scopes.set(child.scopeId, child);
 				addReservation(selected.scopeId, child.scopeId);
+				newlyPublished = true;
 			}
 			const reservation = bindReservation(child, identity);
 			const waitForRelease = waitForReservationRelease(reservation);
-			const childServer = create(child) as ScopedGitEndpointServer & { waitForRelease: Promise<void> };
-			Object.defineProperty(childServer, "waitForRelease", { value: waitForRelease });
-			return childServer;
+			let childServer: (InternalEndpointServer & { waitForRelease: Promise<void> }) | undefined;
+			try {
+				childServer = (publishedServers.get(child.scopeId) ?? create(child)) as InternalEndpointServer & { waitForRelease: Promise<void> };
+				if (newlyPublished) void childServer.__ready.catch(() => rollbackChildPublication(child!, reservation, childServer));
+				Object.defineProperty(childServer, "waitForRelease", { value: waitForRelease, configurable: true });
+				return childServer;
+			} catch (error) {
+				if (newlyPublished) rollbackChildPublication(child, reservation, childServer);
+				throw error;
+			}
 			},
 			invocationMounts: (mountScope = selected) => scopedGitMounts(mountScope),
 			close: async () => {
@@ -742,6 +887,12 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 				return true;
 			},
 		};
+		Object.defineProperties(endpointServer, {
+			__ready: { value: ready },
+			__rawServer: { value: server },
+		});
+		publishedServers.set(selected.scopeId, endpointServer);
+		return endpointServer;
 	};
 	// The wrapper and every denied helper are immutable before any bind.
 	prepareEndpointFiles(endpointRoot, execPath);
@@ -786,6 +937,7 @@ export async function reserveScopedGitChildDescriptor(descriptor: ScopedGitEndpo
 	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("scoped Git endpoint descriptor escapes its fixed subtree");
 	const hostRoot = (descriptor as InternalScopedGitEndpointDescriptor).__hostEndpointRoot;
 	const endpoint = hostRoot ? path.join(hostRoot, "endpoint") : path.join(TARGET, relative, "endpoint");
+	const requesterIdentity = readScopedGitProcessIdentity(process.pid);
 	return await new Promise((resolve, reject) => {
 		const socket = net.createConnection(endpoint); let data = "";
 		socket.setEncoding("utf8"); socket.on("data", (chunk) => data += chunk); socket.on("error", reject);
@@ -801,7 +953,7 @@ export async function reserveScopedGitChildDescriptor(descriptor: ScopedGitEndpo
 			}
 			resolve(result.descriptor);
 		} catch (error) { reject(error); } });
-		socket.end(JSON.stringify({ op: "reserve-child", cwd: options.cwd, rights: options.rights }) + "\n");
+		socket.end(JSON.stringify({ op: "reserve-child", cwd: options.cwd, rights: options.rights, requesterIdentity }) + "\n");
 	});
 }
 

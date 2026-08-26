@@ -561,6 +561,10 @@ function runPiStreaming(
 		let scopedGitBindError: string | undefined;
 		let scopedGitBindingReady = !Boolean(sandbox?.scopedGitWriter && sandbox.scopedGitEndpoint);
 		let pendingScopedClose: { kind: "close"; exitCode: number | null; signal?: NodeJS.Signals } | { kind: "error"; error: Error } | undefined;
+		const scopedGitProcessClosed = new Promise<void>((resolve) => {
+			const done = () => { child.off("close", done); child.off("error", done); resolve(); };
+			child.on("close", done); child.on("error", done);
+		});
 		if (sandbox?.scopedGitWriter && sandbox.scopedGitEndpoint) {
 			// Bind only after the spawned wrapper has a stable /proc identity. Hold
 			// terminal publication until exact bind and release proof complete.
@@ -578,6 +582,9 @@ function runPiStreaming(
 					if (!identity) throw new Error("exact child identity was not observed before process exit");
 					await delegateScopedGitWriterDescriptor(sandbox.scopedGitEndpoint, identity);
 					scopedGitWriterBound = true;
+					// Start the bounded disappearance proof only after the child exits;
+					// execution time is not teardown time.
+					await scopedGitProcessClosed;
 					await waitForScopedGitProcessGone(identity);
 					if (sandbox.scopedGitOwnerEndpoint) await waitForScopedGitChildRelease(sandbox.scopedGitOwnerEndpoint, sandbox.scopedGitEndpoint);
 				} catch (error) {
@@ -2291,12 +2298,12 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		// A hook group that survived teardown is still live/actionable; do not emit
 		// a terminal nested event until a later explicit acknowledgement proves it.
 		if (isolatedGitRuntime?.hookTeardownFailed) statusPayload.teardownUnproven = true;
-		// A teardown refusal is live recovery state even when child setup already
-		// produced failed projections. Keep the durable status nonterminal so parent
-		// fences cannot mistake an updated event for proof that writers stopped.
+		// Recovery evidence remains actionable through teardownUnproven, but process
+		// lifecycle truth is terminal failure. Parent cleanup fences inspect the flag
+		// separately and must not require a false `running` state.
 		if (statusPayload.teardownUnproven) {
 			statusPayload.incomplete = true;
-			statusPayload.state = "running";
+			statusPayload.state = "failed";
 		}
 		// Do not expose a terminal isolated run while its verified export/cleanup
 		// fence is still pending. Export failures and fence refusals are explicitly
@@ -2311,7 +2318,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			}
 		}
 		writeAtomicJson(statusPath, statusPayload);
-		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" || isolatedGitRuntime?.hookTeardownFailed ? "subagent.nested.updated" : "subagent.nested.completed");
+		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" || statusPayload.teardownUnproven || isolatedGitRuntime?.hookTeardownFailed ? "subagent.nested.updated" : "subagent.nested.completed");
 	};
 	const persistGroupDiagnostic = (diagnostic: { groupId: string; agent: string; status: "failed" | "complete" | "paused" | "cancelled"; output?: string; error?: string }): void => {
 		statusPayload.groupDiagnostics ??= [];
@@ -3277,8 +3284,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				success: failures.length === 0,
 			}));
 			const aggregateState = resolveAggregateState(parallelResults.map((result) => ({
-				state: result.teardownUnproven ? "running" : result.cancelled ? "cancelled" : result.interrupted ? "paused" : result.exitCode === 0 ? "completed" : "failed",
-				teardownUnproven: result.teardownUnproven,
+				state: result.teardownUnproven ? "failed" : result.cancelled ? "cancelled" : result.interrupted ? "paused" : result.exitCode === 0 ? "completed" : "failed",
 			})));
 			const aggregateError = failures[0]?.error ?? "Dynamic fanout child failed.";
 			if (aggregateState === "failed") markDynamicGraphGroup(stepIndex, "failed", aggregateError);
@@ -4211,12 +4217,21 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		})),
 	]);
 	statusPayload.state = statusPayload.teardownUnproven
-		? "running"
+		? "failed"
 		: finalAggregate === "completed" ? "complete"
 			: finalAggregate === "failed" ? "failed"
 				: finalAggregate === "cancelled" ? "cancelled"
 					: finalAggregate === "paused" ? "paused"
 						: "failed";
+	statusPayload.incomplete = statusPayload.teardownUnproven ? true : undefined;
+	if (statusPayload.teardownUnproven) for (const step of statusPayload.steps) {
+		if (step.status === "running" || step.status === "pending" || step.status === "paused") {
+			step.status = "failed";
+			step.success = false;
+			step.exitCode = step.exitCode ?? 1;
+			step.endedAt = step.endedAt ?? runEndedAt;
+		}
+	}
 	statusPayload.worktreeExecutionError = worktreeExecutionError;
 	statusPayload.finalOutput = summary;
 	statusPayload.activityState = undefined;
@@ -4237,7 +4252,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 	writeStatusPayload();
-	if (statusPayload.state !== "running") try {
+	if (statusPayload.state !== "running" && !statusPayload.teardownUnproven) try {
 		appendJsonl(
 			eventsPath,
 			JSON.stringify({
@@ -4280,6 +4295,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			success: statusPayload.state === "complete",
 			state: statusPayload.state,
 			teardownUnproven: statusPayload.teardownUnproven,
+			incomplete: statusPayload.teardownUnproven ? true : undefined,
 			finalOutput: summary,
 			summary: worktreeCaptureError || worktreeExecutionError ? summary : interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
 			results: results.map((r) => ({
@@ -4290,7 +4306,8 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				finalOutput: r.output,
 				output: r.output,
 				error: r.error,
-				success: r.success,
+				success: r.teardownUnproven ? false : r.success,
+				...(r.teardownUnproven ? { state: "failed" as const, incomplete: true } : {}),
 				skipped: r.skipped || undefined,
 				sessionFile: r.sessionFile,
 				intercomTarget: r.intercomTarget,
@@ -4356,11 +4373,12 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 		if (teardownUnproven) statusPayload.teardownUnproven = true;
 		if (!terminalPublicationStarted) {
 			const lifecycleError = error instanceof Error ? error.message : String(error);
-			statusPayload.state = teardownUnproven ? "running" : "failed";
+			statusPayload.state = "failed";
+			statusPayload.incomplete = teardownUnproven ? true : undefined;
 			statusPayload.error = statusPayload.error ? `${statusPayload.error}\n${lifecycleError}` : lifecycleError;
 			const endedAt = Date.now();
 			for (const step of statusPayload.steps) {
-				if (!teardownUnproven && (step.status === "running" || step.status === "pending")) {
+				if (step.status === "running" || step.status === "pending" || (teardownUnproven && step.status === "paused")) {
 					step.status = interrupted ? "paused" : "failed";
 					step.exitCode = step.exitCode ?? (interrupted ? 0 : 1);
 					step.endedAt = step.endedAt ?? endedAt;
@@ -4489,7 +4507,8 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			|| isolatedGitRuntime?.exportFenceFailed === true;
 		if (recoveryTeardownUnproven) {
 			statusPayload.teardownUnproven = true;
-			statusPayload.state = "running";
+			statusPayload.incomplete = true;
+			statusPayload.state = "failed";
 		}
 		if (statusPayloadReady) {
 			try { writeAtomicJson(statusPath, statusPayload); } catch (statusError) { console.error(`Failed to persist rejected async status: ${statusError}`); }
@@ -4543,7 +4562,8 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 	if (config.nestedRoute) { status.nestedRoute = config.nestedRoute; status.nestedRouteRequired = true; }
 	if (config.nestedSelf) status.nestedSelf = config.nestedSelf;
 	status.teardownUnproven = teardownUnproven ? true : undefined;
-	status.state = teardownUnproven ? "running" : "failed";
+	status.incomplete = teardownUnproven ? true : undefined;
+	status.state = "failed";
 	status.error = status.error ? `${status.error}\n${terminalError}` : terminalError;
 	status.worktreeExecutionError = status.worktreeExecutionError ?? terminalError;
 	status.endedAt = status.endedAt ?? now;
@@ -4555,7 +4575,7 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 	const forceAllChildrenFailed = /isolated Git (?:cleanup|recovery finalization)/u.test(message)
 		|| /isolated Git (?:cleanup|recovery finalization)/u.test(String(status.error ?? ""));
 	for (const step of statusSteps) {
-		if (!teardownUnproven && (forceAllChildrenFailed || step.status === "running" || step.status === "pending")) {
+		if (forceAllChildrenFailed || step.status === "running" || step.status === "pending" || (teardownUnproven && step.status === "paused")) {
 			step.status = "failed";
 			step.success = false;
 			step.exitCode = step.exitCode ?? 1;
@@ -4618,7 +4638,8 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 		agent: existing?.agent ?? (results.length === 1 ? results[0]?.agent : `chain:${results.map((item: any) => item.agent).join("->")}`),
 		mode: config.resultMode ?? existing?.mode ?? (results.length > 1 ? "chain" : "single"),
 		success: false,
-		state: teardownUnproven ? "running" : "failed",
+		state: "failed",
+		...(teardownUnproven ? { incomplete: true } : {}),
 		summary: existing?.summary ? `${existing.summary}\n\n${terminalError}` : terminalError,
 		results,
 		workflowGraph: status.workflowGraph,

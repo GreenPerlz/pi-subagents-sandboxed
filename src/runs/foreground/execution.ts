@@ -559,6 +559,10 @@ async function runSingleAttempt(
 		// the close/bind race.
 		let scopedGitBindingReady = !scopedGitWriterReserved;
 		let pendingScopedTerminalClose: { code: number | null; signal?: NodeJS.Signals } | undefined;
+		const scopedGitProcessClosed = new Promise<void>((resolve) => {
+			const done = () => { proc.off("close", done); proc.off("error", done); resolve(); };
+			proc.on("close", done); proc.on("error", done);
+		});
 		if (scopedGitWriterReserved && scopedGitEndpoint) {
 			void (async () => {
 				let identity;
@@ -574,6 +578,10 @@ async function runSingleAttempt(
 					if (!identity) throw new Error("exact child identity was not observed before process exit");
 					await delegateScopedGitWriterDescriptor(scopedGitEndpoint, identity);
 					scopedGitWriterBound = true;
+					// The disappearance proof timeout starts only after the child exits.
+					// Long-running workers must not consume their teardown budget while
+					// they are still legitimately executing.
+					await scopedGitProcessClosed;
 					await waitForScopedGitProcessGone(identity);
 					if (scopedGitOwnerEndpoint) await waitForScopedGitChildRelease(scopedGitOwnerEndpoint, scopedGitEndpoint);
 				} catch (error) {

@@ -167,6 +167,27 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("hydrates durable failed cleanup state instead of leaving stale running steps", () => {
+		const asyncRoot = createTempDir("pi-async-job-terminal-hydration-");
+		try {
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = trackerMod!.createAsyncJobTracker(recorder.pi, state as never, asyncRoot, { completionRetentionMs: 60_000 });
+			const asyncDir = path.join(asyncRoot, "run-cleanup-failed");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			tracker.handleStarted({ id: "run-cleanup-failed", asyncDir, agent: "orchestrator" });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "run-cleanup-failed", mode: "single", state: "failed", teardownUnproven: true, incomplete: true, startedAt: 1000, endedAt: 2000, lastUpdate: 2000, steps: [{ agent: "orchestrator", status: "failed", teardownUnproven: true, exitCode: 1 }] }), "utf8");
+			tracker.handleComplete({ id: "run-cleanup-failed", asyncDir, success: false, state: "failed", teardownUnproven: true });
+			const job = state.asyncJobs.get("run-cleanup-failed");
+			assert.equal(job?.status, "failed");
+			assert.equal(job?.steps?.[0]?.status, "failed");
+			assert.equal(job?.runningSteps, 0);
+			assert.equal(job?.updatedAt, 2000);
+			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
+			if (state.poller) clearInterval(state.poller);
+		} finally { removeTempDir(asyncRoot); }
+	});
+
 	it("removes completed jobs after retention and requests a rerender", async () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-");
 		try {

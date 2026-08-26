@@ -12,6 +12,7 @@ import {
 	resetNestedJournalRuntime,
 	resetNestedJournalWorkCounters,
 	setNestedJournalFaultInjector,
+	setNestedRouteLockFaultInjector,
 	createNestedRoute,
 	hasLiveNestedDescendants,
 	hasLiveNestedDescendantsForParent,
@@ -970,6 +971,21 @@ describe("bounded journals and recovery seams", () => {
 });
 
 describe("nested route lock identity", () => {
+	it("retries when an unpublished lock directory disappears before its pending owner is opened", () => {
+		const route = trackRoute("lock-pending-enoent");
+		let removed = false;
+		setNestedRouteLockFaultInjector((phase, lock) => {
+			if (phase !== "after-mkdir" || removed) return;
+			removed = true;
+			fs.rmdirSync(lock);
+		});
+		try {
+			writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("retried", "running", 1) });
+			assert.equal(projectNestedEvents(route).children[0]?.id, "retried");
+			assert.equal(removed, true);
+		} finally { setNestedRouteLockFaultInjector(undefined); }
+	});
+
 	it("fails closed on malformed ownership metadata and recovers only stale exact identities", () => {
 		const route = trackRoute("lock-identity");
 		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
@@ -984,7 +1000,7 @@ describe("nested route lock identity", () => {
 	it("reclaims a lock whose exactly recorded owner has exited", async () => {
 		const route = trackRoute("lock-dead-owner");
 		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
-		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,token:'dead-owner-token'}),{mode:0o600});`;
+		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; const pidNamespace=fs.readlinkSync('/proc/'+process.pid+'/ns/pid'); fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,pidNamespace,token:'dead-owner-token'}),{mode:0o600});`;
 		const owner = spawn(process.execPath, ["-e", script, lock], { stdio: "ignore" });
 		await once(owner, "close");
 
@@ -993,10 +1009,39 @@ describe("nested route lock identity", () => {
 		assert.equal(projectNestedEvents(route).children[0]?.id, "reclaimed");
 	});
 
+	it("does not delete a replacement owner during stale-lock reclamation", async () => {
+		const route = trackRoute("lock-stale-replacement");
+		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
+		const marker = path.join(path.dirname(route.eventSink), "replacement-observed");
+		fs.mkdirSync(lock, { mode: 0o700 });
+		fs.writeFileSync(path.join(lock, "owner"), JSON.stringify({ pid: 999_999_999, uid: process.getuid(), startToken: "1", pidNamespace: fs.readlinkSync(`/proc/${process.pid}/ns/pid`), token: "stale-owner-token" }), { mode: 0o600 });
+		let replacementProcess: ReturnType<typeof spawn> | undefined;
+		let replaced = false;
+		setNestedRouteLockFaultInjector((phase, currentLock) => {
+			if (phase !== "before-stale-release" || replaced) return;
+			replaced = true;
+			fs.rmSync(currentLock, { recursive: true, force: true });
+			fs.mkdirSync(currentLock, { mode: 0o700 });
+			const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+			const close = stat.lastIndexOf(")");
+			const startToken = stat.slice(close + 2).trim().split(/\s+/)[19];
+			fs.writeFileSync(path.join(currentLock, "owner"), JSON.stringify({ pid: process.pid, uid: process.getuid(), startToken, pidNamespace: fs.readlinkSync(`/proc/${process.pid}/ns/pid`), token: "replacement-owner-token" }), { mode: 0o600 });
+			const script = `const fs=require('node:fs'); const lock=process.argv[1], marker=process.argv[2]; setTimeout(()=>{ let token='missing'; try { token=JSON.parse(fs.readFileSync(lock+'/owner','utf8')).token; } catch {} fs.writeFileSync(marker,token); fs.rmSync(lock,{recursive:true,force:true}); },30);`;
+			replacementProcess = spawn(process.execPath, ["-e", script, currentLock, marker], { stdio: "ignore" });
+		});
+		try {
+			writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("replacement-safe", "running", 1) });
+			assert.ok(replacementProcess);
+			await once(replacementProcess, "close");
+			assert.equal(fs.readFileSync(marker, "utf8"), "replacement-owner-token");
+			assert.equal(projectNestedEvents(route).children[0]?.id, "replacement-safe");
+		} finally { setNestedRouteLockFaultInjector(undefined); }
+	});
+
 	it("retries an atomically publishing owner without accepting partial identity", async () => {
 		const route = trackRoute("lock-publication");
 		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
-		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); process.stdout.write('ready'); setTimeout(()=>{ const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,token:'publishing-owner'}),{flag:'wx',mode:0o600}); setTimeout(()=>fs.rmSync(lock,{recursive:true,force:true}),60); },20);`;
+		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); process.stdout.write('ready'); setTimeout(()=>{ const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; const pidNamespace=fs.readlinkSync('/proc/'+process.pid+'/ns/pid'); fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,pidNamespace,token:'publishing-owner'}),{flag:'wx',mode:0o600}); setTimeout(()=>fs.rmSync(lock,{recursive:true,force:true}),60); },20);`;
 		const owner = spawn(process.execPath, ["-e", script, lock], { stdio: ["ignore", "pipe", "inherit"] });
 		await once(owner.stdout!, "data");
 		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("published", "running", 1) });
@@ -1004,10 +1049,21 @@ describe("nested route lock identity", () => {
 		assert.equal(projectNestedEvents(route).children[0]?.id, "published");
 	});
 
+	it("waits for a lock from another PID namespace without reclaiming it", async () => {
+		const route = trackRoute("lock-cross-namespace");
+		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
+		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,pidNamespace:'pid:[999999999]',token:'foreign-namespace-owner'}),{mode:0o600}); process.stdout.write('ready'); setTimeout(()=>fs.rmSync(lock,{recursive:true,force:true}),100);`;
+		const owner = spawn(process.execPath, ["-e", script, lock], { stdio: ["ignore", "pipe", "inherit"] });
+		await once(owner.stdout!, "data");
+		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("cross-namespace", "running", 1) });
+		await once(owner, "close");
+		assert.equal(projectNestedEvents(route).children[0]?.id, "cross-namespace");
+	});
+
 	it("retries live lock contention until the owner releases without dropping the append", async () => {
 		const route = trackRoute("lock-contention");
 		const lock = path.join(path.dirname(route.eventSink), ".route.lock");
-		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,token:'live-owner-token'}),{mode:0o600}); fs.chmodSync(lock+'/owner',0o600); process.stdout.write('ready'); setTimeout(()=>fs.rmSync(lock,{recursive:true,force:true}),150);`;
+		const script = `const fs=require('node:fs'); const lock=process.argv[1]; fs.mkdirSync(lock,{mode:0o700}); const stat=fs.readFileSync('/proc/'+process.pid+'/stat','utf8'); const close=stat.lastIndexOf(')'); const startToken=stat.slice(close+2).trim().split(/\\s+/)[19]; const pidNamespace=fs.readlinkSync('/proc/'+process.pid+'/ns/pid'); fs.writeFileSync(lock+'/owner',JSON.stringify({pid:process.pid,uid:process.getuid(),startToken,pidNamespace,token:'live-owner-token'}),{mode:0o600}); fs.chmodSync(lock+'/owner',0o600); process.stdout.write('ready'); setTimeout(()=>fs.rmSync(lock,{recursive:true,force:true}),150);`;
 		const owner = spawn(process.execPath, ["-e", script, lock], { stdio: ["ignore", "pipe", "inherit"] });
 		await once(owner.stdout!, "data");
 		writeNestedEvent(route, { type: "subagent.nested.updated", ts: 1, parentRunId: route.rootRunId, child: child("contended", "running", 1) });

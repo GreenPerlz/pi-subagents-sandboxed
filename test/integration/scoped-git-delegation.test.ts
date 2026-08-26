@@ -172,11 +172,11 @@ describe("foreground nested writer delegation endpoint", () => {
 				"const ctx = { cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId() { return 'session'; }, getSessionFile() { return null; } }, modelRegistry: { getAvailable() { return []; } } };",
 				"try { const result = await executor.execute('run', { agent: 'work', task: 'Write and commit the nested worker fixture.' }, new AbortController().signal, undefined, ctx); const text = result.content[0]?.type === 'text' ? result.content[0].text : ''; if (result.isError || !text.includes('worker child started')) throw new Error(text || 'nested worker did not start'); console.log(text); } finally { setPiSpawnEntrypointOverrideForTests(undefined); fs.rmSync(routeRoot, { recursive: true, force: true }); fs.rmSync(mockEntrypoint, { force: true }); }",
 			].join("\n");
-			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
+			const args = ["--die-with-parent", "--unshare-pid", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
 			appendHostToolchainMounts(args);
 			args.push("--ro-bind", sourceRoot, sourceRoot, "--bind", worktree, worktree);
 			for (const mount of owner.invocationMounts()) args.push("--ro-bind", mount.source, mount.target!);
-			args.push("--chdir", worktree, "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--", process.execPath, "--experimental-strip-types", "--input-type=module", "-e", script);
+			args.push("--chdir", worktree, "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--setenv", SUBAGENT_SCOPED_GIT_ENDPOINT_ENV, JSON.stringify({ relativeSubtree: "." }), "--", process.execPath, "--experimental-strip-types", "--input-type=module", "-e", script);
 			const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
 				const child = spawn("bwrap", args, { stdio: ["ignore", "pipe", "pipe"] });
 				let stdout = ""; let stderr = "";
@@ -205,9 +205,14 @@ describe("foreground nested writer delegation endpoint", () => {
 			assert.notEqual(await gitRequest(owner.scope.endpoint, ["add", "change"]), 0, "reservation suspends parent mutation before spawn");
 			const nested = spawnBubblewrapHandshake(worktree, child.scope.endpointRoot);
 			await waitForReady(nested);
+			let childMutationSettled = false;
+			const childMutation = gitRequest(child.scope.endpoint, ["add", "change"]).finally(() => { childMutationSettled = true; });
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			assert.equal(childMutationSettled, false, "unbound writer mutations remain fenced");
 			const identity = await identityFor(nested.pid!);
 			const bound = await endpointRequest(child.scope.endpoint, { op: "delegate-writer", descriptor: { relativeSubtree: "." }, identity });
 			assert.equal(bound.ok, true, JSON.stringify(bound));
+			assert.equal(await childMutation, 0, "the exact bound child may mutate");
 			assert.notEqual(await gitRequest(owner.scope.endpoint, ["add", "change"]), 0, "same-worktree parent writer is denied while the bound child group lives");
 			nested.stdin!.write("\n");
 			await waitForExit(nested);
@@ -438,6 +443,89 @@ describe("foreground nested writer delegation endpoint", () => {
 				process.stderr.on("data", (chunk) => stderr += chunk); process.on("error", reject); process.on("close", (status) => resolve({ status, stderr }));
 			});
 			assert.equal(nestedResult.status, 0, nestedResult.stderr);
+		} finally { await owner.close(); }
+	});
+
+	it("rejects unauthenticated writer reservations without publishing an endpoint", async () => {
+		const worktree = repository();
+		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-unauthenticated-reservation-"));
+		roots.add(runtimeRoot);
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
+		try {
+			const before = fs.readdirSync(owner.scope.endpointRoot).sort();
+			const rejected = await endpointRequest(owner.scope.endpoint, { op: "reserve-child", cwd: worktree, rights: "writer" });
+			assert.notEqual(rejected.ok, true);
+			assert.match(String(rejected.error), /requester identity/);
+			assert.deepEqual(fs.readdirSync(owner.scope.endpointRoot).sort(), before, "rejected authority leaves no discoverable child subtree");
+			assert.equal(await gitRequest(owner.scope.endpoint, ["status"]), 0);
+		} finally { await owner.close(); }
+	});
+
+	it("binds a reserved writer after the authenticated requester changes argv", async () => {
+		const worktree = repository();
+		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-requester-exec-"));
+		roots.add(runtimeRoot);
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
+		const originalTitle = process.title;
+		let nested: ReturnType<typeof spawn> | undefined;
+		try {
+			const requesterIdentity = await identityFor(process.pid);
+			const reserved = await endpointRequest(owner.scope.endpoint, { op: "reserve-child", cwd: worktree, rights: "writer", requesterIdentity });
+			const descriptor = reserved.descriptor as { relativeSubtree: string };
+			assert.equal(typeof descriptor?.relativeSubtree, "string");
+			process.title = "scoped-requester-after-exec";
+			nested = spawn("sleep", ["0.2"], { detached: true, stdio: "ignore" });
+			const identity = await identityFor(nested.pid!);
+			const childEndpoint = path.join(owner.scope.endpointRoot, descriptor.relativeSubtree, "endpoint");
+			const bound = await endpointRequest(childEndpoint, { op: "delegate-writer", descriptor, identity });
+			assert.equal(bound.ok, true, JSON.stringify(bound));
+			await waitForExit(nested);
+			await waitForRelease(owner.scope.endpoint, descriptor);
+		} finally {
+			process.title = originalTitle;
+			if (nested && nested.exitCode === null) try { process.kill(-nested.pid!, "SIGKILL"); } catch { /* already gone */ }
+			await owner.close();
+		}
+	});
+
+	it("rolls back remote and direct writer reservations when the child socket cannot listen", async () => {
+		const worktree = repository();
+		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-child-listen-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-"));
+		roots.add(runtimeRoot);
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
+		try {
+			assert.ok(Buffer.byteLength(owner.scope.endpoint) < 108);
+			const before = fs.readdirSync(owner.scope.endpointRoot).sort();
+			const requesterIdentity = await identityFor(process.pid);
+			const rejected = await endpointRequest(owner.scope.endpoint, { op: "reserve-child", cwd: worktree, rights: "writer", requesterIdentity });
+			assert.notEqual(rejected.ok, true);
+			assert.equal(rejected.status, 126);
+			assert.match(Buffer.from(String(rejected.stderr), "base64").toString("utf8"), /listen|path|ENAMETOOLONG|EINVAL/i);
+			assert.deepEqual(fs.readdirSync(owner.scope.endpointRoot).sort(), before);
+			assert.equal(await gitRequest(owner.scope.endpoint, ["status"]), 0);
+
+			const direct = owner.reserveChild({ cwd: worktree, rights: "writer", allowWriter: true }) as ReturnType<typeof owner.reserveChild> & { __ready: Promise<void> };
+			await assert.rejects(direct.__ready, /listen|path|ENAMETOOLONG|EINVAL/i);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.deepEqual(fs.readdirSync(owner.scope.endpointRoot).sort(), before, "direct publication rollback removes the failed scope");
+			assert.equal(await gitRequest(owner.scope.endpoint, ["status"]), 0, "direct rollback releases the parent writer");
+
+			const originalListen = net.Server.prototype.listen;
+			let nested: ReturnType<typeof spawn> | undefined;
+			try {
+				net.Server.prototype.listen = function (..._args: Parameters<typeof originalListen>) { throw new Error("synchronous child listen fixture"); } as typeof originalListen;
+				assert.throws(() => owner.reserveChild({ cwd: worktree, rights: "writer", allowWriter: true }), /synchronous child listen fixture/);
+				nested = spawn("sleep", ["0.2"], { detached: true, stdio: "ignore" });
+				const identity = await identityFor(nested.pid!);
+				assert.throws(() => owner.delegateWriter(identity), /synchronous child listen fixture/);
+				const syncRejected = await endpointRequest(owner.scope.endpoint, { op: "reserve-child", cwd: worktree, rights: "writer", requesterIdentity });
+				assert.match(Buffer.from(String(syncRejected.stderr), "base64").toString("utf8"), /synchronous child listen fixture/);
+			} finally {
+				net.Server.prototype.listen = originalListen;
+				if (nested && nested.exitCode === null) try { process.kill(-nested.pid!, "SIGKILL"); } catch { /* already gone */ }
+			}
+			assert.deepEqual(fs.readdirSync(owner.scope.endpointRoot).sort(), before, "synchronous failures roll back every direct and remote publication path");
+			assert.equal(await gitRequest(owner.scope.endpoint, ["status"]), 0, "synchronous rollback releases the parent writer");
 		} finally { await owner.close(); }
 	});
 

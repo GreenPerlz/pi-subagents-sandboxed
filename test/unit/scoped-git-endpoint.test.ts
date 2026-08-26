@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as net from "node:net";
-import { createScopedGitEndpoint, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, scopedGitDescriptorMounts, scopedGitInvocation, validateScopedGitCommand } from "../../src/sandbox/scoped-git-endpoint.ts";
+import { createScopedGitEndpoint, readScopedGitProcessIdentity, reserveScopedGitChildDescriptor, scopedGitDescriptorMounts, scopedGitInvocation, validateScopedGitCommand, waitForScopedGitProcessGone } from "../../src/sandbox/scoped-git-endpoint.ts";
 
 const roots = new Set<string>();
 function repo(): string {
@@ -156,6 +156,42 @@ describe("scoped Git endpoint", () => {
 			await child.waitForRelease;
 			assert.equal((await request(owner.scope.endpoint, ["status"])).status, 0);
 		} finally { await owner.close(); }
+	});
+
+	it("does not mistake a reused private-group leader PID for the authenticated process", async () => {
+		const childProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+		try {
+			let identity;
+			for (let attempt = 0; attempt < 50 && !identity; attempt += 1) { identity = readScopedGitProcessIdentity(childProcess.pid!); if (!identity) await new Promise<void>((resolve) => setImmediate(resolve)); }
+			assert.ok(identity);
+			assert.equal(identity.pgid, identity.pid);
+			await waitForScopedGitProcessGone({ ...identity, startToken: `${identity.startToken}0` });
+			assert.ok(readScopedGitProcessIdentity(childProcess.pid!), "the replacement process remains live");
+		} finally {
+			try { process.kill(-childProcess.pid!, "SIGKILL"); } catch { /* already gone */ }
+		}
+	});
+
+	it("keeps a live writer fenced when the authenticated process changes argv", async () => {
+		const worktree = repo(); const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-exec-identity-")); roots.add(runtimeRoot);
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
+		const childProcess = spawn(process.execPath, ["-e", "process.stdin.once('data',()=>{process.title='changed-writer-argv';process.stdout.write('CHANGED\\n')});setInterval(()=>{},1000)"], { detached: true, stdio: ["pipe", "pipe", "ignore"] });
+		try {
+			let identity;
+			for (let attempt = 0; attempt < 50 && !identity; attempt += 1) { identity = readScopedGitProcessIdentity(childProcess.pid!); if (!identity) await new Promise<void>((resolve) => setImmediate(resolve)); }
+			assert.ok(identity);
+			const child = owner.delegateWriter(identity);
+			childProcess.stdin.write("change\n");
+			await new Promise<void>((resolve) => childProcess.stdout.once("data", () => resolve()));
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			const suspended = await request(owner.scope.endpoint, ["add", "missing"]);
+			assert.notEqual(suspended.status, 0, "argv changes do not release a live writer reservation");
+			process.kill(-childProcess.pid!, "SIGKILL");
+			await child.waitForRelease;
+		} finally {
+			try { process.kill(-childProcess.pid!, "SIGKILL"); } catch { /* already gone */ }
+			await owner.close();
+		}
 	});
 
 	it("retains the writer fence when a delegated leader exits with a group survivor", async () => {

@@ -64,6 +64,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		ctx.ui.requestRender?.();
 	};
 	const aggregateStatus = (status: Pick<AsyncJobState, "status" | "teardownUnproven" | "steps">): AsyncJobState["status"] => {
+		// Cleanup proof controls retention, not lifecycle truth. Once the durable
+		// runner status is failed, keep it visibly failed while retaining the
+		// teardownUnproven fence and recovery evidence.
+		if (status.status === "complete" || status.status === "failed" || status.status === "paused" || status.status === "cancelled") return status.status;
 		const state = resolveAggregateState([
 			{ state: status.status, teardownUnproven: status.teardownUnproven },
 			...(status.steps ?? []).map((step) => ({ state: step.status, teardownUnproven: step.teardownUnproven })),
@@ -449,14 +453,27 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		const job = state.asyncJobs.get(asyncId);
 		let nestedRefreshFailed = false;
 		if (job) {
-			const completionState = resolveAggregateState([
-				{ state: result.state ?? (result.success ? "complete" : "failed"), teardownUnproven: result.teardownUnproven },
-				...(result.cancelled ? [{ state: "cancelled" }] : []),
-			]);
-			job.status = completionState === "running" ? "running" : completionState === "completed" ? "complete" : completionState === "cancelled" ? "cancelled" : completionState === "paused" ? "paused" : "failed";
-			job.teardownUnproven = result.teardownUnproven;
-			job.updatedAt = Date.now();
 			if (result.asyncDir) job.asyncDir = result.asyncDir;
+			let durableStatus: ReturnType<typeof readStatus>;
+			try { durableStatus = readStatus(job.asyncDir); } catch { durableStatus = null; }
+			if (durableStatus) {
+				job.teardownUnproven = durableStatus.teardownUnproven;
+				job.status = aggregateStatus({ status: durableStatus.state, teardownUnproven: durableStatus.teardownUnproven, steps: durableStatus.steps });
+				job.steps = durableStatus.steps;
+				job.groupDiagnostics = durableStatus.groupDiagnostics ?? job.groupDiagnostics;
+				job.updatedAt = durableStatus.lastUpdate ?? job.updatedAt;
+				if (durableStatus.steps?.length) {
+					job.agents = durableStatus.steps.map((step) => step.agent);
+					job.stepsTotal = durableStatus.steps.length + (job.groupDiagnostics?.length ?? 0);
+					job.runningSteps = durableStatus.steps.filter((step) => step.status === "running").length;
+					job.completedSteps = durableStatus.steps.filter((step) => step.status === "complete" || step.status === "completed").length;
+				}
+			} else {
+				const reportedState = result.state ?? (result.success ? "complete" : "failed");
+				job.status = reportedState === "complete" ? "complete" : reportedState === "cancelled" || result.cancelled ? "cancelled" : reportedState === "paused" ? "paused" : "failed";
+				job.teardownUnproven = result.teardownUnproven;
+				job.updatedAt = Date.now();
+			}
 			try {
 				updateAsyncJobNestedProjection(job);
 			} catch (error) {

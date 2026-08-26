@@ -59,11 +59,16 @@ const LEGACY_INFLIGHT = ".legacy-import-inflight.json";
 /** Test and recovery seam. A fault is raised after the named durable phase. */
 export type NestedJournalFaultPhase = "seal" | "new" | "state" | "snapshot" | "cleanup" | "append" | "manifest";
 let journalFaultInjector: ((phase: NestedJournalFaultPhase, kind: "event" | "control" | "result") => void) | undefined;
+export type NestedRouteLockFaultPhase = "after-mkdir" | "before-stale-release";
+let routeLockFaultInjector: ((phase: NestedRouteLockFaultPhase, lock: string) => void) | undefined;
 const journalWork = { frames: 0, bytes: 0, readdir: 0 };
 export function resetNestedJournalWorkCounters(): void { journalWork.frames = 0; journalWork.bytes = 0; journalWork.readdir = 0; }
 export function getNestedJournalWorkCounters(): { frames: number; bytes: number; readdir: number } { return { ...journalWork }; }
 export function setNestedJournalFaultInjector(injector: ((phase: NestedJournalFaultPhase, kind: "event" | "control" | "result") => void) | undefined): void {
 	journalFaultInjector = injector;
+}
+export function setNestedRouteLockFaultInjector(injector: ((phase: NestedRouteLockFaultPhase, lock: string) => void) | undefined): void {
+	routeLockFaultInjector = injector;
 }
 /** Test/restart seam; production callers simply omit the route. */
 export function resetNestedJournalRuntime(route?: NestedRoute): void { if (route) journalRuntimes.delete(runtimeKey(route)); else journalRuntimes.clear(); }
@@ -887,11 +892,15 @@ function linuxStartToken(pid: number): string | undefined {
 	const probe = probeLinuxStartToken(pid);
 	return probe.state === "present" ? probe.token : undefined;
 }
-function publishRouteLock(root: string, lock: string, identity: { pid: number; uid: number; startToken: string; token: string }): void {
+function linuxPidNamespace(pid: number): string | undefined {
+	try { return fs.readlinkSync(`/proc/${pid}/ns/pid`); } catch { return undefined; }
+}
+function publishRouteLock(root: string, lock: string, identity: { pid: number; uid: number; startToken: string; pidNamespace: string; token: string }): void {
 	// The directory is the no-replace lock primitive. Publish its owner through
 	// an atomically linked, fully written file so contenders can observe either
 	// no owner yet (brief contention) or the complete identity, never partial JSON.
 	fs.mkdirSync(lock, { mode: 0o700 });
+	routeLockFaultInjector?.("after-mkdir", lock);
 	const owner = path.join(lock, "owner");
 	const pending = path.join(lock, `.owner.${identity.token}.pending`);
 	let pendingExists = false;
@@ -907,37 +916,83 @@ function publishRouteLock(root: string, lock: string, identity: { pid: number; u
 		fsyncDirectory(root);
 	} catch (error) {
 		if (pendingExists) { try { fs.unlinkSync(pending); } catch { /* retain uncertain evidence */ } }
-		// Retain the lock directory on publication failure. Deleting an identity
-		// that was not proven would weaken fail-closed ownership semantics.
+		// Remove only an empty unpublished directory. A replacement owner or
+		// pending publication makes rmdir fail and remains authoritative.
+		try { fs.rmdirSync(lock); } catch { /* retain live or uncertain evidence */ }
 		throw error;
 	}
 }
+
+function releaseRouteLock(lock: string, expectedToken: string): boolean {
+	const owner = path.join(lock, "owner");
+	const claim = path.join(lock, `.owner.${expectedToken}.${randomUUID()}.release`);
+	try { fs.renameSync(owner, claim); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+	let matches = false;
+	try {
+		const identity = JSON.parse(fs.readFileSync(claim, "utf8")) as { token?: unknown };
+		matches = identity.token === expectedToken;
+		if (!matches) {
+			try { fs.renameSync(claim, owner); } catch { /* retain claimed evidence */ }
+			return false;
+		}
+		fs.unlinkSync(claim);
+		try { fs.rmdirSync(lock); return true; }
+		catch {
+			// Unexpected contents are evidence. Restore the exact owner identity so
+			// another contender cannot mistake an ownerless directory for absence.
+			try { fs.writeFileSync(owner, `${JSON.stringify(identity)}\n`, { flag: "wx", mode: 0o600 }); } catch { /* retain fail-closed evidence */ }
+			return false;
+		}
+	} catch (error) {
+		if (!matches) { try { fs.renameSync(claim, owner); } catch { /* retain claimed evidence */ } }
+		throw error;
+	}
+}
+
 function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
 	const root = routeRoot(route);
 	const lock = path.join(root, ROUTE_LOCK);
 	const startToken = linuxStartToken(process.pid);
-	if (typeof process.getuid !== "function" || !startToken) throw new Error("Nested route locking requires Linux exact process identity proof.");
-	const identity = { pid: process.pid, uid: process.getuid(), startToken, token: randomUUID() };
+	const pidNamespace = linuxPidNamespace(process.pid);
+	if (typeof process.getuid !== "function" || !startToken || !pidNamespace) throw new Error("Nested route locking requires Linux exact process identity proof.");
+	const identity = { pid: process.pid, uid: process.getuid(), startToken, pidNamespace, token: randomUUID() };
 	for (let attempt = 0; attempt < 80; attempt++) {
 		try {
 			publishRouteLock(root, lock, identity);
 			try { return fn(); } finally {
-				// Never remove a replacement lock. The owner token is the release
-				// capability, not merely the pathname.
-				try { const owner = JSON.parse(fs.readFileSync(path.join(lock, "owner"), "utf8")) as { token?: unknown }; if (owner.token === identity.token) { fs.rmSync(lock, { recursive: true, force: false }); fsyncDirectory(routeRoot(route)); } } catch { /* replacement or crash: leave it untouched */ }
+				// Atomically claim the owner file before release. A stale contender can
+				// never recursively delete a replacement publication.
+				try { if (releaseRouteLock(lock, identity.token)) fsyncDirectory(routeRoot(route)); } catch { /* replacement or crash: leave it untouched */ }
 			}
 		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				// The directory was safely removed between mkdir and owner publication.
+				// Retry the complete atomic publication instead of leaking transient state.
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, 1 + attempt));
+				continue;
+			}
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			let stale = false;
+			let staleToken: string | undefined;
 			try {
 				const st = fs.lstatSync(lock); if (!st.isDirectory() || (st.mode & 0o077) !== 0 || st.uid !== identity.uid) throw new Error("Nested route lock is not trusted.");
 				const ownerFile = path.join(lock, "owner"); const ownerStat = fs.lstatSync(ownerFile);
 				if (ownerStat.isSymbolicLink() || !ownerStat.isFile() || (ownerStat.mode & 0o077) !== 0 || ownerStat.uid !== identity.uid) throw new Error("Nested route lock owner is not trusted.");
-				const raw = JSON.parse(fs.readFileSync(ownerFile, "utf8")) as { pid?: unknown; uid?: unknown; startToken?: unknown; token?: unknown };
-				if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0 || !Number.isInteger(raw.uid) || (raw.uid as number) < 0 || typeof raw.startToken !== "string" || !/^\d+$/.test(raw.startToken) || typeof raw.token !== "string" || !isSafeNestedId(raw.token)) throw new Error("Nested route lock identity is ambiguous.");
+				const raw = JSON.parse(fs.readFileSync(ownerFile, "utf8")) as { pid?: unknown; uid?: unknown; startToken?: unknown; pidNamespace?: unknown; token?: unknown };
+				if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0 || !Number.isInteger(raw.uid) || (raw.uid as number) < 0 || typeof raw.startToken !== "string" || !/^\d+$/.test(raw.startToken) || typeof raw.pidNamespace !== "string" || !/^pid:\[\d+\]$/.test(raw.pidNamespace) || typeof raw.token !== "string" || !isSafeNestedId(raw.token)) throw new Error("Nested route lock identity is ambiguous.");
 				if (raw.uid !== identity.uid) throw new Error("Nested route lock belongs to another user.");
-				const observed = probeLinuxStartToken(raw.pid as number);
-				if (observed.state === "unprovable") throw new Error("Nested route lock identity cannot be proven exactly.");
+				staleToken = raw.token;
+				// Namespace-local PIDs are comparable only inside the namespace that
+				// published them. Cross-namespace ownership remains live/unknown.
+				const observed = raw.pidNamespace === identity.pidNamespace ? probeLinuxStartToken(raw.pid as number) : { state: "unprovable" as const };
+				// Cross-namespace PIDs cannot be classified here. Treat the lock as
+				// live contention and wait for its exact owner to release it; never
+				// reclaim it as stale.
+				if (observed.state === "unprovable") {
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, 1 + attempt));
+					continue;
+				}
 				// ENOENT is exact absence proof. A present PID with a different start
 				// token is PID reuse; neither process can own the recorded lock.
 				stale = observed.state === "absent" || observed.token !== raw.startToken;
@@ -950,7 +1005,7 @@ function withRouteLock<T>(route: NestedRoute, fn: () => T): T {
 				}
 				throw lockError instanceof Error ? lockError : new Error(String(lockError));
 			}
-			if (stale) { try { fs.rmSync(lock, { recursive: true, force: false }); } catch { /* another contender won */ } continue; }
+			if (stale && staleToken) { routeLockFaultInjector?.("before-stale-release", lock); try { releaseRouteLock(lock, staleToken); } catch { /* another contender won */ } continue; }
 			// A live owner gets bounded backoff rather than dropping a journal
 			// operation immediately.
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(100, 2 + attempt * 2));

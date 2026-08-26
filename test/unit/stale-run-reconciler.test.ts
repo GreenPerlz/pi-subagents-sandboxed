@@ -134,13 +134,15 @@ describe("async stale-run reconciliation", () => {
 		try {
 			const asyncDir = path.join(root, "run-missing");
 			writeStatus(asyncDir, { runId: "run-missing", mode: "single", state: "running", pid: 12345, startedAt: 1000, lastUpdate: 1000, error: `recover isolated runtime at ${path.join(root, "missing runtime")}: unavailable`, steps: [{ agent: "worker", status: "running", sandbox: { gitMode: "isolated" } }] });
-			const result = reconcileAsyncRun(asyncDir, { resultsDir: path.join(root, "results"), kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
-			assert.equal(result.status?.state, "running");
+			const resultsDir = path.join(root, "results");
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+			assert.equal(result.status?.state, "failed");
 			assert.equal(result.status?.incomplete, true);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(resultsDir, "run-missing.json"), "utf8")).state, "failed");
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
-	it("keeps stale isolated runs incomplete without bundle or retained runtime evidence", () => {
+	it("terminalizes stale isolated runs as failed with incomplete recovery evidence", () => {
 		const root = tempRoot("pi-stale-isolated-incomplete-");
 		try {
 			const asyncDir = path.join(root, "run-isolated");
@@ -156,13 +158,51 @@ describe("async stale-run reconciliation", () => {
 			});
 			const result = reconcileAsyncRun(asyncDir, { resultsDir, kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
 			assert.equal(result.repaired, true);
-			assert.equal(result.status?.state, "running");
+			assert.equal(result.status?.state, "failed");
 			assert.equal(result.status?.incomplete, true);
-			assert.equal(fs.existsSync(path.join(resultsDir, "run-isolated.json")), false);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(resultsDir, "run-isolated.json"), "utf8")).incomplete, true);
 			assert.match(fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf8"), /repaired_incomplete/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("repairs terminal status whose child projection is still running", () => {
+		const root = tempRoot("pi-terminal-stale-steps-");
+		try {
+			const asyncDir = path.join(root, "run-terminal-stale");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, { runId: "run-terminal-stale", mode: "single", state: "failed", pid: 12345, startedAt: 1000, lastUpdate: 1000, steps: [{ agent: "worker", status: "running" }] });
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(path.join(resultsDir, "run-terminal-stale.json"), JSON.stringify({ id: "run-terminal-stale", success: false, state: "failed", results: [{ agent: "worker", success: false, exitCode: 1, error: "cleanup failed" }] }), "utf8");
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 2000 });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+			assert.equal(result.status?.steps?.[0]?.status, "failed");
+			assert.equal(result.status?.steps?.[0]?.error, "cleanup failed");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("repairs teardown-unproven results to durable failed status without claiming cleanup", () => {
+		const root = tempRoot("pi-terminal-teardown-unproven-");
+		try {
+			const asyncDir = path.join(root, "run-teardown-unproven");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, { runId: "run-teardown-unproven", mode: "single", state: "running", pid: 12345, startedAt: 1000, lastUpdate: 1000, teardownUnproven: true, steps: [{ agent: "worker", status: "running", teardownUnproven: true }] });
+			fs.mkdirSync(resultsDir, { recursive: true });
+			const resultPath = path.join(resultsDir, "run-teardown-unproven.json");
+			fs.writeFileSync(resultPath, JSON.stringify({ id: "run-teardown-unproven", success: false, state: "running", teardownUnproven: true, results: [{ agent: "worker", success: false, status: "paused", teardownUnproven: true }] }), "utf8");
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 2000 });
+			assert.equal(result.status?.state, "failed");
+			assert.equal(result.status?.incomplete, true);
+			assert.equal(result.status?.teardownUnproven, true);
+			assert.equal(result.status?.steps?.[0]?.status, "failed");
+			assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf8")), { id: "run-teardown-unproven", success: false, state: "failed", teardownUnproven: true, results: [{ agent: "worker", success: false, status: "failed", teardownUnproven: true, state: "failed", incomplete: true }], incomplete: true });
+			const statusAfterFirstRepair = fs.readFileSync(path.join(asyncDir, "status.json"), "utf8");
+			const second = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 3000 });
+			assert.equal(second.repaired, false);
+			assert.equal(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8"), statusAfterFirstRepair);
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
 	it("repairs stale status with per-child result outcomes", () => {

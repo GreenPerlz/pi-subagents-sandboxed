@@ -16,6 +16,7 @@
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 
 ### Fixed
+- Async nested orchestrator runs now resolve PID-namespace-local writer identities through the owner namespace, fence mutations until exact binding, tolerate transient route-lock publication races without deleting replacement locks, and persist failed terminal state when cleanup proof is incomplete.
 - Packaged orchestrators now retain isolated writer authority for delegation, so their nested `work` child receives a writable checkout while custom orchestrators and packaged review/explore agents remain read-only.
 - Nested orchestrator preflight now probes the process cwd with the scoped-Git-safe `git rev-parse --is-inside-work-tree` query, allowing isolated workers to start without weakening endpoint path or metadata protections.
 - Isolated packaged writers now mount project-local extension runtime subtrees without exposing the parent repository root or `.git`, while explicit unsafe ancestor mounts remain rejected.

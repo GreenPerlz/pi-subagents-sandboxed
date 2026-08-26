@@ -16,7 +16,7 @@
 - Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
 
 ### Fixed
-- Exited cleanup-unproven orchestrator runs now leave the active widget after terminal retention while keeping failed/incomplete recovery evidence available in durable status and completed-run views.
+- Exited cleanup-unproven orchestrator runs, including legacy records with stale unmarked nested steps, now leave the active widget after terminal retention while keeping failed/incomplete recovery evidence available in durable status and completed-run views.
 - Async nested orchestrator runs now resolve PID-namespace-local writer identities through the owner namespace, fence mutations until exact binding, tolerate transient route-lock publication races without deleting replacement locks, and persist failed terminal state when cleanup proof is incomplete.
 - Packaged orchestrators now retain isolated writer authority for delegation, so their nested `work` child receives a writable checkout while custom orchestrators and packaged review/explore agents remain read-only.
 - Nested orchestrator preflight now probes the process cwd with the scoped-Git-safe `git rev-parse --is-inside-work-tree` query, allowing isolated workers to start without weakening endpoint path or metadata protections.

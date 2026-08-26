@@ -24,11 +24,14 @@ import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 
 function hasExecutingNestedDescendants(children: NestedRunSummary[] | undefined): boolean {
 	for (const child of children ?? []) {
-		if ((child.state === "running" || child.state === "queued") && child.teardownUnproven !== true) return true;
-		for (const step of child.steps ?? []) {
-			if ((step.status === "running" || step.status === "pending") && step.teardownUnproven !== true) return true;
-			if (hasExecutingNestedDescendants(step.children)) return true;
+		if (child.teardownUnproven !== true) {
+			if (child.state === "running" || child.state === "queued") return true;
+			if (child.steps?.some((step) => (step.status === "running" || step.status === "pending") && step.teardownUnproven !== true)) return true;
 		}
+		// A teardown-marked child's own step is the same stale lifecycle
+		// projection, not an independent descendant. Real nested descendants remain
+		// authoritative and are inspected recursively regardless of the marker.
+		if (child.steps?.some((step) => hasExecutingNestedDescendants(step.children))) return true;
 		if (hasExecutingNestedDescendants(child.children)) return true;
 	}
 	return false;

@@ -190,9 +190,13 @@ function mapState(state: string): OverlayRunState {
 }
 
 function hasExecutingOverlayChild(child: OverlayNestedChild): boolean {
-	if ((child.state === "running" || child.state === "queued") && child.teardownUnproven !== true) return true;
-	if (child.steps?.some((step) => ((step.state === "running" || step.state === "queued") && step.teardownUnproven !== true)
-		|| step.children.some(hasExecutingOverlayChild))) return true;
+	if (child.teardownUnproven !== true) {
+		if (child.state === "running" || child.state === "queued") return true;
+		if (child.steps?.some((step) => (step.state === "running" || step.state === "queued") && step.teardownUnproven !== true)) return true;
+	}
+	// The direct step repeats its teardown-marked owner's stale lifecycle state.
+	// Only independently nested descendants can keep that owner active.
+	if (child.steps?.some((step) => step.children.some(hasExecutingOverlayChild))) return true;
 	return child.children.some(hasExecutingOverlayChild);
 }
 
@@ -551,10 +555,16 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 	const unattached = mappedNestedChildren.filter((child) => !attachedIds.has(child.id));
 	if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached);
 	const { model: runModel, thinking: runThinking } = deriveRunModelThinking(steps, run.currentStep);
+	const persistedState = mapState(run.state);
+	const terminalCleanupState = run.teardownUnproven === true
+		&& (persistedState === "failed" || persistedState === "complete" || persistedState === "paused" || persistedState === "cancelled");
 	return {
 		id: run.id,
 		label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
-		state: deriveRunState(mapState(run.state), steps, mappedNestedChildren, run.teardownUnproven === true),
+		// Persisted terminal cleanup state is canonical lifecycle truth. Its nested
+		// snapshots may predate teardown markers and are retained as recovery
+		// evidence, but cannot prove that a process is currently executing.
+		state: terminalCleanupState ? persistedState : deriveRunState(persistedState, steps, mappedNestedChildren, run.teardownUnproven === true),
 		mode: run.mode,
 		source: "async",
 		agents,

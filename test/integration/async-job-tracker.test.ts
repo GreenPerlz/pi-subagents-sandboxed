@@ -197,7 +197,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			const asyncDir = path.join(asyncRoot, "run-retained-evidence");
 			fs.mkdirSync(asyncDir, { recursive: true });
 			tracker.handleStarted({ id: "run-retained-evidence", asyncDir, agent: "orchestrator" });
-			state.asyncJobs.get("run-retained-evidence")!.nestedChildren = [{ id: "cleanup-child", parentRunId: "run-retained-evidence", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "work", teardownUnproven: true }];
+			state.asyncJobs.get("run-retained-evidence")!.nestedChildren = [{ id: "cleanup-child", parentRunId: "run-retained-evidence", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "work", teardownUnproven: true, steps: [{ agent: "work", status: "running" }] }];
 			const statusPath = path.join(asyncDir, "status.json");
 			fs.writeFileSync(statusPath, JSON.stringify({ runId: "run-retained-evidence", mode: "single", state: "failed", teardownUnproven: true, incomplete: true, startedAt: 1000, endedAt: 2000, lastUpdate: 2000, steps: [{ agent: "orchestrator", status: "failed", teardownUnproven: true }] }), "utf8");
 			tracker.handleComplete({ id: "run-retained-evidence", asyncDir, success: false, state: "failed", teardownUnproven: true });

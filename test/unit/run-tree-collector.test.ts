@@ -1301,10 +1301,15 @@ describe("collectRunTree", () => {
 				endedAt: 2000,
 				lastUpdate: 2000,
 				steps: [{ agent: "orchestrator", status: "running", teardownUnproven: true }],
+				nestedChildren: [
+					{ id: "legacy-unmarked-explore", parentRunId: "persisted-cleanup-terminal", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "explore", ownerState: "live", steps: [{ agent: "explore", status: "running" }] },
+					{ id: "marked-work-stale-step", parentRunId: "persisted-cleanup-terminal", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "work", teardownUnproven: true, steps: [{ agent: "work", status: "running" }] },
+				],
 			});
 			const run = collectRunTree(state, 3000, { asyncDirRoot, resultsDir }).find((candidate) => candidate.id === "persisted-cleanup-terminal");
 			assert.strictEqual(run?.state, "failed");
 			assert.strictEqual(run?.steps[0]?.teardownUnproven, true);
+			assert.deepStrictEqual(run?.steps[0]?.children.map((child) => child.state), ["running", "running"]);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

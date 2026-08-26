@@ -2957,12 +2957,18 @@ process.exit(${exitCode});
 		const endpointBefore = fs.existsSync("/tmp/pi-scoped-git/scopes") ? fs.readdirSync("/tmp/pi-scoped-git/scopes").sort() : [];
 		for (const agent of packaged) {
 			mockPi.reset();
-			mockPi.onCall({ output: `${agent.name} direct`, commands: [agent.name === "work" ? `printf '${agent.name}\\n' > ${agent.name}-direct.txt && git add ${agent.name}-direct.txt && git commit -m '${agent.name} direct'` : "git status --porcelain=v1"] });
+			// For orchestrator, this command models the nested work child's commit in
+			// the owner's mount namespace. If the owner is mounted read-only, no nested
+			// Bubblewrap child can recover writer access and this exact command gets EROFS.
+			const authoredFile = agent.name === "work" ? "work-direct.txt" : "orchestrator-delegated-work.txt";
+			mockPi.onCall({ output: `${agent.name} direct`, commands: [`printf '${agent.name}\\n' > ${authoredFile} && git add ${authoredFile} && git commit -m '${agent.name} authored change'`] });
 			const executor = makeExecutor([agent]);
-			const result = await executor.execute(`builtin-direct-${agent.name}`, { agent: agent.name, task: "Inspect the isolated checkout." }, new AbortController().signal, undefined, makeMinimalCtx(repo));
+			const task = agent.name === "work" ? "Implement and commit the isolated change." : "Delegate and export the nested worker's isolated change.";
+			const result = await executor.execute(`builtin-direct-${agent.name}`, { agent: agent.name, task }, new AbortController().signal, undefined, makeMinimalCtx(repo));
 			assert.equal(result.isError, undefined, `${agent.name}: ${result.content[0]?.text ?? ""}`);
 			assert.equal(result.details.results.length, 1);
 			assert.ok(result.details.results[0]?.gitBundle?.path, `${agent.name}: expected one exported bundle`);
+			assert.notEqual(result.details.results[0]?.gitBundle?.head, baseHead, `${agent.name}: expected authored isolated history`);
 			assert.equal(spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(), baseHead);
 			assert.equal(spawnSync("git", ["-C", repo, "status", "--porcelain=v1"], { encoding: "utf8" }).stdout, parentStatus);
 		}

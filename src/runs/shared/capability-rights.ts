@@ -43,7 +43,12 @@ export function resolveCapabilityRights(input: CapabilityRightsInput): Capabilit
 	// explicitly declared bash tool; it must not accidentally deny default edit.
 	const hasMutationTool = tools === undefined || hasTool(tools, "edit") || hasTool(tools, "write");
 	const hasWritableBash = input.sandbox?.bashWrite === true && hasTool(tools, "bash");
-	const writableByTools = hasMutationTool || hasWritableBash;
+	// The packaged orchestrator does not edit directly, but it owns the isolated
+	// checkout and must retain writer authority so it can delegate that authority
+	// to its single work child. Its writable mount decision is still required,
+	// and builtin source authentication prevents custom names from gaining it.
+	const ownsDelegatableWriter = input.packagedRole === "orchestrator" && input.writableCwd === true;
+	const writableByTools = hasMutationTool || hasWritableBash || ownsDelegatableWriter;
 	if (!writableByTools) return "read-only";
 	if (input.sandbox?.gitMode !== "isolated") return "read-only";
 	if (input.writableCwd === false) return "read-only";

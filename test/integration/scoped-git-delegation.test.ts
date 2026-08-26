@@ -126,11 +126,11 @@ afterEach(() => {
 });
 
 describe("foreground nested writer delegation endpoint", () => {
-	it("starts a nested worker after preflight through the real scoped Git endpoint", { skip: !hasBubblewrap ? "Linux Bubblewrap is required" : undefined }, async () => {
+	it("starts a writable nested worker after preflight through the real scoped Git endpoint", { skip: !hasBubblewrap ? "Linux Bubblewrap is required" : undefined }, async () => {
 		const worktree = repository();
 		const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-preflight-runtime-"));
 		roots.add(runtimeRoot);
-		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "read-only" });
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
 		try {
 			const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 			const executorUrl = new URL("../../src/runs/foreground/subagent-executor.ts", import.meta.url).href;
@@ -138,7 +138,13 @@ describe("foreground nested writer delegation endpoint", () => {
 			const piArgsUrl = new URL("../../src/runs/shared/pi-args.ts", import.meta.url).href;
 			const piSpawnUrl = new URL("../../src/runs/shared/pi-spawn.ts", import.meta.url).href;
 			const childEvent = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "worker child started" }], model: "mock/test-model", stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } };
-			const childSource = `process.stdout.write(${JSON.stringify(`${JSON.stringify(childEvent)}\n`)});\n`;
+			const childSource = [
+				"import fs from 'node:fs';",
+				"import { spawnSync } from 'node:child_process';",
+				"fs.writeFileSync('nested-worker.txt', 'nested writer started\\n');",
+				"for (const args of [['add', 'nested-worker.txt'], ['commit', '-m', 'nested worker commit']]) { const result = spawnSync('git', args, { encoding: 'utf8' }); if (result.status !== 0) throw new Error(result.stderr || result.stdout || `git ${args[0]} failed`); }",
+				`process.stdout.write(${JSON.stringify(`${JSON.stringify(childEvent)}\n`)});`,
+			].join("\n");
 			const script = [
 				"import fs from 'node:fs';",
 				"import os from 'node:os';",
@@ -161,10 +167,10 @@ describe("foreground nested writer delegation endpoint", () => {
 				"process.env[piArgs.SUBAGENT_CHILD_AGENT_ENV] = 'orchestrator';",
 				"process.env[piArgs.SUBAGENT_RUN_ID_ENV] = 'scoped-preflight-run';",
 				"const state = { baseCwd: '', currentSessionId: null, asyncJobs: new Map(), foregroundRuns: new Map(), foregroundControls: new Map(), lastForegroundControlId: null, pendingForegroundControlNotices: new Map(), cleanupTimers: new Map(), lastUiContext: null, poller: null, completionSeen: new Map(), watcher: null, watcherRestartTimer: null, resultFileCoalescer: { schedule: () => false, clear() {} } };",
-				"const worker = { name: 'worker', description: 'Worker fixture', prompt: 'Read only fixture', tools: ['read'], systemPromptMode: 'replace' };",
+				"const worker = { name: 'work', source: 'builtin', description: 'Worker fixture', prompt: 'Implementation fixture', tools: ['read', 'bash', 'edit', 'write'], systemPromptMode: 'replace' };",
 				"const executor = createSubagentExecutor({ pi: { events: { emit() {}, on() { return () => {}; } }, getSessionName() { return 'parent'; } }, state, config: { maxSubagentDepth: 2, control: {}, intercomBridge: {} }, asyncByDefault: false, tempArtifactsDir: os.tmpdir(), getSubagentSessionRoot: () => os.tmpdir(), expandTilde: (value) => value, discoverAgents: () => ({ agents: [worker] }) });",
 				"const ctx = { cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId() { return 'session'; }, getSessionFile() { return null; } }, modelRegistry: { getAvailable() { return []; } } };",
-				"try { const result = await executor.execute('run', { agent: 'worker', task: 'Start the worker fixture.' }, new AbortController().signal, undefined, ctx); const text = result.content[0]?.type === 'text' ? result.content[0].text : ''; if (result.isError || !text.includes('worker child started')) throw new Error(text || 'nested worker did not start'); console.log(text); } finally { setPiSpawnEntrypointOverrideForTests(undefined); fs.rmSync(routeRoot, { recursive: true, force: true }); fs.rmSync(mockEntrypoint, { force: true }); }",
+				"try { const result = await executor.execute('run', { agent: 'work', task: 'Write and commit the nested worker fixture.' }, new AbortController().signal, undefined, ctx); const text = result.content[0]?.type === 'text' ? result.content[0].text : ''; if (result.isError || !text.includes('worker child started')) throw new Error(text || 'nested worker did not start'); console.log(text); } finally { setPiSpawnEntrypointOverrideForTests(undefined); fs.rmSync(routeRoot, { recursive: true, force: true }); fs.rmSync(mockEntrypoint, { force: true }); }",
 			].join("\n");
 			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
 			appendHostToolchainMounts(args);
@@ -183,6 +189,8 @@ describe("foreground nested writer delegation endpoint", () => {
 			assert.match(result.stdout, /Preflight: (?:all checks passed|passed with \d+ warning)/);
 			assert.match(result.stdout, /git probe: ok/);
 			assert.match(result.stdout, /worker child started/);
+			assert.equal(fs.readFileSync(path.join(worktree, "nested-worker.txt"), "utf8"), "nested writer started\n");
+			assert.equal(spawnSync("git", ["-C", worktree, "log", "-1", "--format=%s"], { encoding: "utf8" }).stdout.trim(), "nested worker commit");
 		} finally { await owner.close(); }
 	});
 

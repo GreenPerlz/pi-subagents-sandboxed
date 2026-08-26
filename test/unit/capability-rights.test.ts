@@ -11,6 +11,8 @@ test("central capability policy is monotonic across role, tools, sandbox, task, 
 		["omitted tools use the default writer-capable toolset", { sandbox: isolated }, "writer"],
 		["edit in isolated checkout", { agentTools: ["read", "edit"], sandbox: isolated }, "writer"],
 		["write in isolated checkout", { packagedRole: "work", agentTools: ["read", "write"], sandbox: isolated }, "writer"],
+		["orchestrator owns delegatable writer authority", { packagedRole: "orchestrator", agentTools: ["read", "subagent"], sandbox: { provider: "bubblewrap", gitMode: "isolated" }, writableCwd: true }, "writer"],
+		["custom orchestrator name receives no packaged authority", { agentTools: ["read", "subagent"], sandbox: { provider: "bubblewrap", gitMode: "isolated" }, writableCwd: true }, "read-only"],
 		["bash without bashWrite", { agentTools: ["bash"], sandbox: { ...isolated, bashWrite: false } }, "read-only"],
 		["mutation tools with bashWrite disabled", { agentTools: ["edit"], sandbox: { ...isolated, bashWrite: false } }, "read-only"],
 		["bash with bashWrite", { agentTools: ["bash"], sandbox: isolated }, "writer"],
@@ -42,5 +44,6 @@ test("the same policy is applied for every foreground/background execution shape
 		assert.equal(resolveCapabilityRights({ agentTools: ["read", "edit"], sandbox: isolated, taskMutationProhibited: true }), "read-only", `${shape}: task narrowing`);
 		assert.equal(resolveCapabilityRights({ agentTools: ["read", "edit"], sandbox: isolated, exclusiveLease: false }), "read-only", `${shape}: lease`);
 		assert.equal(resolveCapabilityRights({ packagedRole: "work", agentTools: ["read", "write"], sandbox: isolated }), "writer", `${shape}: legitimate writer`);
+		assert.equal(resolveCapabilityRights({ packagedRole: "orchestrator", agentTools: ["read", "subagent"], sandbox: isolated, writableCwd: true }), "writer", `${shape}: orchestrator delegation owner`);
 	}
 });

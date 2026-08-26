@@ -1,5 +1,5 @@
 /** Packaged role identity is the final component of an agent name. */
-export type PackagedAgentRole = "explore" | "work" | "review";
+export type PackagedAgentRole = "explore" | "orchestrator" | "work" | "review";
 export type PackagedAgentSource = "builtin" | "user" | "project";
 
 /**
@@ -15,6 +15,7 @@ export function resolvePackagedAgentRole(name: string | undefined, source?: Pack
 	// fail closed rather than granting packaged writer rights by name.
 	if (source !== "builtin") return undefined;
 	if (roleName === "explore" || roleName === "research" || roleName === "explorer") return "explore";
+	if (roleName === "orchestrator") return "orchestrator";
 	if (roleName === "work" || roleName === "worker") return "work";
 	if (roleName === "review" || roleName === "reviewer") return "review";
 	return undefined;

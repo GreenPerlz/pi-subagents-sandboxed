@@ -77,6 +77,7 @@ export interface OverlayStep {
 	artifactPath?: string;
 	asyncDir?: string;
 	children: OverlayNestedChild[];
+	teardownUnproven?: boolean;
 }
 
 /** A group-level failure/diagnostic has identity but deliberately no child index. */
@@ -188,13 +189,37 @@ function mapState(state: string): OverlayRunState {
 	return "complete";
 }
 
+function hasExecutingOverlayChild(child: OverlayNestedChild): boolean {
+	if ((child.state === "running" || child.state === "queued") && child.teardownUnproven !== true) return true;
+	if (child.steps?.some((step) => ((step.state === "running" || step.state === "queued") && step.teardownUnproven !== true)
+		|| step.children.some(hasExecutingOverlayChild))) return true;
+	return child.children.some(hasExecutingOverlayChild);
+}
+
+function hasTeardownOverlayChild(child: OverlayNestedChild): boolean {
+	return child.teardownUnproven === true
+		|| child.steps?.some((step) => step.teardownUnproven === true || step.children.some(hasTeardownOverlayChild)) === true
+		|| child.children.some(hasTeardownOverlayChild);
+}
+
 function deriveRunState(topLevel: OverlayRunState, steps: OverlayStep[], nestedChildren: OverlayNestedChild[] = [], teardownUnproven = false): OverlayRunState {
-	const values = [
-		{ state: topLevel, teardownUnproven },
+	const descendants = [
 		...steps.map((step) => ({ state: step.state, teardownUnproven: step.teardownUnproven })),
 		...steps.flatMap((s) => s.children).map((child) => ({ state: child.state, teardownUnproven: child.teardownUnproven })),
 		...nestedChildren.map((child) => ({ state: child.state, teardownUnproven: child.teardownUnproven })),
 	];
+	// Cleanup evidence controls retention, not process lifecycle. A durable
+	// failed/incomplete projection must not return to the active bucket merely
+	// because its recovery fence remains actionable. A separately running child
+	// without a teardown marker is still live work and keeps the parent active.
+	const hasLiveDescendant = steps.some((step) => ((step.state === "running" || step.state === "queued") && step.teardownUnproven !== true)
+		|| step.children.some(hasExecutingOverlayChild))
+		|| nestedChildren.some(hasExecutingOverlayChild);
+	const hasRecoveryDescendant = teardownUnproven
+		|| steps.some((step) => step.teardownUnproven === true || step.children.some(hasTeardownOverlayChild))
+		|| nestedChildren.some(hasTeardownOverlayChild);
+	if (hasRecoveryDescendant && !hasLiveDescendant && (topLevel === "failed" || topLevel === "complete" || topLevel === "paused" || topLevel === "cancelled")) return topLevel;
+	const values = [{ state: topLevel, teardownUnproven }, ...descendants];
 	const state = resolveAggregateState(values);
 	if (state === "failed" || state === "cancelled" || state === "paused") return state;
 	if (values.some((value) => value.state === "running")) return "running";
@@ -274,6 +299,7 @@ function mapNestedRunWithStaleState(run: NestedRunSummary, fallbackState?: Overl
 			tokens: step.totalTokens,
 			sessionFile: step.sessionFile,
 			children: mapNestedStepChildrenWithStaleState(step.children, fallbackState, freezeAt),
+			...(step.teardownUnproven ? { teardownUnproven: true } : {}),
 		};
 	});
 	const directChildren: OverlayNestedChild[] = (run.children ?? []).map((child) => mapNestedRunWithStaleState(child, fallbackState, freezeAt));
@@ -518,6 +544,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 			logPath: logPathForStep(run.asyncDir, step.index),
 			artifactPath: resultChild?.artifactPath,
 			children: (step.children ?? []).map(mapNestedRun),
+			...(step.teardownUnproven ? { teardownUnproven: true } : {}),
 		};
 	});
 	const attachedIds = new Set(run.steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
@@ -527,7 +554,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 	return {
 		id: run.id,
 		label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,
-		state: deriveRunState(mapState(run.state), steps, mappedNestedChildren),
+		state: deriveRunState(mapState(run.state), steps, mappedNestedChildren, run.teardownUnproven === true),
 		mode: run.mode,
 		source: "async",
 		agents,
@@ -701,7 +728,9 @@ function collectForegroundRuns(state: SubagentState, now: number): OverlayRun[] 
 // ---------------------------------------------------------------------------
 
 function resolveForegroundRunState(children: { status: string; teardownUnproven?: boolean }[]): OverlayRunState {
-	const state = resolveAggregateState(children.map((child) => ({ state: child.status, teardownUnproven: child.teardownUnproven })));
+	// Foreground display lifecycle ignores recovery-retention metadata. The
+	// teardown marker remains on the child for diagnostics and cleanup fencing.
+	const state = resolveAggregateState(children.map((child) => ({ state: child.status })));
 	if (state === "running") return "running";
 	if (state === "failed") return "failed";
 	if (state === "cancelled") return "cancelled";
@@ -897,6 +926,7 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 				sessionFile: step.sessionFile,
 				logPath: logPathForStep(job.asyncDir, step.index),
 				children: (step.children ?? []).map(mapNestedRun),
+				...(step.teardownUnproven ? { teardownUnproven: true } : {}),
 			};
 		});
 
@@ -915,7 +945,7 @@ function collectAsyncRuns(state: SubagentState, now: number): OverlayRun[] {
 		runs.push({
 			id: job.asyncId,
 			label: `${modeLabel(job.mode)}: ${agents.join(", ")}`,
-			state: deriveRunState(mapState(job.status ?? "running"), steps, mappedNestedChildren),
+			state: deriveRunState(mapState(job.status ?? "running"), steps, mappedNestedChildren, job.teardownUnproven === true),
 			mode: job.mode ?? "single",
 			source: "async",
 			agents,

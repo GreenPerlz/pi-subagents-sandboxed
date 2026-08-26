@@ -7,6 +7,7 @@ import {
 	type AsyncJobState,
 	type AsyncStartedEvent,
 	type ControlEvent,
+	type NestedRunSummary,
 	type SubagentState,
 	POLL_INTERVAL_MS,
 	RESULTS_DIR,
@@ -18,8 +19,20 @@ import { listAsyncRuns } from "./async-status.ts";
 import { isExpectedAsyncRunnerPid } from "./pid-identity.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
-import { hasLiveNestedDescendants, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
 import { resolveAggregateState } from "../../shared/aggregate-state.ts";
+
+function hasExecutingNestedDescendants(children: NestedRunSummary[] | undefined): boolean {
+	for (const child of children ?? []) {
+		if ((child.state === "running" || child.state === "queued") && child.teardownUnproven !== true) return true;
+		for (const step of child.steps ?? []) {
+			if ((step.status === "running" || step.status === "pending") && step.teardownUnproven !== true) return true;
+			if (hasExecutingNestedDescendants(step.children)) return true;
+		}
+		if (hasExecutingNestedDescendants(child.children)) return true;
+	}
+	return false;
+}
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -116,7 +129,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					scheduleCleanup(asyncId);
 				} else {
 					console.error(`Failed to recheck async cleanup fence for '${asyncId}':`, error);
-					if (hasLiveNestedDescendants(job.nestedChildren)) scheduleCleanup(asyncId);
+					if (hasExecutingNestedDescendants(job.nestedChildren)) scheduleCleanup(asyncId);
 					else {
 						state.asyncJobs.delete(asyncId);
 						nestedRefreshErrorSignatures.delete(asyncId);
@@ -126,9 +139,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				return;
 			}
 			nestedRefreshErrorSignatures.delete(asyncId);
-			if (job.teardownUnproven === true || (job.status !== "complete" && job.status !== "failed" && job.status !== "paused" && job.status !== "cancelled") || hasLiveNestedDescendants(job.nestedChildren)) {
+			if ((job.status !== "complete" && job.status !== "failed" && job.status !== "paused" && job.status !== "cancelled") || hasExecutingNestedDescendants(job.nestedChildren)) {
 				// Keep the tracker entry and let the poller observe the eventual
-				// terminal descendant event before trying cleanup again.
+				// terminal descendant event before trying cleanup again. Recovery
+				// evidence is durable on disk, so teardownUnproven alone does not keep
+				// a terminal card in the active in-memory display forever.
 				scheduleCleanup(asyncId);
 				if (state.lastUiContext) rerenderWidget(state.lastUiContext);
 				return;
@@ -300,7 +315,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						job.totalTokens = status.totalTokens ?? job.totalTokens;
 						job.sessionFile = status.sessionFile ?? job.sessionFile;
 						job.teardownUnproven = status.teardownUnproven;
-						if (job.teardownUnproven !== true && (job.status === "complete" || job.status === "failed" || job.status === "paused" || job.status === "cancelled") && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
+						if ((job.status === "complete" || job.status === "failed" || job.status === "paused" || job.status === "cancelled") && !nestedRefreshFailed && !hasExecutingNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 							scheduleCleanup(job.asyncId);
 						}
 						if (widgetRenderKey(job) !== widgetStateBefore) widgetChanged = true;
@@ -317,7 +332,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						job.status = "failed";
 						job.updatedAt = Date.now();
 					}
-					if (!hasLiveNestedDescendants(job.nestedChildren) && !state.cleanupTimers.has(job.asyncId)) {
+					if (!hasExecutingNestedDescendants(job.nestedChildren) && !state.cleanupTimers.has(job.asyncId)) {
 						scheduleCleanup(job.asyncId);
 					}
 				}
@@ -485,7 +500,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (state.lastUiContext) {
 			rerenderWidget(state.lastUiContext);
 		}
-		if (!nestedRefreshFailed && !hasLiveNestedDescendants(job?.nestedChildren)) scheduleCleanup(asyncId);
+		if (!nestedRefreshFailed && !hasExecutingNestedDescendants(job?.nestedChildren)) scheduleCleanup(asyncId);
 	};
 
 	const resetJobs = (ctx?: ExtensionContext) => {

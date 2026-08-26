@@ -188,6 +188,45 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		} finally { removeTempDir(asyncRoot); }
 	});
 
+	it("removes cleanup-unproven terminal cards after retention without deleting evidence", async () => {
+		const asyncRoot = createTempDir("pi-async-job-terminal-retention-");
+		try {
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = trackerMod!.createAsyncJobTracker(recorder.pi, state as never, asyncRoot, { completionRetentionMs: 5 });
+			const asyncDir = path.join(asyncRoot, "run-retained-evidence");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			tracker.handleStarted({ id: "run-retained-evidence", asyncDir, agent: "orchestrator" });
+			state.asyncJobs.get("run-retained-evidence")!.nestedChildren = [{ id: "cleanup-child", parentRunId: "run-retained-evidence", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "work", teardownUnproven: true }];
+			const statusPath = path.join(asyncDir, "status.json");
+			fs.writeFileSync(statusPath, JSON.stringify({ runId: "run-retained-evidence", mode: "single", state: "failed", teardownUnproven: true, incomplete: true, startedAt: 1000, endedAt: 2000, lastUpdate: 2000, steps: [{ agent: "orchestrator", status: "failed", teardownUnproven: true }] }), "utf8");
+			tracker.handleComplete({ id: "run-retained-evidence", asyncDir, success: false, state: "failed", teardownUnproven: true });
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.equal(state.asyncJobs.has("run-retained-evidence"), false);
+			assert.equal(fs.existsSync(statusPath), true, "durable recovery evidence is retained");
+			if (state.poller) clearInterval(state.poller);
+		} finally { removeTempDir(asyncRoot); }
+	});
+
+	it("retains a terminal parent card while a deep unmarked descendant is executing", async () => {
+		const asyncRoot = createTempDir("pi-async-job-deep-live-retention-");
+		try {
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = trackerMod!.createAsyncJobTracker(recorder.pi, state as never, asyncRoot, { completionRetentionMs: 5 });
+			const asyncDir = path.join(asyncRoot, "run-deep-live");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			tracker.handleStarted({ id: "run-deep-live", asyncDir, agent: "orchestrator" });
+			state.asyncJobs.get("run-deep-live")!.nestedChildren = [{ id: "cleanup-middle", parentRunId: "run-deep-live", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "middle", teardownUnproven: true, children: [{ id: "live-deep", parentRunId: "cleanup-middle", parentStepIndex: 0, depth: 2, path: [], state: "running", agent: "work" }] }];
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "run-deep-live", mode: "single", state: "failed", teardownUnproven: true, incomplete: true, startedAt: 1000, endedAt: 2000, lastUpdate: 2000, steps: [{ agent: "orchestrator", status: "failed", teardownUnproven: true }] }), "utf8");
+			tracker.handleComplete({ id: "run-deep-live", asyncDir, success: false, state: "failed", teardownUnproven: true });
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.equal(state.asyncJobs.has("run-deep-live"), true);
+			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
+			if (state.poller) clearInterval(state.poller);
+		} finally { removeTempDir(asyncRoot); }
+	});
+
 	it("removes completed jobs after retention and requests a rerender", async () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-");
 		try {

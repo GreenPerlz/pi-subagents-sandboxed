@@ -319,6 +319,35 @@ describe("renderSubagentResult fork indicator", () => {
 		assert.notEqual(renderGlyph(1), renderGlyph(2));
 	});
 
+	it("renders cleanup-unproven terminal results as failed instead of running", () => {
+		const widget = renderSubagentResult!({
+			content: [{ type: "text", text: "cleanup failed" }],
+			details: {
+				mode: "chain",
+				chainAgents: ["orchestrator"],
+				workflowGraph: {
+					runId: "cleanup-terminal",
+					mode: "chain",
+					phases: [],
+					nodes: [{ id: "step-0", kind: "step", agent: "orchestrator", status: "running", flatIndex: 0, stepIndex: 0 }],
+				},
+				results: [{
+					agent: "orchestrator",
+					task: "cleanup",
+					exitCode: 1,
+					teardownUnproven: true,
+					error: "recovery evidence retained",
+					messages: [],
+					usage: emptyUsage,
+				}],
+			},
+		}, { expanded: false }, theme);
+
+		const text = widget.render(120).join("\n");
+		assert.match(text, /^✗ chain/);
+		assert.doesNotMatch(text, /running/i);
+	});
+
 	it("keeps paused multi-result runs visible in the compact headline", () => {
 		const widget = renderSubagentResult!({
 			content: [{ type: "text", text: "paused" }],

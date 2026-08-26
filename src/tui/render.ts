@@ -526,11 +526,25 @@ function isDoneResult(result: Details["results"][number]): boolean {
 }
 
 function renderResultAggregateValue(result: Details["results"][number]): { state: string; teardownUnproven?: boolean } {
-	if (result.teardownUnproven === true) return { state: "running", teardownUnproven: true };
+	if (result.teardownUnproven === true) return { state: "failed" };
 	if (result.progress?.status === "running" || result.progress?.status === "pending") return { state: result.progress.status };
 	if (result.cancelled) return { state: "cancelled" };
 	if (result.interrupted || result.detached) return { state: "paused" };
 	return { state: result.exitCode === 0 ? "completed" : "failed" };
+}
+
+function resolveRenderedAggregate(details: Pick<Details, "results" | "workflowGraph">) {
+	const resultValues = details.results.map(renderResultAggregateValue);
+	const cleanupTerminal = details.results.some((result) => result.teardownUnproven === true)
+		&& !resultValues.some((value) => value.state === "running" || value.state === "pending");
+	return resolveAggregateState([
+		...resultValues,
+		...(details.workflowGraph?.nodes ?? []).map((node) => ({
+			// Workflow snapshots can lag terminal cleanup truth. Do not let a stale
+			// running group override canonical failed/incomplete child results.
+			state: cleanupTerminal && (node.status === "running" || node.status === "detached") ? "failed" : node.status,
+		})),
+	]);
 }
 
 function workflowGraphHasStatus(details: Pick<Details, "workflowGraph">, statuses: WorkflowNodeStatus[]): boolean {
@@ -1090,10 +1104,7 @@ function renderSingleCompact(d: Details, r: Details["results"][number], theme: T
 }
 
 function renderMultiCompact(d: Details, theme: Theme): Component {
-	const aggregate = resolveAggregateState([
-		...d.results.map(renderResultAggregateValue),
-		...(d.workflowGraph?.nodes ?? []).map((node) => ({ state: node.status })),
-	]);
+	const aggregate = resolveRenderedAggregate(d);
 	const hasRunning = aggregate === "running";
 	const failed = aggregate === "failed";
 	const cancelled = aggregate === "cancelled";
@@ -1305,10 +1316,7 @@ export function renderSubagentResult(
 
 	if (!expanded) return renderMultiCompact(d, theme);
 
-	const aggregate = resolveAggregateState([
-		...d.results.map(renderResultAggregateValue),
-		...(d.workflowGraph?.nodes ?? []).map((node) => ({ state: node.status })),
-	]);
+	const aggregate = resolveRenderedAggregate(d);
 	const hasRunning = aggregate === "running";
 	const ok = d.results.filter((r) => r.progress?.status === "completed" || (r.exitCode === 0 && r.progress?.status !== "running")).length;
 	const hasEmptyWithoutTarget = d.results.some((r) =>

@@ -1187,6 +1187,57 @@ describe("collectRunTree", () => {
 		assert.deepStrictEqual(runs.map((r) => r.id), ["complete-1", "paused-1", "failed-1", "queued-1", "running-1"]);
 	});
 
+	it("keeps cleanup-unproven terminal async jobs out of the active lifecycle bucket", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "cleanup-terminal",
+			asyncDir: "/tmp/cleanup-terminal",
+			status: "failed",
+			teardownUnproven: true,
+			mode: "single",
+			agents: ["orchestrator"],
+			startedAt: 100,
+			updatedAt: 200,
+			steps: [{ agent: "orchestrator", status: "running", teardownUnproven: true }],
+		});
+		const run = collectRunTree(state).find((candidate) => candidate.id === "cleanup-terminal");
+		assert.strictEqual(run?.state, "failed");
+		assert.strictEqual(run?.steps[0]?.teardownUnproven, true);
+	});
+
+	it("keeps a terminal parent out of the active bucket when only a nested child has cleanup evidence", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "nested-cleanup-terminal",
+			asyncDir: "/tmp/nested-cleanup-terminal",
+			status: "failed",
+			mode: "single",
+			agents: ["orchestrator"],
+			startedAt: 100,
+			updatedAt: 200,
+			steps: [{ agent: "orchestrator", status: "failed", children: [{ id: "cleanup-worker", parentRunId: "nested-cleanup-terminal", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "work", teardownUnproven: true }] }],
+		});
+		const run = collectRunTree(state).find((candidate) => candidate.id === "nested-cleanup-terminal");
+		assert.strictEqual(run?.state, "failed");
+	});
+
+	it("keeps a cleanup-unproven terminal parent active while a deep descendant is genuinely running", () => {
+		const state = baseState();
+		addAsyncJob(state, {
+			asyncId: "cleanup-live-descendant",
+			asyncDir: "/tmp/cleanup-live-descendant",
+			status: "failed",
+			teardownUnproven: true,
+			mode: "single",
+			agents: ["orchestrator"],
+			startedAt: 100,
+			updatedAt: 200,
+			steps: [{ agent: "orchestrator", status: "failed", teardownUnproven: true, children: [{ id: "cleanup-middle", parentRunId: "cleanup-live-descendant", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "middle", teardownUnproven: true, children: [{ id: "live-worker", parentRunId: "cleanup-middle", parentStepIndex: 0, depth: 2, path: [], state: "running", agent: "work" }] }] }],
+		});
+		const run = collectRunTree(state).find((candidate) => candidate.id === "cleanup-live-descendant");
+		assert.strictEqual(run?.state, "running");
+	});
+
 	it("loads persisted completed async runs after in-memory cleanup and merges result paths", () => {
 		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
 		try {
@@ -1229,6 +1280,31 @@ describe("collectRunTree", () => {
 			assert.strictEqual(runs[0]!.asyncDir, asyncDir);
 			assert.strictEqual(runs[0]!.steps[0]!.artifactPath, artifactPath);
 			assert.strictEqual(runs[0]!.steps[0]!.sessionFile, sessionFile);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps persisted cleanup-unproven terminal runs out of the active lifecycle bucket", () => {
+		const { root, asyncDirRoot, resultsDir } = makePersistedRoots();
+		try {
+			const state = baseState();
+			writePersistedAsyncStatus(asyncDirRoot, "persisted-cleanup-terminal", {
+				runId: "persisted-cleanup-terminal",
+				sessionId: "test-session",
+				cwd: "/tmp/test",
+				mode: "single",
+				state: "failed",
+				teardownUnproven: true,
+				incomplete: true,
+				startedAt: 1000,
+				endedAt: 2000,
+				lastUpdate: 2000,
+				steps: [{ agent: "orchestrator", status: "running", teardownUnproven: true }],
+			});
+			const run = collectRunTree(state, 3000, { asyncDirRoot, resultsDir }).find((candidate) => candidate.id === "persisted-cleanup-terminal");
+			assert.strictEqual(run?.state, "failed");
+			assert.strictEqual(run?.steps[0]?.teardownUnproven, true);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

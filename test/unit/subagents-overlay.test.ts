@@ -1288,6 +1288,31 @@ describe("subagents overlay detail pane (issue #21)", () => {
 		assert.deepStrictEqual(completedRuns[0]!.agents, ["nested-reviewer"]);
 	});
 
+	it("does not promote stale running children from a terminal cleanup parent", () => {
+		const runs: OverlayRun[] = [
+			{
+				id: "legacy-terminal-parent",
+				label: "single: orchestrator",
+				state: "failed",
+				mode: "single",
+				source: "async",
+				agents: ["orchestrator"],
+				teardownUnproven: true,
+				steps: [{
+					agent: "orchestrator",
+					state: "failed",
+					children: [
+						{ id: "legacy-unmarked", agent: "explore", state: "running", children: [], steps: [{ agent: "explore", state: "running", children: [] }] },
+						{ id: "legacy-marked", agent: "work", state: "running", teardownUnproven: true, children: [], steps: [{ agent: "work", state: "running", children: [] }] },
+					],
+				}],
+			},
+		];
+
+		assert.deepStrictEqual(filterRunsForView(runs, "running"), []);
+		assert.deepStrictEqual(filterRunsForView(runs, "completed").map((run) => run.id), ["legacy-terminal-parent"]);
+	});
+
 	it("keeps counts aligned when a completed nested child has steps and descendants", () => {
 		const runs: OverlayRun[] = [
 			{

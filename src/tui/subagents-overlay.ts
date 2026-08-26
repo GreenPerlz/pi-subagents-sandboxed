@@ -60,6 +60,9 @@ function nestedChildToRun(parent: OverlayRun, child: OverlayNestedChild): Overla
 }
 
 function collectNestedRunsForView(run: OverlayRun, view: SubagentsOverlayView): OverlayRun[] {
+	// A terminal cleanup parent keeps legacy nested snapshots as recovery
+	// evidence. Those snapshots do not become independent active rows.
+	if (view === "running" && run.teardownUnproven === true && !isRunningViewState(run.state)) return [];
 	const matches: OverlayRun[] = [];
 	const visit = (children: OverlayNestedChild[]): void => {
 		for (const child of children) {

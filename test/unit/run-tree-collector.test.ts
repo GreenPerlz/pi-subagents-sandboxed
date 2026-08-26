@@ -11,6 +11,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { collectRunTree, projectPersistedResultForTests, type OverlayRun } from "../../src/tui/run-tree-collector.ts";
 import { resolveSessionPath } from "../../src/tui/session-reader.ts";
+import { filterRunsForView } from "../../src/tui/subagents-overlay.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { listPersistedForegroundRuns } from "../../src/runs/foreground/foreground-status.ts";
 import type { SubagentState, AsyncJobState, NestedRunSummary } from "../../src/shared/types.ts";
@@ -1306,10 +1307,13 @@ describe("collectRunTree", () => {
 					{ id: "marked-work-stale-step", parentRunId: "persisted-cleanup-terminal", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "work", teardownUnproven: true, steps: [{ agent: "work", status: "running" }] },
 				],
 			});
-			const run = collectRunTree(state, 3000, { asyncDirRoot, resultsDir }).find((candidate) => candidate.id === "persisted-cleanup-terminal");
+			const runs = collectRunTree(state, 3000, { asyncDirRoot, resultsDir });
+			const run = runs.find((candidate) => candidate.id === "persisted-cleanup-terminal");
 			assert.strictEqual(run?.state, "failed");
+			assert.strictEqual(run?.teardownUnproven, true);
 			assert.strictEqual(run?.steps[0]?.teardownUnproven, true);
 			assert.deepStrictEqual(run?.steps[0]?.children.map((child) => child.state), ["running", "running"]);
+			assert.ok(!filterRunsForView(runs, "running").some((entry) => entry.id === "legacy-unmarked-explore" || entry.id === "marked-work-stale-step"));
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

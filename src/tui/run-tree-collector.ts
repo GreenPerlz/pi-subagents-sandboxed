@@ -114,6 +114,7 @@ export interface OverlayRun {
 	steps: OverlayStep[];
 	groupDiagnostics?: OverlayGroupDiagnostic[];
 	nestedWarning?: string;
+	teardownUnproven?: boolean;
 }
 
 export interface CollectRunTreeOptions {
@@ -565,6 +566,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 		// snapshots may predate teardown markers and are retained as recovery
 		// evidence, but cannot prove that a process is currently executing.
 		state: terminalCleanupState ? persistedState : deriveRunState(persistedState, steps, mappedNestedChildren, run.teardownUnproven === true),
+		...(run.teardownUnproven ? { teardownUnproven: true } : {}),
 		mode: run.mode,
 		source: "async",
 		agents,

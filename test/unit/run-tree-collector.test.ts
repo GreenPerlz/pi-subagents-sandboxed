@@ -1301,7 +1301,7 @@ describe("collectRunTree", () => {
 				startedAt: 1000,
 				endedAt: 2000,
 				lastUpdate: 2000,
-				steps: [{ agent: "orchestrator", status: "running", teardownUnproven: true }],
+				steps: [{ agent: "orchestrator", status: "running", currentTool: "subagent", teardownUnproven: true }],
 				nestedChildren: [
 					{ id: "legacy-unmarked-explore", parentRunId: "persisted-cleanup-terminal", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "explore", ownerState: "live", steps: [{ agent: "explore", status: "running" }] },
 					{ id: "marked-work-stale-step", parentRunId: "persisted-cleanup-terminal", parentStepIndex: 0, depth: 1, path: [], state: "running", agent: "work", teardownUnproven: true, steps: [{ agent: "work", status: "running" }] },
@@ -1312,7 +1312,10 @@ describe("collectRunTree", () => {
 			assert.strictEqual(run?.state, "failed");
 			assert.strictEqual(run?.teardownUnproven, true);
 			assert.strictEqual(run?.steps[0]?.teardownUnproven, true);
-			assert.deepStrictEqual(run?.steps[0]?.children.map((child) => child.state), ["running", "running"]);
+			assert.strictEqual(run?.steps[0]?.state, "failed");
+			assert.strictEqual(run?.steps[0]?.currentTool, undefined);
+			assert.deepStrictEqual(run?.steps[0]?.children.map((child) => child.state), ["failed", "failed"]);
+			assert.deepStrictEqual(run?.steps[0]?.children.map((child) => child.steps?.[0]?.state), ["failed", "failed"]);
 			assert.ok(!filterRunsForView(runs, "running").some((entry) => entry.id === "legacy-unmarked-explore" || entry.id === "marked-work-stale-step"));
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

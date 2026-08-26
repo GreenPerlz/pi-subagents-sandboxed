@@ -524,15 +524,22 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 		agents.push(...fallbackAgents);
 	}
 	const elapsed = elapsedFromRange(run.startedAt, run.endedAt ?? run.lastUpdate, now);
-	const mappedNestedChildren = (run.nestedChildren ?? []).map(mapNestedRun);
+	const persistedState = mapState(run.state);
+	const terminalCleanupState = run.teardownUnproven === true
+		&& (persistedState === "failed" || persistedState === "complete" || persistedState === "paused" || persistedState === "cancelled");
+	const mapPersistedNested = terminalCleanupState
+		? (child: NestedRunSummary) => mapNestedRunWithStaleState(child, "failed", run.endedAt ?? run.lastUpdate)
+		: mapNestedRun;
+	const mappedNestedChildren = (run.nestedChildren ?? []).map(mapPersistedNested);
 	const steps: OverlayStep[] = run.steps.map((step) => {
 		const resultChild = result?.children.find((child) => child.index === step.index)
 			?? (result?.children.some((child) => child.index !== undefined) ? undefined : result?.children[step.index]);
+		const stepState = terminalCleanupState ? staleNestedState(mapState(step.status), "failed") : mapState(step.status);
 		return {
 			agent: step.agent,
-			state: mapState(step.status),
+			state: stepState,
 			groupId: step.groupId,
-			currentTool: step.currentTool,
+			currentTool: stepState === "running" ? step.currentTool : undefined,
 			elapsed: elapsedFromMs(step.durationMs),
 			startedAt: step.startedAt,
 			model: step.model,
@@ -548,7 +555,7 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 			sessionFile: step.sessionFile ?? resultChild?.sessionFile,
 			logPath: logPathForStep(run.asyncDir, step.index),
 			artifactPath: resultChild?.artifactPath,
-			children: (step.children ?? []).map(mapNestedRun),
+			children: (step.children ?? []).map(mapPersistedNested),
 			...(step.teardownUnproven ? { teardownUnproven: true } : {}),
 		};
 	});
@@ -556,9 +563,6 @@ function overlayRunFromPersistedStatus(run: AsyncRunSummary, result: PersistedRe
 	const unattached = mappedNestedChildren.filter((child) => !attachedIds.has(child.id));
 	if (unattached.length && steps.length) steps[steps.length - 1]!.children.push(...unattached);
 	const { model: runModel, thinking: runThinking } = deriveRunModelThinking(steps, run.currentStep);
-	const persistedState = mapState(run.state);
-	const terminalCleanupState = run.teardownUnproven === true
-		&& (persistedState === "failed" || persistedState === "complete" || persistedState === "paused" || persistedState === "cancelled");
 	return {
 		id: run.id,
 		label: `${modeLabel(run.mode)}: ${agents.join(", ")}`,

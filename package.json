@@ -71,14 +71,14 @@
     }
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "0.84.3",
+    "@earendil-works/pi-tui": "0.84.4",
     "jiti": "^2.7.0",
     "pi-subagent-runtime": "npm:@earendil-works/pi-coding-agent@0.84.3",
     "typebox": "^1.1.24"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.84.3",
-    "@earendil-works/pi-ai": "0.84.3",
-    "@earendil-works/pi-coding-agent": "0.84.3"
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4"
   }
 }

@@ -10,10 +10,10 @@
 | `work` | Implements an approved task, validates it, and escalates unapproved decisions. Isolated Git by default. |
 | `orchestrator` | Coordinates explore → work → review for one issue. Isolated Git by default and bounded nested delegation. |
 
-Packaged `explore`, `research`, and `review` use Bubblewrap, `host-toolchain`, host networking, Pi JSON auth, closed package discovery, and `fallback: fail`. Packaged `work` and `orchestrator` use the same sandbox defaults but `sandboxGitMode: isolated`. Direct launches receive one managed isolated worktree; nested calls inherit the parent's scoped endpoint.
+Packaged `explore`, `research`, and `review` use Bubblewrap, `host-toolchain`, host networking, Pi JSON auth, closed package discovery, and `fallback: fail`. Packaged `work` and `orchestrator` use the same sandbox defaults but `sandboxGitMode: isolated`. Direct launches receive one managed isolated worktree; nested calls inherit the parent's scoped endpoint. These packaged names are the discovery contract: `explore`, `research`, `review`, `work`, and `orchestrator`.
 
 !!! note "The name is not authority"
-    A child called `work` is not automatically allowed to integrate its result. The parent remains the integration owner; inspect the result and recovery bundle before applying it.
+    A child called `work` is not automatically allowed to integrate its result. Names and task prose grant no Git, sandbox, or human-approval authority. The parent remains the integration owner; inspect the result and recovery bundle before applying it. For the ownership and pending native-communication contract, see [Delegation ownership and native communication](delegation-migration.md).
 
 ## Custom agents
 

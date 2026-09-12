@@ -15,22 +15,24 @@ Packaged builtin agents in this fork:
 
 | Agent | Role |
 |---|---|
+| `explore` | Read-only discovery of relevant files, tests, call paths, and invariants. |
 | `research` | Web/docs research with source-backed findings. |
 | `review` | Evidence-backed review of diffs, plans, PRs, issues, and code health. |
 | `work` | Single-writer implementation with validation and decision escalation. |
+| `orchestrator` | One-issue explore → work → fresh-review coordination. |
 
-Custom user/project agents and chains may still exist. Use `subagent({ action: "list" })` before relying on any non-packaged agent name.
+Custom user/project agents and chains may still exist. Use `subagent({ action: "list" })` before relying on any non-packaged agent name. The ownership, current-versus-pending batch, and pending native run-scoped communication contract is documented in `docs/delegation-migration.md`; its target blocks are conceptual pseudocode, not executable API instructions.
 
 ## Core rules
 
 - Keep one parent decision-maker. Children inspect, research, implement, or review; the parent synthesizes and decides next actions.
-- Default issue orchestration owns one isolated worktree in the parent: `explore`, `work`, and fresh `review` run foreground with `async: false`, explorer findings return inline, the worker edits the inherited cwd without committing, and the reviewer inspects the current `git diff`.
-- Reuse the parent-owned isolated worktree for nested steps by omitting `worktree`; request a separate worktree only for explicitly authorized parallel writers.
+- Default issue orchestration uses one runtime-owned isolated Git scope: `explore`, the authorized `work` writer, and fresh `review` run foreground with `async: false`; explorer findings and handoffs return inline, the writer commits authored changes in that scope, and the reviewer inspects authored history/tree/base diff plus any remaining working diff.
+- Reuse the inherited scoped Git context for nested steps by omitting `worktree`; nested writers are serialized and do not create nested worktrees. Request a separate worktree only for explicitly authorized independent writers.
 - Prefer fresh context for `review` and `research` runs unless inherited conversation state is explicitly needed.
 - Omit `output`, `outputMode: "file-only"`, `progress`, and `reads` by default. Results stay inline and no repo-local context/plan/progress/report Markdown is created unless one of those options is explicitly requested.
 - Use `work` for edits, `review` for adversarial checks, and `research` for external facts.
-- Do not let ordinary children run nested subagents. A child can call `subagent` only when its resolved builtin tools explicitly include `subagent`; default packaged agents do not.
-- Prefer `async: true` for subagent runs by default. Use foreground/synchronous runs mainly when you need the child result immediately in the current turn.
+- Do not let ordinary children run nested subagents. A child can call `subagent` only when its resolved builtin tools explicitly include `subagent`; default packaged observer/writer agents do not, while packaged `orchestrator` is the bounded coordination exception.
+- Prefer `async: true` for current detached runs when appropriate. For the pending #91 target, creation is always asynchronous and returns durable receipts for later observation; do not misdescribe that target as the currently implemented single/chain/parallel API. Use foreground/synchronous runs mainly when the current implementation requires the child result immediately in the current turn.
 
 ## Common workflows
 
@@ -50,22 +52,22 @@ For broad questions, run 2-3 `research` agents in parallel with distinct angles:
 
 ### Implement then review
 
-For one issue, keep the parent in control of one isolated worktree. Run each nested `explore`, `work`, and fresh `review` with `async: false`; return exploration inline, embed the relevant findings in one worker task, forbid worker commits, then give the reviewer only an abstract handoff and require it to inspect the actual current `git diff`.
+For one issue, keep the trusted parent in control of one runtime-owned isolated Git scope. Run each nested `explore`, authorized `work`, and fresh `review` with `async: false`; return exploration inline, embed relevant findings in one writer task, require the writer to commit authored changes in that scope, then give the reviewer only an abstract handoff and require it to inspect authored base-to-head history/tree/base diff plus the actual current `git diff` and status.
 
 ```typescript
 subagent({
   tasks: [{
     agent: "orchestrator",
-    task: "Own exactly this issue in the assigned worktree. Explore inline, embed relevant findings in one same-cwd work task that must not commit, then give a fresh reviewer an abstract handoff and require it to inspect current git diff."
+    task: "Own exactly this issue in one runtime-owned isolated scope. Explore inline, embed relevant findings in one same-scope work task that authors and commits only issue changes, then give a fresh observation-only reviewer an abstract handoff and require it to inspect authored history/tree/base diff and current status/diffs."
   }]
 })
 ```
 
-After review returns, the orchestrator may launch exactly one follow-up `work` agent for blockers. Do not use nested worktrees or report files for this default loop.
+After review returns, the orchestrator may launch serialized follow-up `work` passes for blockers. Reassess after each five passes; five is not a stop limit. Do not use nested worktrees or report files for this default loop. Runtime-bounded acceptance self-review is a separate post-result check.
 
 ### Review-only
 
-Use a fresh `review` run for current diffs, plans, issues, PRs, or proposed solutions. Ask it to inspect the actual current `git diff` and `git status`, cite file/line evidence, and return concise findings inline. Do not ask it to edit unless the user explicitly wants a writer pass. Prefer async review runs unless the current turn depends on the answer immediately.
+Use a fresh `review` run for current diffs, plans, issues, PRs, or proposed solutions. Ask it to inspect authored base-to-head history/tree and base-range diff when an isolated writer has committed, then inspect the actual current `git diff` and `git status`, cite file/line evidence, and return concise findings inline. Do not ask it to edit unless the user explicitly wants a writer pass. Prefer async review runs unless the current turn depends on the answer immediately.
 
 ```typescript
 subagent({
@@ -108,20 +110,20 @@ Parallel sandboxed tasks with write-capable tools require an explicitly authoriz
 
 ## Per-issue orchestrators
 
-For one issue, use one parent-owned isolated worktree and one `orchestrator` child. Its nested `explore`, `work`, and fresh `review` children inherit that cwd; no nested worktree or repository-local report handoff is needed. The explorer returns inline findings, the parent embeds them in the worker task, and the reviewer inspects the actual current diff.
+For one issue, use one runtime-owned isolated Git scope and one `orchestrator` child. Its nested `explore`, `work`, and fresh `review` children inherit that scope; no nested worktree or repository-local report handoff is needed. The explorer returns inline findings, the parent embeds them in the writer task, the writer authors commits in the scope, and the reviewer inspects authored history/tree/base diff and any remaining current diff.
 
 ```typescript
 subagent({
   tasks: [{
     agent: "orchestrator",
     label: "Issue #123",
-    task: "Orchestrate exactly this issue in the assigned worktree. Keep explore findings inline, pass relevant findings to same-cwd work, forbid commits, and pass an abstract worker handoff to a fresh reviewer that inspects current git diff."
+    task: "Orchestrate exactly this issue in one runtime-owned isolated scope. Keep explore findings inline, pass relevant findings to same-scope work, require authored commits only in that scope, and pass an abstract handoff to a fresh observation-only reviewer that inspects authored history/tree/base diff and current status/diffs."
   }],
   async: true
 })
 ```
 
-Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `work`, and `review` agents for its assigned issue only. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The parent still owns issue selection, worktree ownership, serial integration, and final close decisions.
+Only agents whose tools include `subagent` should run nested subagents. `orchestrator` is the intended exception: it may use nested `explore`, `work`, and `review` agents for its assigned issue only. Nested work inherits one scoped Git context, serializes writers, and uses inline handoffs. It should use intercom/contact-supervisor sparingly for real blockers or missing decisions, not routine progress. The trusted parent still owns canonical-checkout integration, export/recovery decisions, issue selection, and final close decisions. Names and task prose grant no authority.
 
 ## Status and control
 

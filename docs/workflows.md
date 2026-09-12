@@ -16,43 +16,72 @@ await subagent({
 });
 ```
 
-## Implement, integrate, then review
+## Implement, review, integrate
 
-A direct packaged `work` launch writes and commits inside runtime-issued isolated Git. It does **not** leave a diff in the parent checkout. Ask the parent to verify the returned bundle and authored commits, integrate them deliberately, and only then launch a fresh reviewer against the integrated parent tree:
+A direct packaged `work` launch writes and commits inside a runtime-issued isolated
+Git scope. It does **not** leave a diff in the canonical parent checkout. The
+worker must never stage or commit that canonical checkout; the runtime-owned
+scope is the authorized writing scope.
+
+### Direct writer: export, validate, review, then integrate
+
+The direct worker returns only after its original private scope has been exported
+and removed. Because that scope is gone, the trusted parent must complete the
+review setup before asking a fresh observer to review:
+
+1. **Run the isolated writer.** Have `work` implement and commit the approved
+   change in its private scope.
+2. **Verify the returned bundle and prerequisites.** The parent checks the
+   checksum, authored refs, base, and acceptance prerequisites. This verifies
+   evidence; it is not integration into the canonical checkout.
+3. **Import for review into a disposable validation checkout.** The parent
+   imports the authored refs into an available disposable validation checkout
+   solely for validation and review. This review import is separate from canonical
+   integration and must not modify the canonical parent checkout.
+4. **Review the imported authored state.** A fresh observation-only reviewer
+   inspects `git log <base>..HEAD`, the authored-head tree, and
+   `git diff <base>...HEAD`, plus `git status`, the index diff, and the working
+   tree diff, in that disposable checkout. A clean working tree after a commit
+   is not evidence that there is nothing to review.
+5. **Accept, then integrate.** Only after acceptance validation and the fresh
+   review pass does the trusted parent deliberately import/cherry-pick/apply the
+   intended authored state into the canonical checkout. The parent may remove
+   the disposable validation checkout afterward. Review verification/import and
+   canonical integration are different operations.
+
+A direct launch therefore has this ordering, even though the private scope is
+no longer available when the child result is delivered:
 
 ```text
-Have work implement and commit this approved plan in isolated Git. Return the bundle and authored commit evidence. Verify and integrate the reviewed authored commits into the parent checkout, then use a fresh review agent on the integrated tree.
+work authors commit in private isolated scope
+runtime exports authored refs and removes that private scope
+parent verifies bundle and prerequisites
+parent imports authored refs into disposable validation checkout
+fresh observer reviews authored base-to-HEAD history/tree and remaining diff there
+trusted parent validates acceptance and integrates into canonical checkout
 ```
 
-**1. Run the isolated writer:**
+### Nested orchestrator: review before outer export
 
-```ts
-const result = await subagent({
-  agent: "work",
-  task: "Implement the approved plan in isolated Git. Commit the authored change, validate it, and return changed files, commands, risks, and Git bundle evidence.",
-  async: false
-});
-```
-
-**2. Stop and integrate:** the trusted parent verifies the returned checksum and bundle, imports the exact reported refs, inspects the authored commits, and deliberately cherry-picks or applies the intended state. This is an ordinary parent Git operation, not another `subagent` call; follow [Git, worktrees & recovery](git-worktrees.md). Do not proceed merely because `result` exists.
-
-**3. Only after integration, launch the fresh reviewer:**
-
-```ts
-await subagent({
-  agent: "review",
-  task: "Inspect the integrated parent history, git diff/status, and affected files. Review correctness, tests, scope, and safety; do not edit.",
-  async: false
-});
-```
-
-A reviewer launched before step 2 cannot see the isolated writer commit in the parent checkout.
-
-The packaged orchestrator can coordinate an inline explore/work/review loop in its one runtime-owned scope, but it still does not replace parent review or integration ownership:
+The packaged orchestrator can coordinate an inline explore/work/review loop in
+its one runtime-owned scope. Its nested steps inherit one scoped Git context,
+serialize writers, and do not create nested worktrees, so the fresh observer can
+review that authored scope before the outer runtime exports and removes it. The
+trusted parent still verifies the exported bundle and performs canonical
+integration only after acceptance; this is not a reason to launch a direct
+reviewer in an already removed child scope:
 
 ```text
-Have orchestrator own this issue: explore first, have work implement, then have a fresh review inspect the diff. Keep the handoffs inline and stop on an unapproved decision.
+orchestrator explores inline
+scoped work writer authors commit
+fresh observer reviews authored history/tree/base diff in inherited scope
+runtime completes acceptance and required teardown/export
+trusted parent verifies exported bundle and deliberately integrates canonical state
 ```
+
+For either workflow, the fresh reviewer is observation-only and may report
+findings but may not edit, stage, commit, or integrate. Handoffs remain inline;
+stop for a real decision or blocker, not an arbitrary fixed loop count.
 
 ## Research with sources
 
@@ -109,6 +138,6 @@ const result = await subagent({
 });
 ```
 
-After the parent verifies and integrates the intended authored commits, launch a separate fresh `review` agent. Setting `acceptance.review.required: true` is appropriate only when that run can actually produce authenticated reviewer evidence; it does not automatically launch an independent reviewer for an ordinary packaged `work` call.
+After the runtime exports the authored bundle, the trusted parent verifies it and imports it into a disposable validation checkout. A fresh observer reviews the authored history/tree plus any remaining diff there, followed by acceptance; only then does the trusted parent integrate the intended authored commits into the canonical parent checkout. Setting `acceptance.review.required: true` is appropriate only when that run can actually produce authenticated reviewer evidence; it does not automatically launch an independent reviewer for an ordinary packaged `work` call.
 
 Acceptance permissions are guarded by the target agent's frontmatter. Read the [settings reference](settings-reference.md) for all fields.

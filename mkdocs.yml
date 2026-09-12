@@ -46,6 +46,7 @@ nav:
       - Mental model & execution modes: concepts.md
       - Agents: agents.md
       - Workflows: workflows.md
+      - Delegation ownership & native communication: delegation-migration.md
   - Safety:
       - Sandbox & security: sandbox-security.md
       - Git, worktrees & recovery: git-worktrees.md

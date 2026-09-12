@@ -5,7 +5,7 @@
 ### Changed
 - Made packaged `work` and `orchestrator` direct launches use one isolated managed Git worktree by default; `explore`, `research`, and `review` remain read-only, nested descendants inherit a scoped endpoint, and custom agents remain read-only unless they explicitly opt into isolated Git.
 - Added trusted user-global ceilings for sandbox opt-out and parent `worktree:false`; project settings may narrow worktree opt-out but cannot authorize host Git or sandbox opt-out. Authorized host-Git runs emit a prominent NO ISOLATION diagnostic.
-- Made packaged issue orchestration parent-owned by default: one isolated worktree, inline explorer findings embedded in a same-cwd no-commit worker task, and a fresh reviewer that inspects the current `git diff`.
+- Made packaged issue orchestration use a runtime-owned isolated scope by default: the authorized worker authors commits there, inline explorer findings are embedded in the same-cwd worker task, and a fresh observer reviews authored history/tree plus the base-range diff and any remaining working/index diff.
 - Made omitted output inline-only with no repo-local Markdown report; explicit output/file-only persistence and explicit legacy reads/progress behavior remain available.
 - Added guarded `worktree` overrides; shared worktree requests now require permission from every affected agent, and the packaged orchestrator explicitly permits them.
 - Added authoritative per-agent acceptance defaults and deny-by-default `canBeChangedByAgent` policies for explicit run overrides, enforced consistently before foreground/background/chain/parallel/dynamic child launch.
@@ -13,7 +13,7 @@
 - Added exact and segment-aware wildcard override paths, management/frontmatter serialization, bundled agent policies, and a concise settings reference for the complete configuration surface.
 - Added the `max` thinking level to subagent settings and clarify selectors for models whose registry metadata explicitly supports it.
 - Packaged read-only agents now request a closed Bubblewrap `host-toolchain` sandbox with read-only Git; packaged `work` and `orchestrator` use isolated Git by default. Host-Git opt-out via `sandbox: { provider: "none" }` now requires trusted user-global authorization.
-- Reduced packaged builtin agents to `researcher`, `reviewer`, and `worker`; removed the packaged `context-builder`, `delegate`, `oracle`, `planner`, and `scout` agents.
+- Packaged builtin agents are `explore`, `research`, `review`, `work`, and `orchestrator`; read-only roles stay observation-only while `work` and `orchestrator` use runtime-owned isolated Git scopes for authorized authored commits.
 
 ### Fixed
 - Agent discovery no longer registers skill documents as executable subagents or treats user-level `~/.pi` and `~/.agents` directories as project roots.

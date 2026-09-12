@@ -43,7 +43,7 @@
    /run explore find the files and tests relevant to authentication
    ```
 
-Read [mental model & execution modes](concepts.md) next, then choose an [agent](agents.md) and [workflow](workflows.md). When a writer edits code, read [Git, worktrees & recovery](git-worktrees.md) before integrating anything.
+Read [mental model & execution modes](concepts.md) next, then choose an [agent](agents.md) and [workflow](workflows.md). For the migration contract covering ownership, authored-history review, target batches, and native communication, read [Delegation ownership and native communication](delegation-migration.md). When a writer edits code, read [Git, worktrees & recovery](git-worktrees.md) before integrating anything.
 
 !!! warning "Fail closed is intentional"
     Bubblewrap is the default and packaged agents request `fallback: fail`. Do not work around a missing `bwrap` by making an unsafe opt-out. Fix the setup or make an explicitly trusted, narrowly authorized decision.

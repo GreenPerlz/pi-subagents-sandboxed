@@ -1986,6 +1986,77 @@ process.exit(${exitCode});
 		}
 	});
 
+	it("uses and cleans a writable private agent copy for pi-json-ephemeral children", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({
+			commands: [`printf '{"refreshed":true}\\n' > "$PI_CODING_AGENT_DIR/auth.json"`],
+			output: "SUBAGENT_EPHEMERAL_AUTH_OK",
+		});
+		const agentDir = path.join(tempDir, "ephemeral-agent-home");
+		fs.mkdirSync(agentDir, { recursive: true });
+		const authPath = path.join(agentDir, "auth.json");
+		const originalAuth = JSON.stringify({ antigravity: { type: "oauth", access: "expired", refresh: "secret", expires: 1 } });
+		fs.writeFileSync(authPath, originalAuth, { encoding: "utf8", mode: 0o600 });
+		fs.writeFileSync(path.join(agentDir, "subagents.json"), "{}\n", "utf8");
+		fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:ambient"] }), "utf8");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("echo", { model: "openai/gpt-5.5" })]);
+			const result = await executor.execute(
+				"single-sandbox-ephemeral-auth",
+				{ agent: "echo", task: "Reply exactly: SUBAGENT_EPHEMERAL_AUTH_OK", sandbox: { provider: "bubblewrap", auth: "pi-json-ephemeral" } },
+				new AbortController().signal,
+				undefined,
+				canonicalFastModeCtx(),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.match(result.content[0]?.text ?? "", /SUBAGENT_EPHEMERAL_AUTH_OK/);
+			assert.equal(result.details.results[0]?.sandbox?.auth, "pi-json-ephemeral");
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const privateAgentDir = bwrapArgs.find((arg, index) => bwrapArgs[index - 1] === "--bind" && arg.endsWith(`${path.sep}private-agent`));
+			assert.ok(privateAgentDir, "private agent dir should be mounted into the sandbox");
+			assertMountMode(bwrapArgs, privateAgentDir, "rw");
+			assertNotMounted(bwrapArgs, authPath);
+			assert.equal(fs.existsSync(privateAgentDir), false, "private credential directory should be removed with run temp cleanup");
+			assert.equal(fs.readFileSync(authPath, "utf8"), originalAuth, "host auth must remain byte-identical");
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
+	it("cleans pi-json-ephemeral credentials after a failed foreground child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ exitCode: 1, stderr: "provider failed" });
+		const agentDir = path.join(tempDir, "failed-ephemeral-agent-home");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "auth.json"), "{\"secret\":true}\n", { encoding: "utf8", mode: 0o600 });
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const fakeBwrap = installFakeBwrap();
+		try {
+			const executor = makeExecutor([makeAgent("echo", { model: "openai/gpt-5.5" })]);
+			const result = await executor.execute(
+				"single-sandbox-ephemeral-auth-failure",
+				{ agent: "echo", task: "Fail", sandbox: { provider: "bubblewrap", auth: "pi-json-ephemeral" } },
+				new AbortController().signal,
+				undefined,
+				canonicalFastModeCtx(),
+			);
+			assert.equal(result.isError, true);
+			const bwrapArgs = readFakeBwrapArgs(fakeBwrap.recordDir);
+			const privateAgentDir = bwrapArgs.find((arg, index) => bwrapArgs[index - 1] === "--bind" && arg.endsWith(`${path.sep}private-agent`));
+			assert.ok(privateAgentDir);
+			assert.equal(fs.existsSync(privateAgentDir), false);
+		} finally {
+			fakeBwrap.restore();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
 	it("does not expose intercom tools for non-async foreground sandbox runs even with active bridge", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-intercom-active-agent-"));
 		const intercomExtensionDir = path.join(agentDir, "extensions", "pi-intercom");

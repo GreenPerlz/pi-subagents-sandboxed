@@ -182,7 +182,7 @@ Do work
 				...(agent.name === "work" || agent.name === "orchestrator" ? { gitMode: "isolated" } : { gitMode: "read-only" }),
 				profile: "host-toolchain",
 				network: "host",
-				auth: "pi-json",
+				auth: "pi-json-ephemeral",
 				fallback: "fail",
 				packageDiscovery: "closed",
 			}, `${agent.name} should resolve the packaged Git policy`);

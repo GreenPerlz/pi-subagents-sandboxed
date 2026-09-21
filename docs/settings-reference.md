@@ -64,7 +64,7 @@ This page is the compact reference for persistent extension settings, agent Mark
 - **`sandbox.allowWorktreeOptOut`** — User-global ceiling for an explicit parent `worktree: false` request; a project may set it to false to narrow the ceiling but cannot set it true when the user has not enabled it.
 - **`sandbox.defaultProfile`** — Sets the default sandbox profile, normally `host-toolchain`. The profile determines the base mounts and runtime shape.
 - **`sandbox.network`** — Uses `host` for normal network access or `none` for an isolated network namespace. Model/API calls generally require `host`.
-- **`sandbox.auth`** — Uses `pi-json` to mount Pi auth files read-only or `env` to rely on inherited credentials. Prefer `pi-json` when supported.
+- **`sandbox.auth`** — Use `pi-json-ephemeral` for a writable run-private copy that supports OAuth refresh without changing host credentials, `pi-json` for legacy read-only mounts, or `env` to rely on inherited credentials. Prefer `pi-json-ephemeral` for ordinary model-backed agents.
 - **`sandbox.trustProject`** — Allows the sandbox policy to trust project-local files and configuration. Leave it false for stricter treatment of project input.
 - **`sandbox.fallback`** — Uses `fail` to refuse unsandboxed execution or `none` to continue without the sandbox after setup failure. Packaged agents use fail-closed behavior.
 - **`sandbox.extraReadOnlyMounts`** — Adds narrow read-only paths for required tools or inputs. Avoid broad mounts such as the whole home directory.
@@ -126,7 +126,7 @@ Detached async runs have no cancellation producer in the public settings/API tod
 - **`sandboxNetwork`** — Sets this agent's network mode to values such as `host` or `none`. Offline mode prevents normal model/API access from inside the child process.
 - **`sandboxTrustProject`** — Allows sandbox policy to trust project-local files and configuration for this agent. Keep it false unless project-local discovery is required.
 - **`sandboxBashWrite`** — Lets a bash-only agent imply writable cwd access. Without it, bash-only/read-only agents remain read-only while `edit` or `write` agents are inferred as writers.
-- **`sandboxAuth`** — Selects the child authentication policy, commonly `pi-json` or `env`. `pi-json` mounts the necessary Pi auth files read-only.
+- **`sandboxAuth`** — Selects the child authentication policy. `pi-json-ephemeral` copies the necessary JSON into a writable run-private agent directory; `pi-json` mounts host JSON read-only; `env` relies on inherited credentials.
 - **`sandboxFallback`** — Chooses `fail` or `none` if sandbox setup cannot be applied. `fail` prevents accidental unsandboxed execution.
 - **`sandboxExtraReadOnlyMounts`** — Adds comma-separated read-only mounts for this agent. Use the narrowest paths containing required tools or inputs.
 - **`sandboxExtraWritableMounts`** — Adds comma-separated writable mounts for this agent. Restrict them to required caches, outputs, or work directories.

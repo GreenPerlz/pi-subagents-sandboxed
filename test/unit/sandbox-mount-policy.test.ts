@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { buildSubagentSandboxMounts } from "../../src/sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable } from "../../src/sandbox/write-inference.ts";
+import { ephemeralPiAgentDir, prepareEphemeralPiAgentDir } from "../../src/sandbox/ephemeral-auth.ts";
 
 const tempRoots: string[] = [];
 
@@ -544,6 +545,65 @@ describe("subagent sandbox mount policy", () => {
 		assert.equal(mountMode(mounts, authPath), "ro");
 		assert.equal(mountMode(mounts, subagentsPath), "ro");
 		assert.equal(mountMode(mounts, settingsPath), undefined);
+	});
+
+	it("mounts a writable run-private agent directory for pi-json-ephemeral without exposing settings", () => {
+		const root = tempRoot();
+		const cwd = mkdirp(path.join(root, "project"));
+		const tempDir = mkdirp(path.join(root, "run-temp"));
+		const agentDir = mkdirp(path.join(root, "agent"));
+		const hostAuth = writeFile(path.join(agentDir, "auth.json"), JSON.stringify({ antigravity: { type: "oauth", access: "old", refresh: "secret", expires: 1 } }));
+		writeFile(path.join(agentDir, "subagents.json"), JSON.stringify({ agentOverrides: { work: { model: "antigravity/gemini" } } }));
+		writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:ambient"] }));
+
+		const privateDir = prepareEphemeralPiAgentDir({ authMode: "pi-json-ephemeral", tempDir, sourceAgentDir: agentDir });
+		assert.equal(privateDir, ephemeralPiAgentDir(tempDir));
+		const mounts = buildSubagentSandboxMounts({ cwd, tempDir, authMode: "pi-json-ephemeral", agentDir });
+
+		assert.equal(mountMode(mounts, privateDir!), "rw");
+		assert.equal(mountMode(mounts, hostAuth), undefined);
+		assert.equal(fs.existsSync(path.join(privateDir!, "settings.json")), false);
+		assert.deepEqual(JSON.parse(fs.readFileSync(path.join(privateDir!, "auth.json"), "utf8")), JSON.parse(fs.readFileSync(hostAuth, "utf8")));
+		assert.equal(fs.statSync(privateDir!).mode & 0o777, 0o700);
+		assert.equal(fs.statSync(path.join(privateDir!, "auth.json")).mode & 0o777, 0o600);
+
+		fs.writeFileSync(path.join(privateDir!, "auth.json"), "{\"refreshed\":true}\n", "utf8");
+		assert.match(fs.readFileSync(hostAuth, "utf8"), /antigravity/);
+	});
+
+	it("recreates ephemeral auth without following child-created destination symlinks", () => {
+		const root = tempRoot();
+		const tempDir = mkdirp(path.join(root, "run-temp"));
+		const agentDir = mkdirp(path.join(root, "agent"));
+		const trustedAuth = writeFile(path.join(agentDir, "auth.json"), "{\"trusted\":true}\n");
+		const privateDir = prepareEphemeralPiAgentDir({ authMode: "pi-json-ephemeral", tempDir, sourceAgentDir: agentDir })!;
+		const unrelated = writeFile(path.join(root, "unrelated.json"), "do-not-touch\n");
+		fs.unlinkSync(path.join(privateDir, "auth.json"));
+		fs.symlinkSync(unrelated, path.join(privateDir, "auth.json"));
+
+		const recreated = prepareEphemeralPiAgentDir({ authMode: "pi-json-ephemeral", tempDir, sourceAgentDir: agentDir });
+
+		assert.equal(recreated, privateDir);
+		assert.equal(fs.readFileSync(unrelated, "utf8"), "do-not-touch\n");
+		assert.equal(fs.lstatSync(path.join(privateDir, "auth.json")).isFile(), true);
+		assert.equal(fs.readFileSync(path.join(privateDir, "auth.json"), "utf8"), fs.readFileSync(trustedAuth, "utf8"));
+	});
+
+	it("keeps concurrent runs in separate private agent directories", () => {
+		const root = tempRoot();
+		const agentDir = mkdirp(path.join(root, "agent"));
+		writeFile(path.join(agentDir, "auth.json"), "{\"token\":\"host\"}\n");
+		const first = prepareEphemeralPiAgentDir({ authMode: "pi-json-ephemeral", tempDir: mkdirp(path.join(root, "run-a")), sourceAgentDir: agentDir })!;
+		const second = prepareEphemeralPiAgentDir({ authMode: "pi-json-ephemeral", tempDir: mkdirp(path.join(root, "run-b")), sourceAgentDir: agentDir })!;
+		fs.writeFileSync(path.join(first, "auth.json"), "{\"token\":\"refreshed-a\"}\n", "utf8");
+		assert.match(fs.readFileSync(path.join(second, "auth.json"), "utf8"), /host/);
+	});
+
+	it("requires a runtime temp directory for pi-json-ephemeral", () => {
+		assert.throws(
+			() => prepareEphemeralPiAgentDir({ authMode: "pi-json-ephemeral", tempDir: undefined }),
+			/runtime-managed temporary directory/,
+		);
 	});
 
 	it("mounts intercom extension package dir read-only without mounting broad node_modules", () => {

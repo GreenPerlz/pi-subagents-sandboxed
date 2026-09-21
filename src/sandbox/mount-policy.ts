@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { detectGitWorktreePointerGitdir } from "./preflight.ts";
 import type { SandboxMount, SandboxMountMode, GitMode } from "./types.ts";
 import { resolveGitMode } from "./config.ts";
+import { authModeUsesEphemeralPiJson, ephemeralPiAgentDir } from "./ephemeral-auth.ts";
 
 export interface StructuredOutputMountInput {
 	schemaPath?: string;
@@ -31,7 +32,7 @@ export interface SubagentSandboxMountInput {
 	spawnCommand?: string;
 	/** Args paired with spawnCommand; absolute CLI script args are mounted read-only. */
 	spawnArgs?: string[];
-	/** Sandbox auth mode. `pi-json` mounts Pi auth JSON read-only without mounting settings JSON. */
+	/** Sandbox auth mode. `pi-json` mounts trusted JSON read-only; `pi-json-ephemeral` mounts a run-private writable copy. */
 	authMode?: string;
 	/** Pi agent config directory; defaults to PI_CODING_AGENT_DIR or ~/.pi/agent. */
 	agentDir?: string;
@@ -301,7 +302,18 @@ function authModeUsesPiJson(authMode: string | undefined): boolean {
 		|| normalized === "json";
 }
 
-function addSandboxAuthMounts(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, authMode: string | undefined, agentDir: string | undefined): void {
+function addSandboxAuthMounts(
+	mounts: SandboxMount[],
+	seen: Map<string, SandboxMount["mode"]>,
+	authMode: string | undefined,
+	agentDir: string | undefined,
+	tempDir: string | undefined,
+): void {
+	if (authModeUsesEphemeralPiJson(authMode)) {
+		if (!tempDir) throw new Error("pi-json-ephemeral auth requires a runtime-managed temporary directory");
+		addSandboxMount(mounts, seen, ephemeralPiAgentDir(tempDir), "rw");
+		return;
+	}
 	if (!authModeUsesPiJson(authMode)) return;
 	const dir = path.resolve(expandTilde(agentDir || defaultAgentDir()));
 	addSandboxMount(mounts, seen, path.join(dir, "auth.json"), "ro");
@@ -416,7 +428,7 @@ export function buildSubagentSandboxMounts(input: SubagentSandboxMountInput): Sa
 	for (const packageRoot of input.packageRoots ?? []) addReadonlyPackageRuntimePath(mounts, seen, packageRoot);
 	addSandboxExtensionMountParents(mounts, seen, input.piArgs);
 	addSandboxSpawnMounts(mounts, seen, input.spawnCommand, input.spawnArgs);
-	addSandboxAuthMounts(mounts, seen, input.authMode, input.agentDir);
+	addSandboxAuthMounts(mounts, seen, input.authMode, input.agentDir, input.tempDir);
 	addExplicitMounts(mounts, seen, input.extraReadOnlyMounts, "ro");
 	addExplicitMounts(mounts, seen, input.extraWritableMounts, "rw", protectedGitPaths);
 	if (input.intercomStateDir) {

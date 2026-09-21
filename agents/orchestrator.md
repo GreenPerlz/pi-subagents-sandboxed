@@ -9,7 +9,7 @@ sandboxProvider: bubblewrap
 sandboxGitMode: isolated
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json
+sandboxAuth: pi-json-ephemeral
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh

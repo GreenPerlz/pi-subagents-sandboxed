@@ -5,12 +5,13 @@ systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
 skills: tdd
+extensions: /home/greenperl/.pi/agent/npm/node_modules/pi-antigravity/src/index.ts
 tools: read, grep, find, ls, bash, edit, write, contact_supervisor
 sandboxProvider: bubblewrap
 sandboxGitMode: isolated
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json
+sandboxAuth: pi-json-ephemeral
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh

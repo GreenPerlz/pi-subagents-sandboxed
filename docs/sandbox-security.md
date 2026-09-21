@@ -9,11 +9,14 @@ Resolution is run options → agent frontmatter → settings defaults. Every gua
 Packaged defaults:
 
 - `provider: bubblewrap`, `profile: host-toolchain`, `network: host`.
-- `auth: pi-json`: required Pi auth files are read-only; full settings are not mounted.
+- `auth: pi-json-ephemeral` (packaged agents): the trusted runner copies `auth.json` and `subagents.json` into a mode-0700 run-private agent directory, mounts that copy writable, and points child Pi at it. OAuth refreshes work without modifying the host files. The copy is removed with the run temp directory; `settings.json` is never copied. Positive integer `providers.<provider>.modelOverrides.<model>.contextWindow` values from `models.json` are projected into a private mode-0600 `models.json`, including for nested workers. No provider credentials, commands, routing, custom model definitions, or other model fields are inherited. Invalid declared context limits fail the launch rather than silently reverting to a larger window.
+- `auth: pi-json`: legacy read-only Pi JSON mounts remain available for agents that must forbid all credential mutation, including OAuth refresh persistence.
 - `packageDiscovery: closed`: child Pi starts with closed extension/prompt/theme discovery and only explicit runtime extensions.
 - `fallback: fail`: if Bubblewrap cannot be applied, the child does not run unsandboxed.
 - `explore`, `research`, `review`: Git `read-only`.
 - `work`, `orchestrator`: Git `isolated`.
+
+To cap Gemini 3.8 Flash's worker context metadata, add `"gemini-3.8-flash": { "contextWindow": 272000 }` under the relevant provider's `modelOverrides` in the launching Pi agent directory's `models.json`. With Pi's default 16,384-token compaction reserve, compaction becomes eligible above 255,616 tokens. The bundled Pi 0.85.1 runtime also checks estimated context after tool batches, before the next assistant request. Compaction needs a summarizable history segment; this is not a hard request-token ceiling. Changes apply to newly prepared private workers, not already-running children. Legacy `pi-json` mounts do not inherit these projected limits.
 
 Host networking is needed for normal model/API calls. Set `network: none` only for a task that can operate offline; it prevents normal provider access.
 

@@ -57,6 +57,7 @@ import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diag
 import type { SpawnableInvocation } from "../../sandbox/types.ts";
 import { buildSubagentSandboxMounts } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable } from "../../sandbox/write-inference.ts";
+import { prepareEphemeralPiAgentDir } from "../../sandbox/ephemeral-auth.ts";
 import { resolveSavedOutputPath, shouldPersistSavedOutput } from "../../shared/output-paths.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, isChildProcessGroupGone, processControlUnsupported, signalChildProcessGroup } from "../../shared/post-exit-stdio-guard.ts";
@@ -284,6 +285,12 @@ async function runSingleAttempt(
 		sandboxIntercomExtensionDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.extensionDir : undefined,
 		sandboxIntercomStateDir: closedSandboxRuntime && sandboxIntercomBridgeApplies ? options.sandboxIntercomBridge?.stateDir : undefined,
 	});
+
+	const privateAgentDir = prepareEphemeralPiAgentDir({
+		authMode: options.sandbox?.auth,
+		tempDir,
+	});
+	if (privateAgentDir) sharedEnv.PI_CODING_AGENT_DIR = privateAgentDir;
 
 	const result: SingleResult = {
 		agent: agent.name,

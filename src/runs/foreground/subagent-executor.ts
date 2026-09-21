@@ -67,6 +67,7 @@ import { delegateScopedGitWriterDescriptor, readScopedGitProcessIdentity, reserv
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { isExpectedAsyncRunnerPid } from "../background/pid-identity.ts";
 import { resolveAggregateState } from "../../shared/aggregate-state.ts";
+import { normalizeAuthorizedCwds, resolveExplicitCwd } from "../shared/cwd-policy.ts";
 
 function exportBundleWithRetries(runtime: IsolatedGitRuntime, options: Parameters<typeof exportIsolatedGitBundle>[1]): ReturnType<typeof exportIsolatedGitBundle> {
 	let lastError: unknown;
@@ -80,7 +81,7 @@ import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { inspectSubagentStatus } from "../background/run-status.ts";
 import { applyForceTopLevelAsyncOverride } from "../background/top-level-async.ts";
 import { validateAcceptanceInput } from "../shared/acceptance.ts";
-import { validateAndFormatAgentOverridePolicy } from "../shared/agent-override-policy.ts";
+import { evaluateAgentOverridePolicy, formatAgentOverridePolicyError } from "../shared/agent-override-policy.ts";
 import {
 	cleanupWorktrees,
 	createWorktrees,
@@ -241,8 +242,10 @@ interface ExecutionContextData {
 	scopedGitEndpoint?: ScopedGitEndpointDescriptor;
 }
 
-function resolveRequestedCwd(runtimeCwd: string, requestedCwd: string | undefined): string {
-	return requestedCwd ? path.resolve(runtimeCwd, requestedCwd) : runtimeCwd;
+function resolveRequestedCwd(runtimeCwd: string, requestedCwd: unknown): string {
+	const resolved = resolveExplicitCwd({ invokingCwd: runtimeCwd }, requestedCwd === undefined ? "." : requestedCwd);
+	if ("error" in resolved) throw new Error(`Invalid cwd: ${resolved.error}`);
+	return resolved.canonical;
 }
 
 function getForegroundControl(state: SubagentState, runId: string | undefined) {
@@ -1637,7 +1640,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 	if (!effectiveAsync) return null;
 
 	if (hasChain && params.chain) {
-		const chainWorktreeTaskCwdError = buildChainWorktreeTaskCwdError(params.chain as ChainStep[], effectiveCwd);
+		const chainWorktreeTaskCwdError = buildChainWorktreeTaskCwdError(params.chain as ChainStep[], effectiveCwd, ctx.cwd);
 		if (chainWorktreeTaskCwdError) {
 			return {
 				content: [{ type: "text", text: chainWorktreeTaskCwdError }],
@@ -1654,7 +1657,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			return buildParallelModeError(`Max ${maxParallelTasks} tasks`);
 		}
 		if (params.worktree) {
-			const worktreeTaskCwdError = buildParallelWorktreeTaskCwdError(params.tasks, effectiveCwd);
+			const worktreeTaskCwdError = buildParallelWorktreeTaskCwdError(params.tasks, effectiveCwd, ctx.cwd);
 			if (worktreeTaskCwdError) return buildParallelModeError(worktreeTaskCwdError);
 		}
 	}
@@ -2078,6 +2081,8 @@ interface ForegroundParallelRunInput {
 	artifactsDir: string;
 	maxOutput?: MaxOutputConfig;
 	paramsCwd: string;
+	/** Trusted ExtensionContext cwd used for every relative task cwd. */
+	invokingCwd: string;
 	maxSubagentDepths: number[];
 	nestedFenceTimeoutMs?: number;
 	availableModels: ModelInfo[];
@@ -2146,18 +2151,19 @@ function createParallelWorktreeSetup(
 function buildParallelWorktreeTaskCwdError(
 	tasks: ReadonlyArray<{ agent: string; cwd?: string }>,
 	sharedCwd: string,
+	invokingCwd: string = sharedCwd,
 ): string | undefined {
-	const conflict = findWorktreeTaskCwdConflict(tasks, sharedCwd);
+	const conflict = findWorktreeTaskCwdConflict(tasks, sharedCwd, invokingCwd);
 	if (!conflict) return undefined;
 	return formatWorktreeTaskCwdConflict(conflict, sharedCwd);
 }
 
-function buildChainWorktreeTaskCwdError(chain: ChainStep[], sharedCwd: string): string | undefined {
+function buildChainWorktreeTaskCwdError(chain: ChainStep[], sharedCwd: string, invokingCwd: string = sharedCwd): string | undefined {
 	for (let stepIndex = 0; stepIndex < chain.length; stepIndex++) {
 		const step = chain[stepIndex]!;
 		if (!isParallelStep(step) || !step.worktree) continue;
-		const stepCwd = resolveChildCwd(sharedCwd, step.cwd);
-		const conflict = findWorktreeTaskCwdConflict(step.parallel, stepCwd);
+		const stepCwd = step.cwd === undefined ? sharedCwd : resolveChildCwd(invokingCwd, step.cwd);
+		const conflict = findWorktreeTaskCwdConflict(step.parallel, stepCwd, invokingCwd);
 		if (!conflict) continue;
 		const detail = formatWorktreeTaskCwdConflict(conflict, stepCwd);
 		return `parallel chain step ${stepIndex + 1}: ${detail}`;
@@ -2171,14 +2177,15 @@ function resolveParallelTaskCwd(
 	worktreeSetup: WorktreeSetup | undefined,
 	index: number,
 	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[],
+	invokingCwd: string = paramsCwd,
 ): string {
 	// Isolated Git mapping happens inside runSingleAttempt, where the exact
 	// requested parent repository cwd is still available. Returning the private
 	// path here would make that mapping reject its own worktree as outside the
 	// assigned repository and would also discard task cwd subdirectories.
-	if (isolatedGitWorktrees?.[index]) return resolveChildCwd(paramsCwd, task.cwd);
+	if (isolatedGitWorktrees?.[index]) return task.cwd === undefined ? paramsCwd : resolveChildCwd(invokingCwd, task.cwd);
 	if (worktreeSetup) return worktreeSetup.worktrees[index]!.agentCwd;
-	return resolveChildCwd(paramsCwd, task.cwd);
+	return task.cwd === undefined ? paramsCwd : resolveChildCwd(invokingCwd, task.cwd);
 }
 
 function buildParallelWorktreeSuffix(
@@ -2197,6 +2204,7 @@ function findDuplicateParallelOutputPath(input: {
 	behaviors: ResolvedStepBehavior[];
 	paramsCwd: string;
 	ctxCwd: string;
+	invokingCwd: string;
 	worktreeSetup?: WorktreeSetup;
 	isolatedGitWorktrees?: (IsolatedGitWorktree | undefined)[];
 	absoluteOnly?: boolean;
@@ -2207,7 +2215,7 @@ function findDuplicateParallelOutputPath(input: {
 		if (!behavior?.output) continue;
 		const task = input.tasks[index]!;
 		if (input.absoluteOnly && (typeof behavior.output !== "string" || !path.isAbsolute(behavior.output))) continue;
-		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees);
+		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees, input.invokingCwd);
 		const outputPath = resolveSingleOutputPath(behavior.output, input.ctxCwd, taskCwd);
 		if (!outputPath) continue;
 		const previous = seen.get(outputPath);
@@ -2238,7 +2246,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 		}
 		const behavior = input.behaviors[index];
 		const effectiveSkills = behavior?.skills;
-		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees);
+		const taskCwd = resolveParallelTaskCwd(task, input.paramsCwd, input.worktreeSetup, index, input.isolatedGitWorktrees, input.invokingCwd);
 		const agentConfig = input.agents.find((agent) => agent.name === task.agent);
 		const taskSandbox = sandboxAt(input.sandboxes, index, input.sandbox);
 		// Issue capability after the resolved per-task sandbox is available and
@@ -2511,7 +2519,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	}
 
 	if (params.worktree) {
-		const worktreeTaskCwdError = buildParallelWorktreeTaskCwdError(tasks, effectiveCwd);
+		const worktreeTaskCwdError = buildParallelWorktreeTaskCwdError(tasks, effectiveCwd, ctx.cwd);
 		if (worktreeTaskCwdError) return buildParallelModeError(worktreeTaskCwdError);
 	}
 
@@ -2648,10 +2656,10 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 
 	const behaviors = agentConfigs.map((config, index) => suppressProgressForReadOnlyTask(resolveStepBehavior(config, behaviorOverrides[index]!), taskTexts[index]));
 	// Request-only validation must happen before acquiring managed resources.
-	const duplicateOutputError = findDuplicateParallelOutputPath({ tasks, behaviors, paramsCwd: effectiveCwd, ctxCwd: ctx.cwd, absoluteOnly: Boolean(params.worktree || isolatedGitRequested) });
+	const duplicateOutputError = findDuplicateParallelOutputPath({ tasks, behaviors, paramsCwd: effectiveCwd, ctxCwd: ctx.cwd, absoluteOnly: Boolean(params.worktree || isolatedGitRequested), invokingCwd: ctx.cwd });
 	if (duplicateOutputError) return buildParallelModeError(duplicateOutputError);
 	for (let index = 0; index < tasks.length; index++) {
-		const taskCwd = resolveParallelTaskCwd(tasks[index]!, effectiveCwd, undefined, index);
+		const taskCwd = resolveParallelTaskCwd(tasks[index]!, effectiveCwd, undefined, index, undefined, ctx.cwd);
 		// The base probe above precedes output/session path resolution and setup.
 		const outputPath = resolveSingleOutputPath(behaviors[index]?.output, ctx.cwd, taskCwd);
 		const savedOutputPath = shouldPersistSavedOutput({
@@ -3206,6 +3214,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			artifactsDir,
 			maxOutput: params.maxOutput,
 			paramsCwd: effectiveCwd,
+			invokingCwd: ctx.cwd,
 			availableModels,
 			modelOverrides,
 			behaviors,
@@ -4412,7 +4421,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		let preAuthenticatedEndpoint: ScopedGitEndpointDescriptor | undefined;
 		const rawEndpoint = process.env[SUBAGENT_SCOPED_GIT_ENDPOINT_ENV];
 		if (rawEndpoint) { try { preAuthenticatedEndpoint = JSON.parse(rawEndpoint) as ScopedGitEndpointDescriptor; } catch (error) { return { content: [{ type: "text", text: `Scoped Git endpoint descriptor is malformed: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "single", results: [] } }; } }
-		const requestCwd = resolveRequestedCwd(ctx.cwd, params.cwd);
+		let requestCwd: string;
+		try {
+			requestCwd = resolveRequestedCwd(ctx.cwd, params.cwd);
+		} catch (error) {
+			return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: getRequestedModeLabel(params), results: [] } };
+		}
 		const paramsWithResolvedCwd = params.cwd === undefined ? params : { ...params, cwd: requestCwd };
 		let authenticatedInheritedRoute: ReturnType<typeof resolveRequiredInheritedNestedRouteFromEnv>;
 		try {
@@ -4562,11 +4576,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			};
 		}
 
-		const normalized = normalizeRepeatedParallelCounts(paramsWithResolvedCwd);
+		const normalized = normalizeRepeatedParallelCounts(params);
 		if (normalized.error) return normalized.error;
 		const normalizedParams = normalized.params!;
 		// Keep the pre-default, raw request for override policy. In particular,
-		// context inferred from agent frontmatter is not a caller override.
+		// context inferred from agent frontmatter is not a caller override. Cwd
+		// aliases remain raw until authorization captures their canonical identity.
 		const rawOverrideParams = normalizedParams;
 
 		let effectiveParams = applyForceTopLevelAsyncOverride(
@@ -4576,9 +4591,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		);
 
 		const scope: AgentScope = resolveExecutionAgentScope(effectiveParams.agentScope);
-		const effectiveCwd = effectiveParams.cwd ?? ctx.cwd;
+		// requestCwd is already canonicalized from the trusted invoking cwd. It is
+		// used for discovery/settings and as the fallback for omitted child cwds;
+		// raw cwd fields stay untouched until the policy admission below.
+		let effectiveCwd = requestCwd;
 		const parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
 		deps.state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+		// Non-cwd defaults continue to use the requested discovery root. Cwd
+		// permission, however, must come only from definitions visible at the
+		// trusted invoking root so an outside project cannot authorize itself.
+		const invokingAgents = deps.discoverAgents(ctx.cwd, scope).agents;
 		const discoveredAgents = deps.discoverAgents(effectiveCwd, scope).agents;
 		const sandboxSettings = readSandboxSettings(effectiveCwd, scope);
 		// provider:none is intentionally not a normal agent default. It is only
@@ -4738,9 +4760,26 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		);
 		if (validationError) return validationError;
 
-		const overridePolicyError = validateAndFormatAgentOverridePolicy(rawOverrideParams, discoveredAgents);
+		const overridePolicy = evaluateAgentOverridePolicy(rawOverrideParams, discoveredAgents, {
+			cwdContext: { invokingCwd: ctx.cwd },
+			cwdAgents: invokingAgents,
+		});
+		const overridePolicyError = formatAgentOverridePolicyError(overridePolicy.violations);
 		if (overridePolicyError) {
 			return validationErrorResult(getRequestedModeLabel(effectiveParams), overridePolicyError);
+		}
+		try {
+			const normalizedCwds = normalizeAuthorizedCwds(effectiveParams, overridePolicy.cwdResolutions);
+			if ("error" in normalizedCwds) {
+				return validationErrorResult(getRequestedModeLabel(effectiveParams), normalizedCwds.error);
+			}
+			effectiveParams = normalizedCwds;
+			effectiveCwd = effectiveParams.cwd ?? requestCwd;
+		} catch (error) {
+			return validationErrorResult(
+				getRequestedModeLabel(effectiveParams),
+				error instanceof Error ? error.message : String(error),
+			);
 		}
 
 		let sessionFileForIndex: (idx?: number) => string | undefined = () => undefined;

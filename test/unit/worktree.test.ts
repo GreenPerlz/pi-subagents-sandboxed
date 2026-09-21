@@ -190,6 +190,20 @@ describe("worktree", () => {
 		);
 	});
 
+	it("uses the trusted invoking cwd when group and task cwd values are both relative", () => {
+		const invokingCwd = path.join("/tmp", "repo");
+		const sharedCwd = path.join(invokingCwd, "child");
+		assert.equal(
+			findWorktreeTaskCwdConflict(
+				[{ agent: "worker-a", cwd: "child" }],
+				sharedCwd,
+				invokingCwd,
+			),
+			undefined,
+		);
+		assert.ok(findWorktreeTaskCwdConflict([{ agent: "worker-a", cwd: "child" }], sharedCwd));
+	});
+
 	it("findWorktreeTaskCwdConflict returns the first conflicting task cwd", () => {
 		const sharedCwd = path.join("/tmp", "repo");
 		const conflict = findWorktreeTaskCwdConflict(

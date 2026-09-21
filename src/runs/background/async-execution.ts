@@ -458,7 +458,10 @@ export function executeAsyncChain(
 	const resultMode = params.resultMode ?? "chain";
 	const chainSkills = params.chainSkills ?? [];
 	const availableModels = params.availableModels;
-	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	// AsyncExecutionContext.cwd is supplied by the trusted extension context;
+	// never derive this authority from a request field.
+	const invokingCwd = ctx.cwd;
+	const runnerCwd = cwd === undefined ? ctx.cwd : (path.isAbsolute(cwd) ? cwd : resolveChildCwd(invokingCwd, cwd));
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
 	const sharedSandbox: SandboxTransport | undefined = hasSandboxResolutionInputs
 		? resolveSandboxTransport({ settings: params.sandboxSettings, run: params.sandboxRun })
@@ -614,7 +617,7 @@ export function executeAsyncChain(
 	) => {
 		const a = agents.find((x) => x.name === s.agent)!;
 		const stepSandbox = sandboxOverride !== undefined ? sandboxOverride : resolveStepSandbox(a);
-		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
+		const stepCwd = s.cwd === undefined ? runnerCwd : (path.isAbsolute(s.cwd) ? s.cwd : resolveChildCwd(invokingCwd, s.cwd));
 		const instructionCwd = behaviorCwd ?? stepCwd;
 		const behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
 		const skillNames = behavior.skills === false ? [] : behavior.skills;
@@ -709,8 +712,11 @@ export function executeAsyncChain(
 					const agent = agents.find((candidate) => candidate.name === task.agent)!;
 					return suppressProgressForReadOnlyTask(resolveStepBehavior(agent, buildStepOverrides(task), chainSkills), task.task, originalTask);
 				});
+				const groupCwd = s.cwd === undefined ? runnerCwd : (path.isAbsolute(s.cwd) ? s.cwd : resolveChildCwd(invokingCwd, s.cwd));
 				const progressPrecreated = parallelBehaviors.some((behavior) => behavior.progress);
 				if (progressPrecreated) {
+					// Progress is chain-wide: prompts and runner mounts use runnerCwd,
+					// even when a group runs its children from a different cwd.
 					if (!s.worktree) writeInitialProgressFile(runnerCwd);
 					progressInstructionCreated = true;
 				}
@@ -725,26 +731,33 @@ export function executeAsyncChain(
 				return {
 					parallel: s.parallel.map((t, taskIndex) => {
 						let behaviorCwd: string | undefined;
+						const taskWithCwd = t.cwd === undefined
+							? { ...t, cwd: groupCwd }
+							: { ...t, cwd: path.isAbsolute(t.cwd) ? t.cwd : resolveChildCwd(invokingCwd, t.cwd) };
 						if (s.worktree) {
 							try {
-								behaviorCwd = resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s${stepIndex}`, taskIndex);
+								behaviorCwd = resolveExpectedWorktreeAgentCwd(groupCwd, `${id}-s${stepIndex}`, taskIndex);
 							} catch {
 								behaviorCwd = undefined;
 							}
 						}
-						return buildSeqStep(t, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], stepIndex * 1000 + taskIndex, stepSandboxes[taskIndex]);
+						return buildSeqStep(taskWithCwd, nextSessionFile(), behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], stepIndex * 1000 + taskIndex, stepSandboxes[taskIndex]);
 					}),
 					concurrency: s.concurrency,
 					failFast: s.failFast,
 					worktree: s.worktree,
+					cwd: groupCwd,
 					...(worktreeOptOutAllowed ? { worktreeOptOutAuthorized: true } : {}),
 				};
 			}
 			if (isDynamicParallelStep(s)) {
 				const agent = agents.find((candidate) => candidate.name === s.parallel.agent)!;
 				const behavior = suppressProgressForReadOnlyTask(resolveStepBehavior(agent, buildStepOverrides(s.parallel), chainSkills), s.parallel.task, originalTask);
+				const dynamicCwd = s.cwd === undefined ? runnerCwd : (path.isAbsolute(s.cwd) ? s.cwd : resolveChildCwd(invokingCwd, s.cwd));
 				const progressPrecreated = behavior.progress;
 				if (progressPrecreated) {
+					// Keep dynamic fanout on the same chain-wide progress path as its
+					// prompts and runner mount.
 					writeInitialProgressFile(runnerCwd);
 					progressInstructionCreated = true;
 				}
@@ -755,9 +768,13 @@ export function executeAsyncChain(
 				const dynamicSandbox = dynamicWorktreeOptOutAllowed && resolvedDynamicSandbox?.gitMode === "isolated"
 					? { ...resolvedDynamicSandbox, gitMode: "read-only" as const }
 					: resolvedDynamicSandbox;
+				const dynamicTemplate = s.parallel.cwd === undefined
+					? { ...s.parallel, cwd: dynamicCwd }
+					: { ...s.parallel, cwd: path.isAbsolute(s.parallel.cwd) ? s.parallel.cwd : resolveChildCwd(invokingCwd, s.parallel.cwd) };
 				return {
 					expand: s.expand,
-					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior, stepIndex, dynamicSandbox),
+					cwd: dynamicCwd,
+					parallel: buildSeqStep(dynamicTemplate as SequentialStep, undefined, undefined, progressPrecreated, behavior, stepIndex, dynamicSandbox),
 					collect: s.collect,
 					concurrency: s.concurrency,
 					worktree: s.worktree,
@@ -958,7 +975,7 @@ export function executeAsyncSingle(
 		nestedSelf,
 	} = params;
 	const task = params.task ?? "";
-	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	const runnerCwd = cwd === undefined ? ctx.cwd : (path.isAbsolute(cwd) ? cwd : resolveChildCwd(ctx.cwd, cwd));
 	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
 	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
 	const explicitNestedRoute = Object.prototype.hasOwnProperty.call(params, "nestedRoute") && nestedRoute !== undefined;

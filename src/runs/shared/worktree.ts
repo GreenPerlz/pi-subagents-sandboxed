@@ -217,12 +217,13 @@ function normalizeComparableCwd(cwd: string): string {
 export function findWorktreeTaskCwdConflict(
 	tasks: ReadonlyArray<{ agent: string; cwd?: string }>,
 	sharedCwd: string,
+	invokingCwd: string = sharedCwd,
 ): WorktreeTaskCwdConflict | undefined {
 	const normalizedSharedCwd = normalizeComparableCwd(sharedCwd);
 	for (let index = 0; index < tasks.length; index++) {
 		const task = tasks[index]!;
 		if (!task.cwd) continue;
-		const taskCwd = path.isAbsolute(task.cwd) ? task.cwd : path.resolve(sharedCwd, task.cwd);
+		const taskCwd = path.isAbsolute(task.cwd) ? task.cwd : path.resolve(invokingCwd, task.cwd);
 		if (normalizeComparableCwd(taskCwd) === normalizedSharedCwd) continue;
 		return { index, agent: task.agent, cwd: task.cwd };
 	}

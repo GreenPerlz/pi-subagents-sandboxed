@@ -643,6 +643,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 	});
 
 	it("rejects top-level parallel worktree runs with a conflicting task cwd", async () => {
+		fs.mkdirSync(path.join(tempDir, "other"), { recursive: true });
 		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: "leaf-777" });
 		const executor = makeExecutor();
 
@@ -892,6 +893,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 	});
 
 	it("rejects invalid background top-level parallel requests during executor preflight", async () => {
+		fs.mkdirSync(path.join(tempDir, "other"), { recursive: true });
 		const executor = makeExecutor();
 		for (const testCase of [
 			{
@@ -929,6 +931,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 	});
 
 	it("rejects async chain worktree runs with a conflicting task cwd", async () => {
+		fs.mkdirSync(path.join(tempDir, "other"), { recursive: true });
 		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: "leaf-chain" });
 		const executor = makeExecutor();
 
@@ -1033,11 +1036,15 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(args[modelIndex + 1], "anthropic/claude-haiku-4-5");
 	});
 
-	it("resolves parallel task cwd values relative to the request cwd", async () => {
-		const worktreeDir = path.join(tempDir, "worktree");
-		writePackageSkill(path.join(worktreeDir, "packages", "app"), "parallel-step-skill");
+	it("resolves parallel task cwd values relative to the trusted invoking cwd", async () => {
+		const invokingCwd = path.join(tempDir, "invoking");
+		const sharedCwd = path.join(tempDir, "shared-request");
+		const invokingTaskCwd = path.join(invokingCwd, "packages", "app");
+		const sharedTaskCwd = path.join(sharedCwd, "packages", "app");
+		writePackageSkill(invokingTaskCwd, "invoking-parallel-step-skill");
+		writePackageSkill(sharedTaskCwd, "shared-parallel-step-skill");
 		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [{ name: "echo", description: "Echo test agent", skills: ["parallel-step-skill"] }],
+			agents: [{ name: "echo", description: "Echo test agent", skills: ["invoking-parallel-step-skill"] }],
 			projectAgentsDir: null,
 		}));
 
@@ -1045,15 +1052,15 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			"id",
 			{
 				tasks: [{ agent: "echo", task: "test", cwd: "packages/app" }],
-				cwd: worktreeDir,
+				cwd: sharedCwd,
 			},
 			new AbortController().signal,
 			undefined,
-			makeCtx(makeSessionManagerRecorder().manager),
+			{ ...makeCtx(makeSessionManagerRecorder().manager), cwd: invokingCwd },
 		);
 
 		assert.equal(result.isError, undefined);
-		assert.deepEqual(result.details?.results?.[0]?.skills, ["parallel-step-skill"]);
+		assert.deepEqual(result.details?.results?.[0]?.skills, ["invoking-parallel-step-skill"]);
 	});
 
 	it("uses request cwd for project builtin overrides during management", async () => {

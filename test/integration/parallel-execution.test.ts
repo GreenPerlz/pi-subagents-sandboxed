@@ -638,6 +638,39 @@ Inspect`));
 		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
 	});
 
+	it("top-level parallel executes omitted cwd in shared cwd and explicit cwd in invoking cwd", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const invokingCwd = path.join(tempDir, "invoking");
+		const sharedCwd = path.join(tempDir, "shared-request");
+		const explicitCwd = path.join(invokingCwd, "explicit-task");
+		fs.mkdirSync(invokingCwd, { recursive: true });
+		fs.mkdirSync(sharedCwd, { recursive: true });
+		fs.mkdirSync(explicitCwd, { recursive: true });
+		const sharedMarker = path.join(tempDir, "parallel-shared-cwd.txt");
+		const explicitMarker = path.join(tempDir, "parallel-explicit-cwd.txt");
+		mockPi.onCall({ output: "shared cwd", commands: [`pwd > ${sharedMarker}`] });
+		mockPi.onCall({ output: "explicit cwd", commands: [`pwd > ${explicitMarker}`] });
+		const executor = makeExecutor();
+
+		const result = await executor.execute(
+			"parallel-cwd-resolution",
+			{
+				tasks: [
+					{ agent: "echo", task: "Use the shared cwd" },
+					{ agent: "echo", task: "Use the explicit cwd", cwd: "explicit-task" },
+				],
+				cwd: sharedCwd,
+				concurrency: 1,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(invokingCwd),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.equal(fs.readFileSync(sharedMarker, "utf8").trim(), sharedCwd);
+		assert.equal(fs.readFileSync(explicitMarker, "utf8").trim(), explicitCwd);
+	});
+
 	it("top-level parallel sandbox preserves child output, session, and progress mounts without worktree", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Sandboxed parallel done" });
 		const fakeBwrap = installFakeBwrap();

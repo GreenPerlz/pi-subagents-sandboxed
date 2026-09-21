@@ -22,6 +22,8 @@ const OutputOverride = Type.Unsafe({
 	description: "Explicit output filename/path (string), or false to disable file output. Omitted output stays inline-only. Explicit output changes require the target agent to permit output.",
 });
 
+const CwdDescription = "Working directory for this child or group. Relative paths resolve against the trusted actual invoking context.cwd (never process cwd or another requested shared cwd); existing same/canonical descendants are implicitly allowed, while canonical outside paths require the target agent's cwd permission and still pass normal Git/sandbox gates. For groups, group cwd is the fallback for omitted task cwd and an explicit task cwd takes precedence.";
+
 const OutputModeOverride = Type.String({
 	enum: ["inline", "file-only"],
 	description: "Return inline output (default) or only a concise reference to an intentional saved output. file-only requests persistence; explicit changes require outputMode permission.",
@@ -126,7 +128,7 @@ const AcceptanceOverride = Type.Unsafe({
 const TaskItem = Type.Object({
 	agent: Type.String(),
 	task: Type.String(),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(Type.String({ description: CwdDescription })),
 	count: Type.Optional(Type.Integer({ minimum: 1, description: "Repeat this parallel task N times with the same settings." })),
 	output: Type.Optional(OutputOverride),
 	outputMode: Type.Optional(OutputModeOverride),
@@ -146,7 +148,7 @@ const ParallelTaskSchema = Type.Object({
 	label: Type.Optional(Type.String({ description: "Optional user-facing label for this parallel task." })),
 	as: Type.Optional(Type.String({ description: "Optional safe identifier used as {outputs.name} in later chain steps." })),
 	outputSchema: Type.Optional(JsonSchemaObject),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(Type.String({ description: CwdDescription })),
 	count: Type.Optional(Type.Integer({ minimum: 1, description: "Repeat this parallel task N times with the same settings." })),
 	output: Type.Optional(OutputOverride),
 	outputMode: Type.Optional(OutputModeOverride),
@@ -175,7 +177,7 @@ const DynamicParallelTemplateSchema = Type.Object({
 	phase: Type.Optional(Type.String({ description: "Optional phase/group label for status and graph rendering." })),
 	label: Type.Optional(Type.String({ description: "Optional user-facing label; item templates are supported." })),
 	outputSchema: Type.Optional(JsonSchemaObject),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(Type.String({ description: CwdDescription })),
 	output: Type.Optional(OutputOverride),
 	outputMode: Type.Optional(OutputModeOverride),
 	reads: Type.Optional(ReadsOverride),
@@ -201,7 +203,7 @@ const ChainItem = Type.Object({
 	label: Type.Optional(Type.String({ description: "Optional user-facing label for this chain step." })),
 	as: Type.Optional(Type.String({ description: "Optional safe identifier used as {outputs.name} in later chain steps." })),
 	outputSchema: Type.Optional(JsonSchemaObject),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(Type.String({ description: CwdDescription })),
 	output: Type.Optional(OutputOverride),
 	outputMode: Type.Optional(OutputModeOverride),
 	reads: Type.Optional(ReadsOverride),
@@ -296,7 +298,7 @@ export const SubagentParams = Type.Object({
 	chainDir: Type.Optional(Type.String({ description: "Persistent directory for chain artifacts. Default: a user-scoped temp directory under <tmpdir>/ (auto-cleaned after 24h)" })),
 	async: Type.Optional(Type.Boolean({ description: "Run in background (default: false, or per config)" })),
 	agentScope: Type.Optional(Type.String({ description: "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" })),
-	cwd: Type.Optional(Type.String({ description: "Override cwd for affected children; each target agent must permit cwd." })),
+	cwd: Type.Optional(Type.String({ description: "Shared cwd for affected children. Relative paths resolve against trusted actual invoking context.cwd, never process cwd or another requested cwd. Same/canonical descendants are implicitly permitted; canonical outside paths require each affected target agent's explicit cwd permission from invoking-context-visible definitions and still pass Git/sandbox gates. Group cwd is the fallback for omitted tasks; explicit task cwd takes precedence." })),
 	artifacts: Type.Optional(Type.Boolean({ description: "Write debug artifacts (default: true)" })),
 	includeProgress: Type.Optional(Type.Boolean({ description: "Include full progress in result (default: false)" })),
 	share: Type.Optional(Type.Boolean({ description: "Upload session to GitHub Gist for sharing (default: false); explicit share changes require every affected agent to permit share." })),

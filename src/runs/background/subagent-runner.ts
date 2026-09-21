@@ -1883,7 +1883,7 @@ function prepareParallelTaskRun(
 	worktreeSetup: WorktreeSetup | undefined,
 	taskIndex: number,
 ): { taskForRun: SubagentStep; taskCwd: string } {
-	if (!worktreeSetup) return { taskForRun: task, taskCwd: cwd };
+	if (!worktreeSetup) return { taskForRun: task, taskCwd: task.cwd ?? cwd };
 	return {
 		taskForRun: { ...task, cwd: undefined },
 		taskCwd: worktreeSetup.worktrees[taskIndex]!.agentCwd,
@@ -3301,6 +3301,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 			const concurrency = group.concurrency ?? MAX_PARALLEL_CONCURRENCY;
 			const failFast = group.failFast ?? false;
 			const groupStartFlatIndex = flatIndex;
+			const groupCwd = group.cwd ?? cwd;
 			let aborted = false;
 			let worktreeSetup: WorktreeSetup | undefined;
 			if (!group.worktree
@@ -3325,7 +3326,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 				break;
 			}
 			if (group.worktree) {
-				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(group.parallel, cwd);
+				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(group.parallel, groupCwd);
 				if (worktreeTaskCwdConflict) {
 					const failedAt = Date.now();
 					markParallelGroupSetupFailure({
@@ -3333,7 +3334,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 						results,
 						group,
 						groupStartFlatIndex,
-						setupError: formatWorktreeTaskCwdConflict(worktreeTaskCwdConflict, cwd),
+						setupError: formatWorktreeTaskCwdConflict(worktreeTaskCwdConflict, groupCwd),
 						failedAt,
 						statusPath,
 						eventsPath,
@@ -3345,7 +3346,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 					break;
 				}
 				try {
-					worktreeSetup = createWorktrees(cwd, `${id}-s${stepIndex}`, group.parallel.length, {
+					worktreeSetup = createWorktrees(groupCwd, `${id}-s${stepIndex}`, group.parallel.length, {
 						agents: group.parallel.map((task) => task.agent),
 						setupHook: config.worktreeSetupHook
 							? { hookPath: config.worktreeSetupHook, timeoutMs: config.worktreeSetupHookTimeoutMs }
@@ -3451,7 +3452,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 						const taskSessionDir = config.sessionDir
 							? path.join(config.sessionDir, `parallel-${taskIdx}`)
 							: undefined;
-						const { taskForRun, taskCwd: preparedTaskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
+						const { taskForRun, taskCwd: preparedTaskCwd } = prepareParallelTaskRun(task, groupCwd, worktreeSetup, taskIdx);
 						const isolatedGit = resolveIsolatedGitWorktree(taskForRun, fi);
 						const packagedRole = resolvePackagedAgentRole(taskForRun.agent, taskForRun.source);
 						const isolatedGitRights = resolveCapabilityRights({
@@ -3464,7 +3465,7 @@ async function runSubagentCore(config: SubagentRunConfig): Promise<void> {
 							exclusiveLease: true,
 						});
 						const isolatedGitCapability = isolatedGit
-							? await issueIsolatedCapability(isolatedGit, isolatedGitRights, preparedTaskCwd, cwd)
+							? await issueIsolatedCapability(isolatedGit, isolatedGitRights, preparedTaskCwd, groupCwd)
 							: undefined;
 						// Keep the requested parent cwd in the step context; runSingleStep
 						// maps it to the private worktree and preserves subdirectories.

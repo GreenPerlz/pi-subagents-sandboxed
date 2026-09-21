@@ -103,7 +103,7 @@ interface TypesModule {
 
 interface ExecutorModule {
 	createSubagentExecutor?: (...args: unknown[]) => {
-		execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean; details?: { asyncId?: string } }>;
+		execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean; details?: { asyncId?: string; asyncDir?: string } }>;
 	};
 }
 
@@ -350,6 +350,136 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		} finally {
 			removeTempDir(dir);
 		}
+	});
+
+	it("bootstraps cwd authorization from the trusted invoking discovery root", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const invokingCwd = path.join(tempDir, "trusted-invoking");
+		const requestedCwd = path.join(tempDir, "requested-sibling");
+		fs.mkdirSync(invokingCwd, { recursive: true });
+		fs.mkdirSync(requestedCwd, { recursive: true });
+		enableTrustedSandboxOptOut();
+		const targetWithoutCwdPermission = makeAgent("worker", { canBeChangedByAgent: [] });
+		// Keep the permitted branch independent of host user sandbox defaults. The
+		// behavior under test is cwd authorization, not provider selection.
+		const targetWithCwdPermission = makeAgent("worker", { canBeChangedByAgent: ["cwd"], sandbox: { provider: "none" } });
+		const discoveryRoots: string[] = [];
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state: { baseCwd: invokingCwd, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (p: string) => p,
+			discoverAgents: (cwd: string) => {
+				discoveryRoots.push(cwd);
+				return { agents: [path.resolve(cwd) === path.resolve(invokingCwd) ? targetWithoutCwdPermission : targetWithCwdPermission] };
+			},
+		});
+		const ctx = makeMinimalCtx(invokingCwd);
+
+		const denied = await executor.execute(
+			"trusted-cwd-bootstrap-denied",
+			{ agent: "worker", task: "must not run", cwd: requestedCwd },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		assert.equal(denied.isError, true);
+		assert.match(denied.content[0]?.text ?? "", /worker: denied cwd/);
+		assert.equal(mockPi.callCount(), 0, "outside project definition must not authorize cwd");
+		assert.deepEqual(discoveryRoots.slice(0, 2), [invokingCwd, requestedCwd]);
+
+		mockPi.onCall({ output: "outside cwd accepted", commands: [`pwd > ${path.join(requestedCwd, "observed-cwd.txt")}`] });
+		const permittedTargetExecutor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state: { baseCwd: invokingCwd, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [targetWithCwdPermission] }),
+		});
+		const permitted = await permittedTargetExecutor.execute(
+			"trusted-cwd-bootstrap-permitted",
+			{ agent: "worker", task: "report cwd", cwd: requestedCwd },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		assert.equal(permitted.isError, undefined, permitted.content[0]?.text);
+		assert.equal(fs.readFileSync(path.join(requestedCwd, "observed-cwd.txt"), "utf8").trim(), requestedCwd);
+	});
+
+	it("pins admitted symlink cwd identities across foreground and async chain execution", { skip: !createSubagentExecutor || !isAsyncAvailable() ? "executor or async runner unavailable" : undefined }, async () => {
+		const invokingCwd = path.join(tempDir, "trusted-invoking-alias");
+		const inside = path.join(invokingCwd, "inside");
+		const outside = path.join(tempDir, "outside-alias-target");
+		const link = path.join(invokingCwd, "link");
+		const observed = path.join(tempDir, "observed-cwd.txt");
+		const outsideMarker = path.join(outside, "outside-marker.txt");
+		fs.mkdirSync(inside, { recursive: true });
+		fs.mkdirSync(outside, { recursive: true });
+		fs.symlinkSync(inside, link);
+		enableTrustedSandboxOptOut();
+		const worker = makeAgent("worker", { canBeChangedByAgent: ["sandbox.provider"], sandbox: { provider: "none" } });
+		const ctx = makeMinimalCtx(invokingCwd);
+		const makeExecutor = () => createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state: { baseCwd: invokingCwd, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map() },
+			config: {},
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => tempDir,
+			expandTilde: (value: string) => value,
+			discoverAgents: () => ({ agents: [worker] }),
+		});
+		const retarget = `rm -f ../link && ln -s ../outside-alias-target ../link`;
+		const observe = `test "$(pwd -P)" = "${inside}" || touch "${outsideMarker}"; pwd -P > "${observed}"`;
+		const chain = [
+			{ agent: "worker", task: "Retarget the alias", cwd: "link" },
+			{ agent: "worker", task: "Observe the admitted cwd", cwd: "link" },
+		];
+
+		mockPi.onCall({ output: "retargeted", commands: [retarget] });
+		mockPi.onCall({ output: "observed", commands: [observe] });
+		const foreground = await makeExecutor().execute("symlink-cwd-foreground", { chain, async: false, sandbox: { provider: "none" } }, new AbortController().signal, undefined, ctx);
+		assert.equal(foreground.isError, undefined, foreground.content[0]?.text);
+		assert.equal(fs.realpathSync(link), outside, "foreground retarget command must change the alias");
+		assert.equal(fs.readFileSync(observed, "utf8").trim(), inside);
+		assert.equal(fs.existsSync(outsideMarker), false, "foreground child must not execute through the retargeted alias");
+
+		fs.unlinkSync(link);
+		fs.symlinkSync(inside, link);
+		fs.rmSync(observed, { force: true });
+		mockPi.reset();
+		mockPi.onCall({ output: "retargeted", commands: [retarget] });
+		mockPi.onCall({ output: "observed", commands: [observe] });
+		const taskCallId = `symlink-cwd-async-call-${Date.now().toString(36)}`;
+		const started = await makeExecutor().execute(taskCallId, { chain, async: true, sandbox: { provider: "none" } }, new AbortController().signal, undefined, ctx);
+		assert.equal(started.isError, undefined, started.content[0]?.text);
+		const asyncId = started.details?.asyncId;
+		assert.ok(asyncId, "expected actual async run id");
+		const asyncDir = started.details?.asyncDir;
+		assert.ok(asyncDir, "expected actual async run directory");
+		assert.equal(asyncDir, path.join(ASYNC_DIR!, asyncId));
+		const configPath = path.join(TEMP_ROOT_DIR!, `async-cfg-${asyncId}.json`);
+		const serializedConfig = JSON.parse(fs.readFileSync(configPath, "utf8")) as { steps?: Array<{ cwd?: string }> };
+		assert.deepEqual(serializedConfig.steps?.map((step) => step.cwd), [inside, inside]);
+		const resultPath = await waitForAsyncResultFile(asyncId, 30_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as AsyncResultPayload;
+		assert.equal(payload.success, true, JSON.stringify(payload));
+		assert.deepEqual(payload.results.map((result) => ({ output: result.output, success: result.success })), [
+			{ output: "retargeted", success: true },
+			{ output: "observed", success: true },
+		]);
+		assert.equal(fs.realpathSync(link), outside, "async retarget command must change the alias");
+		assert.equal(fs.readFileSync(observed, "utf8").trim(), inside);
+		assert.equal(fs.existsSync(outsideMarker), false, "async child must not execute through the retargeted alias");
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(configPath, { force: true });
+		fs.rmSync(path.join(RESULTS_DIR!, `${asyncId}.json`), { force: true });
 	});
 
 	it("keeps an explicit root route separate from ambient ancestry for async chains", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1879,6 +2009,140 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(payload.workflowGraph?.nodes?.[1]?.error ?? "", /Collected output validation failed/);
 	});
 
+	it("async static groups execute omitted cwd in group cwd and explicit task cwd in invoking cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const invokingCwd = path.join(tempDir, "invoking-async-static");
+		const sharedCwd = path.join(tempDir, "shared-async-static");
+		const groupCwd = path.join(sharedCwd, "group");
+		const explicitCwd = path.join(invokingCwd, "explicit-task");
+		fs.mkdirSync(groupCwd, { recursive: true });
+		fs.mkdirSync(explicitCwd, { recursive: true });
+		const groupMarker = path.join(tempDir, "async-static-group-cwd.txt");
+		const explicitMarker = path.join(tempDir, "async-static-task-cwd.txt");
+		mockPi.onCall({ output: "group cwd", commands: [`pwd > ${groupMarker}`] });
+		mockPi.onCall({ output: "explicit task cwd", commands: [`pwd > ${explicitMarker}`] });
+		const id = `async-static-cwd-${Date.now().toString(36)}`;
+		const started = executeAsyncChain!(id, {
+			chain: [{
+				parallel: [
+					{ agent: "worker", task: "Use group cwd" },
+					{ agent: "worker", task: "Override group cwd", cwd: "explicit-task" },
+				],
+				cwd: groupCwd,
+				concurrency: 1,
+			}],
+			agents: [makeAgent("worker")],
+			ctx: { pi: { events: createEventBus() }, cwd: invokingCwd, currentSessionId: "async-static-cwd" },
+			cwd: sharedCwd,
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sandbox: { provider: "none" },
+		});
+		assert.equal(started.isError, undefined, started.content[0]?.text);
+		const resultPath = await waitForAsyncResultFile(id, 30_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as AsyncResultPayload & { cwd?: string };
+		assert.equal(payload.success, true, JSON.stringify(payload));
+		assert.equal(payload.mode, "chain");
+		assert.equal(payload.cwd, sharedCwd);
+		assert.equal(fs.readFileSync(groupMarker, "utf8").trim(), groupCwd);
+		assert.equal(fs.readFileSync(explicitMarker, "utf8").trim(), explicitCwd);
+	});
+
+	it("async dynamic fanout executes template cwd fallback and explicit template override", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const invokingCwd = path.join(tempDir, "invoking-async-dynamic");
+		const sharedCwd = path.join(tempDir, "shared-async-dynamic");
+		const groupCwd = path.join(sharedCwd, "group");
+		const explicitCwd = path.join(invokingCwd, "explicit-template");
+		fs.mkdirSync(groupCwd, { recursive: true });
+		fs.mkdirSync(explicitCwd, { recursive: true });
+		const fallbackMarker = path.join(tempDir, "async-dynamic-fallback-cwd.txt");
+		const overrideMarker = path.join(tempDir, "async-dynamic-override-cwd.txt");
+		mockPi.onCall({ output: "first targets", structuredOutput: { items: [{ path: "first" }] } });
+		mockPi.onCall({ output: "first result", structuredOutput: { ok: "first" }, commands: [`pwd > ${fallbackMarker}`] });
+		mockPi.onCall({ output: "second targets", structuredOutput: { items: [{ path: "second" }] } });
+		mockPi.onCall({ output: "second result", structuredOutput: { ok: "second" }, commands: [`pwd > ${overrideMarker}`] });
+		const id = `async-dynamic-cwd-${Date.now().toString(36)}`;
+		const started = executeAsyncChain!(id, {
+			chain: [
+				{ agent: "producer", task: "Produce first", as: "firstTargets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "firstTargets", path: "/items" }, item: "item", key: "/path", maxItems: 2 },
+					parallel: { agent: "consumer", task: "Consume {item.path}", outputSchema: { type: "object" } },
+					collect: { as: "firstResults" },
+					cwd: groupCwd,
+				},
+				{ agent: "producer", task: "Produce second", as: "secondTargets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "secondTargets", path: "/items" }, item: "item", key: "/path", maxItems: 2 },
+					parallel: { agent: "consumer", task: "Consume {item.path}", cwd: "explicit-template", outputSchema: { type: "object" } },
+					collect: { as: "secondResults" },
+					cwd: groupCwd,
+				},
+			],
+			agents: [makeAgent("producer"), makeAgent("consumer")],
+			ctx: { pi: { events: createEventBus() }, cwd: invokingCwd, currentSessionId: "async-dynamic-cwd" },
+			cwd: sharedCwd,
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			sandbox: { provider: "none" },
+		});
+		assert.equal(started.isError, undefined, started.content[0]?.text);
+		const resultPath = await waitForAsyncResultFile(id, 30_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as AsyncResultPayload & { cwd?: string };
+		assert.equal(payload.success, true, JSON.stringify(payload));
+		assert.equal(payload.mode, "chain");
+		assert.equal(payload.cwd, sharedCwd);
+		assert.equal(fs.readFileSync(fallbackMarker, "utf8").trim(), groupCwd);
+		assert.equal(fs.readFileSync(overrideMarker, "utf8").trim(), explicitCwd);
+		const firstResults = payload.outputs?.firstResults?.structured as Array<{ key: string; structured: unknown }>;
+		const secondResults = payload.outputs?.secondResults?.structured as Array<{ key: string; structured: unknown }>;
+		assert.deepEqual(firstResults.map(({ key, structured }) => ({ key, structured })), [{ key: "first", structured: { ok: "first" } }]);
+		assert.deepEqual(secondResults.map(({ key, structured }) => ({ key, structured })), [{ key: "second", structured: { ok: "second" } }]);
+	});
+
+	it("async worktree static group keeps chain progress at runner cwd when group cwd differs", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const repoDir = createRepo("pi-subagent-async-progress-worktree-");
+		const groupCwd = path.join(repoDir, "group");
+		fs.mkdirSync(groupCwd, { recursive: true });
+		fs.writeFileSync(path.join(groupCwd, "group-input.txt"), "group input\n", "utf8");
+		git(repoDir, ["add", "group/group-input.txt"]);
+		git(repoDir, ["commit", "-m", "add group input"]);
+		const id = `async-progress-worktree-${Date.now().toString(36)}`;
+		const observedCwd = path.join(tempDir, "async-progress-observed-cwd.txt");
+		const worktreeCwd = path.join(os.tmpdir(), `pi-worktree-${id}-s0-0`, "group");
+		try {
+			mockPi.onCall({
+				output: "progress worktree complete",
+				commands: [
+					`test -f ${JSON.stringify(path.join(repoDir, "progress.md"))}`,
+					`pwd > ${JSON.stringify(observedCwd)}`,
+				],
+			});
+			const started = executeAsyncChain!(id, {
+				chain: [{ parallel: [{ agent: "worker", task: "Track progress from the group", reads: ["group-input.txt"], progress: true }], cwd: groupCwd, worktree: true }],
+				agents: [makeAgent("worker")],
+				ctx: { pi: { events: createEventBus() }, cwd: repoDir, currentSessionId: "async-progress-worktree" },
+				cwd: repoDir,
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				sandbox: { provider: "none" },
+			});
+			assert.equal(started.isError, undefined, started.content[0]?.text);
+			const resultPath = await waitForAsyncResultFile(id, 30_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf8")) as AsyncResultPayload;
+			assert.equal(payload.success, true, JSON.stringify(payload));
+			assert.equal(fs.existsSync(path.join(repoDir, "progress.md")), true, "runner progress file belongs to chain root");
+			assert.equal(fs.readFileSync(observedCwd, "utf8").trim(), worktreeCwd);
+			const taskArg = readLastMockPiArgs(mockPi).at(-1) ?? "";
+			assert.ok(taskArg.includes(`Update progress at: ${path.join(repoDir, "progress.md")}`));
+			assert.ok(taskArg.includes(`[Read from: ${path.join(worktreeCwd, "group-input.txt")}]`));
+		} finally {
+			removeTempDir(repoDir);
+		}
+	});
+
 	it("top-level async worktree parallel resolves reads and output against the worktree cwd", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		enableTrustedSandboxOptOut();
 		const repoDir = createRepo("pi-subagent-async-worktree-");
@@ -2931,8 +3195,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(result.content[0]?.text ?? "", /Skills not found: pi-subagents/);
 	});
 
-	it("background chains resolve relative step cwd values against the shared cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("background chains resolve relative step cwd values against the actual invoking cwd, not the shared cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "Done asynchronously" });
+		const invokingCwd = path.join(tempDir, "invoking");
+		fs.mkdirSync(invokingCwd, { recursive: true });
 		const chainCwd = createTempDir("pi-subagent-async-chain-cwd-");
 		const id = `async-chain-skill-cwd-${Date.now().toString(36)}`;
 		const asyncDir = path.join(ASYNC_DIR, id);
@@ -2940,11 +3206,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const statusPath = path.join(asyncDir, "status.json");
 
 		try {
-			writePackageSkill(path.join(chainCwd, "packages", "app"), "async-chain-step-skill");
+			writePackageSkill(path.join(invokingCwd, "packages", "app"), "async-chain-step-skill");
 			executeAsyncChain(id, {
 				chain: [{ agent: "worker", task: "Do work", cwd: "packages/app", skill: ["async-chain-step-skill"] }],
 				agents: [makeAgent("worker")],
-				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				ctx: { pi: { events: { emit() {} } }, cwd: invokingCwd, currentSessionId: "session-1" },
 				cwd: chainCwd,
 				artifactConfig: {
 					enabled: false,

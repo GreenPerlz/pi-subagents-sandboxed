@@ -7,7 +7,7 @@ Most users need no configuration beyond Bubblewrap. Effective values resolve fro
 3. agent frontmatter (overrides settings defaults),
 4. permitted run options (override frontmatter).
 
-At each user or project scope, dedicated `subagents.json` wins over the legacy `settings.json -> subagents` block. Agent discovery separately follows project over user over packaged definitions. A run option is effective only when the target agent's `canBeChangedByAgent` permits that exact override; precedence is not authority. The complete list of settings, frontmatter fields, acceptance fields, run options, and recovery metadata is preserved in the [settings reference](settings-reference.md); use this page to route concepts rather than duplicate that reference.
+At each user or project scope, dedicated `subagents.json` wins over the legacy `settings.json -> subagents` block. Agent discovery separately follows project over user over packaged definitions. A run option is effective only when the target agent's `canBeChangedByAgent` permits that exact override; precedence is not authority. For cwd, existing same/canonical descendants of the trusted actual invoking `ctx.cwd` are implicitly allowed; canonical outside paths require explicit `cwd` permission from definitions visible at that invoking root and still pass normal Git/read-only/trust/sandbox gates. Relative cwd values anchor at actual invoking `ctx.cwd`, never process cwd or a requested shared cwd; group cwd is fallback and explicit task cwd wins. The complete list of settings, frontmatter fields, acceptance fields, run options, and recovery metadata is preserved in the [settings reference](settings-reference.md); use this page to route concepts rather than duplicate that reference.
 
 ## Minimal safe defaults
 
@@ -47,7 +47,7 @@ subagent({ action: "get", agent: "review" })
 subagent({ action: "doctor" })
 ```
 
-Guarded fields such as `model`, `context`, `output`, `worktree`, `acceptance.*`, and `sandbox.*` are checked against every affected agent's `canBeChangedByAgent`. `async`, `clarify`, and `concurrency` are orchestration controls, not grants of child capability.
+Guarded fields such as `model`, `context`, `output`, `worktree`, `acceptance.*`, and `sandbox.*` are checked against every affected agent's `canBeChangedByAgent`. Cwd uses canonical containment: an existing path equal to or beneath trusted actual invoking `ctx.cwd` is implicitly permitted; outside, ancestor, prefix-sibling, or symlink-escaping paths need explicit `cwd` permission from definitions visible at that invoking root and still pass Git/read-only/trust/sandbox gates. Relative values anchor at actual invoking `ctx.cwd`, never process cwd or a requested shared cwd. In groups, group cwd is the fallback and explicit task cwd wins. `async`, `clarify`, and `concurrency` are orchestration controls, not grants of child capability.
 
 ## Configuration checklist
 

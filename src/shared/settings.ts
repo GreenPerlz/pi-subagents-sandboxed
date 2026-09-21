@@ -105,6 +105,8 @@ export interface DynamicParallelStep {
 	collect: DynamicCollectSpec;
 	concurrency?: number;
 	worktree?: boolean;
+	/** Group fallback cwd; relative values resolve against the invoking context. */
+	cwd?: string;
 	failFast?: boolean;
 	phase?: string;
 	label?: string;

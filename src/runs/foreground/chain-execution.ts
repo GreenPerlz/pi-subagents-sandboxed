@@ -122,6 +122,8 @@ interface ParallelChainRunInput {
 	ctx: ExtensionContext;
 	intercomEvents?: IntercomEventBus;
 	cwd?: string;
+	/** Trusted invocation cwd used as the base for explicit task cwd values. */
+	invokingCwd: string;
 	runId: string;
 	globalTaskIndex: number;
 	sessionDirForIndex: (idx?: number) => string | undefined;
@@ -326,12 +328,16 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 
 			const isolatedGit = input.isolatedGitWorktrees?.[taskIndex];
 			// Keep the requested parent cwd until runSingleAttempt maps it into the
-			// private worktree. This preserves task subdirectories for isolated Git.
-			const taskCwd = isolatedGit
-				? resolveChildCwd(input.cwd ?? input.ctx.cwd, task.cwd)
-				: (input.worktreeSetup
-					? input.worktreeSetup.worktrees[taskIndex]!.agentCwd
-					: resolveChildCwd(input.cwd ?? input.ctx.cwd, task.cwd));
+			// private worktree. Explicit task cwd values always resolve against the
+			// trusted invoking context; omitted values use the group's fallback cwd.
+			const requestedTaskCwd = task.cwd === undefined
+				? (input.cwd ?? input.ctx.cwd)
+				: resolveChildCwd(input.invokingCwd, task.cwd);
+		const taskCwd = isolatedGit
+			? requestedTaskCwd
+			: (input.worktreeSetup
+				? input.worktreeSetup.worktrees[taskIndex]!.agentCwd
+				: requestedTaskCwd);
 			// Scope-check each isolated task's canonical requested cwd before any
 			// per-task output/session/interrupt/artifact path or runtime setup.
 			// Issue capability only after the resolved sandbox is known, but before
@@ -708,6 +714,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		chainDir: chainDirBase,
 	} = params;
 	const chainSkills = chainSkillsParam ?? [];
+	// ExtensionContext.cwd is trusted invocation authority; request cwd values
+	// never supply this base.
+	const invokingCwd = ctx.cwd;
 	const sharedSandbox: SandboxTransport | undefined = normalizeSandboxTransport(params.sandbox);
 	const hasSandboxResolutionInputs = params.sandboxSettings !== undefined || params.sandboxRun !== undefined;
 	const resolveStepSandbox = (agent: AgentConfig): SandboxTransport | undefined => {
@@ -1201,7 +1210,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			// cleanup/recovery synthetic children must retain these flat identities.
 			const groupBaseIndex = globalTaskIndex;
 			const parallelTemplates = stepTemplates as string[];
-			const parallelCwd = resolveChildCwd(cwd ?? ctx.cwd, step.cwd);
+			const sharedCwd = cwd ?? ctx.cwd;
+			const parallelCwd = step.cwd === undefined ? sharedCwd : resolveChildCwd(invokingCwd, step.cwd);
 			const stepAgentConfigs = step.parallel
 				.map((task) => agents.find((agent) => agent.name === task.agent))
 				.filter((agent): agent is AgentConfig => Boolean(agent));
@@ -1241,7 +1251,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				const behavior = parallelBehaviors[taskIndex]!;
 				const task = step.parallel[taskIndex]!;
 				const taskAgentConfig = agents.find((agent) => agent.name === task.agent);
-				const taskCwd = resolveChildCwd(parallelCwd, task.cwd);
+				const taskCwd = task.cwd === undefined ? parallelCwd : resolveChildCwd(invokingCwd, task.cwd);
 				const outputPath = typeof behavior.output === "string" ? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output)) : undefined;
 				const savedOutputPath = shouldPersistSavedOutput({ output: behavior.output, outputMode: behavior.outputMode, tools: taskAgentConfig?.tools })
 					? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId, index: globalTaskIndex + taskIndex }) : undefined;
@@ -1293,7 +1303,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				}
 			}
 			if (step.worktree) {
-				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(step.parallel, parallelCwd);
+				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(step.parallel, parallelCwd, invokingCwd);
 				if (worktreeTaskCwdConflict) {
 					return await buildIsolatedChainError(
 						`parallel chain step ${stepIndex + 1}: ${formatWorktreeTaskCwdConflict(worktreeTaskCwdConflict, parallelCwd)}`,
@@ -1322,10 +1332,10 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					const task = step.parallel[taskIndex]!;
 					const taskAgentConfig = agents.find((agent) => agent.name === task.agent);
 					const taskCwd = isolatedGitWorktrees?.[taskIndex]
-						? resolveChildCwd(cwd ?? ctx.cwd, task.cwd)
+						? (task.cwd === undefined ? parallelCwd : resolveChildCwd(invokingCwd, task.cwd))
 						: (worktreeSetup
 							? worktreeSetup.worktrees[taskIndex]!.agentCwd
-							: resolveChildCwd(cwd ?? ctx.cwd, task.cwd));
+							: (task.cwd === undefined ? parallelCwd : resolveChildCwd(invokingCwd, task.cwd)));
 					const outputPath = typeof behavior.output === "string"
 						? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
 						: undefined;
@@ -1357,6 +1367,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					// Preserve the chain step's requested parent cwd for isolated Git
 					// subdirectory mapping.
 					cwd: parallelCwd,
+					invokingCwd,
 					runId,
 					globalTaskIndex,
 					sessionDirForIndex,
@@ -1688,6 +1699,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				failFast: step.failFast,
 				worktree: step.worktree,
 			};
+			const dynamicCwd = step.cwd === undefined ? (cwd ?? ctx.cwd) : resolveChildCwd(invokingCwd, step.cwd);
 			const parallelTemplates = materialized.parallel.map((task) => task.task ?? "{previous}");
 			const parallelBehaviors = resolveParallelBehaviors(dynamicParallelStep.parallel, agents, stepIndex, chainSkills)
 				.map((behavior, taskIndex) => suppressProgressForReadOnlyTask(behavior, parallelTemplates[taskIndex] ?? dynamicParallelStep.parallel[taskIndex]?.task, originalTask));
@@ -1696,7 +1708,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				const behavior = parallelBehaviors[taskIndex]!;
 				const task = dynamicParallelStep.parallel[taskIndex]!;
 				const taskAgentConfig = agents.find((agent) => agent.name === task.agent);
-				const taskCwd = resolveChildCwd(cwd ?? ctx.cwd, task.cwd);
+				const taskCwd = task.cwd === undefined ? dynamicCwd : resolveChildCwd(invokingCwd, task.cwd);
 				const outputPath = typeof behavior.output === "string" ? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output)) : undefined;
 				const savedOutputPath = shouldPersistSavedOutput({ output: behavior.output, outputMode: behavior.outputMode, tools: taskAgentConfig?.tools })
 					? resolveSavedOutputPath({ runtimeCwd: ctx.cwd, requestedCwd: taskCwd, agent: task.agent, runId, index: globalTaskIndex + taskIndex }) : undefined;
@@ -1763,7 +1775,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				originalTask,
 				ctx,
 				intercomEvents,
-				cwd,
+				cwd: dynamicCwd,
+				invokingCwd,
 				runId,
 				globalTaskIndex,
 				sessionDirForIndex,
@@ -1958,7 +1971,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				?? (seqStep.model ? resolveModelCandidate(seqStep.model, availableModels, ctx.model?.provider) : null)
 				?? resolveModelCandidate(agentConfig.model, availableModels, ctx.model?.provider);
 
-			const stepCwd = resolveChildCwd(cwd ?? ctx.cwd, seqStep.cwd);
+			const stepCwd = seqStep.cwd === undefined ? (cwd ?? ctx.cwd) : resolveChildCwd(invokingCwd, seqStep.cwd);
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
 				: undefined;

@@ -179,7 +179,7 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, i
 		label: "Subagent",
 		description: [
 			"Delegate to subagents from child-safe fanout mode.",
-			"Explicit agent-specific overrides are deny-by-default and must be listed by each target agent's canBeChangedByAgent policy; denied paths fail before child spawn.",
+			"Explicit agent-specific overrides are deny-by-default and must be listed by each target agent's canBeChangedByAgent policy; denied paths fail before child spawn. Cwd relative values use trusted actual invoking ctx.cwd, with same/canonical descendants implicitly allowed and canonical outside paths requiring explicit cwd permission from invoking-context-visible definitions plus normal Git/read-only/trust/sandbox gates; group cwd is the fallback and explicit task cwd takes precedence.",
 			"For goal-style requests such as /goal, goal, active goal, or work until evidence says done, use explicit acceptance on the delegated run: criteria for the target, evidence/verify for proof, stopRules for constraints, selfReview only to override the target agent default, and maxFinalizationTurns for the bounded loop.",
 			"Allowed management/control actions: list, get, status, interrupt, resume, doctor.",
 			"Agent config mutation actions create, update, and delete are blocked in this mode.",

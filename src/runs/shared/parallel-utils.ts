@@ -48,6 +48,7 @@ export interface ParallelStepGroup {
 	concurrency?: number;
 	failFast?: boolean;
 	worktree?: boolean;
+	cwd?: string;
 	/** Trusted parent preflight result; never accepted from model-generated input. */
 	worktreeOptOutAuthorized?: boolean;
 }
@@ -58,6 +59,7 @@ export interface DynamicRunnerGroup {
 	collect: DynamicCollectSpec;
 	concurrency?: number;
 	worktree?: boolean;
+	cwd?: string;
 	/** Trusted parent preflight result; never accepted from model-generated input. */
 	worktreeOptOutAuthorized?: boolean;
 	failFast?: boolean;

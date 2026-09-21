@@ -1,6 +1,7 @@
 import type { AgentConfig } from "../../agents/agents.ts";
 import { isDynamicParallelStep, isParallelStep, type ChainStep } from "../../shared/settings.ts";
 import type { AcceptanceInput } from "../../shared/types.ts";
+import { evaluateCwdPolicy, type CwdPolicyContext, type CwdPolicyEvaluation, type ResolvedCwd } from "./cwd-policy.ts";
 
 /** Canonical paths whose values can be changed for a particular child agent at run time. */
 export const GUARDED_AGENT_OVERRIDE_PATHS = [
@@ -243,11 +244,12 @@ export function collectAgentOverridePaths(params: AgentOverridePolicyParams): Ma
 
 export function findAgentOverridePolicyViolations(
 	targets: readonly AgentOverridePolicyTarget[],
+	options: { allowImplicitCwd?: boolean } = {},
 ): AgentOverridePolicyViolation[] {
 	const violations: AgentOverridePolicyViolation[] = [];
 	for (const target of targets) {
 		const denied = [...new Set(target.paths)]
-			.filter((path) => !(path === "worktree" && target.worktreeOptOut === true && target.agent.canOptOutOfWorktree === true) && !isAgentOverrideAllowed(target.agent, path))
+			.filter((path) => !(options.allowImplicitCwd && path === "cwd") && !(path === "worktree" && target.worktreeOptOut === true && target.agent.canOptOutOfWorktree === true) && !isAgentOverrideAllowed(target.agent, path))
 			.sort((a, b) => a.localeCompare(b));
 		if (denied.length > 0) {
 			violations.push({
@@ -260,17 +262,40 @@ export function findAgentOverridePolicyViolations(
 	return violations;
 }
 
-export function validateAgentOverridePolicy(
+export interface AgentOverridePolicyEvaluation {
+	violations: AgentOverridePolicyViolation[];
+	cwdResolutions: ReadonlyMap<string, ResolvedCwd>;
+}
+
+export function evaluateAgentOverridePolicy(
 	params: AgentOverridePolicyParams,
 	agents: readonly AgentConfig[],
-): AgentOverridePolicyViolation[] {
+	options: { cwdContext?: CwdPolicyContext; cwdAgents?: readonly AgentConfig[] } = {},
+): AgentOverridePolicyEvaluation {
 	const pathsByAgent = collectAgentOverridePaths(params);
 	const targets: AgentOverridePolicyTarget[] = [];
 	for (const [agentName, paths] of pathsByAgent) {
 		const agent = agents.find((candidate) => candidate.name === agentName);
 		if (agent) targets.push({ agent, paths: [...paths], ...(params.worktree === false ? { worktreeOptOut: true } : {}) });
 	}
-	return findAgentOverridePolicyViolations(targets);
+	const cwdEvaluation: CwdPolicyEvaluation = options.cwdContext
+		? evaluateCwdPolicy(params, options.cwdAgents ?? agents, options.cwdContext)
+		: { violations: [], resolutions: new Map() };
+	return {
+		violations: [
+			...findAgentOverridePolicyViolations(targets, { allowImplicitCwd: Boolean(options.cwdContext) }),
+			...cwdEvaluation.violations,
+		],
+		cwdResolutions: cwdEvaluation.resolutions,
+	};
+}
+
+export function validateAgentOverridePolicy(
+	params: AgentOverridePolicyParams,
+	agents: readonly AgentConfig[],
+	options: { cwdContext?: CwdPolicyContext; cwdAgents?: readonly AgentConfig[] } = {},
+): AgentOverridePolicyViolation[] {
+	return evaluateAgentOverridePolicy(params, agents, options).violations;
 }
 
 export function formatAgentOverridePolicyError(violations: readonly AgentOverridePolicyViolation[]): string {
@@ -288,6 +313,7 @@ export function formatAgentOverridePolicyError(violations: readonly AgentOverrid
 export function validateAndFormatAgentOverridePolicy(
 	params: AgentOverridePolicyParams,
 	agents: readonly AgentConfig[],
+	options: { cwdContext?: CwdPolicyContext; cwdAgents?: readonly AgentConfig[] } = {},
 ): string | undefined {
-	return formatAgentOverridePolicyError(validateAgentOverridePolicy(params, agents)) || undefined;
+	return formatAgentOverridePolicyError(validateAgentOverridePolicy(params, agents, options)) || undefined;
 }

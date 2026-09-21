@@ -82,6 +82,7 @@ type TestChainStep = TestSequentialStep | {
 	concurrency?: number;
 	failFast?: boolean;
 	label?: string;
+	cwd?: string;
 	acceptance?: unknown;
 };
 
@@ -665,6 +666,52 @@ process.exit(child.status ?? 0);
 		assert.equal(result.details.workflowGraph?.nodes[0]?.outputName, "contextOutput");
 	});
 
+	it("foreground dynamic fanout executes template cwd fallback and explicit template override", async () => {
+		const invokingCwd = path.join(tempDir, "invoking-dynamic");
+		const sharedCwd = path.join(tempDir, "shared-dynamic");
+		const groupCwd = path.join(sharedCwd, "group");
+		const explicitCwd = path.join(invokingCwd, "explicit-template");
+		fs.mkdirSync(groupCwd, { recursive: true });
+		fs.mkdirSync(explicitCwd, { recursive: true });
+		const fallbackMarker = path.join(tempDir, "foreground-dynamic-fallback-cwd.txt");
+		const overrideMarker = path.join(tempDir, "foreground-dynamic-override-cwd.txt");
+		mockPi.onCall({ output: "first targets", structuredOutput: { items: [{ path: "first" }] } });
+		mockPi.onCall({ output: "first result", structuredOutput: { ok: "first" }, commands: [`pwd > ${fallbackMarker}`] });
+		mockPi.onCall({ output: "second targets", structuredOutput: { items: [{ path: "second" }] } });
+		mockPi.onCall({ output: "second result", structuredOutput: { ok: "second" }, commands: [`pwd > ${overrideMarker}`] });
+
+		const result = await executeChain(
+			makeChainParams(
+				[
+					{ agent: "producer", task: "Produce first", as: "firstTargets", outputSchema: { type: "object" } },
+					{
+						expand: { from: { output: "firstTargets", path: "/items" }, item: "item", key: "/path", maxItems: 2 },
+						parallel: { agent: "consumer", task: "Consume {item.path}", outputSchema: { type: "object" } },
+						collect: { as: "firstResults" },
+						cwd: groupCwd,
+					},
+					{ agent: "producer", task: "Produce second", as: "secondTargets", outputSchema: { type: "object" } },
+					{
+						expand: { from: { output: "secondTargets", path: "/items" }, item: "item", key: "/path", maxItems: 2 },
+						parallel: { agent: "consumer", task: "Consume {item.path}", cwd: "explicit-template", outputSchema: { type: "object" } },
+						collect: { as: "secondResults" },
+						cwd: groupCwd,
+					},
+				],
+				[makeAgent("producer"), makeAgent("consumer")],
+				{ cwd: sharedCwd, ctx: makeMinimalCtx(invokingCwd) },
+			),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.equal(fs.readFileSync(fallbackMarker, "utf8").trim(), groupCwd);
+		assert.equal(fs.readFileSync(overrideMarker, "utf8").trim(), explicitCwd);
+		const firstResults = result.details.outputs?.firstResults?.structured as Array<{ key: string; structured: unknown }>;
+		const secondResults = result.details.outputs?.secondResults?.structured as Array<{ key: string; structured: unknown }>;
+		assert.deepEqual(firstResults.map(({ key, structured }) => ({ key, structured })), [{ key: "first", structured: { ok: "first" } }]);
+		assert.deepEqual(secondResults.map(({ key, structured }) => ({ key, structured })), [{ key: "second", structured: { ok: "second" } }]);
+	});
+
 	it("expands structured named output into dynamic parallel children and collects results", async () => {
 		mockPi.onCall({
 			output: "targets",
@@ -1096,10 +1143,12 @@ process.exit(child.status ?? 0);
 		assert.ok(result.content[0].text.includes("Unknown agent"));
 	});
 
-	it("resolves relative step cwd values against the chain cwd for skills", async () => {
+	it("resolves relative step cwd values against the actual invoking cwd, not the shared chain cwd", async () => {
 		mockPi.onCall({ output: "ok" });
-		const chainCwd = path.join(tempDir, "worktree");
-		const stepPackageDir = path.join(chainCwd, "packages", "app");
+		const invokingCwd = path.join(tempDir, "invoking");
+		const chainCwd = path.join(tempDir, "shared-chain-cwd");
+		fs.mkdirSync(chainCwd, { recursive: true });
+		const stepPackageDir = path.join(invokingCwd, "packages", "app");
 		writePackageSkill(stepPackageDir, "chain-step-skill");
 		const agents = [makeAgent("analyst", { skills: ["chain-step-skill"] })];
 
@@ -1107,12 +1156,44 @@ process.exit(child.status ?? 0);
 			makeChainParams(
 				[{ agent: "analyst", task: "Analyze", cwd: "packages/app" }],
 				agents,
-				{ cwd: chainCwd },
+				{ cwd: chainCwd, ctx: makeMinimalCtx(invokingCwd) },
 			),
 		);
 
 		assert.ok(!result.isError, `chain should succeed: ${JSON.stringify(result.content)}`);
 		assert.deepEqual(result.details.results[0]?.skills, ["chain-step-skill"]);
+	});
+
+	it("foreground static groups execute omitted cwd in group cwd and explicit task cwd in invoking cwd", async () => {
+		const invokingCwd = path.join(tempDir, "invoking-static");
+		const sharedCwd = path.join(tempDir, "shared-static");
+		const groupCwd = path.join(sharedCwd, "group");
+		const explicitCwd = path.join(invokingCwd, "explicit-task");
+		fs.mkdirSync(groupCwd, { recursive: true });
+		fs.mkdirSync(explicitCwd, { recursive: true });
+		const groupMarker = path.join(tempDir, "foreground-static-group-cwd.txt");
+		const explicitMarker = path.join(tempDir, "foreground-static-task-cwd.txt");
+		mockPi.onCall({ output: "group cwd", commands: [`pwd > ${groupMarker}`] });
+		mockPi.onCall({ output: "explicit task cwd", commands: [`pwd > ${explicitMarker}`] });
+
+		const result = await executeChain(
+			makeChainParams(
+				[{
+					parallel: [
+						{ agent: "worker", task: "Use group cwd" },
+						{ agent: "worker", task: "Override group cwd", cwd: "explicit-task" },
+					],
+					cwd: groupCwd,
+					concurrency: 1,
+				}],
+				[makeAgent("worker")],
+				{ cwd: sharedCwd, ctx: makeMinimalCtx(invokingCwd) },
+			),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.equal(fs.readFileSync(groupMarker, "utf8").trim(), groupCwd);
+		assert.equal(fs.readFileSync(explicitMarker, "utf8").trim(), explicitCwd);
 	});
 
 	it("tracks chain metadata (chainAgents, totalSteps)", async () => {

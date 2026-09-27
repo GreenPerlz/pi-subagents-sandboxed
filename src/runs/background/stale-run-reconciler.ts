@@ -14,6 +14,7 @@ interface StartedRunMetadata {
 	runId: string;
 	pid?: number;
 	sessionId?: string;
+	cwd?: string;
 	mode?: SubagentRunMode;
 	agents?: string[];
 	chainStepCount?: number;
@@ -100,13 +101,16 @@ interface ResultChildOutcome {
 interface ResultRepairData {
 	state: "complete" | "failed" | "paused" | "cancelled";
 	results?: ResultChildOutcome[];
+	sessionId?: string;
+	cwd?: string;
 	finalOutput?: string;
 	teardownUnproven?: boolean;
 }
 
-function readResultRepairData(resultPath: string, fallbackState?: AsyncStatus["state"]): (ResultRepairData & { workflowGraph?: AsyncStatus["workflowGraph"]; groupDiagnostics?: AsyncStatus["groupDiagnostics"]; outputs?: AsyncStatus["outputs"]; sessionFile?: string; finalOutput?: string }) | undefined {
+function readResultRepairData(resultPath: string, fallbackState?: AsyncStatus["state"], expectedRunId?: string): (ResultRepairData & { workflowGraph?: AsyncStatus["workflowGraph"]; groupDiagnostics?: AsyncStatus["groupDiagnostics"]; outputs?: AsyncStatus["outputs"]; sessionFile?: string; finalOutput?: string }) | undefined {
 	try {
 		const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as {
+			id?: string; runId?: string; sessionId?: string; cwd?: string;
 			success?: boolean; state?: string; exitCode?: number; results?: ResultChildOutcome[];
 			workflowGraph?: AsyncStatus["workflowGraph"];
 			groupDiagnostics?: AsyncStatus["groupDiagnostics"];
@@ -114,6 +118,8 @@ function readResultRepairData(resultPath: string, fallbackState?: AsyncStatus["s
 			outputs?: AsyncStatus["outputs"];
 			sessionFile?: string; finalOutput?: string;
 		};
+		const resultIdentityMatches = (data.id === expectedRunId || data.runId === expectedRunId)
+			&& (!data.id || !data.runId || data.id === data.runId);
 		const childFailed = data.results?.some((child) => child.cancelled !== true && child.interrupted !== true
 			&& child.state !== "paused" && child.state !== "cancelled"
 			&& (child.success === false || child.state === "failed" || (child.exitCode !== undefined && child.exitCode !== null && child.exitCode !== 0))) === true;
@@ -121,6 +127,8 @@ function readResultRepairData(resultPath: string, fallbackState?: AsyncStatus["s
 		return {
 			state,
 			...(Array.isArray(data.results) ? { results: data.results } : {}),
+			...(resultIdentityMatches && typeof data.sessionId === "string" ? { sessionId: data.sessionId } : {}),
+			...(resultIdentityMatches && typeof data.cwd === "string" ? { cwd: data.cwd } : {}),
 			...(data.workflowGraph ? { workflowGraph: data.workflowGraph } : {}),
 			...(Array.isArray(data.groupDiagnostics) ? { groupDiagnostics: data.groupDiagnostics } : {}),
 			...(data.outputs ? { outputs: data.outputs } : {}),
@@ -162,7 +170,7 @@ function repairTeardownResultProjection(resultPath: string): boolean {
 }
 
 function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: number): AsyncStatus | undefined {
-	const repair = readResultRepairData(resultPath, status.state);
+	const repair = readResultRepairData(resultPath, status.state, status.runId);
 	if (!repair) return undefined;
 	const cleanupUnproven = status.teardownUnproven === true || repair.teardownUnproven === true || repair.results?.some((child) => child.teardownUnproven === true);
 	// Result diagnostics for parallel groups are intentionally unindexed. Build
@@ -226,6 +234,8 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 		}));
 	const repaired: AsyncStatus = {
 		...status,
+		...(!status.sessionId && repair.sessionId ? { sessionId: repair.sessionId } : {}),
+		...(!status.cwd && repair.cwd ? { cwd: repair.cwd } : {}),
 		state: repair.state,
 		activityState: undefined,
 		lastUpdate: now,
@@ -250,6 +260,7 @@ function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, no
 	return {
 		runId: startedRun.runId || path.basename(asyncDir),
 		...(startedRun.sessionId ? { sessionId: startedRun.sessionId } : {}),
+		...(startedRun.cwd ? { cwd: startedRun.cwd } : {}),
 		mode: startedRun.mode ?? "single",
 		state: "running",
 		pid: startedRun.pid,
@@ -323,6 +334,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 			durationMs: Math.max(0, now - status.startedAt),
 			asyncDir,
 			sessionId: status.sessionId,
+			cwd: status.cwd,
 			sessionFile: status.sessionFile,
 		},
 	};

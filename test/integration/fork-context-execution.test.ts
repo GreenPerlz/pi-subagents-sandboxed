@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
 import { createEventBus, createMockPi, createTempDir, events, removeTempDir, tryImport } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT } from "../../src/shared/types.ts";
+import { INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR } from "../../src/shared/types.ts";
 
 interface ExecutorModule {
 	createSubagentExecutor?: (...args: unknown[]) => {
@@ -22,6 +22,7 @@ interface ExecutorModule {
 				context?: "fresh" | "fork";
 				mode?: "single" | "parallel" | "chain";
 				asyncId?: string;
+				asyncDir?: string;
 				results?: Array<{ detached?: boolean; exitCode?: number; finalOutput?: string; skills?: string[] }>;
 			};
 		}>;
@@ -89,10 +90,35 @@ function makeState(cwd: string) {
 	};
 }
 
+async function waitForAsyncRunnerExit(asyncDir: string, runId: string): Promise<void> {
+	const statusPath = path.join(asyncDir, "status.json");
+	const deadline = Date.now() + 15_000;
+	while (Date.now() < deadline) {
+		let status: { runId?: string; pid?: number } | undefined;
+		try {
+			status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { runId?: string; pid?: number };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (status?.runId && status.runId !== runId) throw new Error(`Async runner status in '${asyncDir}' belongs to '${status.runId}', expected '${runId}'.`);
+		if (typeof status?.pid === "number") {
+			try {
+				process.kill(status.pid, 0);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+				if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+			}
+		}
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	throw new Error(`Async runner '${runId}' did not exit before fixture cleanup; preserving '${path.dirname(asyncDir)}'.`);
+}
+
 describe("fork context execution wiring", { skip: !available ? "subagent executor not importable" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
 	let previousFixtureAgentDir: string | undefined;
+	let pendingAsyncRunners: Array<{ asyncDir: string; runId: string }> = [];
 
 	before(() => {
 		mockPi = createMockPi();
@@ -105,6 +131,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 	beforeEach(() => {
 		tempDir = createTempDir("pi-subagent-fork-test-");
+		pendingAsyncRunners = [];
 		previousFixtureAgentDir = process.env.PI_CODING_AGENT_DIR;
 		const fixtureAgentDir = path.join(tempDir, "fixture-user-settings");
 		fs.mkdirSync(fixtureAgentDir, { recursive: true });
@@ -114,13 +141,23 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		mockPi.onCall({ output: "ok" });
 	});
 
-	afterEach(() => {
-		if (previousFixtureAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-		else process.env.PI_CODING_AGENT_DIR = previousFixtureAgentDir;
-		if (originalHome === undefined) delete process.env.HOME;
-		else process.env.HOME = originalHome;
-		if (originalUserProfile === undefined) delete process.env.USERPROFILE;
-		else process.env.USERPROFILE = originalUserProfile;
+	afterEach(async () => {
+		try {
+			for (const runner of pendingAsyncRunners) {
+				await waitForAsyncRunnerExit(runner.asyncDir, runner.runId);
+				const resultPath = path.join(RESULTS_DIR, `${runner.runId}.json`);
+				fs.rmSync(runner.asyncDir, { recursive: true, force: true });
+				fs.rmSync(resultPath, { force: true });
+				fs.rmSync(path.join(RESULTS_DIR, ".claims", `${path.basename(resultPath)}.claim`), { force: true });
+			}
+		} finally {
+			if (previousFixtureAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousFixtureAgentDir;
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
+		}
 		removeTempDir(tempDir);
 	});
 
@@ -814,6 +851,8 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(result.isError, undefined);
 		assert.equal(result.details?.mode, "parallel");
 		assert.ok(result.details?.asyncId, "expected an asyncId for background top-level parallel runs");
+		assert.ok(result.details?.asyncDir, "expected an async directory for background top-level parallel runs");
+		pendingAsyncRunners.push({ asyncDir: result.details.asyncDir, runId: result.details.asyncId });
 		assert.match(result.content[0]?.text ?? "", /Async parallel:/);
 	});
 
@@ -837,6 +876,8 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(result.isError, undefined);
 		assert.equal(result.details?.mode, "chain");
 		assert.ok(result.details?.asyncId, "expected an asyncId for background chain runs");
+		assert.ok(result.details?.asyncDir, "expected an async directory for background chain runs");
+		pendingAsyncRunners.push({ asyncDir: result.details.asyncDir, runId: result.details.asyncId });
 		assert.match(result.content[0]?.text ?? "", /Async chain:/);
 	});
 

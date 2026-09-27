@@ -650,6 +650,7 @@ export interface AsyncStartedEvent {
 	runnerStartToken?: string;
 	runnerUid?: number;
 	sessionId?: string;
+	cwd?: string;
 	mode?: SubagentRunMode;
 	agent?: string;
 	agents?: string[];
@@ -775,6 +776,7 @@ export interface AsyncJobState {
 	teardownUnproven?: boolean;
 	pid?: number;
 	sessionId?: string;
+	cwd?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;

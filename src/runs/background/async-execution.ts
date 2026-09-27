@@ -335,7 +335,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 		removeConfigIfPresent();
 		return { error: "async runner identity cannot be verified safely on this platform" };
 	}
-	const config = cfg as { id?: string; asyncDir?: string; resultMode?: string; steps?: unknown[]; parallelGroups?: unknown; workflowGraph?: unknown; sessionDir?: string; artifactsDir?: string };
+	const config = cfg as { id?: string; asyncDir?: string; resultMode?: string; steps?: unknown[]; parallelGroups?: unknown; workflowGraph?: unknown; sessionDir?: string; artifactsDir?: string; sessionId?: string; cwd?: string };
 	const runnerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 	const expectedArgv = [runtimePath, jitiCliPath, runnerPath, cfgPath];
 	const runnerIdentity = formatAsyncRunnerIdentity(runnerPath, cfgPath, config.id ?? suffix, startToken, uid, expectedArgv);
@@ -367,6 +367,8 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 				startedAt: existing.startedAt ?? Date.now(),
 				lastUpdate: Date.now(),
 				...(existing.steps ? {} : { steps: configuredSteps }),
+				...(config.sessionId ? { sessionId: config.sessionId } : {}),
+				cwd: config.cwd ?? cwd,
 				...(config.parallelGroups ?? configuredParallelGroups.length ? { parallelGroups: config.parallelGroups ?? configuredParallelGroups } : {}),
 				...(config.workflowGraph ? { workflowGraph: config.workflowGraph } : {}),
 				...(config.sessionDir ? { sessionDir: config.sessionDir } : {}),
@@ -915,6 +917,7 @@ export function executeAsyncChain(
 			...(spawnResult.runnerStartToken ? { runnerStartToken: spawnResult.runnerStartToken } : {}),
 			...(spawnResult.runnerUid !== undefined ? { runnerUid: spawnResult.runnerUid } : {}),
 			sessionId: ctx.currentSessionId,
+			cwd: runnerCwd,
 			mode: resultMode,
 			agent: firstAgents[0],
 			agents: flatAgents,

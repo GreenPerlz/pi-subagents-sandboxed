@@ -40,6 +40,7 @@ describe("async stale-run reconciliation", () => {
 				sessionId: "session-current",
 				mode: "single",
 				state: "running",
+				cwd: "/repo",
 				pid: 12345,
 				startedAt: 1000,
 				lastUpdate: 1000,
@@ -64,6 +65,7 @@ describe("async stale-run reconciliation", () => {
 			const resultJson = JSON.parse(fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8"));
 			assert.equal(resultJson.success, false);
 			assert.equal(resultJson.sessionId, "session-current");
+			assert.equal(resultJson.cwd, "/repo");
 			assert.equal(resultJson.state, "failed");
 			assert.equal(resultJson.exitCode, 1);
 			assert.match(resultJson.summary, /process 12345 exited or disappeared/);
@@ -174,10 +176,12 @@ describe("async stale-run reconciliation", () => {
 			const resultsDir = path.join(root, "results");
 			writeStatus(asyncDir, { runId: "run-terminal-stale", mode: "single", state: "failed", pid: 12345, startedAt: 1000, lastUpdate: 1000, steps: [{ agent: "worker", status: "running" }] });
 			fs.mkdirSync(resultsDir, { recursive: true });
-			fs.writeFileSync(path.join(resultsDir, "run-terminal-stale.json"), JSON.stringify({ id: "run-terminal-stale", success: false, state: "failed", results: [{ agent: "worker", success: false, exitCode: 1, error: "cleanup failed" }] }), "utf8");
+			fs.writeFileSync(path.join(resultsDir, "run-terminal-stale.json"), JSON.stringify({ id: "run-terminal-stale", sessionId: "session-from-result", cwd: "/repo-from-result", success: false, state: "failed", results: [{ agent: "worker", success: false, exitCode: 1, error: "cleanup failed" }] }), "utf8");
 			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 2000 });
 			assert.equal(result.repaired, true);
 			assert.equal(result.status?.state, "failed");
+			assert.equal(result.status?.sessionId, "session-from-result");
+			assert.equal(result.status?.cwd, "/repo-from-result");
 			assert.equal(result.status?.steps?.[0]?.status, "failed");
 			assert.equal(result.status?.steps?.[0]?.error, "cleanup failed");
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }

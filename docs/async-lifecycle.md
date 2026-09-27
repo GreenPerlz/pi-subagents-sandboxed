@@ -25,6 +25,10 @@ subagent({ action: "status", id: "<run-id>" })
 
 Async state is persisted under the runtime temporary scope (`async-subagent-runs/<id>/status.json` and `events.jsonl`), with child session files in the configured session directory. Completion is delivered to the originating session; status and run logs retain child outcomes, nested paths, and sandbox/Git diagnostics.
 
+## Result routing and legacy files
+
+Completion results are delivered only when their `sessionId` matches the current session, or when a result without a session ID has a matching canonical `cwd`. A result that lacks route data can inherit it from its matching terminal async status when the run IDs agree. Legacy results with no verifiable session or cwd route are moved to the results directory's `.quarantine` folder and kept for recovery; they are never delivered to an arbitrary session. Concurrent watchers claim a result before delivery so only one live watcher processes it.
+
 ## Control and revival
 
 ```ts

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
 import {
@@ -22,7 +23,7 @@ import { resolveAggregateState } from "../../shared/aggregate-state.ts";
 const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
 
-type ResultWatcherFs = Pick<typeof fs, "existsSync" | "readFileSync" | "unlinkSync" | "readdirSync" | "mkdirSync" | "watch">;
+type ResultWatcherFs = Pick<typeof fs, "existsSync" | "readFileSync" | "writeFileSync" | "renameSync" | "unlinkSync" | "readdirSync" | "mkdirSync" | "watch">;
 
 type ResultWatcherTimers = {
 	setTimeout: typeof setTimeout;
@@ -119,21 +120,81 @@ function isNotFoundError(error: unknown): boolean {
 	return getErrorCode(error) === "ENOENT";
 }
 
-function hasDurableTerminalStatus(fsApi: ResultWatcherFs, data: ResultFileData, resultPath: string): boolean {
-	// Legacy result-only receipts do not carry an async directory and remain
-	// consumable. When they do, the result is not safe to unlink until the
-	// sibling status rename has durably published terminal truth.
-	if (!data.asyncDir || !fsApi.existsSync(data.asyncDir)) return true;
+type ResultStatusProof = {
+	terminal: boolean;
+	unavailable: boolean;
+	sessionId?: string;
+	cwd?: string;
+};
+
+function inspectResultStatus(fsApi: ResultWatcherFs, data: ResultFileData, resultPath: string): ResultStatusProof {
+	if (!data.asyncDir || !fsApi.existsSync(data.asyncDir)) return { terminal: true, unavailable: false };
 	const statusPath = path.join(data.asyncDir, "status.json");
 	try {
-		const status = JSON.parse(fsApi.readFileSync(statusPath, "utf-8")) as { runId?: string; state?: string; teardownUnproven?: boolean };
-		if (data.id && status.runId && data.id !== status.runId) return false;
-		return status.teardownUnproven !== true
-			&& (status.state === "complete" || status.state === "failed" || status.state === "paused" || status.state === "cancelled");
+		const status = JSON.parse(fsApi.readFileSync(statusPath, "utf-8")) as { runId?: string; state?: string; teardownUnproven?: boolean; sessionId?: string; cwd?: string };
+		if (data.id && data.runId && data.id !== data.runId) return { terminal: false, unavailable: true };
+		const resultRunId = data.runId ?? data.id ?? path.basename(resultPath).replace(/\.json$/i, "");
+		if (!resultRunId || status.runId !== resultRunId) return { terminal: false, unavailable: true };
+		return {
+			terminal: status.teardownUnproven !== true
+				&& (status.state === "complete" || status.state === "failed" || status.state === "paused" || status.state === "cancelled"),
+			unavailable: false,
+			...(typeof status.sessionId === "string" && status.sessionId ? { sessionId: status.sessionId } : {}),
+			...(typeof status.cwd === "string" && status.cwd ? { cwd: status.cwd } : {}),
+		};
 	} catch (error) {
 		if (!isNotFoundError(error)) console.error(`Failed to verify durable async status before consuming '${resultPath}':`, error);
-		return false;
+		return { terminal: false, unavailable: true };
 	}
+}
+
+function sameCwd(left: string, right: string): boolean {
+	const resolvedLeft = path.resolve(left);
+	const resolvedRight = path.resolve(right);
+	return process.platform === "win32"
+		? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+		: resolvedLeft === resolvedRight;
+}
+
+function quarantineUnroutedResult(fsApi: ResultWatcherFs, resultsDir: string, resultPath: string, file: string): void {
+	const quarantineDir = path.join(resultsDir, ".quarantine");
+	fsApi.mkdirSync(quarantineDir, { recursive: true });
+	const quarantinedPath = path.join(quarantineDir, `${randomUUID()}-${path.basename(file)}`);
+	fsApi.renameSync(resultPath, quarantinedPath);
+	console.error(`Quarantined subagent result without session or cwd routing metadata at '${quarantinedPath}'.`);
+}
+
+function claimResult(fsApi: ResultWatcherFs, resultsDir: string, file: string): string | undefined {
+	const claimsDir = path.join(resultsDir, ".claims");
+	fsApi.mkdirSync(claimsDir, { recursive: true });
+	const claimPath = path.join(claimsDir, `${path.basename(file)}.claim`);
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			fsApi.writeFileSync(claimPath, JSON.stringify({ pid: process.pid, claimedAt: Date.now() }), { flag: "wx", mode: 0o600 });
+			return claimPath;
+		} catch (error) {
+			if (getErrorCode(error) !== "EEXIST") throw error;
+			let ownerPid: unknown;
+			try {
+				ownerPid = (JSON.parse(fsApi.readFileSync(claimPath, "utf-8")) as { pid?: unknown }).pid;
+			} catch {
+				return undefined;
+			}
+			if (!Number.isInteger(ownerPid) || (ownerPid as number) <= 0) return undefined;
+			try {
+				process.kill(ownerPid as number, 0);
+				return undefined;
+			} catch (ownerError) {
+				if (getErrorCode(ownerError) !== "ESRCH") return undefined;
+				try { fsApi.unlinkSync(claimPath); } catch (unlinkError) { if (!isNotFoundError(unlinkError)) throw unlinkError; }
+			}
+		}
+	}
+	return undefined;
+}
+
+function releaseResultClaim(fsApi: ResultWatcherFs, claimPath: string): void {
+	try { fsApi.unlinkSync(claimPath); } catch (error) { if (!isNotFoundError(error)) console.error(`Failed to release subagent result claim '${claimPath}':`, error); }
 }
 
 function shouldFallBackToPolling(error: unknown): boolean {
@@ -168,10 +229,29 @@ export function createResultWatcher(
 	const handleResult = async (file: string) => {
 		const resultPath = path.join(resultsDir, file);
 		if (!fsApi.existsSync(resultPath)) return;
+		let claimPath: string | undefined;
 		try {
 			const data = JSON.parse(fsApi.readFileSync(resultPath, "utf-8")) as ResultFileData;
-			if (data.sessionId && data.sessionId !== state.currentSessionId) return;
-			if (!data.sessionId && data.cwd && (!state.baseCwd || data.cwd !== state.baseCwd)) return;
+			const statusProof = inspectResultStatus(fsApi, data, resultPath);
+			const resultSessionId = typeof data.sessionId === "string" && data.sessionId.trim() ? data.sessionId : undefined;
+			const resultCwd = typeof data.cwd === "string" && data.cwd.trim() ? data.cwd : undefined;
+			if (resultSessionId && statusProof.sessionId && resultSessionId !== statusProof.sessionId) return;
+			if (resultCwd && statusProof.cwd && !sameCwd(resultCwd, statusProof.cwd)) return;
+			const sessionId = resultSessionId ?? statusProof.sessionId;
+			const cwd = resultCwd ?? statusProof.cwd;
+			if (!sessionId && !cwd) {
+				if (statusProof.unavailable) {
+					timers.setTimeout(() => state.resultFileCoalescer.schedule(file, 0), 250);
+					return;
+				}
+				quarantineUnroutedResult(fsApi, resultsDir, resultPath, file);
+				return;
+			}
+			if (sessionId) {
+				if (!state.currentSessionId || sessionId !== state.currentSessionId) return;
+			} else if (!state.baseCwd || !cwd || !sameCwd(cwd, state.baseCwd)) {
+				return;
+			}
 
 			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
@@ -184,13 +264,16 @@ export function createResultWatcher(
 					return;
 				}
 			}
-			if (!hasDurableTerminalStatus(fsApi, data, resultPath)) {
+			if (!statusProof.terminal) {
 				// The result may have won the crash race with status publication. Keep
 				// it as the recovery source and retry after the status rename rather than
 				// dropping it or requiring a new result-directory watch event.
 				timers.setTimeout(() => state.resultFileCoalescer.schedule(file, 0), 250);
 				return;
 			}
+			claimPath = claimResult(fsApi, resultsDir, file);
+			if (!claimPath) return;
+			if (!fsApi.existsSync(resultPath)) return;
 			const now = Date.now();
 			const completionKey = buildCompletionKey(data, `result:${file}`);
 			if (markSeenWithTtl(state.completionSeen, completionKey, now, completionTtlMs)) {
@@ -309,6 +392,8 @@ export function createResultWatcher(
 		} catch (error) {
 			if (isNotFoundError(error)) return;
 			console.error(`Failed to process subagent result file '${resultPath}':`, error);
+		} finally {
+			if (claimPath) releaseResultClaim(fsApi, claimPath);
 		}
 	};
 

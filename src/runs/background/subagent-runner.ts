@@ -4552,6 +4552,7 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 			runId: config.id,
 			mode: config.resultMode ?? (config.steps.length > 1 ? "chain" : "single"),
 			cwd: config.cwd,
+			...(config.sessionId ? { sessionId: config.sessionId } : {}),
 			...(config.nestedRoute ? { nestedRoute: config.nestedRoute, nestedRouteRequired: true as const } : {}),
 			...(config.nestedSelf ? { nestedSelf: config.nestedSelf } : {}),
 			steps: config.steps.flatMap((step) => isParallelGroup(step) ? step.parallel.map((child) => ({ agent: child.agent, status: "failed" })) : isDynamicRunnerGroup(step) ? [{ agent: `expand:${step.parallel.agent}`, status: "failed" }] : [{ agent: step.agent, status: "failed" }]),
@@ -4566,6 +4567,9 @@ export function writeRejectedRunnerTerminal(config: SubagentRunConfig, error: un
 		|| existing?.teardownUnproven === true
 		|| existingResults.some((child: Record<string, any>) => child.teardownUnproven === true);
 	fs.mkdirSync(config.asyncDir, { recursive: true });
+	status.runId = config.id;
+	status.cwd = config.cwd;
+	status.sessionId = config.sessionId ?? undefined;
 	if (config.nestedRoute) { status.nestedRoute = config.nestedRoute; status.nestedRouteRequired = true; }
 	if (config.nestedSelf) status.nestedSelf = config.nestedSelf;
 	status.teardownUnproven = teardownUnproven ? true : undefined;

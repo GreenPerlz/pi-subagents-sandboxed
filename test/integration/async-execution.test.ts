@@ -55,6 +55,7 @@ interface AsyncResultPayload {
 
 interface AsyncStatusPayload {
 	sessionId?: string;
+	cwd?: string;
 	pid?: number;
 	runnerIdentity?: string;
 	activityState?: string;
@@ -828,6 +829,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			maxSubagentDepth: 2,
 		});
 		assert.equal(launch.isError, undefined);
+		const launcherStatusPath = path.join(ASYNC_DIR, id, "status.json");
+		assert.equal(fs.existsSync(launcherStatusPath), true, "launcher must persist status before returning");
+		const launcherStatus = JSON.parse(fs.readFileSync(launcherStatusPath, "utf-8")) as AsyncStatusPayload;
+		assert.equal(launcherStatus.sessionId, "session-fast-parallel");
+		assert.equal(launcherStatus.cwd, tempDir);
 		const statusPath = await waitForAsyncStatusFile(id);
 		const initialStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
 		assert.equal(initialStatus.steps?.[0]?.fastMode?.model, "openai/gpt-5.5");
@@ -3204,13 +3210,18 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const asyncDir = path.join(ASYNC_DIR, id);
 		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
 		const statusPath = path.join(asyncDir, "status.json");
+		const startedEvents: unknown[] = [];
 
 		try {
 			writePackageSkill(path.join(invokingCwd, "packages", "app"), "async-chain-step-skill");
 			executeAsyncChain(id, {
 				chain: [{ agent: "worker", task: "Do work", cwd: "packages/app", skill: ["async-chain-step-skill"] }],
 				agents: [makeAgent("worker")],
-				ctx: { pi: { events: { emit() {} } }, cwd: invokingCwd, currentSessionId: "session-1" },
+				ctx: {
+					pi: { events: { emit(event: string, payload: unknown) { if (event === "subagent:async-started") startedEvents.push(payload); } } },
+					cwd: invokingCwd,
+					currentSessionId: "session-1",
+				},
 				cwd: chainCwd,
 				artifactConfig: {
 					enabled: false,
@@ -3235,9 +3246,12 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
 			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+			const startedEvent = startedEvents.find((event) => (event as { id?: string }).id === id) as { cwd?: string } | undefined;
 			assert.equal(payload.success, true);
 			assert.equal(payload.sessionId, "session-1");
 			assert.equal(status.sessionId, "session-1");
+			assert.equal(startedEvent?.cwd, chainCwd);
+			assert.equal(status.cwd, chainCwd);
 			assert.deepEqual(status.steps?.[0]?.skills, ["async-chain-step-skill"]);
 		} finally {
 			removeTempDir(chainCwd);

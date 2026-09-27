@@ -28,6 +28,168 @@ function createState(): SubagentState {
 }
 
 describe("result watcher", () => {
+	it("quarantines a legacy result with no verifiable session or cwd route", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-unrouted-"));
+		try {
+			const emitted: unknown[] = [];
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const resultPath = path.join(resultsDir, "unrouted.json");
+			fs.writeFileSync(resultPath, JSON.stringify({ id: "unrouted", success: true, summary: "must not be delivered" }), "utf-8");
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit: (_event, data) => emitted.push(data) } }, state, resultsDir, 60_000);
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			watcher.stopResultWatcher();
+
+			assert.equal(emitted.length, 0);
+			assert.equal(fs.existsSync(resultPath), false);
+			const quarantined = fs.readdirSync(path.join(resultsDir, ".quarantine"));
+			assert.equal(quarantined.length, 1);
+			assert.match(quarantined[0] ?? "", /unrouted\.json$/);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves another session's result untouched and unseen", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-foreign-session-"));
+		try {
+			const emitted: unknown[] = [];
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const resultPath = path.join(resultsDir, "foreign-session.json");
+			fs.writeFileSync(resultPath, JSON.stringify({
+				id: "foreign-session",
+				sessionId: "session-other",
+				cwd: "/other-project",
+				success: true,
+				summary: "must remain for its owner",
+			}), "utf-8");
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit: (_event, data) => emitted.push(data) } }, state, resultsDir, 60_000);
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			watcher.stopResultWatcher();
+
+			assert.equal(emitted.length, 0);
+			assert.equal(fs.existsSync(resultPath), true);
+			assert.equal(state.completionSeen.size, 0);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the matching terminal status route for a legacy result", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-status-route-"));
+		const asyncDir = path.join(resultsDir, "async-run");
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "status-routed",
+				sessionId: "session-current",
+				cwd: "/repo",
+				mode: "single",
+				state: "complete",
+				startedAt: Date.now(),
+				steps: [{ agent: "worker", status: "complete" }],
+			}), "utf-8");
+			const resultPath = path.join(resultsDir, "status-routed.json");
+			fs.writeFileSync(resultPath, JSON.stringify({ id: "status-routed", asyncDir, success: true, summary: "done" }), "utf-8");
+			const emitted: unknown[] = [];
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit: (_event, data) => emitted.push(data) } }, state, resultsDir, 60_000);
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			watcher.stopResultWatcher();
+
+			assert.equal(emitted.length, 1);
+			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not inherit a terminal status route when the result run id does not match", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-mismatched-status-route-"));
+		const asyncDir = path.join(resultsDir, "async-run");
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "different-run",
+				sessionId: "session-current",
+				cwd: "/repo",
+				mode: "single",
+				state: "complete",
+				startedAt: Date.now(),
+				steps: [{ agent: "worker", status: "complete" }],
+			}), "utf-8");
+			const resultPath = path.join(resultsDir, "result-without-id.json");
+			fs.writeFileSync(resultPath, JSON.stringify({ asyncDir, success: true, summary: "must not inherit another run's route" }), "utf-8");
+			const emitted: unknown[] = [];
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit: (_event, data) => emitted.push(data) } }, state, resultsDir, 60_000);
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			watcher.stopResultWatcher();
+
+			assert.equal(emitted.length, 0);
+			assert.equal(fs.existsSync(resultPath), true);
+			assert.equal(state.completionSeen.size, 0);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses a canonical cwd route when the result has no session id", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-cwd-route-"));
+		try {
+			const emitted: unknown[] = [];
+			const state = createState();
+			state.currentSessionId = null;
+			const matchingPath = path.join(resultsDir, "matching-cwd.json");
+			const mismatchedPath = path.join(resultsDir, "mismatched-cwd.json");
+			fs.writeFileSync(matchingPath, JSON.stringify({ id: "matching-cwd", cwd: path.join(path.sep, "repo", path.sep), success: true, summary: "same cwd" }), "utf-8");
+			fs.writeFileSync(mismatchedPath, JSON.stringify({ id: "mismatched-cwd", cwd: path.join(path.sep, "other"), success: true, summary: "different cwd" }), "utf-8");
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit: (_event, data) => emitted.push(data) } }, state, resultsDir, 60_000);
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			watcher.stopResultWatcher();
+
+			assert.equal(emitted.length, 1);
+			assert.equal(fs.existsSync(matchingPath), false);
+			assert.equal(fs.existsSync(mismatchedPath), true);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("delivers a shared result only once across concurrent watchers", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-claim-"));
+		try {
+			const emitted: unknown[] = [];
+			const pi = { events: { on: () => () => {}, emit: (_event: string, data: unknown) => emitted.push(data) } };
+			const firstState = createState();
+			const secondState = createState();
+			firstState.currentSessionId = "session-1";
+			secondState.currentSessionId = "session-1";
+			const resultPath = path.join(resultsDir, "shared.json");
+			fs.writeFileSync(resultPath, JSON.stringify({ id: "shared", sessionId: "session-1", success: true, summary: "once" }), "utf-8");
+			const firstWatcher = createResultWatcher(pi, firstState, resultsDir, 60_000);
+			const secondWatcher = createResultWatcher(pi, secondState, resultsDir, 60_000);
+			firstWatcher.primeExistingResults();
+			secondWatcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			firstWatcher.stopResultWatcher();
+			secondWatcher.stopResultWatcher();
+
+			assert.equal(emitted.length, 1);
+			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("processes deferred session-scoped results after session identity is restored", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-session-"));
 		try {
@@ -77,6 +239,8 @@ describe("result watcher", () => {
 			fs.mkdirSync(asyncDir, { recursive: true });
 			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
 				runId: "crash-race",
+				sessionId: "session-current",
+				cwd: "/repo",
 				mode: "parallel",
 				state: "running",
 				startedAt: Date.now(),
@@ -94,6 +258,7 @@ describe("result watcher", () => {
 			}), "utf-8");
 			const emitted: unknown[] = [];
 			const state = createState();
+			state.currentSessionId = "session-current";
 			const watcher = createResultWatcher({ events: { on: () => () => {}, emit: (_event, data) => emitted.push(data) } }, state, resultsDir, 60_000);
 			watcher.primeExistingResults();
 			await new Promise((resolve) => setTimeout(resolve, 100));
@@ -101,7 +266,7 @@ describe("result watcher", () => {
 			assert.equal(emitted.length, 0);
 
 			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
-				runId: "crash-race", mode: "parallel", state: "failed", startedAt: Date.now(), steps: [{ agent: "worker", status: "failed" }],
+				runId: "crash-race", sessionId: "session-current", cwd: "/repo", mode: "parallel", state: "failed", startedAt: Date.now(), steps: [{ agent: "worker", status: "failed" }],
 			}), "utf-8");
 			watcher.primeExistingResults();
 			await new Promise((resolve) => setTimeout(resolve, 400));
@@ -528,11 +693,13 @@ describe("result watcher", () => {
 			const emitted: Array<{ event: string; data: unknown }> = [];
 			const pi = { events: { on: () => () => {}, emit: (event: string, data: unknown) => emitted.push({ event, data }) } };
 			const state = createState();
+			state.currentSessionId = "session-1";
 			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
 			const resultPath = path.join(resultsDir, "canonical-output.json");
 			fs.writeFileSync(resultPath, JSON.stringify({
 				id: "canonical-output",
 				runId: "canonical-output",
+				sessionId: "session-1",
 				success: true,
 				state: "complete",
 				finalOutput: "canonical top-level output",
@@ -563,11 +730,13 @@ describe("result watcher", () => {
 			const emitted: Array<{ event: string; data: unknown }> = [];
 			const pi = { events: { on: () => () => {}, emit: (event: string, data: unknown) => emitted.push({ event, data }) } };
 			const state = createState();
+			state.currentSessionId = "session-1";
 			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
 			const resultPath = path.join(resultsDir, "canonical-diagnostics.json");
 			fs.writeFileSync(resultPath, JSON.stringify({
 				id: "canonical-diagnostics",
 				runId: "canonical-diagnostics",
+				sessionId: "session-1",
 				success: false,
 				state: "failed",
 				results: [

@@ -16,7 +16,7 @@ const hostToolchainConfig: ResolvedSandboxConfig = {
 function availableProvider(): BubblewrapSandboxProvider {
 	return new BubblewrapSandboxProvider({
 		isBubblewrapAvailable: () => true,
-		pathExists: (candidate) => ["/usr", "/bin", "/etc", "/opt/node"].includes(candidate),
+		pathExists: (candidate) => ["/usr", "/bin", "/etc", "/opt/node/bin/node", "/tmp/standalone/bin/node"].includes(candidate),
 		realPath: (candidate) => candidate,
 		hostPathLstat: (candidate) => ({ isSymbolicLink: () => candidate === "/bin" }) as fs.Stats,
 		hostPathReadLink: () => "usr/bin",
@@ -62,20 +62,21 @@ describe("Bubblewrap sandbox provider", () => {
 		assert.deepEqual(args.slice(-2), ["pi", "--version"]);
 	});
 
-	it("mounts an absolute Node install root so npm/npx are available to sandboxed Pi", () => {
+	it("mounts only the Node executable and the explicitly requested standalone Pi distribution", () => {
 		const result = availableProvider().wrapInvocation({
 			config: hostToolchainConfig,
 			invocation: {
-				command: "/opt/node/bin/node",
-				args: ["/workspace/pi/dist/cli.js", "--version"],
+				command: "/tmp/standalone/bin/node",
+				args: ["/tmp/standalone/pi/dist/cli.js", "--version"],
 				cwd: "/home/alice/project",
 			},
-			mounts: [{ source: "/home/alice/project", mode: "ro" }, { source: "/opt/node", mode: "ro" }],
+			mounts: [{ source: "/home/alice/project", mode: "ro" }, { source: "/tmp/standalone/pi/dist", mode: "ro" }],
 		});
-
 		const args = result.invocation.args;
-		assert.deepEqual(args.slice(args.indexOf("/opt/node") - 1, args.indexOf("/opt/node") + 2), ["--ro-bind", "/opt/node", "/opt/node"]);
-		assert.equal(args.filter((arg) => arg === "/opt/node").length, 2, "node install root should only be bound once");
+		assert.ok(args.includes("/tmp/standalone/bin/node"));
+		assert.ok(args.includes("/tmp/standalone/pi/dist"));
+		assert.equal(args.includes("/tmp"), false);
+		assert.equal(args.includes("/tmp/standalone"), false);
 	});
 
 	it("pins read-only mount inodes across pathname replacement", () => {

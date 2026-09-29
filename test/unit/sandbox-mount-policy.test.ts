@@ -356,7 +356,9 @@ describe("subagent sandbox mount policy", () => {
 			spawnArgs: [cliPath, "-p", "Task: hello"],
 		});
 
-		assert.equal(mountMode(mounts, nodeInstallRoot), "ro");
+		assert.equal(mountMode(mounts, nodePath), "ro");
+		assert.equal(mountMode(mounts, nodeInstallRoot), undefined);
+		assert.equal(mountMode(mounts, path.join(nodeInstallRoot, "bin", "npm")), undefined);
 		assert.equal(mountMode(mounts, nodeModulesRoot), "ro");
 	});
 
@@ -371,8 +373,9 @@ describe("subagent sandbox mount policy", () => {
 
 		const mounts = buildSubagentSandboxMounts({ cwd, spawnCommand: linkedNodePath });
 
-		assert.equal(mountMode(mounts, path.join(root, ".local")), "ro", "the symlink path must remain visible");
-		assert.equal(mountMode(mounts, nodeInstallRoot), "ro", "the symlink target must be executable inside bwrap");
+		assert.equal(mountMode(mounts, linkedNodePath), "ro");
+		assert.equal(mountMode(mounts, realNodePath), "ro", "the symlink target must be executable inside bwrap");
+		assert.equal(mountMode(mounts, nodeInstallRoot), undefined, "the target's siblings must remain private");
 	});
 
 	it("mounts explicit extra read-only and writable sandbox paths with least privilege", () => {

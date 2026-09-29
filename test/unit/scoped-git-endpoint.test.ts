@@ -23,7 +23,7 @@ async function request(endpoint: string, args: string[], input = ""): Promise<{ 
 	return await new Promise((resolve, reject) => {
 		const connect = () => { const socket = net.createConnection(endpoint); let data = ""; socket.setEncoding("utf8");
 			socket.on("data", (chunk) => data += chunk); socket.on("error", (error: NodeJS.ErrnoException) => error.code === "ECONNREFUSED" ? setTimeout(connect, 10) : reject(error)); socket.on("end", () => { const value = JSON.parse(data); resolve({ status: value.status, stdout: Buffer.from(value.stdout, "base64").toString(), stderr: Buffer.from(value.stderr, "base64").toString() }); });
-			socket.on("connect", () => socket.end(JSON.stringify({ args, input: Buffer.from(input).toString("base64") }) + "\n")); };
+			socket.on("connect", () => socket.write(JSON.stringify({ args, input: Buffer.from(input).toString("base64") }) + "\n")); };
 		connect();
 	});
 }
@@ -79,6 +79,24 @@ describe("scoped Git endpoint", () => {
 		} finally { await owner.close(); }
 	});
 
+	it("answers framed control requests without waiting for a client half-close", async () => {
+		const worktree = repo(); const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-runtime-")); roots.add(runtimeRoot);
+		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "read-only" });
+		try {
+			const result = await new Promise<{ descriptor?: { relativeSubtree: string } }>((resolve, reject) => {
+				const socket = net.createConnection(owner.scope.endpoint);
+				let response = "";
+				const timer = setTimeout(() => { socket.destroy(); reject(new Error("owner waited for client half-close")); }, 2000);
+				socket.setEncoding("utf8");
+				socket.on("data", (chunk) => response += chunk);
+				socket.on("error", reject);
+				socket.on("end", () => { clearTimeout(timer); try { resolve(JSON.parse(response)); } catch (error) { reject(error); } });
+				socket.on("connect", () => socket.write(JSON.stringify({ op: "reserve-child", rights: "read-only" }) + "\n"));
+			});
+			assert.match(result.descriptor?.relativeSubtree ?? "", /^[a-f0-9]+$/);
+		} finally { await owner.close(); }
+	});
+
 	it("serializes dynamic child and grandchild coordinates without host metadata", async () => {
 		const worktree = repo(); const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-runtime-")); roots.add(runtimeRoot);
 		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
@@ -96,7 +114,7 @@ describe("scoped Git endpoint", () => {
 		const worktree = repo(); const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "scoped-runtime-")); roots.add(runtimeRoot);
 		const owner = createScopedGitEndpoint({ runtimeRoot, worktree, rights: "writer" });
 		try {
-			const mount = owner.invocationMounts()[0]!;
+			const mount = owner.invocationMounts().find((entry) => entry.target === "/run/pi-scoped-git")!;
 			const args = ["--die-with-parent", "--proc", "/proc", "--dev", "/dev", "--dir", "/run"];
 			const nodeRoot = path.dirname(path.dirname(process.execPath));
 			for (const system of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", nodeRoot]) {

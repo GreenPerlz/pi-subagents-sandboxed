@@ -92,11 +92,9 @@ function addMount(args: string[], mount: SandboxMount, seen?: Set<string>, diagn
 	args.push("--bind", mount.source, target);
 }
 
-function nodeInstallRoot(command: string): string | undefined {
-	if (!path.isAbsolute(command)) return undefined;
-	const commandDir = path.dirname(command);
-	if (path.basename(command) !== "node" || path.basename(commandDir) !== "bin") return undefined;
-	return path.dirname(commandDir);
+function nodeExecutable(command: string): string | undefined {
+	if (!path.isAbsolute(command) || path.basename(command) !== "node") return undefined;
+	return command;
 }
 
 function addEnvironment(args: string[], env: SpawnableInvocation["env"]): void {
@@ -266,8 +264,8 @@ export class BubblewrapSandboxProvider implements SandboxProvider {
 				addMount(args, { source: dnsMount, mode: "ro" }, seenMounts, diagnosticMounts);
 			}
 		}
-		const nodeRoot = nodeInstallRoot(input.invocation.command);
-		if (nodeRoot && this.pathExists(nodeRoot)) addMount(args, { source: nodeRoot, mode: "ro" }, seenMounts, diagnosticMounts);
+		const nodePath = nodeExecutable(input.invocation.command);
+		if (nodePath && this.pathExists(nodePath)) addMount(args, { source: this.realPath(nodePath), target: nodePath, mode: "ro" }, seenMounts, diagnosticMounts);
 		for (const mount of pinned.mounts) {
 			addMount(args, mount, seenMounts, diagnosticMounts);
 		}

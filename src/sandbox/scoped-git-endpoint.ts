@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { SandboxMount, SpawnableInvocation } from "./types.ts";
+import { resolveNodeRuntime } from "../runs/shared/pi-spawn.ts";
 
 /** Rights understood by the owner endpoint.  They are deliberately not
  * bearer credentials: a scope is an opaque reference to owner memory. */
@@ -44,6 +45,7 @@ export interface ScopedGitScope {
 	readonly endpoint: string;
 	/** Host Git's exec directory, which is overlaid atomically in children. */
 	readonly execPath: string;
+	readonly nodeRuntime: string;
 }
 
 export interface ScopedGitEndpointOptions {
@@ -87,6 +89,7 @@ const TARGET = "/run/pi-scoped-git";
 const WRAPPER = `${TARGET}/git`;
 const MAX_REQUEST = 1024 * 1024;
 const MAX_OUTPUT = 8 * 1024 * 1024;
+const MAX_RESPONSE = Math.ceil(MAX_OUTPUT * 4 / 3) * 2 + 4096;
 const DEADLINE = 15_000;
 const writerLeases = new Map<string, string>();
 const randomPart = () => randomBytes(8).toString("hex");
@@ -527,30 +530,32 @@ function redactEndpointText(value: string, selected: ScopedGitScope, runtimeRoot
 	return value.split(selected.worktree).join(".").split(selected.endpointRoot).join("<scoped-endpoint>").split(runtimeRoot ?? "\0").join("<scoped-runtime>").replace(/\/tmp\/pi-scoped-git(?:-[^\s/]+)?(?:\/[^\s]*)?/gu, "<scoped-runtime>");
 }
 
-function scopeFor(options: ScopedGitEndpointOptions, endpointRoot: string, endpoint: string, execPath: string): ScopedGitScope {
+function scopeFor(options: ScopedGitEndpointOptions, endpointRoot: string, endpoint: string, execPath: string, nodeRuntime: string): ScopedGitScope {
 	const worktree = canonical(options.worktree);
 	const cwd = canonical(options.cwd ?? worktree);
 	if (!within(worktree, cwd)) throw new Error("scoped Git endpoint cwd escapes its canonical worktree");
 	return Object.freeze({
 		runtimeId: options.runtimeId ?? randomUUID(), scopeId: randomUUID(), worktree, cwd,
-		rights: options.rights, network: options.network ?? "host", endpointRoot, endpoint, execPath,
+		rights: options.rights, network: options.network ?? "host", endpointRoot, endpoint, execPath, nodeRuntime,
 	});
 }
 
 function wrapperSource(): string {
-	const node = JSON.stringify(process.execPath);
-	const client = `${TARGET}/client.mjs`;
-	return `#!/bin/sh\nexec ${node} ${client} "$@"\n`;
+	return `#!/bin/sh\nexec ${TARGET}/node-runtime ${TARGET}/client.mjs "$@"\n`;
 }
 
 function clientSource(): string {
-	return `import fs from "node:fs"; import net from "node:net";\nconst chunks=[]; let n=0; const b=Buffer.allocUnsafe(65536);\nwhile(true){const r=fs.readSync(0,b,0,b.length,null);if(!r)break;n+=r;if(n>${MAX_REQUEST})throw Error("request too large");chunks.push(Buffer.from(b.subarray(0,r)));}\nconst request=JSON.stringify({args:process.argv.slice(2),input:Buffer.concat(chunks,n).toString("base64")})+"\\n"; const started=Date.now(); let done=false; function connect(){ const socket=net.createConnection("${TARGET}/endpoint"); let data=""; socket.setEncoding("utf8"); socket.on("data", chunk => data += chunk); socket.on("error", error => { if(!done && Date.now()-started<${DEADLINE}) return setTimeout(connect,10); if(done)return; done=true; process.stderr.write(String(error)); process.exitCode=126; }); socket.on("end", () => { if(done)return; done=true; try { const result=JSON.parse(data); process.stdout.write(Buffer.from(result.stdout||"","base64")); process.stderr.write(Buffer.from(result.stderr||"","base64")); process.exitCode=result.status; } catch (error) { process.stderr.write(String(error)); process.exitCode=126; } }); socket.end(request); } connect();\n`;
+	return `import fs from "node:fs"; import net from "node:net";\nconst chunks=[]; let n=0; const b=Buffer.allocUnsafe(65536);\nwhile(true){const r=fs.readSync(0,b,0,b.length,null);if(!r)break;n+=r;if(n>${MAX_REQUEST})throw Error("request too large");chunks.push(Buffer.from(b.subarray(0,r)));}\nconst request=JSON.stringify({args:process.argv.slice(2),input:Buffer.concat(chunks,n).toString("base64")})+"\\n"; const started=Date.now(); let done=false; function connect(){ const socket=net.createConnection("${TARGET}/endpoint"); let data="", bytes=0; socket.setEncoding("utf8"); socket.setTimeout(${DEADLINE},()=>socket.destroy(Error("scoped Git response timed out"))); socket.on("data", chunk => { bytes+=Buffer.byteLength(chunk,"utf8"); if(bytes>${MAX_RESPONSE})socket.destroy(Error("scoped Git response too large")); else data+=chunk; }); socket.on("error", error => { if(done)return; if(error.code==="ECONNREFUSED" && Date.now()-started<${DEADLINE}) return setTimeout(connect,10); done=true; process.stderr.write(String(error)); process.exitCode=126; }); socket.on("end", () => { if(done)return; done=true; try { const result=JSON.parse(data); process.stdout.write(Buffer.from(result.stdout||"","base64")); process.stderr.write(Buffer.from(result.stderr||"","base64")); process.exitCode=result.status; } catch (error) { process.stderr.write(String(error)); process.exitCode=126; } }); socket.write(request); } connect();\n`;
 }
 
-function prepareEndpointFiles(endpointRoot: string, execPath: string): void {
+function prepareEndpointFiles(endpointRoot: string, execPath: string, nodeRuntime: string): void {
 	fs.writeFileSync(path.join(endpointRoot, "git"), wrapperSource(), { mode: 0o555 });
 	fs.writeFileSync(path.join(endpointRoot, "git-helper-denied"), "#!/bin/sh\nprintf '%s\\n' 'scoped Git endpoint rejects direct helper' >&2\nexit 126\n", { mode: 0o555 });
 	fs.writeFileSync(path.join(endpointRoot, "client.mjs"), clientSource(), { mode: 0o444 });
+	// Carry only the interpreter into the endpoint subtree. Child descriptors
+	// rebind this file even when the host Node lives under /tmp.
+	fs.copyFileSync(fs.realpathSync(nodeRuntime), path.join(endpointRoot, "node-runtime"));
+	fs.chmodSync(path.join(endpointRoot, "node-runtime"), 0o555);
 	prepareExecOverlay(endpointRoot, execPath);
 }
 
@@ -558,6 +563,23 @@ function prepareEndpointFiles(endpointRoot: string, execPath: string): void {
 export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): ScopedGitEndpointServer {
 	const runtimeRoot = canonical(options.runtimeRoot);
 	const endpointRoot = path.join(runtimeRoot, "scopes", randomPart());
+	// A standalone Pi executable is not a JavaScript interpreter. Reject aliases
+	// and non-Node executables before publishing a wrapper that cannot run.
+	const nodeRuntime = resolveNodeRuntime();
+	if (!nodeRuntime || !path.isAbsolute(nodeRuntime)) throw new Error("scoped Git endpoint requires an absolute Node runtime for its JavaScript client");
+	let realNode: string;
+	try { realNode = fs.realpathSync(nodeRuntime); }
+	catch { throw new Error("scoped Git endpoint requires an executable Node runtime"); }
+	if (realNode === fs.realpathSync(process.execPath) && !/^node(?:\.exe)?$/i.test(path.basename(realNode))) {
+		throw new Error("scoped Git endpoint rejects a Node candidate aliased to standalone Pi");
+	}
+	const probe = spawnSync(nodeRuntime, ["-e", "process.stdout.write('pi-scoped-node-ok')"], {
+		encoding: "utf8", timeout: 1500, killSignal: "SIGKILL", maxBuffer: 1024,
+		env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: os.tmpdir(), NODE_OPTIONS: "" },
+	});
+	if (probe.status !== 0 || probe.stdout !== "pi-scoped-node-ok" || probe.stderr !== "") {
+		throw new Error("scoped Git endpoint requires a working Node JavaScript runtime");
+	}
 	let acquiredWriterLease: { worktree: string; scopeId: string } | undefined;
 	try {
 	fs.mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
@@ -566,7 +588,7 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 	if (process.platform !== "win32" && Buffer.byteLength(endpoint) >= 108) throw new Error("scoped Git endpoint socket path exceeds the platform limit");
 	const gitPath = options.gitPath ?? "git";
 	const execPath = resolveGitExecPath(gitPath);
-	const scope = scopeFor(options, endpointRoot, endpoint, execPath);
+	const scope = scopeFor(options, endpointRoot, endpoint, execPath, nodeRuntime);
 	if (scope.rights === "writer") {
 		if (writerLeases.has(scope.worktree)) throw new Error("scoped Git writer lease is already held for this canonical worktree");
 		writerLeases.set(scope.worktree, scope.scopeId);
@@ -728,8 +750,8 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 						let childServer: InternalEndpointServer | undefined;
 						try {
 							fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
-							child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath);
-							prepareEndpointFiles(childRoot, selected.execPath);
+							child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath, selected.nodeRuntime);
+							prepareEndpointFiles(childRoot, selected.execPath, selected.nodeRuntime);
 							scopes.set(child.scopeId, child);
 							if (requester) reservation = addReservation(selected.scopeId, child.scopeId, requester);
 							childServer = create(child) as InternalEndpointServer;
@@ -799,8 +821,8 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 				let childServer: InternalEndpointServer | undefined;
 				try {
 					fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
-					child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath);
-					prepareEndpointFiles(childRoot, selected.execPath);
+					child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights, network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath, selected.nodeRuntime);
+					prepareEndpointFiles(childRoot, selected.execPath, selected.nodeRuntime);
 					scopes.set(child.scopeId, child);
 					if (rights === "writer") reservation = addReservation(selected.scopeId, child.scopeId);
 					childServer = create(child) as InternalEndpointServer;
@@ -827,8 +849,8 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 			if (!child) {
 				const childRoot = path.join(selected.endpointRoot, randomPart());
 				fs.mkdirSync(childRoot, { recursive: true, mode: 0o700 });
-				child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights: "writer", network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath);
-				prepareEndpointFiles(childRoot, selected.execPath);
+				child = scopeFor({ ...options, runtimeId: selected.runtimeId, worktree: selected.worktree, cwd: childCwd, rights: "writer", network: selected.network }, childRoot, path.join(childRoot, "endpoint"), selected.execPath, selected.nodeRuntime);
+				prepareEndpointFiles(childRoot, selected.execPath, selected.nodeRuntime);
 				scopes.set(child.scopeId, child);
 				addReservation(selected.scopeId, child.scopeId);
 				newlyPublished = true;
@@ -895,7 +917,7 @@ export function createScopedGitEndpoint(options: ScopedGitEndpointOptions): Scop
 		return endpointServer;
 	};
 	// The wrapper and every denied helper are immutable before any bind.
-	prepareEndpointFiles(endpointRoot, execPath);
+	prepareEndpointFiles(endpointRoot, execPath, nodeRuntime);
 	const result = create(scope);
 	return result;
 	} catch (error) {
@@ -915,6 +937,44 @@ export function scopedGitInvocation(scope: ScopedGitScope, invocation: Spawnable
 	return { ...invocation, command: WRAPPER, cwd: scope.cwd, env: { ...invocation.env, PATH: "/run/pi-scoped-git", SCOPED_GIT_ENDPOINT: TARGET }, };
 }
 
+// The owner consumes a newline-delimited frame and closes the response. Do not
+// half-close the request: Bun standalone sockets may translate end(frame) into
+// a close before the owner's asynchronous response can be read.
+function scopedGitControlRequest(endpoint: string, body: object, retryRefused = false): Promise<Record<string, unknown>> {
+	return new Promise((resolve, reject) => {
+		const deadline = Date.now() + DEADLINE;
+		const connect = () => {
+			const socket = net.createConnection(endpoint);
+			let data = ""; let bytes = 0; let finished = false;
+			const timer = setTimeout(() => socket.destroy(new Error("scoped Git control response timed out")), Math.max(1, deadline - Date.now()));
+			const finish = (error?: Error, result?: Record<string, unknown>) => {
+				if (finished) return;
+				finished = true; clearTimeout(timer);
+				if (error) reject(error); else resolve(result!);
+			};
+			socket.setEncoding("utf8");
+			socket.on("data", (chunk) => {
+				bytes += Buffer.byteLength(chunk, "utf8");
+				if (bytes > MAX_RESPONSE) socket.destroy(new Error("scoped Git control response too large"));
+				else data += chunk;
+			});
+			socket.on("error", (error: NodeJS.ErrnoException) => {
+				if (finished) return;
+				if (retryRefused && error.code === "ECONNREFUSED" && Date.now() < deadline) {
+					finished = true; clearTimeout(timer); setTimeout(connect, 10); return;
+				}
+				finish(error);
+			});
+			socket.on("end", () => {
+				try { finish(undefined, JSON.parse(data) as Record<string, unknown>); }
+				catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
+			});
+			socket.write(JSON.stringify(body) + "\n");
+		};
+		connect();
+	});
+}
+
 /** Ask the owner endpoint for one dynamically-created narrower subtree. */
 export async function validateScopedGitChildDescriptor(descriptor: ScopedGitEndpointDescriptor, options: { cwd?: string; rights?: ScopedGitRights } = {}): Promise<void> {
 	if (!descriptor || typeof descriptor.relativeSubtree !== "string") throw new Error("invalid scoped Git endpoint descriptor");
@@ -923,12 +983,8 @@ export async function validateScopedGitChildDescriptor(descriptor: ScopedGitEndp
 	const hostRoot = (descriptor as InternalScopedGitEndpointDescriptor).__hostEndpointRoot;
 	if (!hostRoot) return;
 	const endpoint = path.join(hostRoot, "endpoint");
-	await new Promise<void>((resolve, reject) => {
-		const socket = net.createConnection(endpoint); let data = "";
-		socket.setEncoding("utf8"); socket.on("data", (chunk) => data += chunk); socket.on("error", reject);
-		socket.on("end", () => { try { const result = JSON.parse(data) as { ok?: boolean; error?: string }; if (!result.ok) throw new Error(result.error ?? "scoped Git child validation failed"); resolve(); } catch (error) { reject(error); } });
-		socket.end(JSON.stringify({ op: "validate-child", cwd: options.cwd, rights: options.rights }) + "\n");
-	});
+	const result = await scopedGitControlRequest(endpoint, { op: "validate-child", cwd: options.cwd, rights: options.rights });
+	if (!result.ok) throw new Error(typeof result.error === "string" ? result.error : "scoped Git child validation failed");
 }
 
 export async function reserveScopedGitChildDescriptor(descriptor: ScopedGitEndpointDescriptor, options: { cwd?: string; rights?: ScopedGitRights } = {}): Promise<ScopedGitEndpointDescriptor> {
@@ -938,23 +994,17 @@ export async function reserveScopedGitChildDescriptor(descriptor: ScopedGitEndpo
 	const hostRoot = (descriptor as InternalScopedGitEndpointDescriptor).__hostEndpointRoot;
 	const endpoint = hostRoot ? path.join(hostRoot, "endpoint") : path.join(TARGET, relative, "endpoint");
 	const requesterIdentity = readScopedGitProcessIdentity(process.pid);
-	return await new Promise((resolve, reject) => {
-		const socket = net.createConnection(endpoint); let data = "";
-		socket.setEncoding("utf8"); socket.on("data", (chunk) => data += chunk); socket.on("error", reject);
-		socket.on("end", () => { try {
-			const result = JSON.parse(data) as { descriptor?: ScopedGitEndpointDescriptor; ownerRelativeSubtree?: string; error?: string };
-			if (!result.descriptor) throw new Error(result.error ?? "scoped Git child reservation failed");
-			if (result.ownerRelativeSubtree) {
-				const ownerRoot = (descriptor as InternalScopedGitEndpointDescriptor).__hostEndpointRoot;
-				attachDescriptorMetadata(result.descriptor, {
-					ownerRelativeSubtree: result.ownerRelativeSubtree,
-					hostEndpointRoot: ownerRoot ? path.join(ownerRoot, result.ownerRelativeSubtree) : undefined,
-				});
-			}
-			resolve(result.descriptor);
-		} catch (error) { reject(error); } });
-		socket.end(JSON.stringify({ op: "reserve-child", cwd: options.cwd, rights: options.rights, requesterIdentity }) + "\n");
-	});
+	const result = await scopedGitControlRequest(endpoint, { op: "reserve-child", cwd: options.cwd, rights: options.rights, requesterIdentity });
+	if (!result.descriptor || typeof result.descriptor !== "object" || typeof (result.descriptor as ScopedGitEndpointDescriptor).relativeSubtree !== "string") throw new Error(typeof result.error === "string" ? result.error : "scoped Git child reservation failed");
+	const child = result.descriptor as ScopedGitEndpointDescriptor;
+	if (typeof result.ownerRelativeSubtree === "string") {
+		const ownerRoot = (descriptor as InternalScopedGitEndpointDescriptor).__hostEndpointRoot;
+		attachDescriptorMetadata(child, {
+			ownerRelativeSubtree: result.ownerRelativeSubtree,
+			hostEndpointRoot: ownerRoot ? path.join(ownerRoot, result.ownerRelativeSubtree) : undefined,
+		});
+	}
+	return child;
 }
 
 export async function cancelScopedGitChildDescriptor(ownerDescriptor: ScopedGitEndpointDescriptor, childDescriptor: ScopedGitEndpointDescriptor): Promise<void> {
@@ -964,21 +1014,8 @@ export async function cancelScopedGitChildDescriptor(ownerDescriptor: ScopedGitE
 	if ([ownerRelative, childRelative].some((relative) => relative === ".." || relative.startsWith(`..${path.sep}`))) throw new Error("scoped Git endpoint descriptor escapes its fixed subtree");
 	const ownerHostRoot = (ownerDescriptor as InternalScopedGitEndpointDescriptor).__hostEndpointRoot;
 	const endpoint = ownerHostRoot ? path.join(ownerHostRoot, "endpoint") : path.join(TARGET, ownerRelative, "endpoint");
-	await new Promise<void>((resolve, reject) => {
-		const deadline = Date.now() + DEADLINE;
-		const connect = () => {
-			let data = "";
-			const socket = net.createConnection(endpoint);
-			socket.setEncoding("utf8"); socket.on("data", (chunk) => data += chunk);
-			socket.on("error", (error: NodeJS.ErrnoException) => {
-				if (error.code === "ECONNREFUSED" && Date.now() < deadline) return setTimeout(connect, 10);
-				reject(error);
-			});
-			socket.on("end", () => { try { const result = JSON.parse(data) as { ok?: boolean; error?: string }; if (!result.ok) throw new Error(result.error ?? "scoped Git writer reservation cancellation failed"); resolve(); } catch (error) { reject(error); } });
-			socket.end(JSON.stringify({ op: "cancel-child", descriptor: { relativeSubtree: childRelative } }) + "\n");
-		};
-		connect();
-	});
+	const result = await scopedGitControlRequest(endpoint, { op: "cancel-child", descriptor: { relativeSubtree: childRelative } }, true);
+	if (!result.ok) throw new Error(typeof result.error === "string" ? result.error : "scoped Git writer reservation cancellation failed");
 }
 
 export async function waitForScopedGitProcessGone(identity: ScopedGitProcessIdentity): Promise<void> {
@@ -999,14 +1036,9 @@ export async function waitForScopedGitChildRelease(ownerDescriptor: ScopedGitEnd
 	const endpoint = path.join(ownerHostRoot, "endpoint");
 	const deadline = Date.now() + DEADLINE;
 	while (Date.now() < deadline) {
-		const released = await new Promise<boolean>((resolve, reject) => {
-			let data = "";
-			const socket = net.createConnection(endpoint);
-			socket.setEncoding("utf8"); socket.on("data", (chunk) => data += chunk);
-			socket.on("error", reject);
-			socket.on("end", () => { try { const result = JSON.parse(data) as { ok?: boolean; released?: boolean; error?: string }; if (!result.ok) throw new Error(result.error ?? "scoped Git child release status failed"); resolve(result.released === true); } catch (error) { reject(error); } });
-			socket.end(JSON.stringify({ op: "child-status", descriptor: { relativeSubtree: childRelative } }) + "\n");
-		});
+		const result = await scopedGitControlRequest(endpoint, { op: "child-status", descriptor: { relativeSubtree: childRelative } });
+		if (!result.ok) throw new Error(typeof result.error === "string" ? result.error : "scoped Git child release status failed");
+		const released = result.released === true;
 		if (released) return;
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
@@ -1019,12 +1051,8 @@ export async function delegateScopedGitWriterDescriptor(descriptor: ScopedGitEnd
 	if (relative === ".." || relative.startsWith(`..${path.sep}`)) throw new Error("scoped Git endpoint descriptor escapes its fixed subtree");
 	const hostRoot = (descriptor as InternalScopedGitEndpointDescriptor).__hostEndpointRoot;
 	const endpoint = hostRoot ? path.join(hostRoot, "endpoint") : path.join(TARGET, relative, "endpoint");
-	await new Promise<void>((resolve, reject) => {
-		const socket = net.createConnection(endpoint); let data = "";
-		socket.setEncoding("utf8"); socket.on("data", (chunk) => data += chunk); socket.on("error", reject);
-		socket.on("end", () => { try { const result = JSON.parse(data) as { ok?: boolean; error?: string }; if (!result.ok) throw new Error(result.error ?? "scoped Git writer delegation failed"); resolve(); } catch (error) { reject(error); } });
-		socket.end(JSON.stringify({ op: "delegate-writer", descriptor, identity }) + "\n");
-	});
+	const result = await scopedGitControlRequest(endpoint, { op: "delegate-writer", descriptor, identity });
+	if (!result.ok) throw new Error(typeof result.error === "string" ? result.error : "scoped Git writer delegation failed");
 }
 
 export function scopedGitDescriptorMounts(descriptor: ScopedGitEndpointDescriptor): SandboxMount[] {

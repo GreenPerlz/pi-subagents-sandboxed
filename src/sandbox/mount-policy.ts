@@ -257,11 +257,9 @@ function addSandboxExtensionMountParents(mounts: SandboxMount[], seen: Map<strin
 }
 
 function addNodeRuntimeMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, command: string): void {
-	const commandDir = path.dirname(command);
-	const installRoot = path.basename(command) === "node" && path.basename(commandDir) === "bin"
-		? path.dirname(commandDir)
-		: undefined;
-	addSandboxMount(mounts, seen, installRoot && existsSync(installRoot) ? installRoot : command, "ro");
+	// The interpreter is an executable file, not an authorization to read its
+	// entire installation (which may contain credentials or unrelated tools).
+	addSandboxMount(mounts, seen, command, "ro");
 }
 
 function addSandboxSpawnCommandMount(mounts: SandboxMount[], seen: Map<string, SandboxMount["mode"]>, command: string | undefined): void {

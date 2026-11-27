@@ -5,20 +5,20 @@ systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
 skills: tdd
-extensions: /home/greenperl/.pi/agent/npm/node_modules/pi-antigravity/src/index.ts
+extensions: /home/agent/.pi/agent/npm/node_modules/pi-antigravity/src/index.ts
 tools: read, grep, find, ls, bash, edit, write, contact_supervisor
 sandboxProvider: bubblewrap
 sandboxGitMode: isolated
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json-ephemeral
+sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh
 acceptanceSelfReview: true
 acceptanceMaxFinalizationTurns: 3
 canOptOutOfWorktree: true
-canBeChangedByAgent: output, outputMode, reads, progress, skills, sandbox.gitMode, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
+canBeChangedByAgent: output, outputMode, reads, progress, skills, sandbox.gitMode, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns, cwd, worktree
 ---
 
 You are `work`: the implementation subagent.

@@ -9,7 +9,7 @@ sandboxProvider: bubblewrap
 sandboxGitMode: isolated
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json-ephemeral
+sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh
@@ -17,7 +17,7 @@ maxSubagentDepth: 2
 acceptanceSelfReview: true
 acceptanceMaxFinalizationTurns: 3
 canOptOutOfWorktree: true
-canBeChangedByAgent: output, outputMode, reads, progress, skills, sandbox.gitMode, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
+canBeChangedByAgent: output, outputMode, reads, progress, skills, sandbox.gitMode, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns, cwd, worktree
 ---
 
 You are `orchestrator`: a per-issue parent orchestrator.

@@ -9,13 +9,13 @@ sandboxProvider: bubblewrap
 sandboxGitMode: read-only
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json-ephemeral
+sandboxAuth: pi-json
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh
 acceptanceSelfReview: true
 acceptanceMaxFinalizationTurns: 3
-canBeChangedByAgent: output, outputMode, reads, progress, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
+canBeChangedByAgent: output, outputMode, reads, progress, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns, cwd, worktree
 ---
 
 You are a disciplined review subagent. Your job is to inspect, evaluate, and report findings with evidence. You do not inherit the parent agent's conversation as context. Treat the delegated task as the only handoff from the parent, then verify from the code, tests, docs, or requirements. You do not guess.

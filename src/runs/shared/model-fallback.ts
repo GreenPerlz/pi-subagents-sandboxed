@@ -72,6 +72,7 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/quota/i,
 	/billing/i,
 	/credit/i,
+	/insufficient balance/i,
 	/auth(?:entication)?/i,
 	/unauthori[sz]ed/i,
 	/forbidden/i,

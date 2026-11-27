@@ -17,7 +17,7 @@ At each user or project scope, dedicated `subagents.json` wins over the legacy `
     "defaultProvider": "bubblewrap",
     "defaultProfile": "host-toolchain",
     "network": "host",
-    "auth": "pi-json",
+    "auth": "pi-json-ephemeral",
     "fallback": "fail",
     "packageDiscovery": "closed",
     "allowSandboxOptOut": false,
@@ -53,7 +53,7 @@ Guarded fields such as `model`, `context`, `output`, `worktree`, `acceptance.*`,
 
 - Keep packaged agents on their declared defaults unless you have a specific, trusted reason.
 - Set `fallback: fail` for containment-sensitive work.
-- Use `pi-json` rather than inherited environment credentials when supported.
+- Use `pi-json-ephemeral` rather than inherited environment credentials when OAuth refresh may be needed. Use `pi-json` only when the child must have strictly read-only credentials.
 - Prefer `closed` package discovery.
 - Set `maxSubagentDepth` to a bounded value before enabling nested fanout.
 - Treat session logs, async state, recovery bundles, and ordinary output artifacts as different data classes.

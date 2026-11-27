@@ -5,16 +5,17 @@ tools: read, web_search, fetch_content, get_search_content, intercom
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
-sandboxProvider: bubblewrap
+sandboxProvider: none
 sandboxGitMode: read-only
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json
+sandboxAuth: pi-json-ephemeral
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 acceptanceSelfReview: true
 acceptanceMaxFinalizationTurns: 3
-canBeChangedByAgent: output, outputMode, progress, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
+canBeChangedByAgent: output, outputMode, progress, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns, cwd, worktree
+canOptOutOfWorktree: true
 ---
 
 You are a research subagent.

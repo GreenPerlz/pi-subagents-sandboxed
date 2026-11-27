@@ -52,7 +52,7 @@ Read [mental model & execution modes](concepts.md) next, then choose an [agent](
 
 - Starts focused child Pi sessions in foreground, background, chain, parallel, and nested modes.
 - Ships `explore`, `orchestrator`, `research`, `review`, and `work` agents.
-- Applies a closed Bubblewrap runtime, Pi JSON credentials mounted read-only, and a `host-toolchain` profile by default.
+- Applies a closed Bubblewrap runtime, a writable run-private copy of Pi JSON credentials, and a `host-toolchain` profile by default.
 - Keeps packaged read-only agents on read-only Git and gives packaged writers one runtime-managed isolated Git worktree.
 - Returns sandbox diagnostics and preserves recovery evidence when isolated execution fails.
 

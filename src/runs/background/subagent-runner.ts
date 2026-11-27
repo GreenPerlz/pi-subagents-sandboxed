@@ -15,6 +15,7 @@ import { createIsolatedGitRuntime, createIsolatedGitWorktree, exportIsolatedGitB
 import { diagnoseSandboxFailure, sandboxResultDetails } from "../../sandbox/diagnostics.ts";
 import { buildSubagentSandboxMounts, type SubagentSandboxMountInput } from "../../sandbox/mount-policy.ts";
 import { inferSandboxCwdWritable, hasSandboxWritableAgent, sandboxDynamicFanoutUnsupportedMessage, sandboxParallelWorktreeRequiredMessage } from "../../sandbox/write-inference.ts";
+import { prepareEphemeralPiAgentDir } from "../../sandbox/ephemeral-auth.ts";
 import type { ResolvedSandboxConfig, SandboxResultDetails, SandboxTransport, SpawnableInvocation } from "../../sandbox/types.ts";
 import { writeSavedOutput } from "../../shared/output-paths.ts";
 import { appendSavedOutputSystemPrompt, captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -375,6 +376,11 @@ function runPiStreaming(
 		// Authentication below must precede caller-controlled output/package effects.
 		let outputStream: fs.WriteStream | undefined;
 		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv(maxSubagentDepth) };
+		const privateAgentDir = prepareEphemeralPiAgentDir({
+			authMode: sandbox?.config.auth,
+			tempDir: sandbox?.tempDir,
+		});
+		if (privateAgentDir) spawnEnv.PI_CODING_AGENT_DIR = privateAgentDir;
 		let piSpawnSpec: ReturnType<typeof getPiSpawnCommand> | undefined;
 		let spawnSpec: SpawnableInvocation;
 		let sandboxDetails: SandboxResultDetails | undefined = sandbox ? sandboxResultDetails(sandbox.config) : undefined;

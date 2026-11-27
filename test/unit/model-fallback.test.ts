@@ -148,6 +148,14 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("authentication failed"), true);
 	});
 
+	it("recognizes DeepSeek insufficient-balance failures regardless of casing", () => {
+		const observedError = '402: {"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}';
+		assert.equal(isRetryableModelFailure(observedError), true);
+		assert.equal(isRetryableModelFailure(observedError.replace("Insufficient Balance", "INSUFFICIENT BALANCE")), true);
+		assert.equal(isRetryableModelFailure('402: {"message":"Invalid request","type":"unknown_error","param":null,"code":"invalid_request_error"}'), false);
+		assert.equal(isRetryableModelFailure("ordinary task failure"), false);
+	});
+
 	it("does not treat ordinary task/tool failures as retryable model failures", () => {
 		assert.equal(isRetryableModelFailure("bash failed (exit 1): command not found"), false);
 		assert.equal(isRetryableModelFailure("read failed (exit 1): no such file or directory"), false);

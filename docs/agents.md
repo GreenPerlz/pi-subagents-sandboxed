@@ -10,7 +10,7 @@
 | `work` | Implements an approved task, validates it, and escalates unapproved decisions. Isolated Git by default. |
 | `orchestrator` | Coordinates explore → work → review for one issue. Isolated Git by default and bounded nested delegation. |
 
-Packaged `explore`, `research`, and `review` use Bubblewrap, `host-toolchain`, host networking, Pi JSON auth, closed package discovery, and `fallback: fail`. Packaged `work` and `orchestrator` use the same sandbox defaults but `sandboxGitMode: isolated`. Direct launches receive one managed isolated worktree; nested calls inherit the parent's scoped endpoint.
+Packaged `explore`, `research`, and `review` use Bubblewrap, `host-toolchain`, host networking, run-private ephemeral Pi JSON auth, closed package discovery, and `fallback: fail`. Packaged `work` and `orchestrator` use the same sandbox defaults but `sandboxGitMode: isolated`. Direct launches receive one managed isolated worktree; nested calls inherit the parent's scoped endpoint.
 
 !!! note "The name is not authority"
     A child called `work` is not automatically allowed to integrate its result. The parent remains the integration owner; inspect the result and recovery bundle before applying it.
@@ -28,7 +28,7 @@ sandboxProvider: bubblewrap
 sandboxGitMode: read-only
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json
+sandboxAuth: pi-json-ephemeral
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh

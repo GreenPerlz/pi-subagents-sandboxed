@@ -5,17 +5,18 @@ tools: read, grep, find, ls, bash
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
-sandboxProvider: bubblewrap
+sandboxProvider: none
 sandboxGitMode: read-only
 sandboxProfile: host-toolchain
 sandboxNetwork: host
-sandboxAuth: pi-json
+sandboxAuth: pi-json-ephemeral
 sandboxFallback: fail
 sandboxPackageDiscovery: closed
 defaultContext: fresh
 acceptanceSelfReview: true
 acceptanceMaxFinalizationTurns: 3
-canBeChangedByAgent: output, outputMode, reads, progress, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns
+canBeChangedByAgent: output, outputMode, reads, progress, acceptance.criteria, acceptance.evidence, acceptance.verify, acceptance.review, acceptance.stopRules, acceptance.selfReview, acceptance.maxFinalizationTurns, cwd, worktree
+canOptOutOfWorktree: true
 ---
 
 # Explore Agent
